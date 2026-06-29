@@ -24,9 +24,7 @@ fn broken_hydra() -> Arc<HydraClient> {
 }
 
 fn fake_kratos() -> Arc<KratosClient> {
-    Arc::new(
-        KratosClient::new("http://localhost:1").expect("fake kratos client should build"),
-    )
+    Arc::new(KratosClient::new("http://localhost:1").expect("fake kratos client should build"))
 }
 
 fn fake_keto() -> Arc<KetoClient> {
@@ -54,7 +52,13 @@ fn scim_state(pool: DbPool, hydra: Arc<HydraClient>) -> Arc<ScimState> {
     })
 }
 
-async fn serve(app: Router) -> (tokio::task::JoinHandle<()>, String, tokio::sync::oneshot::Sender<()>) {
+async fn serve(
+    app: Router,
+) -> (
+    tokio::task::JoinHandle<()>,
+    String,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("random port should bind");
@@ -227,5 +231,7 @@ async fn scim_auth_error_branches() {
     );
 
     let _ = broken_shutdown_tx.send(());
-    broken_handle.await.expect("broken server task should finish");
+    broken_handle
+        .await
+        .expect("broken server task should finish");
 }

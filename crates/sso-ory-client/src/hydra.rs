@@ -223,6 +223,70 @@ impl HydraClient {
         handle_response(response).await
     }
 
+    /// Fetch a logout request by challenge.
+    #[instrument(skip(self), fields(admin_url = %self.admin_url))]
+    pub async fn get_logout_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+        let url = self
+            .admin_url
+            .join("admin/oauth2/auth/requests/logout")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "fetching logout request");
+        let response = self
+            .client
+            .get(url)
+            .query(&[("logout_challenge", challenge)])
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Accept a logout request.
+    #[instrument(skip(self, body), fields(admin_url = %self.admin_url))]
+    pub async fn accept_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        let url = self
+            .admin_url
+            .join("admin/oauth2/auth/requests/logout/accept")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "accepting logout request");
+        let response = self
+            .client
+            .put(url)
+            .query(&[("logout_challenge", challenge)])
+            .json(&body)
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Reject a logout request.
+    #[instrument(skip(self, body), fields(admin_url = %self.admin_url))]
+    pub async fn reject_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        let url = self
+            .admin_url
+            .join("admin/oauth2/auth/requests/logout/reject")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "rejecting logout request");
+        let response = self
+            .client
+            .put(url)
+            .query(&[("logout_challenge", challenge)])
+            .json(&body)
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
     /// Proxy an authorization request to Hydra's public `/oauth2/auth` endpoint.
     #[instrument(skip(self))]
     pub async fn authorize(&self, query: Vec<(String, String)>) -> Result<Value, OryClientError> {
@@ -385,8 +449,8 @@ mod tests {
 
     use axum::{
         Json, Router,
-        extract::Form,
-        routing::{get, post},
+        extract::{Form, Query},
+        routing::{get, post, put},
     };
     use serde_json::json;
 
@@ -400,6 +464,18 @@ mod tests {
                 get(get_client).put(update_client).delete(delete_client),
             )
             .route("/oauth2/introspect", post(introspect))
+            .route(
+                "/admin/oauth2/auth/requests/logout",
+                get(get_logout_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/logout/accept",
+                put(accept_logout_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/logout/reject",
+                put(reject_logout_request),
+            )
     }
 
     async fn create_client(Json(body): Json<Value>) -> Json<Value> {
@@ -432,6 +508,36 @@ mod tests {
         Json(json!({
             "active": true,
             "sub": form.get("token").cloned().unwrap_or_default(),
+        }))
+    }
+
+    async fn get_logout_request(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("logout_challenge").cloned().unwrap_or_default(),
+            "subject": "subject-1",
+            "client": { "client_id": "client-1" }
+        }))
+    }
+
+    async fn accept_logout_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("logout_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
+        }))
+    }
+
+    async fn reject_logout_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("logout_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
         }))
     }
 
@@ -518,5 +624,38 @@ mod tests {
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client.create_oauth2_client(json!({})).await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 400, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_logout_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client.get_logout_request("challenge-1").await.unwrap();
+        assert_eq!(resp["challenge"], "challenge-1");
+        assert_eq!(resp["subject"], "subject-1");
+    }
+
+    #[tokio::test]
+    async fn accept_logout_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .accept_logout_request("challenge-1", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(resp["redirect_to"], "http://redirect");
+        assert_eq!(resp["challenge"], "challenge-1");
+    }
+
+    #[tokio::test]
+    async fn reject_logout_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .reject_logout_request("challenge-1", json!({ "error": "denied" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["redirect_to"], "http://redirect");
+        assert_eq!(resp["body"]["error"], "denied");
     }
 }

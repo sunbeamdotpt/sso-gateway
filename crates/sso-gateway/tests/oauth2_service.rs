@@ -4,15 +4,13 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{
-        IdMappingRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool,
-    },
+    db::{IdMappingRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::{application::ApplicationServiceImpl, tenant::TenantServiceImpl},
 };
-use sso_ory_client::HydraClient;
+use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
     router::ServiceRouter,
@@ -50,7 +48,8 @@ async fn oauth2_public_endpoints_round_trip() {
         api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
-    let application_service = Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_service =
+        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
@@ -73,11 +72,18 @@ async fn oauth2_public_endpoints_round_trip() {
         .build_axum()
         .expect("server should build");
 
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
+
     let app = server
         .app()
         .merge(oauth2_router(oauth_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings.clone()));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -93,7 +99,9 @@ async fn oauth2_public_endpoints_round_trip() {
 
     // Create an application for client-credentials grants.
     let create_resp = client
-        .post(format!("{base}/iam.v1.ApplicationService/CreateApplication"))
+        .post(format!(
+            "{base}/iam.v1.ApplicationService/CreateApplication"
+        ))
         .header("x-tenant-id", &system_tenant_ulid)
         .header("content-type", "application/json")
         .json(&json!({
@@ -114,7 +122,10 @@ async fn oauth2_public_endpoints_round_trip() {
         create_resp.text().await.unwrap_or_default()
     );
 
-    let app: serde_json::Value = create_resp.json().await.expect("application should be json");
+    let app: serde_json::Value = create_resp
+        .json()
+        .await
+        .expect("application should be json");
     let app_id = app["id"].as_str().expect("application id should exist");
 
     // The Hydra client_id is exposed through the RotateSecret RPC.
@@ -132,7 +143,9 @@ async fn oauth2_public_endpoints_round_trip() {
         rotate_resp.text().await.unwrap_or_default()
     );
     let rotated: serde_json::Value = rotate_resp.json().await.expect("secret should be json");
-    let client_id = rotated["clientId"].as_str().expect("client_id should exist");
+    let client_id = rotated["clientId"]
+        .as_str()
+        .expect("client_id should exist");
     let client_secret = rotated["clientSecret"]
         .as_str()
         .expect("client_secret should exist");
@@ -220,7 +233,10 @@ async fn oauth2_public_endpoints_round_trip() {
     // Unknown client_id is rejected.
     let unknown_auth_resp = client
         .get(format!("{base}/oauth2/auth"))
-        .query(&[("client_id", "unknown-client-id"), ("response_type", "token")])
+        .query(&[
+            ("client_id", "unknown-client-id"),
+            ("response_type", "token"),
+        ])
         .send()
         .await
         .expect("authorize request should complete");
@@ -279,7 +295,8 @@ async fn oauth2_missing_client_id_is_rejected() {
         api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
-    let application_service = Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_service =
+        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
@@ -302,11 +319,18 @@ async fn oauth2_missing_client_id_is_rejected() {
         .build_axum()
         .expect("server should build");
 
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
+
     let app = server
         .app()
         .merge(oauth2_router(oauth_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings.clone()));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {

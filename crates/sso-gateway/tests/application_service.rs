@@ -9,7 +9,7 @@ use sso_gateway::{
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::{application::ApplicationServiceImpl, tenant::TenantServiceImpl},
 };
-use sso_ory_client::HydraClient;
+use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
     router::ServiceRouter,
@@ -38,6 +38,10 @@ async fn application_service_round_trip() {
     let hydra = Arc::new(
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("kratos client should build"),
+    );
     let mappings = IdMappingRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
     let api_keys = TenantApiKeyRepo::new(pool);
@@ -47,7 +51,7 @@ async fn application_service_round_trip() {
         api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
-    let application_service = Arc::new(ApplicationServiceImpl::new(hydra, mappings));
+    let application_service = Arc::new(ApplicationServiceImpl::new(hydra, mappings.clone()));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
@@ -62,7 +66,9 @@ async fn application_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await

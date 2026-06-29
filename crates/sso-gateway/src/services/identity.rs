@@ -15,11 +15,10 @@ use crate::{
         CreateIdentityRequest, CreateIdentitySchemaRequest, CreateLoginFlowRequest,
         CreateRegistrationFlowRequest, DeleteIdentityRequest, DeleteIdentitySchemaRequest,
         DeleteSessionRequest, Flow, GetIdentityRequest, GetIdentitySchemaRequest,
-        GetSessionRequest, Identity, IdentitySchema, IdentityService,
-        ListIdentitiesRequest, ListIdentitiesResponse, ListIdentitySchemasRequest,
-        ListIdentitySchemasResponse, ListSessionsRequest, ListSessionsResponse,
-        Session, SetDefaultIdentitySchemaRequest, UpdateIdentityRequest,
-        UpdateIdentitySchemaRequest,
+        GetSessionRequest, Identity, IdentitySchema, IdentityService, ListIdentitiesRequest,
+        ListIdentitiesResponse, ListIdentitySchemasRequest, ListIdentitySchemasResponse,
+        ListSessionsRequest, ListSessionsResponse, Session, SetDefaultIdentitySchemaRequest,
+        UpdateIdentityRequest, UpdateIdentitySchemaRequest,
     },
 };
 
@@ -674,10 +673,14 @@ mod tests {
 
     #[test]
     fn build_kratos_identity_payload_includes_password_when_set() {
-        let payload = build_kratos_identity_payload("default", json!({"email": "a@b.com"}), "secret");
+        let payload =
+            build_kratos_identity_payload("default", json!({"email": "a@b.com"}), "secret");
         assert_eq!(payload["schema_id"], "default");
         assert_eq!(payload["traits"]["email"], "a@b.com");
-        assert_eq!(payload["credentials"]["password"]["config"]["password"], "secret");
+        assert_eq!(
+            payload["credentials"]["password"]["config"]["password"],
+            "secret"
+        );
     }
 
     #[test]
@@ -783,7 +786,11 @@ mod tests {
                 status,
                 message: "msg".into(),
             });
-            assert_eq!(std::mem::discriminant(&err), std::mem::discriminant(&expected), "status {status}");
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&expected),
+                "status {status}"
+            );
         }
 
         assert!(matches!(

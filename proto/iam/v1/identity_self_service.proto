@@ -1,0 +1,216 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/identity.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// BrowserSession is the gateway's view of an authenticated session.
+// It is intentionally separate from the admin Session message in identity.proto.
+message BrowserSession {
+  string id = 1;
+  string identity_id = 2;
+  string tenant_id = 3;
+  bool active = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp authenticated_at = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  string authenticator_assurance_level = 8;
+  google.protobuf.Struct identity_traits = 9;
+}
+
+// SelfServiceFlow is the gateway's opaque representation of a Kratos self-service
+// flow (login, registration, settings, recovery, verification).
+message SelfServiceFlow {
+  string id = 1;
+  string type = 2;
+  string state = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  google.protobuf.Timestamp issued_at = 5;
+  string return_to = 6;
+  string request_url = 7;
+  string active_method = 8;
+  string identity_schema_id = 9;
+  OAuth2LoginRequest oauth2_login_request = 10;
+  UiContainer ui = 11;
+}
+
+// UiContainer carries the action, method, nodes and messages rendered by the UI.
+message UiContainer {
+  string action = 1;
+  string method = 2;
+  repeated UiNode nodes = 3;
+  repeated UiMessage messages = 4;
+}
+
+// UiNode is a single UI element inside a flow container.
+message UiNode {
+  string type = 1;
+  string group = 2;
+  repeated UiMessage messages = 3;
+  UiNodeMeta meta = 4;
+  oneof attributes {
+    UiNodeInputAttributes input = 5;
+    UiNodeTextAttributes text = 6;
+    UiNodeAnchorAttributes anchor = 7;
+    UiNodeImageAttributes image = 8;
+    UiNodeScriptAttributes script = 9;
+  }
+}
+
+message UiNodeMeta {
+  string label_id = 1;
+  string label_text = 2;
+}
+
+message UiNodeInputAttributes {
+  string name = 1;
+  string type = 2;
+  string value = 3;
+  bool required = 4;
+  bool disabled = 5;
+  string autocomplete = 6;
+  string node_type = 7;
+}
+
+message UiNodeTextAttributes {
+  string id = 1;
+  string text = 2;
+}
+
+message UiNodeAnchorAttributes {
+  string href = 1;
+  string title = 2;
+  string id = 3;
+}
+
+message UiNodeImageAttributes {
+  string src = 1;
+  string width = 2;
+  string height = 3;
+  string id = 4;
+}
+
+message UiNodeScriptAttributes {
+  string src = 1;
+  string async = 2;
+  string referrerpolicy = 3;
+  string crossorigin = 4;
+  string integrity = 5;
+  string type = 6;
+  string id = 7;
+  string nonce = 8;
+}
+
+message UiMessage {
+  string id = 1;
+  string text = 2;
+  string type = 3;
+  repeated UiMessageContext context = 4;
+}
+
+message UiMessageContext {
+  string key = 1;
+  string value = 2;
+}
+
+// OAuth2LoginRequest surfaces the OIDC login request embedded in a login flow.
+message OAuth2LoginRequest {
+  string challenge = 1;
+  string client_id = 2;
+  string client_name = 3;
+  repeated string requested_scope = 4;
+  repeated string requested_access_token_audience = 5;
+  string subject = 6;
+  bool skip = 7;
+}
+
+// LogoutFlow is returned when a browser logout flow is created.
+message LogoutFlow {
+  string id = 1;
+  string logout_url = 2;
+  string logout_token = 3;
+}
+
+// FlowError is the gateway's view of a Kratos flow error.
+message FlowError {
+  string id = 1;
+  string error = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message ToSessionRequest {
+  // Optional explicit session token. When empty, the gateway uses the request cookies.
+  string session_token = 1;
+}
+
+message GetFlowRequest {
+  string id = 1;
+}
+
+message SubmitFlowRequest {
+  string id = 1;
+  google.protobuf.Struct body = 2;
+}
+
+// CreateLoginFlowRequest and CreateRegistrationFlowRequest are defined in identity.proto.
+
+message CreateSettingsFlowRequest {
+  string return_to = 1;
+}
+
+message CreateRecoveryFlowRequest {
+  string return_to = 1;
+}
+
+message CreateLogoutFlowRequest {
+  string return_to = 1;
+}
+
+message SubmitLogoutFlowRequest {
+  string id = 1;
+  string token = 2;
+  string return_to = 3;
+}
+
+message CreateVerificationFlowRequest {
+  string return_to = 1;
+}
+
+message GetFlowErrorRequest {
+  string id = 1;
+}
+
+message WebAuthnJsResponse {
+  string content = 1;
+}
+
+// IdentitySelfService exposes browser-facing Kratos self-service flows through
+// a gateway-owned, Ory-agnostic contract.
+service IdentitySelfService {
+  rpc ToSession(ToSessionRequest) returns (BrowserSession);
+  rpc GetLoginFlow(GetFlowRequest) returns (SelfServiceFlow);
+  rpc GetRegistrationFlow(GetFlowRequest) returns (SelfServiceFlow);
+  rpc GetSettingsFlow(GetFlowRequest) returns (SelfServiceFlow);
+  rpc GetRecoveryFlow(GetFlowRequest) returns (SelfServiceFlow);
+  rpc GetVerificationFlow(GetFlowRequest) returns (SelfServiceFlow);
+  rpc SubmitLoginFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  rpc SubmitRegistrationFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  rpc SubmitSettingsFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  rpc SubmitRecoveryFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  rpc SubmitVerificationFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  rpc CreateLoginFlow(CreateLoginFlowRequest) returns (SelfServiceFlow);
+  rpc CreateRegistrationFlow(CreateRegistrationFlowRequest) returns (SelfServiceFlow);
+  rpc CreateSettingsFlow(CreateSettingsFlowRequest) returns (SelfServiceFlow);
+  rpc CreateRecoveryFlow(CreateRecoveryFlowRequest) returns (SelfServiceFlow);
+  rpc CreateLogoutFlow(CreateLogoutFlowRequest) returns (LogoutFlow);
+  rpc SubmitLogoutFlow(SubmitLogoutFlowRequest) returns (google.protobuf.Empty);
+  rpc CreateVerificationFlow(CreateVerificationFlowRequest) returns (SelfServiceFlow);
+  rpc GetFlowError(GetFlowErrorRequest) returns (FlowError);
+  rpc GetWebAuthnJavaScript(google.protobuf.Empty) returns (WebAuthnJsResponse);
+}

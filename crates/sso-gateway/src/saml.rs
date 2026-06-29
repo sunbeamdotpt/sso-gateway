@@ -5,7 +5,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Query, State},
-    http::{StatusCode, Response},
+    http::{Response, StatusCode},
     response::IntoResponse,
     routing::get,
 };
@@ -66,12 +66,12 @@ async fn metadata(
     State(state): State<Arc<SamlState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, SamlError> {
-    let provider_id = params
-        .get("provider_id")
-        .ok_or_else(|| SamlError::Response(Box::new(saml_error(
+    let provider_id = params.get("provider_id").ok_or_else(|| {
+        SamlError::Response(Box::new(saml_error(
             StatusCode::BAD_REQUEST,
             "missing provider_id",
-        ))))?;
+        )))
+    })?;
 
     let provider = state.service.providers.get_by_id(provider_id).await?;
     let xml = state.service.generate_sp_metadata(&provider)?;
@@ -109,7 +109,9 @@ mod tests {
         let resp = saml_error(StatusCode::NOT_FOUND, "missing provider");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "application/json"
         );
     }
@@ -123,13 +125,19 @@ mod tests {
     #[test]
     fn saml_error_from_db_error_maps_other_to_internal() {
         let err: SamlError = crate::db::DbError::Sqlx(sqlx::Error::PoolTimedOut).into();
-        assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn saml_error_from_service_error_maps_internal() {
         let err: SamlError = sunbeam_g2v::error::ServiceError::Internal("fail".into()).into();
-        assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]

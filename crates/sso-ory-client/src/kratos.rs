@@ -163,6 +163,353 @@ impl KratosClient {
         handle_response(response).await
     }
 
+    /// Validate a session from a browser cookie or explicit token via the public whoami endpoint.
+    #[instrument(skip(self, cookie, token))]
+    pub async fn to_session(
+        &self,
+        cookie: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join("sessions/whoami")?;
+        let mut request = self.client.get(url).header("accept", "application/json");
+        if let Some(token) = token {
+            request = request.header("X-Session-Token", token);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Get an existing self-service login flow by id.
+    #[instrument(skip(self, cookie))]
+    pub async fn get_login_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.get_flow("login", id, cookie).await
+    }
+
+    /// Get an existing self-service registration flow by id.
+    #[instrument(skip(self, cookie))]
+    pub async fn get_registration_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.get_flow("registration", id, cookie).await
+    }
+
+    /// Get an existing self-service settings flow by id.
+    #[instrument(skip(self, cookie))]
+    pub async fn get_settings_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.get_flow("settings", id, cookie).await
+    }
+
+    /// Get an existing self-service recovery flow by id.
+    #[instrument(skip(self, cookie))]
+    pub async fn get_recovery_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.get_flow("recovery", id, cookie).await
+    }
+
+    /// Get an existing self-service verification flow by id.
+    #[instrument(skip(self, cookie))]
+    pub async fn get_verification_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.get_flow("verification", id, cookie).await
+    }
+
+    async fn get_flow(
+        &self,
+        flow_type: &str,
+        id: &str,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join(&format!("self-service/{flow_type}/flows"))?;
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("id", id)])
+            .header("accept", "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Submit a self-service login flow.
+    #[instrument(skip(self, cookie, body))]
+    pub async fn submit_login_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.submit_flow("login", id, cookie, body).await
+    }
+
+    /// Submit a self-service registration flow.
+    #[instrument(skip(self, cookie, body))]
+    pub async fn submit_registration_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.submit_flow("registration", id, cookie, body).await
+    }
+
+    /// Submit a self-service settings flow.
+    #[instrument(skip(self, cookie, body))]
+    pub async fn submit_settings_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.submit_flow("settings", id, cookie, body).await
+    }
+
+    /// Submit a self-service recovery flow.
+    #[instrument(skip(self, cookie, body))]
+    pub async fn submit_recovery_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.submit_flow("recovery", id, cookie, body).await
+    }
+
+    /// Submit a self-service verification flow.
+    #[instrument(skip(self, cookie, body))]
+    pub async fn submit_verification_flow(
+        &self,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.submit_flow("verification", id, cookie, body).await
+    }
+
+    async fn submit_flow(
+        &self,
+        flow_type: &str,
+        id: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join(&format!("self-service/{flow_type}"))?;
+        let mut request = self
+            .client
+            .post(url)
+            .query(&[("flow", id)])
+            .header("accept", "application/json")
+            .json(&body);
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Create a browser logout flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_logout_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join("self-service/logout/browser")?;
+        let mut request = self.client.get(url).header("accept", "application/json");
+        if let Some(return_to) = return_to {
+            request = request.query(&[("return_to", return_to)]);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Submit a logout flow using the token returned by `create_logout_flow`.
+    #[instrument(skip(self, cookie))]
+    pub async fn submit_logout_flow(
+        &self,
+        token: &str,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<(), OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join("self-service/logout")?;
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("token", token)])
+            .header("accept", "application/json");
+        if let Some(return_to) = return_to {
+            request = request.query(&[("return_to", return_to)]);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ory_error(response).await)
+        }
+    }
+
+    /// Create a browser verification flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_verification_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.create_browser_flow("verification", return_to, cookie)
+            .await
+    }
+
+    /// Create a browser login flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_login_browser_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.create_browser_flow("login", return_to, cookie).await
+    }
+
+    /// Create a browser registration flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_registration_browser_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.create_browser_flow("registration", return_to, cookie)
+            .await
+    }
+
+    /// Create a browser settings flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_settings_browser_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.create_browser_flow("settings", return_to, cookie)
+            .await
+    }
+
+    /// Create a browser recovery flow.
+    #[instrument(skip(self, cookie))]
+    pub async fn create_recovery_browser_flow(
+        &self,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.create_browser_flow("recovery", return_to, cookie)
+            .await
+    }
+
+    #[instrument(skip(self, cookie))]
+    async fn create_browser_flow(
+        &self,
+        flow: &str,
+        return_to: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join(&format!("self-service/{flow}/browser"))?;
+        let mut request = self.client.get(url).header("accept", "application/json");
+        if let Some(return_to) = return_to {
+            request = request.query(&[("return_to", return_to)]);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Get a self-service flow error by id.
+    #[instrument(skip(self))]
+    pub async fn get_flow_error(&self, id: &str) -> Result<Value, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join("self-service/errors")?;
+        let request = self
+            .client
+            .get(url)
+            .query(&[("id", id)])
+            .header("accept", "application/json");
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Fetch the WebAuthn JavaScript asset served by Kratos.
+    #[instrument(skip(self))]
+    pub async fn get_webauthn_js(&self) -> Result<String, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join(".well-known/ory/webauthn.js")?;
+        let response = self
+            .client
+            .get(url)
+            .header("accept", "application/javascript")
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        if response.status().is_success() {
+            response.text().await.map_err(OryClientError::Http)
+        } else {
+            Err(ory_error(response).await)
+        }
+    }
+
     async fn send_json(
         &self,
         method: Method,
@@ -226,6 +573,7 @@ async fn ory_error(response: reqwest::Response) -> OryClientError {
 mod tests {
     use axum::{
         Json, Router,
+        extract::Query,
         routing::{get, post},
     };
     use serde_json::json;
@@ -233,7 +581,7 @@ mod tests {
     use super::*;
 
     fn app() -> Router {
-        Router::new()
+        let admin = Router::new()
             .route("/admin/identities", post(create_identity))
             .route(
                 "/admin/identities/{id}",
@@ -241,7 +589,19 @@ mod tests {
                     .put(update_identity)
                     .delete(delete_identity),
             )
-            .route("/schemas/{id}", get(get_schema))
+            .route("/schemas/{id}", get(get_schema));
+
+        let public = Router::new()
+            .route("/sessions/whoami", get(whoami))
+            .route("/self-service/{flow}/browser", get(create_browser_flow))
+            .route("/self-service/login/flows", get(get_login_flow))
+            .route("/self-service/login", post(submit_login_flow))
+            .route("/self-service/logout/browser", get(create_logout_flow))
+            .route("/self-service/logout", get(submit_logout_flow))
+            .route("/self-service/errors", get(get_flow_error))
+            .route("/.well-known/ory/webauthn.js", get(webauthn_js));
+
+        Router::new().merge(admin).merge(public)
     }
 
     async fn create_identity(Json(body): Json<Value>) -> Json<Value> {
@@ -268,6 +628,89 @@ mod tests {
 
     async fn get_schema(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
         Json(json!({ "id": id, "schema": "{}" }))
+    }
+
+    async fn create_browser_flow(
+        axum::extract::Path(flow): axum::extract::Path<String>,
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": format!("{flow}-1"),
+            "type": flow,
+            "return_to": params.get("return_to").cloned().unwrap_or_default()
+        }))
+    }
+
+    async fn whoami(headers: axum::http::HeaderMap) -> Json<Value> {
+        let token = headers
+            .get("x-session-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let cookie = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        Json(json!({
+            "id": "session-1",
+            "active": true,
+            "identity": { "id": "identity-1", "traits": { "email": "a@example.com" } },
+            "token": token,
+            "cookie": cookie,
+        }))
+    }
+
+    async fn get_login_flow(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": params.get("id").cloned().unwrap_or_default(),
+            "type": "login",
+            "state": "choose_method"
+        }))
+    }
+
+    async fn submit_login_flow(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": params.get("flow").cloned().unwrap_or_default(),
+            "type": "login",
+            "state": "passed_challenge",
+            "body": body
+        }))
+    }
+
+    async fn create_logout_flow(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": "logout-1",
+            "logout_url": "http://logout",
+            "logout_token": "token-1",
+            "return_to": params.get("return_to").cloned().unwrap_or_default()
+        }))
+    }
+
+    async fn submit_logout_flow(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "token": params.get("token").cloned().unwrap_or_default()
+        }))
+    }
+
+    async fn get_flow_error(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": params.get("id").cloned().unwrap_or_default(),
+            "error": { "message": "oops" }
+        }))
+    }
+
+    async fn webauthn_js() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::OK, "console.log('webauthn');")
     }
 
     async fn start_server() -> (tokio::task::JoinHandle<()>, String) {
@@ -324,5 +767,137 @@ mod tests {
         let client = KratosClient::new(&url).unwrap();
         let resp = client.get_identity_schema("default").await.unwrap();
         assert_eq!(resp["id"], "default");
+    }
+
+    #[tokio::test]
+    async fn to_session_with_cookie_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .to_session(Some("ory_kratos_session=abc"), None)
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "session-1");
+        assert_eq!(resp["cookie"], "ory_kratos_session=abc");
+    }
+
+    #[tokio::test]
+    async fn to_session_with_token_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client.to_session(None, Some("token-1")).await.unwrap();
+        assert_eq!(resp["token"], "token-1");
+    }
+
+    #[tokio::test]
+    async fn get_login_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .get_login_flow("flow-1", Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "login");
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_login_flow("flow-1", Some("cookie"), json!({ "identifier": "a" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["state"], "passed_challenge");
+        assert_eq!(resp["body"]["identifier"], "a");
+    }
+
+    #[tokio::test]
+    async fn create_login_browser_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_login_browser_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "login-1");
+        assert_eq!(resp["type"], "login");
+        assert_eq!(resp["return_to"], "http://return");
+    }
+
+    #[tokio::test]
+    async fn create_registration_browser_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_registration_browser_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "registration-1");
+        assert_eq!(resp["type"], "registration");
+    }
+
+    #[tokio::test]
+    async fn create_settings_browser_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_settings_browser_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "settings-1");
+        assert_eq!(resp["type"], "settings");
+    }
+
+    #[tokio::test]
+    async fn create_recovery_browser_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_recovery_browser_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "recovery-1");
+        assert_eq!(resp["type"], "recovery");
+    }
+
+    #[tokio::test]
+    async fn create_logout_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_logout_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "logout-1");
+        assert_eq!(resp["return_to"], "http://return");
+    }
+
+    #[tokio::test]
+    async fn submit_logout_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        client
+            .submit_logout_flow("token-1", None, Some("cookie"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_flow_error_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client.get_flow_error("error-1").await.unwrap();
+        assert_eq!(resp["id"], "error-1");
+    }
+
+    #[tokio::test]
+    async fn get_webauthn_js_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client.get_webauthn_js().await.unwrap();
+        assert_eq!(resp, "console.log('webauthn');");
     }
 }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use buffa::Message;
 use buffa::bytes::Bytes;
 use buffa::view::{HasMessageView, MessageView};
-use buffa_types::google::protobuf::Struct as ProtoStruct;
 use buffa_types::google::protobuf::Empty;
+use buffa_types::google::protobuf::Struct as ProtoStruct;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use http::HeaderMap;
 use serde_json::json;
@@ -18,9 +18,9 @@ use crate::{
     middleware::TenantId,
     proto::iam::v1::{
         ScimCreateGroupRequest, ScimCreateUserRequest, ScimDeleteGroupRequest,
-        ScimDeleteUserRequest, ScimGetGroupRequest, ScimGetUserRequest, ScimGroup, ScimListGroupsRequest,
-        ScimListGroupsResponse, ScimListUsersRequest, ScimListUsersResponse, ScimMember,
-        ScimService, ScimUpdateGroupRequest, ScimUpdateUserRequest, ScimUser,
+        ScimDeleteUserRequest, ScimGetGroupRequest, ScimGetUserRequest, ScimGroup,
+        ScimListGroupsRequest, ScimListGroupsResponse, ScimListUsersRequest, ScimListUsersResponse,
+        ScimMember, ScimService, ScimUpdateGroupRequest, ScimUpdateUserRequest, ScimUser,
     },
 };
 
@@ -28,7 +28,9 @@ const BACKEND_KRATOS: &str = "kratos";
 const SCIM_GROUP_NAMESPACE: &str = "scim_group";
 const SCIM_GROUP_RELATION: &str = "member";
 
-fn decode_request<'a, Req: HasMessageView>(bytes: &'a Bytes) -> Result<Req::View<'a>, ServiceError> {
+fn decode_request<'a, Req: HasMessageView>(
+    bytes: &'a Bytes,
+) -> Result<Req::View<'a>, ServiceError> {
     Req::View::decode_view(bytes)
         .map_err(|e| ServiceError::Internal(format!("failed to decode self-encoded request: {e}")))
 }
@@ -79,7 +81,10 @@ impl ScimService for ScimServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         let _req = request.to_owned_message();
 
-        let public_ids = self.mappings.list_public_ids(&tenant_id, BACKEND_KRATOS).await?;
+        let public_ids = self
+            .mappings
+            .list_public_ids(&tenant_id, BACKEND_KRATOS)
+            .await?;
         let mut users = Vec::with_capacity(public_ids.len());
         for public_id in public_ids {
             match self.load_user(&tenant_id, &public_id).await {
@@ -114,9 +119,10 @@ impl ScimService for ScimServiceImpl {
     ) -> ServiceResult<ScimUser> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let input = req.user.as_option().ok_or_else(|| {
-            ServiceError::InvalidArgument("user is required".into())
-        })?;
+        let input = req
+            .user
+            .as_option()
+            .ok_or_else(|| ServiceError::InvalidArgument("user is required".into()))?;
 
         let traits = scim_user_to_traits(input);
         let schema = self.resolve_schema(&tenant_id, "").await?;
@@ -126,7 +132,11 @@ impl ScimService for ScimServiceImpl {
             "schema_id": schema.schema_id,
             "traits": traits,
         });
-        let created = self.kratos.create_identity(payload).await.map_err(map_ory_error)?;
+        let created = self
+            .kratos
+            .create_identity(payload)
+            .await
+            .map_err(map_ory_error)?;
         let ory_id = created["id"]
             .as_str()
             .ok_or_else(|| ServiceError::Internal("kratos response missing id".into()))?;
@@ -136,7 +146,8 @@ impl ScimService for ScimServiceImpl {
             .await?;
 
         for group_id in &input.groups {
-            self.add_user_to_group(&tenant_id, &public_id, group_id).await?;
+            self.add_user_to_group(&tenant_id, &public_id, group_id)
+                .await?;
         }
 
         let user = self.load_user(&tenant_id, &public_id).await?;
@@ -151,9 +162,10 @@ impl ScimService for ScimServiceImpl {
     ) -> ServiceResult<ScimUser> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let input = req.user.as_option().ok_or_else(|| {
-            ServiceError::InvalidArgument("user is required".into())
-        })?;
+        let input = req
+            .user
+            .as_option()
+            .ok_or_else(|| ServiceError::InvalidArgument("user is required".into()))?;
 
         let (ory_id, _) = self.resolve_identity(&tenant_id, &req.id).await?;
         let traits = scim_user_to_traits(input);
@@ -173,7 +185,8 @@ impl ScimService for ScimServiceImpl {
         if !input.groups.is_empty() {
             self.groups.remove_user_from_all_groups(&req.id).await?;
             for group_id in &input.groups {
-                self.add_user_to_group(&tenant_id, &req.id, group_id).await?;
+                self.add_user_to_group(&tenant_id, &req.id, group_id)
+                    .await?;
             }
         }
 
@@ -195,7 +208,10 @@ impl ScimService for ScimServiceImpl {
             .await?;
 
         self.groups.remove_user_from_all_groups(&req.id).await?;
-        self.kratos.delete_identity(&ory_id).await.map_err(map_ory_error)?;
+        self.kratos
+            .delete_identity(&ory_id)
+            .await
+            .map_err(map_ory_error)?;
         self.mappings
             .delete(&tenant_id, BACKEND_KRATOS, &req.id)
             .await?;
@@ -243,14 +259,16 @@ impl ScimService for ScimServiceImpl {
     ) -> ServiceResult<ScimGroup> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let input = req.group.as_option().ok_or_else(|| {
-            ServiceError::InvalidArgument("group is required".into())
-        })?;
+        let input = req
+            .group
+            .as_option()
+            .ok_or_else(|| ServiceError::InvalidArgument("group is required".into()))?;
 
         let row = self.groups.create(&tenant_id, &input.display_name).await?;
         for member in &input.members {
             if member.r#type == "User" || member.r#type.is_empty() {
-                self.add_user_to_group(&tenant_id, &member.value, &row.id).await?;
+                self.add_user_to_group(&tenant_id, &member.value, &row.id)
+                    .await?;
             }
         }
 
@@ -266,16 +284,22 @@ impl ScimService for ScimServiceImpl {
     ) -> ServiceResult<ScimGroup> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let input = req.group.as_option().ok_or_else(|| {
-            ServiceError::InvalidArgument("group is required".into())
-        })?;
+        let input = req
+            .group
+            .as_option()
+            .ok_or_else(|| ServiceError::InvalidArgument("group is required".into()))?;
 
-        let row = self.groups.update(&tenant_id, &req.id, &input.display_name).await?;
+        let row = self
+            .groups
+            .update(&tenant_id, &req.id, &input.display_name)
+            .await?;
 
         // Replace memberships.
         let existing = self.groups.list_members(&req.id).await?;
         for user_id in &existing {
-            self.groups.remove_member(&tenant_id, &req.id, user_id).await?;
+            self.groups
+                .remove_member(&tenant_id, &req.id, user_id)
+                .await?;
             let _ = self
                 .keto
                 .delete_relation_tuple(SCIM_GROUP_NAMESPACE, &req.id, SCIM_GROUP_RELATION, user_id)
@@ -284,7 +308,8 @@ impl ScimService for ScimServiceImpl {
         }
         for member in &input.members {
             if member.r#type == "User" || member.r#type.is_empty() {
-                self.add_user_to_group(&tenant_id, &member.value, &req.id).await?;
+                self.add_user_to_group(&tenant_id, &member.value, &req.id)
+                    .await?;
             }
         }
 
@@ -355,7 +380,11 @@ impl ScimServiceImpl {
 
     async fn load_user(&self, tenant_id: &str, public_id: &str) -> Result<ScimUser, ServiceError> {
         let (ory_id, _) = self.resolve_identity(tenant_id, public_id).await?;
-        let identity = self.kratos.get_identity(&ory_id).await.map_err(map_ory_error)?;
+        let identity = self
+            .kratos
+            .get_identity(&ory_id)
+            .await
+            .map_err(map_ory_error)?;
         let traits = &identity["traits"];
 
         let email = traits["email"].as_str().unwrap_or("").to_string();
@@ -422,7 +451,10 @@ impl ScimServiceImpl {
         group_id: &str,
     ) -> Result<(), ServiceError> {
         // Verify the user belongs to the tenant.
-        let _ = self.mappings.get_ory_id(tenant_id, BACKEND_KRATOS, user_id).await?;
+        let _ = self
+            .mappings
+            .get_ory_id(tenant_id, BACKEND_KRATOS, user_id)
+            .await?;
         self.groups.add_member(tenant_id, group_id, user_id).await?;
         self.keto
             .create_relation_tuple(SCIM_GROUP_NAMESPACE, group_id, SCIM_GROUP_RELATION, user_id)
@@ -484,7 +516,10 @@ impl ScimServiceImpl {
         tenant_id: String,
         id: String,
     ) -> Result<Response<ScimUser>, connectrpc::ConnectError> {
-        let req = ScimGetUserRequest { id, ..Default::default() };
+        let req = ScimGetUserRequest {
+            id,
+            ..Default::default()
+        };
         svc_req!(svc_req, req, ScimGetUserRequest);
         ScimService::get_user(self, request_context(tenant_id), svc_req).await
     }
@@ -522,7 +557,10 @@ impl ScimServiceImpl {
         tenant_id: String,
         id: String,
     ) -> Result<Response<Empty>, connectrpc::ConnectError> {
-        let req = ScimDeleteUserRequest { id, ..Default::default() };
+        let req = ScimDeleteUserRequest {
+            id,
+            ..Default::default()
+        };
         svc_req!(svc_req, req, ScimDeleteUserRequest);
         ScimService::delete_user(self, request_context(tenant_id), svc_req).await
     }
@@ -541,7 +579,10 @@ impl ScimServiceImpl {
         tenant_id: String,
         id: String,
     ) -> Result<Response<ScimGroup>, connectrpc::ConnectError> {
-        let req = ScimGetGroupRequest { id, ..Default::default() };
+        let req = ScimGetGroupRequest {
+            id,
+            ..Default::default()
+        };
         svc_req!(svc_req, req, ScimGetGroupRequest);
         ScimService::get_group(self, request_context(tenant_id), svc_req).await
     }
@@ -579,7 +620,10 @@ impl ScimServiceImpl {
         tenant_id: String,
         id: String,
     ) -> Result<Response<Empty>, connectrpc::ConnectError> {
-        let req = ScimDeleteGroupRequest { id, ..Default::default() };
+        let req = ScimDeleteGroupRequest {
+            id,
+            ..Default::default()
+        };
         svc_req!(svc_req, req, ScimDeleteGroupRequest);
         ScimService::delete_group(self, request_context(tenant_id), svc_req).await
     }
@@ -703,15 +747,21 @@ mod tests {
     #[tokio::test]
     async fn map_ory_error_maps_non_ory_variants() {
         assert!(matches!(
-            map_ory_error(OryClientError::Http(reqwest::get("http://localhost:1").await.unwrap_err())),
+            map_ory_error(OryClientError::Http(
+                reqwest::get("http://localhost:1").await.unwrap_err()
+            )),
             ServiceError::Unavailable(_)
         ));
         assert!(matches!(
-            map_ory_error(OryClientError::Serialization(serde_json::from_str::<serde_json::Value>("not json").unwrap_err())),
+            map_ory_error(OryClientError::Serialization(
+                serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+            )),
             ServiceError::Serialization(_)
         ));
         assert!(matches!(
-            map_ory_error(OryClientError::Url(reqwest::Url::parse("not-a-url").unwrap_err())),
+            map_ory_error(OryClientError::Url(
+                reqwest::Url::parse("not-a-url").unwrap_err()
+            )),
             ServiceError::Configuration(_)
         ));
         assert!(matches!(

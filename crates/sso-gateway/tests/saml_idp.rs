@@ -18,12 +18,7 @@ mod support;
 
 const SIG_ALG_RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 
-fn build_authn_request_xml(
-    id: &str,
-    issuer: &str,
-    destination: &str,
-    acs_url: &str,
-) -> String {
+fn build_authn_request_xml(id: &str, issuer: &str, destination: &str, acs_url: &str) -> String {
     let now = chrono::Utc::now();
     let request = AuthnRequestRef {
         base: RequestBaseRef {
@@ -91,10 +86,7 @@ fn encode_redirect(
     redirect_encode(&params).expect("encode redirect")
 }
 
-async fn create_kratos_identity_and_session(
-    public_url: &str,
-    email: &str,
-) -> (String, String) {
+async fn create_kratos_identity_and_session(public_url: &str, email: &str) -> (String, String) {
     let client = reqwest::Client::new();
 
     let flow: serde_json::Value = client
@@ -353,12 +345,7 @@ async fn saml_idp_sso_signed_request_verifies_signature() {
         &destination,
         &sp_client.acs_url,
     );
-    let redirect_url = encode_redirect(
-        &destination,
-        &request_xml,
-        Some(&signer),
-        "signed-state",
-    );
+    let redirect_url = encode_redirect(&destination, &request_xml, Some(&signer), "signed-state");
 
     let client = reqwest::Client::new();
     let resp = client

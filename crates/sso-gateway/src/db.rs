@@ -59,9 +59,7 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             DbError::SamlIdentityMappingNotFound => {
                 Self::NotFound("saml identity mapping not found".to_string())
             }
-            DbError::SamlIdpKeyNotFound => {
-                Self::NotFound("saml idp key not found".to_string())
-            }
+            DbError::SamlIdpKeyNotFound => Self::NotFound("saml idp key not found".to_string()),
             DbError::SamlSpClientNotFound => {
                 Self::NotFound("saml service provider client not found".to_string())
             }
@@ -1090,13 +1088,11 @@ impl ScimGroupRepo {
     }
 
     pub async fn delete(&self, tenant_id: &str, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query(
-            "DELETE FROM scim_groups WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM scim_groups WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::TenantNotFound);
         }
@@ -1128,13 +1124,11 @@ impl ScimGroupRepo {
         group_id: &str,
         user_id: &str,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            "DELETE FROM scim_group_members WHERE group_id = $1 AND user_id = $2",
-        )
-        .bind(group_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM scim_group_members WHERE group_id = $1 AND user_id = $2")
+            .bind(group_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1485,22 +1479,61 @@ mod tests {
     #[test]
     fn db_error_into_service_error_maps_all_variants() {
         let cases: Vec<(DbError, ServiceError)> = vec![
-            (DbError::Sqlx(sqlx::Error::PoolTimedOut), ServiceError::Database("sqlx error: PoolTimedOut".into())),
-            (DbError::MissingSystemTenant, ServiceError::Internal("missing system tenant".into())),
-            (DbError::TenantNotFound, ServiceError::NotFound("tenant not found".into())),
-            (DbError::MappingNotFound, ServiceError::NotFound("id mapping not found".into())),
-            (DbError::SchemaNotFound, ServiceError::NotFound("identity schema not found".into())),
-            (DbError::TupleNotFound, ServiceError::NotFound("permission tuple not found".into())),
-            (DbError::SamlProviderNotFound, ServiceError::NotFound("saml provider not found".into())),
-            (DbError::SamlRequestNotFound, ServiceError::NotFound("saml request not found".into())),
-            (DbError::SamlIdentityMappingNotFound, ServiceError::NotFound("saml identity mapping not found".into())),
-            (DbError::SamlIdpKeyNotFound, ServiceError::NotFound("saml idp key not found".into())),
-            (DbError::SamlSpClientNotFound, ServiceError::NotFound("saml service provider client not found".into())),
-            (DbError::ApiKeyNotFound, ServiceError::Unauthenticated("api key not found or expired".into())),
+            (
+                DbError::Sqlx(sqlx::Error::PoolTimedOut),
+                ServiceError::Database("sqlx error: PoolTimedOut".into()),
+            ),
+            (
+                DbError::MissingSystemTenant,
+                ServiceError::Internal("missing system tenant".into()),
+            ),
+            (
+                DbError::TenantNotFound,
+                ServiceError::NotFound("tenant not found".into()),
+            ),
+            (
+                DbError::MappingNotFound,
+                ServiceError::NotFound("id mapping not found".into()),
+            ),
+            (
+                DbError::SchemaNotFound,
+                ServiceError::NotFound("identity schema not found".into()),
+            ),
+            (
+                DbError::TupleNotFound,
+                ServiceError::NotFound("permission tuple not found".into()),
+            ),
+            (
+                DbError::SamlProviderNotFound,
+                ServiceError::NotFound("saml provider not found".into()),
+            ),
+            (
+                DbError::SamlRequestNotFound,
+                ServiceError::NotFound("saml request not found".into()),
+            ),
+            (
+                DbError::SamlIdentityMappingNotFound,
+                ServiceError::NotFound("saml identity mapping not found".into()),
+            ),
+            (
+                DbError::SamlIdpKeyNotFound,
+                ServiceError::NotFound("saml idp key not found".into()),
+            ),
+            (
+                DbError::SamlSpClientNotFound,
+                ServiceError::NotFound("saml service provider client not found".into()),
+            ),
+            (
+                DbError::ApiKeyNotFound,
+                ServiceError::Unauthenticated("api key not found or expired".into()),
+            ),
         ];
         for (err, expected) in cases {
             let actual: ServiceError = err.into();
-            assert_eq!(std::mem::discriminant(&actual), std::mem::discriminant(&expected));
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
         }
     }
 
@@ -1524,4 +1557,3 @@ mod tests {
         let _size = std::mem::size_of::<IdentitySchemaRow>();
     }
 }
-

@@ -28,7 +28,10 @@ pub struct Oauth2State {
 
 pub fn router(state: Arc<Oauth2State>) -> Router {
     Router::new()
-        .route("/.well-known/openid-configuration", get(openid_configuration))
+        .route(
+            "/.well-known/openid-configuration",
+            get(openid_configuration),
+        )
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth2/auth", get(authorize))
         .route("/oauth2/token", post(token))
@@ -37,15 +40,15 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/oauth2/revoke", post(revoke))
         .route(
             "/oauth2/auth/requests/login",
-            get(get_login)
-                .put(accept_login)
-                .delete(reject_login),
+            get(get_login).put(accept_login).delete(reject_login),
         )
         .route(
             "/oauth2/auth/requests/consent",
-            get(get_consent)
-                .put(accept_consent)
-                .delete(reject_consent),
+            get(get_consent).put(accept_consent).delete(reject_consent),
+        )
+        .route(
+            "/oauth2/auth/requests/logout",
+            get(get_logout).put(accept_logout).delete(reject_logout),
         )
         .with_state(state)
 }
@@ -123,10 +126,7 @@ async fn token(
     }
 }
 
-async fn userinfo(
-    State(state): State<Arc<Oauth2State>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> impl IntoResponse {
     let token = match bearer_token(&headers) {
         Some(t) => t,
         None => return unauthorized(),
@@ -256,6 +256,50 @@ async fn reject_consent(
     }
 }
 
+async fn get_logout(
+    State(state): State<Arc<Oauth2State>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let challenge = match params.get("logout_challenge") {
+        Some(c) => c.clone(),
+        None => return bad_request("missing logout_challenge"),
+    };
+    match state.hydra.get_logout_request(&challenge).await {
+        Ok(value) => json_response(value),
+        Err(err) => map_ory_error(err),
+    }
+}
+
+async fn accept_logout(
+    State(state): State<Arc<Oauth2State>>,
+    Query(params): Query<HashMap<String, String>>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let challenge = match params.get("logout_challenge") {
+        Some(c) => c.clone(),
+        None => return bad_request("missing logout_challenge"),
+    };
+    match state.hydra.accept_logout_request(&challenge, body).await {
+        Ok(value) => json_response(value),
+        Err(err) => map_ory_error(err),
+    }
+}
+
+async fn reject_logout(
+    State(state): State<Arc<Oauth2State>>,
+    Query(params): Query<HashMap<String, String>>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let challenge = match params.get("logout_challenge") {
+        Some(c) => c.clone(),
+        None => return bad_request("missing logout_challenge"),
+    };
+    match state.hydra.reject_logout_request(&challenge, body).await {
+        Ok(value) => json_response(value),
+        Err(err) => map_ory_error(err),
+    }
+}
+
 async fn validate_public_client(
     state: &Oauth2State,
     headers: &HeaderMap,
@@ -363,7 +407,6 @@ fn map_ory_error(err: OryClientError) -> Response<Body> {
     (status, axum::Json(body)).into_response()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,14 +421,20 @@ mod tests {
     #[test]
     fn bearer_token_extracts_token() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret-token"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
         assert_eq!(bearer_token(&headers), Some("secret-token"));
     }
 
     #[test]
     fn bearer_token_rejects_non_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
         assert_eq!(bearer_token(&headers), None);
     }
 
@@ -465,7 +514,9 @@ mod tests {
         let resp = json_response(json!({"key": "value"}));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "application/json"
         );
     }

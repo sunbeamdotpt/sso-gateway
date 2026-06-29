@@ -10,13 +10,11 @@ use sso_gateway::{
     },
     middleware::auth_middleware,
     oauth2::{Oauth2State, router as oauth2_router},
-    proto::iam::v1::{
-        ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt,
-    },
+    proto::iam::v1::{ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt},
     scim::{ScimState, router as scim_router},
     services::{
-        application::ApplicationServiceImpl, identity::IdentityServiceImpl,
-        scim::ScimServiceImpl, tenant::TenantServiceImpl,
+        application::ApplicationServiceImpl, identity::IdentityServiceImpl, scim::ScimServiceImpl,
+        tenant::TenantServiceImpl,
     },
 };
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
@@ -50,12 +48,10 @@ async fn scim_users_and_groups_round_trip() {
         .expect("system tenant should bootstrap");
 
     let hydra = Arc::new(
-        HydraClient::new(&hydra_admin_url, &hydra_public_url)
-            .expect("hydra client should build"),
+        HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
-    let kratos = Arc::new(
-        KratosClient::new(&kratos_admin_url).expect("kratos client should build"),
-    );
+    let kratos =
+        Arc::new(KratosClient::new(&kratos_admin_url).expect("kratos client should build"));
     let keto = Arc::new(
         KetoClient::new(&keto_read_url, &keto_write_url).expect("keto client should build"),
     );
@@ -64,17 +60,15 @@ async fn scim_users_and_groups_round_trip() {
     let schemas = IdentitySchemaRepo::new(pool.clone());
     let groups = ScimGroupRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let api_keys = TenantApiKeyRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
-    let application_service = Arc::new(ApplicationServiceImpl::new(
-        hydra.clone(),
-        mappings.clone(),
-    ));
+    let application_service =
+        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
         mappings.clone(),
@@ -121,7 +115,9 @@ async fn scim_users_and_groups_round_trip() {
         .merge(oauth2_router(oauth_state))
         .merge(scim_router(scim_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -158,7 +154,9 @@ async fn scim_users_and_groups_round_trip() {
 
     // Create an OAuth2 client for bearer-token authentication.
     let app_resp = client
-        .post(format!("{base}/iam.v1.ApplicationService/CreateApplication"))
+        .post(format!(
+            "{base}/iam.v1.ApplicationService/CreateApplication"
+        ))
         .header("x-tenant-id", tenant_id)
         .header("content-type", "application/json")
         .json(&json!({
@@ -194,14 +192,18 @@ async fn scim_users_and_groups_round_trip() {
         rotate_resp.text().await.unwrap_or_default()
     );
     let rotated: serde_json::Value = rotate_resp.json().await.expect("secret should be json");
-    let client_id = rotated["clientId"].as_str().expect("client_id should exist");
+    let client_id = rotated["clientId"]
+        .as_str()
+        .expect("client_id should exist");
     let client_secret = rotated["clientSecret"]
         .as_str()
         .expect("client_secret should exist");
 
     // Create and default an identity schema so SCIM users validate.
     let schema_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/CreateIdentitySchema"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/CreateIdentitySchema"
+        ))
         .header("x-tenant-id", tenant_id)
         .header("content-type", "application/json")
         .json(&json!({
@@ -228,7 +230,9 @@ async fn scim_users_and_groups_round_trip() {
     );
 
     let set_default_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"
+        ))
         .header("x-tenant-id", tenant_id)
         .header("content-type", "application/json")
         .json(&json!({ "schemaId": "default" }))
@@ -336,7 +340,10 @@ async fn scim_users_and_groups_round_trip() {
         .await
         .expect("list users request should succeed");
     assert!(list_users_resp.status().is_success(), "list users failed");
-    let users_list: serde_json::Value = list_users_resp.json().await.expect("users list should be json");
+    let users_list: serde_json::Value = list_users_resp
+        .json()
+        .await
+        .expect("users list should be json");
     assert_eq!(users_list["totalResults"], 1);
 
     // Get user.
@@ -366,7 +373,10 @@ async fn scim_users_and_groups_round_trip() {
         "update user failed: {}",
         update_user_resp.text().await.unwrap_or_default()
     );
-    let updated_user: serde_json::Value = update_user_resp.json().await.expect("updated user should be json");
+    let updated_user: serde_json::Value = update_user_resp
+        .json()
+        .await
+        .expect("updated user should be json");
     assert_eq!(updated_user["userName"], "alice.updated");
 
     // Create a group containing the user.
@@ -385,10 +395,15 @@ async fn scim_users_and_groups_round_trip() {
         "create group failed: {}",
         create_group_resp.text().await.unwrap_or_default()
     );
-    let group: serde_json::Value = create_group_resp.json().await.expect("group should be json");
+    let group: serde_json::Value = create_group_resp
+        .json()
+        .await
+        .expect("group should be json");
     let group_id = group["id"].as_str().expect("group id should exist");
     assert_eq!(group["displayName"], "Engineering");
-    let members = group["members"].as_array().expect("members should be array");
+    let members = group["members"]
+        .as_array()
+        .expect("members should be array");
     assert_eq!(members.len(), 1);
 
     // List groups.
@@ -416,7 +431,10 @@ async fn scim_users_and_groups_round_trip() {
         "update group failed: {}",
         update_group_resp.text().await.unwrap_or_default()
     );
-    let updated_group: serde_json::Value = update_group_resp.json().await.expect("updated group should be json");
+    let updated_group: serde_json::Value = update_group_resp
+        .json()
+        .await
+        .expect("updated group should be json");
     assert_eq!(updated_group["displayName"], "Engineering-Updated");
 
     // Delete group and user.

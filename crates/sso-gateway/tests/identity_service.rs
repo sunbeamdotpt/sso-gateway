@@ -87,7 +87,11 @@ async fn identity_service_round_trip() {
         api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
-    let identity_service = Arc::new(IdentityServiceImpl::new(kratos, mappings, schemas));
+    let identity_service = Arc::new(IdentityServiceImpl::new(
+        kratos.clone(),
+        mappings.clone(),
+        schemas,
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = identity_service.register(connect_router);
@@ -102,7 +106,9 @@ async fn identity_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -225,7 +231,9 @@ async fn identity_service_round_trip() {
 
     // Schema registry CRUD.
     let schema_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/CreateIdentitySchema"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/CreateIdentitySchema"
+        ))
         .header("x-tenant-id", &system_tenant_ulid)
         .header("content-type", "application/json")
         .json(&json!({
@@ -262,7 +270,9 @@ async fn identity_service_round_trip() {
     assert!(get_schema_resp.status().is_success(), "get schema failed");
 
     let update_schema_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/UpdateIdentitySchema"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/UpdateIdentitySchema"
+        ))
         .header("x-tenant-id", &system_tenant_ulid)
         .header("content-type", "application/json")
         .json(&json!({
@@ -281,7 +291,10 @@ async fn identity_service_round_trip() {
         .send()
         .await
         .expect("update schema request should succeed");
-    assert!(update_schema_resp.status().is_success(), "update schema failed");
+    assert!(
+        update_schema_resp.status().is_success(),
+        "update schema failed"
+    );
 
     let list_schema_resp = client
         .post(format!("{base}/iam.v1.IdentityService/ListIdentitySchemas"))
@@ -291,7 +304,10 @@ async fn identity_service_round_trip() {
         .send()
         .await
         .expect("list schemas request should succeed");
-    assert!(list_schema_resp.status().is_success(), "list schemas failed");
+    assert!(
+        list_schema_resp.status().is_success(),
+        "list schemas failed"
+    );
     let listed_schemas: serde_json::Value = list_schema_resp
         .json()
         .await
@@ -307,14 +323,19 @@ async fn identity_service_round_trip() {
     assert!(schema_ids.contains(&"default"));
 
     let set_default_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"
+        ))
         .header("x-tenant-id", &system_tenant_ulid)
         .header("content-type", "application/json")
         .json(&json!({ "schemaId": "custom" }))
         .send()
         .await
         .expect("set default schema request should succeed");
-    assert!(set_default_resp.status().is_success(), "set default schema failed");
+    assert!(
+        set_default_resp.status().is_success(),
+        "set default schema failed"
+    );
 
     // Self-service flows are backed by Kratos public API.
     let login_resp = client
@@ -335,7 +356,9 @@ async fn identity_service_round_trip() {
     assert!(!login_flow["type"].as_str().unwrap_or("").is_empty());
 
     let reg_resp = client
-        .post(format!("{base}/iam.v1.IdentityService/CreateRegistrationFlow"))
+        .post(format!(
+            "{base}/iam.v1.IdentityService/CreateRegistrationFlow"
+        ))
         .header("x-tenant-id", &system_tenant_ulid)
         .header("content-type", "application/json")
         .json(&json!({}))
@@ -347,7 +370,10 @@ async fn identity_service_round_trip() {
         "create registration flow failed: {}",
         reg_resp.text().await.unwrap_or_default()
     );
-    let reg_flow: serde_json::Value = reg_resp.json().await.expect("registration flow should be json");
+    let reg_flow: serde_json::Value = reg_resp
+        .json()
+        .await
+        .expect("registration flow should be json");
     assert!(!reg_flow["id"].as_str().unwrap_or("").is_empty());
     assert!(!reg_flow["type"].as_str().unwrap_or("").is_empty());
 

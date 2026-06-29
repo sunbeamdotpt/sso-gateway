@@ -1,6 +1,6 @@
 use sso_gateway::db::{
-    DbError, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, ScimGroupRepo, TenantApiKeyRepo,
-    TenantRepo, bootstrap_system_tenant, create_pool,
+    DbError, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, ScimGroupRepo,
+    TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool,
 };
 
 mod support;
@@ -86,7 +86,14 @@ async fn db_edge_cases() {
         .create(&tenant_id, "app", "obj1", "owner", "sub1")
         .await
         .expect("tuple should be created");
-    assert_eq!(tuples.list(&tenant_id, None, None, None).await.unwrap().len(), 1);
+    assert_eq!(
+        tuples
+            .list(&tenant_id, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         tuples
             .list(&tenant_id, Some("app"), None, None)
@@ -111,11 +118,13 @@ async fn db_edge_cases() {
             .len(),
         1
     );
-    assert!(tuples
-        .list(&tenant_id, Some("other"), None, None)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        tuples
+            .list(&tenant_id, Some("other"), None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let groups = ScimGroupRepo::new(pool.clone());
     assert!(matches!(

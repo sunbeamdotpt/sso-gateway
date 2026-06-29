@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
+use gamlastan::security::InMemoryReplayCache;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdentitySchemaRepo, SamlIdpKeyRepo, SamlIdentityMappingRepo,
+        IdMappingRepo, IdentitySchemaRepo, SamlIdentityMappingRepo, SamlIdpKeyRepo,
         SamlProviderRepo, SamlReplayCache, SamlRequestRepo, TenantApiKeyRepo, TenantRepo,
         bootstrap_system_tenant, create_pool,
     },
@@ -16,7 +17,6 @@ use sso_gateway::{
         federation::FederationServiceImpl, identity::IdentityServiceImpl, tenant::TenantServiceImpl,
     },
 };
-use gamlastan::security::InMemoryReplayCache;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -194,10 +194,10 @@ async fn federation_saml_login_round_trip() {
         schemas.clone(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(
-        kratos,
+        kratos.clone(),
         providers,
         requests,
-        mappings,
+        mappings.clone(),
         federation_mappings,
         schemas,
         idp_keys,
@@ -227,7 +227,9 @@ async fn federation_saml_login_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys.clone()));
+        .layer(Extension(api_keys.clone()))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -447,10 +449,10 @@ async fn federation_saml_signed_login_is_idempotent() {
         schemas.clone(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(
-        kratos,
+        kratos.clone(),
         providers,
         requests,
-        mappings,
+        mappings.clone(),
         federation_mappings,
         schemas,
         idp_keys,
@@ -478,7 +480,9 @@ async fn federation_saml_signed_login_is_idempotent() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys.clone()));
+        .layer(Extension(api_keys.clone()))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -632,7 +636,6 @@ async fn federation_saml_signed_login_is_idempotent() {
     handle.await.expect("server task should finish");
 }
 
-
 #[tokio::test]
 async fn federation_saml_metadata_endpoint() {
     let (_pg, database_url) = support::start_postgres()
@@ -758,7 +761,6 @@ async fn federation_saml_metadata_endpoint() {
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn federation_saml_db_replay_cache_rejects_duplicates() {

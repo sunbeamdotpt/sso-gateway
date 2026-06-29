@@ -1,32 +1,33 @@
 use std::sync::Arc;
 
-use axum::{Extension, Router as AxumRouter, middleware::from_fn, routing::get};
-use connectrpc::Router as ConnectRouter;
-use gamlastan::crypto::SamlSigner;
-use gamlastan::crypto::keys::build_idp_keys_manager;
 use crate::{
     config::Config,
     db::{
-        AuditLogRepo, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, SamlIdpKeyRepo,
-        SamlIdentityMappingRepo, SamlProviderRepo, SamlReplayCache, SamlRequestRepo,
-        SamlSpClientRepo, ScimGroupRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant,
-        create_pool,
+        AuditLogRepo, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo,
+        SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo, SamlReplayCache,
+        SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantApiKeyRepo, TenantRepo,
+        bootstrap_system_tenant, create_pool,
     },
     middleware::{audit_middleware, auth_middleware},
     oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{
-        ApplicationServiceExt, FederationServiceExt, IdentityServiceExt, PermissionServiceExt,
-        ScimServiceExt, TenantServiceExt,
+        ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
+        OAuth2ConsentServiceExt, PermissionServiceExt, ScimServiceExt, TenantServiceExt,
     },
     saml::{SamlState, router as saml_router},
     saml_idp::{SamlIdpState, router as saml_idp_router},
     scim::{ScimState, router as scim_router},
     services::{
         application::ApplicationServiceImpl, federation::FederationServiceImpl,
-        identity::IdentityServiceImpl, permission::PermissionServiceImpl,
+        identity::IdentityServiceImpl, identity_self_service::IdentitySelfServiceImpl,
+        oauth2_consent::OAuth2ConsentServiceImpl, permission::PermissionServiceImpl,
         scim::ScimServiceImpl, tenant::TenantServiceImpl,
     },
 };
+use axum::{Extension, Router as AxumRouter, middleware::from_fn, routing::get};
+use connectrpc::Router as ConnectRouter;
+use gamlastan::crypto::SamlSigner;
+use gamlastan::crypto::keys::build_idp_keys_manager;
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
 use sunbeam_g2v::{
     error::ServiceResult,
@@ -122,11 +123,14 @@ pub async fn run(config: Config) -> ServiceResult<()> {
     ));
     let oauth_mappings = mappings.clone();
     let scim_mappings = mappings.clone();
+    let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
+    let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
+
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),
         providers,
         requests,
-        mappings,
+        mappings.clone(),
         federation_mappings,
         schemas,
         idp_keys.clone(),
@@ -166,6 +170,8 @@ pub async fn run(config: Config) -> ServiceResult<()> {
     let connect_router: ConnectRouter = permission_service.register(connect_router);
     let connect_router: ConnectRouter = scim_service.register(connect_router);
     let connect_router: ConnectRouter = federation_service.register(connect_router);
+    let connect_router: ConnectRouter = self_service.register(connect_router);
+    let connect_router: ConnectRouter = oauth2_consent_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
 
     let public_routes = AxumRouter::new()
@@ -195,7 +201,9 @@ pub async fn run(config: Config) -> ServiceResult<()> {
         .layer(from_fn(audit_middleware))
         .layer(from_fn(auth_middleware))
         .layer(Extension(api_keys))
-        .layer(Extension(audit_log));
+        .layer(Extension(audit_log))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let listener = tokio::net::TcpListener::bind(server.config().addr)
         .await

@@ -380,7 +380,11 @@ mod tests {
                 status,
                 message: "msg".into(),
             });
-            assert_eq!(std::mem::discriminant(&err), std::mem::discriminant(&expected), "status {status}");
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&expected),
+                "status {status}"
+            );
         }
     }
 }

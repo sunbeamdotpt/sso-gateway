@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// ConsentRequest is the gateway's view of a Hydra OAuth2 consent request.
+message ConsentRequest {
+  string challenge = 1;
+  string client_id = 2;
+  string client_name = 3;
+  string subject = 4;
+  bool skip = 5;
+  repeated string requested_scope = 6;
+  repeated string requested_access_token_audience = 7;
+  google.protobuf.Struct oidc_context = 8;
+}
+
+message AcceptConsentRequest {
+  string challenge = 1;
+  repeated string grant_scope = 2;
+  repeated string grant_access_token_audience = 3;
+  bool remember = 4;
+  int64 remember_for = 5;
+  google.protobuf.Struct session = 6;
+}
+
+message RejectConsentRequest {
+  string challenge = 1;
+  string error = 2;
+  string error_description = 3;
+  string error_hint = 4;
+  int32 status_code = 5;
+}
+
+message ConsentResponse {
+  string redirect_to = 1;
+}
+
+// LogoutRequest is the gateway's view of a Hydra OIDC logout request.
+message LogoutRequest {
+  string challenge = 1;
+  string subject = 2;
+  string client_id = 3;
+  string request_url = 4;
+  string post_logout_redirect_uri = 5;
+}
+
+message AcceptLogoutRequest {
+  string challenge = 1;
+}
+
+message RejectLogoutRequest {
+  string challenge = 1;
+  string error = 2;
+  string error_description = 3;
+  string error_hint = 4;
+  int32 status_code = 5;
+}
+
+message LogoutResponse {
+  string redirect_to = 1;
+}
+
+message GetChallengeRequest {
+  string challenge = 1;
+}
+
+// OAuth2ConsentService exposes Hydra consent and logout request handling
+// through a gateway-owned, Ory-agnostic Connect-RPC contract.
+service OAuth2ConsentService {
+  rpc GetConsentRequest(GetChallengeRequest) returns (ConsentRequest);
+  rpc AcceptConsent(AcceptConsentRequest) returns (ConsentResponse);
+  rpc RejectConsent(RejectConsentRequest) returns (ConsentResponse);
+  rpc GetLogoutRequest(GetChallengeRequest) returns (LogoutRequest);
+  rpc AcceptLogout(AcceptLogoutRequest) returns (LogoutResponse);
+  rpc RejectLogout(RejectLogoutRequest) returns (LogoutResponse);
+}

@@ -4,12 +4,15 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{PermissionTupleRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{
+        IdMappingRepo, PermissionTupleRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant,
+        create_pool,
+    },
     middleware::auth_middleware,
     proto::iam::v1::{PermissionServiceExt, TenantServiceExt},
     services::{permission::PermissionServiceImpl, tenant::TenantServiceImpl},
 };
-use sso_ory_client::KetoClient;
+use sso_ory_client::{KetoClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
     router::ServiceRouter,
@@ -40,7 +43,7 @@ async fn permission_service_round_trip() {
     );
     let tuples = PermissionTupleRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let api_keys = TenantApiKeyRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
@@ -59,10 +62,18 @@ async fn permission_service_round_trip() {
         .build_axum()
         .expect("server should build");
 
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
+    let mappings = IdMappingRepo::new(pool.clone());
+
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await

@@ -11,12 +11,12 @@ use gamlastan::core::protocol::response::{
 use gamlastan::crypto::keys::bergshamra_keys::KeysManager;
 use gamlastan::crypto::keys::loader;
 use gamlastan::crypto::{SamlSigner, SamlVerifier};
-use gamlastan::profiles::sso::sp::{
-    create_authn_request, process_response_with_verified_signatures,
-};
 use gamlastan::metadata::types::{
     Endpoint, EntityDescriptor, EntityRoles, IndexedEndpoint, KeyDescriptor, RoleDescriptorBase,
     SpSsoDescriptor, SsoDescriptorBase,
+};
+use gamlastan::profiles::sso::sp::{
+    create_authn_request, process_response_with_verified_signatures,
 };
 use gamlastan::profiles::sso::web_browser::{AuthnRequestOptions, bindings as saml_bindings};
 use gamlastan::security::SecurityConfig;
@@ -27,7 +27,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::db::{
-    IdMappingRepo, IdentitySchemaRepo, SamlIdpKeyRepo, SamlIdentityMappingRepo, SamlProviderRepo,
+    IdMappingRepo, IdentitySchemaRepo, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
     SamlProviderRow, SamlRequestRepo,
 };
 use crate::middleware::TenantId;
@@ -187,7 +187,8 @@ impl FederationService for FederationServiceImpl {
 
         if provider.authn_requests_signed && self.saml_signer.is_none() {
             return Err(ServiceError::Configuration(
-                "provider requires signed AuthnRequests but no SAML signing key is configured".into(),
+                "provider requires signed AuthnRequests but no SAML signing key is configured"
+                    .into(),
             )
             .into());
         }
@@ -363,9 +364,8 @@ impl FederationService for FederationServiceImpl {
 impl FederationServiceImpl {
     /// Generate SAML 2.0 SP metadata XML for a configured provider.
     pub fn generate_sp_metadata(&self, provider: &SamlProviderRow) -> Result<String, ServiceError> {
-        let mut base = RoleDescriptorBase::new(vec![
-            "urn:oasis:names:tc:SAML:2.0:protocol".to_string(),
-        ]);
+        let mut base =
+            RoleDescriptorBase::new(vec!["urn:oasis:names:tc:SAML:2.0:protocol".to_string()]);
 
         if let Some(cert_pem) = &self.sp_certificate_pem
             && let Some(key_info) = key_info_from_certificate_pem(cert_pem)
@@ -379,10 +379,8 @@ impl FederationServiceImpl {
         }
 
         let acs_url = resolve_acs_url(&self.public_base_url, &provider.acs_url);
-        let acs_endpoint = IndexedEndpoint::new_default(
-            Endpoint::new(saml_bindings::HTTP_POST, acs_url),
-            0,
-        );
+        let acs_endpoint =
+            IndexedEndpoint::new_default(Endpoint::new(saml_bindings::HTTP_POST, acs_url), 0);
 
         let authn_requests_signed = provider.authn_requests_signed && self.saml_signer.is_some();
 
@@ -427,7 +425,11 @@ impl FederationServiceImpl {
 
 fn resolve_acs_url(public_base_url: &str, provider_acs_url: &str) -> String {
     if provider_acs_url.starts_with('/') {
-        format!("{}{}", public_base_url.trim_end_matches('/'), provider_acs_url)
+        format!(
+            "{}{}",
+            public_base_url.trim_end_matches('/'),
+            provider_acs_url
+        )
     } else {
         provider_acs_url.to_string()
     }
@@ -579,8 +581,6 @@ fn json_web_key_to_proto(value: serde_json::Value) -> JSONWebKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use sso_ory_client::error::OryClientError;
     use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
     use gamlastan::core::assertion::name_id::NameId;
     use gamlastan::core::constants;
@@ -588,6 +588,8 @@ mod tests {
     use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
     use gamlastan::security::InMemoryReplayCache;
     use gamlastan::xml::SamlSerialize;
+    use serde_json::json;
+    use sso_ory_client::error::OryClientError;
 
     fn build_test_response(request_id: &str, sp_entity_id: &str, acs_url: &str) -> SamlResponse {
         let options = ResponseOptions {
@@ -725,7 +727,10 @@ mod tests {
 
     #[test]
     fn test_key_info_from_certificate_pem_returns_none_for_empty() {
-        assert!(key_info_from_certificate_pem("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").is_none());
+        assert!(
+            key_info_from_certificate_pem("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")
+                .is_none()
+        );
     }
 
     #[test]
@@ -737,7 +742,10 @@ mod tests {
     #[test]
     fn test_verify_saml_signature_errors_for_bad_cert() {
         let err = verify_saml_signature("<xml/>", Some("not a certificate")).unwrap_err();
-        assert!(matches!(err, gamlastan::crypto::error::CryptoError::KeyNotFound(_)));
+        assert!(matches!(
+            err,
+            gamlastan::crypto::error::CryptoError::KeyNotFound(_)
+        ));
     }
 
     #[test]
@@ -750,25 +758,37 @@ mod tests {
     #[test]
     fn test_require_tenant_missing() {
         let ctx = RequestContext::new(http::HeaderMap::new());
-        assert!(matches!(require_tenant(&ctx), Err(ServiceError::Unauthenticated(_))));
+        assert!(matches!(
+            require_tenant(&ctx),
+            Err(ServiceError::Unauthenticated(_))
+        ));
     }
 
     #[tokio::test]
     async fn test_map_ory_error_maps_all_variants() {
         assert!(matches!(
-            map_ory_error(OryClientError::Ory { status: 400, message: "bad".into() }),
+            map_ory_error(OryClientError::Ory {
+                status: 400,
+                message: "bad".into()
+            }),
             ServiceError::InvalidArgument(_)
         ));
         assert!(matches!(
-            map_ory_error(OryClientError::Http(reqwest::get("http://localhost:1").await.unwrap_err())),
+            map_ory_error(OryClientError::Http(
+                reqwest::get("http://localhost:1").await.unwrap_err()
+            )),
             ServiceError::Unavailable(_)
         ));
         assert!(matches!(
-            map_ory_error(OryClientError::Serialization(serde_json::from_str::<serde_json::Value>("not json").unwrap_err())),
+            map_ory_error(OryClientError::Serialization(
+                serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+            )),
             ServiceError::Serialization(_)
         ));
         assert!(matches!(
-            map_ory_error(OryClientError::Url(reqwest::Url::parse("not-a-url").unwrap_err())),
+            map_ory_error(OryClientError::Url(
+                reqwest::Url::parse("not-a-url").unwrap_err()
+            )),
             ServiceError::Configuration(_)
         ));
         assert!(matches!(

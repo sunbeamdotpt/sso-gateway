@@ -84,7 +84,6 @@ impl Config {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -175,7 +174,10 @@ mod tests {
         assert_eq!(config.redis_url, "redis://redis:6379");
         assert_eq!(config.hydra_admin_url, "http://hydra:4445");
         assert_eq!(config.public_base_url, "https://gateway.example.com");
-        assert_eq!(config.saml_idp_entity_id, Some("https://idp.example.com".to_string()));
+        assert_eq!(
+            config.saml_idp_entity_id,
+            Some("https://idp.example.com".to_string())
+        );
         assert_eq!(config.saml_request_ttl_seconds, 600);
         assert!(!config.saml_require_signed_assertions);
         assert!(config.saml_require_signed_responses);
@@ -198,9 +200,7 @@ mod tests {
         set_env("DATABASE_URL", "postgres://u:p@localhost/db");
         let err = Config::from_env().unwrap_err();
         drop(_guard);
-        assert!(
-            matches!(err, ConfigError::InvalidSystemTenantUlid(ref s) if s == "not-a-ulid")
-        );
+        assert!(matches!(err, ConfigError::InvalidSystemTenantUlid(ref s) if s == "not-a-ulid"));
     }
 
     #[test]

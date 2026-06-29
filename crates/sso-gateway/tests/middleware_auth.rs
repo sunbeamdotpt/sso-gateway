@@ -6,7 +6,7 @@ use sso_gateway::{
     middleware::{TenantId, audit_middleware, auth_middleware, hash_api_key},
     oauth2::{Oauth2State, router as oauth2_router},
 };
-use sso_ory_client::HydraClient;
+use sso_ory_client::{HydraClient, KratosClient};
 use tokio::net::TcpListener;
 
 mod support;
@@ -15,7 +15,13 @@ async fn echo(Extension(tenant): Extension<TenantId>) -> impl IntoResponse {
     tenant.0.clone()
 }
 
-async fn serve(app: Router) -> (tokio::task::JoinHandle<()>, String, tokio::sync::oneshot::Sender<()>) {
+async fn serve(
+    app: Router,
+) -> (
+    tokio::task::JoinHandle<()>,
+    String,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("random port should bind");
@@ -71,6 +77,11 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         public_base_url: "http://localhost".to_string(),
     });
     let audit_repo = AuditLogRepo::new(pool.clone());
+    let mappings = IdMappingRepo::new(pool.clone());
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
 
     let app = Router::new()
         .route("/echo", get(echo))
@@ -78,7 +89,9 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .layer(from_fn(audit_middleware))
         .layer(from_fn(auth_middleware))
         .layer(Extension(api_keys))
-        .layer(Extension(audit_repo));
+        .layer(Extension(audit_repo))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (handle, base, shutdown_tx) = serve(app).await;
     let client = reqwest::Client::new();
@@ -137,7 +150,10 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .send()
         .await
         .expect("invalid tenant request should complete");
-    assert_eq!(invalid_tenant_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_tenant_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 
     let empty_tenant_resp = client
         .get(format!("{base}/echo"))
@@ -149,11 +165,15 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
 
     // Give the audit middleware's spawned insert task time to complete.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE resource = '/echo'")
-        .fetch_one(&pool)
-        .await
-        .expect("audit log count should be readable");
-    assert!(audit_count >= 1, "audit log should contain at least one /echo entry");
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE resource = '/echo'")
+            .fetch_one(&pool)
+            .await
+            .expect("audit log count should be readable");
+    assert!(
+        audit_count >= 1,
+        "audit log should contain at least one /echo entry"
+    );
 
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");

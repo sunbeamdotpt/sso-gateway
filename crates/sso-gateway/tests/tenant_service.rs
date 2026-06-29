@@ -4,11 +4,12 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{IdMappingRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::TenantServiceExt,
     services::tenant::TenantServiceImpl,
 };
+use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,
     router::ServiceRouter,
@@ -33,7 +34,12 @@ async fn tenant_service_round_trip() {
         .expect("system tenant should bootstrap");
 
     let repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let api_keys = TenantApiKeyRepo::new(pool.clone());
+    let mappings = IdMappingRepo::new(pool.clone());
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
     let tenant_service = Arc::new(TenantServiceImpl::new(
         repo,
         api_keys.clone(),
@@ -51,7 +57,9 @@ async fn tenant_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -160,7 +168,12 @@ async fn tenant_api_key_auth_round_trip() {
         .expect("system tenant should bootstrap");
 
     let repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let api_keys = TenantApiKeyRepo::new(pool.clone());
+    let mappings = IdMappingRepo::new(pool.clone());
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
     let tenant_service = Arc::new(TenantServiceImpl::new(
         repo,
         api_keys.clone(),
@@ -178,7 +191,9 @@ async fn tenant_api_key_auth_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys));
+        .layer(Extension(api_keys))
+        .layer(Extension(kratos))
+        .layer(Extension(mappings));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await

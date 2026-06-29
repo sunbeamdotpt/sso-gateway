@@ -8,7 +8,9 @@ use axum::{
 };
 use connectrpc::RequestContext;
 
-use crate::db::{AuditLogRepo, DbError, TenantApiKeyRepo};
+use crate::db::{AuditLogRepo, DbError, IdMappingRepo, TenantApiKeyRepo};
+use sso_ory_client::KratosClient;
+use std::sync::Arc;
 use sunbeam_g2v::error::ServiceError;
 
 pub const TENANT_ID_HEADER: &str = "x-tenant-id";
@@ -26,6 +28,8 @@ pub struct ApiKeyContext {
 
 pub async fn auth_middleware(
     Extension(api_keys): Extension<TenantApiKeyRepo>,
+    Extension(kratos): Extension<Arc<KratosClient>>,
+    Extension(mappings): Extension<IdMappingRepo>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -58,6 +62,21 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    let cookie_value = request
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(cookie) = cookie_value {
+        match authenticate_session_cookie(&kratos, &mappings, cookie).await {
+            Ok(tenant_id) => {
+                request.extensions_mut().insert(TenantId(tenant_id));
+                return next.run(request).await;
+            }
+            Err(resp) => return *resp,
+        }
+    }
+
     let tenant_value = request
         .headers()
         .get(TENANT_ID_HEADER)
@@ -79,6 +98,46 @@ pub async fn auth_middleware(
     }
 
     next.run(request).await
+}
+
+async fn authenticate_session_cookie(
+    kratos: &KratosClient,
+    mappings: &IdMappingRepo,
+    cookie: &str,
+) -> Result<String, Box<Response>> {
+    let session = kratos.to_session(Some(cookie), None).await.map_err(|_| {
+        Box::new(auth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired session cookie",
+        ))
+    })?;
+
+    let ory_identity_id = session["identity"]["id"].as_str().unwrap_or("");
+
+    if ory_identity_id.is_empty() {
+        return Err(Box::new(auth_error(
+            StatusCode::UNAUTHORIZED,
+            "session missing identity",
+        )));
+    }
+
+    let tenant_id = mappings
+        .get_tenant_id_by_ory_id("kratos", ory_identity_id)
+        .await
+        .map_err(|_| {
+            Box::new(auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to resolve tenant",
+            ))
+        })?
+        .ok_or_else(|| {
+            Box::new(auth_error(
+                StatusCode::UNAUTHORIZED,
+                "identity not registered",
+            ))
+        })?;
+
+    Ok(tenant_id)
 }
 
 async fn authenticate_api_key(
@@ -272,9 +331,10 @@ mod tests {
         let resp = auth_error(StatusCode::FORBIDDEN, "no");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "application/json"
         );
     }
-
 }

@@ -11,8 +11,8 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use gamlastan::bindings::traits::HttpRequest;
 use gamlastan::bindings::redirect::{redirect_decode, redirect_verify_signature};
+use gamlastan::bindings::traits::HttpRequest;
 use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::constants;
@@ -59,9 +59,9 @@ impl From<crate::db::DbError> for SamlIdpError {
 impl From<sso_ory_client::error::OryClientError> for SamlIdpError {
     fn from(err: sso_ory_client::error::OryClientError) -> Self {
         let status = match err {
-            sso_ory_client::error::OryClientError::Ory { status: 401 | 403, .. } => {
-                StatusCode::UNAUTHORIZED
-            }
+            sso_ory_client::error::OryClientError::Ory {
+                status: 401 | 403, ..
+            } => StatusCode::UNAUTHORIZED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::Response(Box::new(idp_error(status, "session invalid")))
@@ -153,9 +153,12 @@ async fn sso(
     Query(query): Query<HashMap<String, String>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, SamlIdpError> {
-    let provider_id = query
-        .get("provider_id")
-        .ok_or_else(|| SamlIdpError::Response(Box::new(idp_error(StatusCode::BAD_REQUEST, "missing provider_id"))))?;
+    let provider_id = query.get("provider_id").ok_or_else(|| {
+        SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::BAD_REQUEST,
+            "missing provider_id",
+        )))
+    })?;
 
     let url = req.uri().to_string();
     let redirect_req = RedirectRequest::from_url(&url);
@@ -194,7 +197,9 @@ async fn sso(
 
     let sp_client = state.sp_clients.get_by_id(provider_id).await?;
 
-    if let Some(issuer) = &authn_request.base.issuer && issuer.value != sp_client.entity_id {
+    if let Some(issuer) = &authn_request.base.issuer
+        && issuer.value != sp_client.entity_id
+    {
         return Err(SamlIdpError::Response(Box::new(idp_error(
             StatusCode::BAD_REQUEST,
             "issuer mismatch",
@@ -245,7 +250,12 @@ async fn sso(
         .headers()
         .get("X-Session-Token")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| SamlIdpError::Response(Box::new(idp_error(StatusCode::UNAUTHORIZED, "missing session"))))?;
+        .ok_or_else(|| {
+            SamlIdpError::Response(Box::new(idp_error(
+                StatusCode::UNAUTHORIZED,
+                "missing session",
+            )))
+        })?;
 
     let session = state.kratos.whoami(session_token).await?;
     let identity = session.get("identity").ok_or_else(|| {
@@ -254,15 +264,12 @@ async fn sso(
             "session missing identity",
         )))
     })?;
-    let identity_id = identity
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            SamlIdpError::Response(Box::new(idp_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session missing identity id",
-            )))
-        })?;
+    let identity_id = identity.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+        SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session missing identity id",
+        )))
+    })?;
     let email = identity
         .get("traits")
         .and_then(|t| t.get("email"))
@@ -270,15 +277,14 @@ async fn sso(
         .unwrap_or(identity_id);
 
     let idp_key = state.idp_keys.get_active(&sp_client.tenant_id).await?;
-    let mut key_manager = build_idp_keys_manager(idp_key.private_key_pem.as_bytes()).map_err(
-        |e| {
+    let mut key_manager =
+        build_idp_keys_manager(idp_key.private_key_pem.as_bytes()).map_err(|e| {
             warn!("saml idp signing key error: {e}");
             SamlIdpError::Response(Box::new(idp_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "idp request unavailable",
             )))
-        },
-    )?;
+        })?;
     key_manager.add_trusted_cert(idp_key.certificate_pem.into_bytes());
     let signer = SamlSigner::new(key_manager);
 
@@ -315,14 +321,12 @@ async fn sso(
         )))
     })?;
     let response_id = response.base.id.clone();
-    let status_pos = response_xml
-        .find("<samlp:Status")
-        .ok_or_else(|| {
-            SamlIdpError::Response(Box::new(idp_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "response missing status element",
-            )))
-        })?;
+    let status_pos = response_xml.find("<samlp:Status").ok_or_else(|| {
+        SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response missing status element",
+        )))
+    })?;
     let mut xml_with_signature = response_xml;
     xml_with_signature.insert_str(status_pos, &response_signature_template(&response_id));
     let signed_xml = signer.sign_enveloped(&xml_with_signature).map_err(|e| {
@@ -428,7 +432,9 @@ mod tests {
         let resp = idp_error(StatusCode::BAD_REQUEST, "missing provider_id");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "application/json"
         );
     }
@@ -456,7 +462,10 @@ mod tests {
     #[test]
     fn saml_idp_error_from_db_error_maps_other_to_internal() {
         let err: SamlIdpError = crate::db::DbError::Sqlx(sqlx::Error::PoolTimedOut).into();
-        assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -476,13 +485,19 @@ mod tests {
             message: "down".into(),
         }
         .into();
-        assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn saml_idp_error_from_service_error_maps_internal() {
         let err: SamlIdpError = sunbeam_g2v::error::ServiceError::Internal("fail".into()).into();
-        assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

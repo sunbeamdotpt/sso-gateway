@@ -50,7 +50,10 @@ pub struct ScimState {
 
 pub fn router(state: Arc<ScimState>) -> Router {
     Router::new()
-        .route("/scim/v2/ServiceProviderConfig", get(service_provider_config))
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(service_provider_config),
+        )
         .route("/scim/v2/ResourceTypes", get(resource_types))
         .route("/scim/v2/Schemas", get(schemas))
         .route("/scim/v2/Users", get(list_users).post(create_user))
@@ -66,21 +69,23 @@ pub fn router(state: Arc<ScimState>) -> Router {
         .with_state(state)
 }
 
-async fn resolve_tenant(
-    state: &ScimState,
-    headers: &HeaderMap,
-) -> Result<String, ScimError> {
+async fn resolve_tenant(state: &ScimState, headers: &HeaderMap) -> Result<String, ScimError> {
     let token = match bearer_token(headers) {
         Some(t) => t,
-        None => return Err(ScimError::Response(Box::new(scim_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-        )))),
+        None => {
+            return Err(ScimError::Response(Box::new(scim_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ))));
+        }
     };
 
     let introspect = state.hydra.introspect_token(token).await.map_err(|e| {
         warn!("token introspection failed: {}", e);
-        ScimError::Response(Box::new(scim_error(StatusCode::UNAUTHORIZED, "unauthorized")))
+        ScimError::Response(Box::new(scim_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )))
     })?;
 
     if !introspect["active"].as_bool().unwrap_or(false) {
@@ -179,7 +184,9 @@ async fn create_user(
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
     let resp = state.service.create_user_http(tenant_id, user).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn get_user(
@@ -189,7 +196,9 @@ async fn get_user(
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
     let resp = state.service.get_user_http(tenant_id, id).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn update_user(
@@ -200,7 +209,9 @@ async fn update_user(
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
     let resp = state.service.update_user_http(tenant_id, id, user).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn delete_user(
@@ -236,7 +247,9 @@ async fn create_group(
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
     let resp = state.service.create_group_http(tenant_id, group).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn get_group(
@@ -246,7 +259,9 @@ async fn get_group(
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
     let resp = state.service.get_group_http(tenant_id, id).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn update_group(
@@ -256,8 +271,13 @@ async fn update_group(
     Json(group): Json<ScimGroup>,
 ) -> Result<Response<Body>, ScimError> {
     let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.update_group_http(tenant_id, id, group).await?;
-    Ok(scim_json(serde_json::to_value(resp.body).unwrap_or_default()))
+    let resp = state
+        .service
+        .update_group_http(tenant_id, id, group)
+        .await?;
+    Ok(scim_json(
+        serde_json::to_value(resp.body).unwrap_or_default(),
+    ))
 }
 
 async fn delete_group(
@@ -353,7 +373,9 @@ mod tests {
         let resp = scim_json(json!({"ok": true}));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             SCIM_CONTENT_TYPE
         );
     }
@@ -371,12 +393,24 @@ mod tests {
     #[test]
     fn map_service_error_maps_codes() {
         for (code, expected) in [
-            (connectrpc::ErrorCode::InvalidArgument, StatusCode::BAD_REQUEST),
+            (
+                connectrpc::ErrorCode::InvalidArgument,
+                StatusCode::BAD_REQUEST,
+            ),
             (connectrpc::ErrorCode::NotFound, StatusCode::NOT_FOUND),
-            (connectrpc::ErrorCode::PermissionDenied, StatusCode::FORBIDDEN),
-            (connectrpc::ErrorCode::Unauthenticated, StatusCode::UNAUTHORIZED),
+            (
+                connectrpc::ErrorCode::PermissionDenied,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                connectrpc::ErrorCode::Unauthenticated,
+                StatusCode::UNAUTHORIZED,
+            ),
             (connectrpc::ErrorCode::AlreadyExists, StatusCode::CONFLICT),
-            (connectrpc::ErrorCode::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                connectrpc::ErrorCode::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ] {
             let err = connectrpc::ConnectError::new(code, "msg");
             assert_eq!(map_service_error(err).status(), expected);

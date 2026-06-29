@@ -1,6 +1,11 @@
 pub mod application;
 pub mod federation;
 pub mod identity;
+pub mod identity_self_service;
+pub mod identity_self_service_mapper;
+pub mod oauth2_consent;
+pub mod oauth2_consent_mapper;
 pub mod permission;
+pub mod proto_util;
 pub mod scim;
 pub mod tenant;
