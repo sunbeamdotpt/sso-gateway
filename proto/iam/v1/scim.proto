@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message ScimUser {
+  string id = 1;
+  string user_name = 2;
+  google.protobuf.Struct name = 3;
+  repeated google.protobuf.Struct emails = 4;
+  bool active = 5;
+  repeated string groups = 6;
+  google.protobuf.Struct meta = 7;
+}
+
+message ScimGroup {
+  string id = 1;
+  string display_name = 2;
+  repeated ScimMember members = 3;
+  google.protobuf.Struct meta = 4;
+}
+
+message ScimMember {
+  string value = 1;
+  string display = 2;
+  string type = 3;
+}
+
+message ScimListUsersRequest {
+  string filter = 1;
+  PageRequest page = 2;
+}
+
+message ScimListUsersResponse {
+  repeated ScimUser users = 1;
+  PageResponse page = 2;
+}
+
+message ScimGetUserRequest {
+  string id = 1;
+}
+
+message ScimCreateUserRequest {
+  ScimUser user = 1;
+}
+
+message ScimUpdateUserRequest {
+  string id = 1;
+  ScimUser user = 2;
+}
+
+message ScimDeleteUserRequest {
+  string id = 1;
+}
+
+message ScimListGroupsRequest {
+  string filter = 1;
+  PageRequest page = 2;
+}
+
+message ScimListGroupsResponse {
+  repeated ScimGroup groups = 1;
+  PageResponse page = 2;
+}
+
+message ScimGetGroupRequest {
+  string id = 1;
+}
+
+message ScimCreateGroupRequest {
+  ScimGroup group = 1;
+}
+
+message ScimUpdateGroupRequest {
+  string id = 1;
+  ScimGroup group = 2;
+}
+
+message ScimDeleteGroupRequest {
+  string id = 1;
+}
+
+service ScimService {
+  rpc ListUsers(ScimListUsersRequest) returns (ScimListUsersResponse);
+  rpc GetUser(ScimGetUserRequest) returns (ScimUser);
+  rpc CreateUser(ScimCreateUserRequest) returns (ScimUser);
+  rpc UpdateUser(ScimUpdateUserRequest) returns (ScimUser);
+  rpc DeleteUser(ScimDeleteUserRequest) returns (google.protobuf.Empty);
+  rpc ListGroups(ScimListGroupsRequest) returns (ScimListGroupsResponse);
+  rpc GetGroup(ScimGetGroupRequest) returns (ScimGroup);
+  rpc CreateGroup(ScimCreateGroupRequest) returns (ScimGroup);
+  rpc UpdateGroup(ScimUpdateGroupRequest) returns (ScimGroup);
+  rpc DeleteGroup(ScimDeleteGroupRequest) returns (google.protobuf.Empty);
+}

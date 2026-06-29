@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/struct.proto";
+import "iam/v1/identity.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message OpenIDConfiguration {
+  string issuer = 1;
+  string authorization_endpoint = 2;
+  string token_endpoint = 3;
+  string userinfo_endpoint = 4;
+  string jwks_uri = 5;
+  repeated string response_types_supported = 6;
+  repeated string grant_types_supported = 7;
+  repeated string subject_types_supported = 8;
+  repeated string id_token_signing_alg_values_supported = 9;
+  repeated string scopes_supported = 10;
+}
+
+message JSONWebKey {
+  string kty = 1;
+  string use = 2;
+  string kid = 3;
+  string alg = 4;
+  string n = 5;
+  string e = 6;
+  string x = 7;
+  string y = 8;
+  string crv = 9;
+}
+
+message JSONWebKeySet {
+  repeated JSONWebKey keys = 1;
+}
+
+message GetOpenIDConfigurationRequest {}
+message GetJSONWebKeysRequest {}
+
+message SamlLoginResponse {
+  string redirect_url = 1;
+  string request_id = 2;
+}
+
+message InitiateSamlLoginRequest {
+  string provider_id = 1;
+  string relay_state = 2;
+}
+
+message AcceptSamlAssertionRequest {
+  string provider_id = 1;
+  string encoded_assertion = 2;
+  string relay_state = 3;
+}
+
+service FederationService {
+  rpc GetOpenIDConfiguration(GetOpenIDConfigurationRequest) returns (OpenIDConfiguration);
+  rpc GetJSONWebKeys(GetJSONWebKeysRequest) returns (JSONWebKeySet);
+  rpc InitiateSamlLogin(InitiateSamlLoginRequest) returns (SamlLoginResponse);
+  rpc AcceptSamlAssertion(AcceptSamlAssertionRequest) returns (Session);
+}

@@ -1,0 +1,24 @@
+[package]
+name = "sso-ory-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+url = "2"
+rand = "0.8"
+
+[dev-dependencies]
+sunbeam-test = { git = "https://github.com/sunbeamdotpt/test.git", rev = "3ef953ca05234206ff62ea860da24a508a0a02c6" }
+testcontainers = "0.27.3"
+tokio = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }

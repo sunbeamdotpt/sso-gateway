@@ -1,0 +1,154 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message Identity {
+  string id = 1;
+  string tenant_id = 2;
+  string schema_id = 3;
+  google.protobuf.Struct traits = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message Session {
+  string id = 1;
+  string identity_id = 2;
+  string tenant_id = 3;
+  bool active = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp authenticated_at = 6;
+}
+
+message Flow {
+  string id = 1;
+  string type = 2;
+  string tenant_id = 3;
+  string identity_id = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Struct ui = 6;
+}
+
+message CreateIdentityRequest {
+  string schema_id = 1;
+  google.protobuf.Struct traits = 2;
+  string password = 3;
+}
+
+message GetIdentityRequest {
+  string id = 1;
+}
+
+message ListIdentitiesRequest {
+  PageRequest page = 1;
+}
+
+message ListIdentitiesResponse {
+  repeated Identity identities = 1;
+  PageResponse page = 2;
+}
+
+message UpdateIdentityRequest {
+  string id = 1;
+  string schema_id = 2;
+  google.protobuf.Struct traits = 3;
+}
+
+message DeleteIdentityRequest {
+  string id = 1;
+}
+
+message IdentitySchema {
+  string id = 1;
+  string tenant_id = 2;
+  string schema_id = 3;
+  google.protobuf.Struct schema_json = 4;
+  bool is_default = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message CreateIdentitySchemaRequest {
+  string schema_id = 1;
+  google.protobuf.Struct schema_json = 2;
+  bool is_default = 3;
+}
+
+message GetIdentitySchemaRequest {
+  string schema_id = 1;
+}
+
+message ListIdentitySchemasRequest {
+  PageRequest page = 1;
+}
+
+message ListIdentitySchemasResponse {
+  repeated IdentitySchema schemas = 1;
+  PageResponse page = 2;
+}
+
+message UpdateIdentitySchemaRequest {
+  string schema_id = 1;
+  google.protobuf.Struct schema_json = 2;
+  bool is_default = 3;
+}
+
+message DeleteIdentitySchemaRequest {
+  string schema_id = 1;
+}
+
+message SetDefaultIdentitySchemaRequest {
+  string schema_id = 1;
+}
+
+message CreateLoginFlowRequest {
+  string return_to = 1;
+}
+
+message CreateRegistrationFlowRequest {
+  string return_to = 1;
+}
+
+message GetSessionRequest {
+  string id = 1;
+}
+
+message ListSessionsRequest {
+  string identity_id = 1;
+  PageRequest page = 2;
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+  PageResponse page = 2;
+}
+
+message DeleteSessionRequest {
+  string id = 1;
+}
+
+service IdentityService {
+  rpc CreateIdentity(CreateIdentityRequest) returns (Identity);
+  rpc GetIdentity(GetIdentityRequest) returns (Identity);
+  rpc ListIdentities(ListIdentitiesRequest) returns (ListIdentitiesResponse);
+  rpc UpdateIdentity(UpdateIdentityRequest) returns (Identity);
+  rpc DeleteIdentity(DeleteIdentityRequest) returns (google.protobuf.Empty);
+  rpc CreateIdentitySchema(CreateIdentitySchemaRequest) returns (IdentitySchema);
+  rpc GetIdentitySchema(GetIdentitySchemaRequest) returns (IdentitySchema);
+  rpc ListIdentitySchemas(ListIdentitySchemasRequest) returns (ListIdentitySchemasResponse);
+  rpc UpdateIdentitySchema(UpdateIdentitySchemaRequest) returns (IdentitySchema);
+  rpc DeleteIdentitySchema(DeleteIdentitySchemaRequest) returns (google.protobuf.Empty);
+  rpc SetDefaultIdentitySchema(SetDefaultIdentitySchemaRequest) returns (IdentitySchema);
+  rpc CreateLoginFlow(CreateLoginFlowRequest) returns (Flow);
+  rpc CreateRegistrationFlow(CreateRegistrationFlowRequest) returns (Flow);
+  rpc GetSession(GetSessionRequest) returns (Session);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (google.protobuf.Empty);
+}

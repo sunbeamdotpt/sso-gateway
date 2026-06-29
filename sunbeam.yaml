@@ -1,0 +1,29 @@
+schema: 1
+project:
+  name: sso-gateway
+  kind: rust-app
+  description: "Unified IAM gateway — Rust Axum + connect-rust + Ory Hydra/Kratos/Keto."
+targets:
+  build:
+    exec: "cargo build --release"
+  test:
+    exec: [cargo, test]
+  lint:
+    exec: "cargo clippy -- -D warnings"
+  fmt:
+    exec: "cargo fmt"
+  clean:
+    exec: "cargo clean"
+  doc:
+    exec: "cargo doc --no-deps"
+deps:
+  services:
+    - postgres
+    - hydra
+    - kratos
+    - keto
+    - redis
+tenant:
+  namespace: sso-gateway
+outputs:
+  - target/release/sso-gateway
