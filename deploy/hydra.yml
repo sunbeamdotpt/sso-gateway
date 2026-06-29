@@ -1,0 +1,24 @@
+serve:
+  cookies:
+    same_site_mode: Lax
+  admin:
+    host: 0.0.0.0
+    port: 4445
+  public:
+    host: 0.0.0.0
+    port: 4444
+urls:
+  self:
+    issuer: http://localhost:4444
+  consent: http://localhost:8080/oauth2/consent
+  login: http://localhost:8080/oauth2/login
+  logout: http://localhost:8080/oauth2/logout
+secrets:
+  system:
+    - youReallyNeedToChangeThis
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+    pairwise:
+      salt: youReallyNeedToChangeThisToo

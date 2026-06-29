@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message Tenant {
+  string id = 1;
+  string slug = 2;
+  string display_name = 3;
+  google.protobuf.Timestamp created_at = 4;
+  map<string, string> settings = 5;
+}
+
+message ApiKey {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  repeated string scopes = 4;
+  string plaintext = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message CreateTenantRequest {
+  string slug = 1;
+  string display_name = 2;
+  map<string, string> settings = 3;
+}
+
+message GetTenantRequest {
+  string id = 1;
+}
+
+message ListTenantsRequest {
+  PageRequest page = 1;
+}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+  PageResponse page = 2;
+}
+
+message RotateApiKeyRequest {
+  string tenant_id = 1;
+  string name = 2;
+  repeated string scopes = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+service TenantService {
+  rpc CreateTenant(CreateTenantRequest) returns (Tenant);
+  rpc GetTenant(GetTenantRequest) returns (Tenant);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  rpc RotateApiKey(RotateApiKeyRequest) returns (ApiKey);
+}

@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message RelationTuple {
+  string id = 1;
+  string tenant_id = 2;
+  string namespace = 3;
+  string object = 4;
+  string relation = 5;
+  string subject_id = 6;
+  string subject_set_namespace = 7;
+  string subject_set_object = 8;
+  string subject_set_relation = 9;
+  google.protobuf.Timestamp created_at = 10;
+}
+
+message CheckPermissionRequest {
+  string namespace = 1;
+  string object = 2;
+  string relation = 3;
+  string subject_id = 4;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+}
+
+message CreateRelationTupleRequest {
+  string namespace = 1;
+  string object = 2;
+  string relation = 3;
+  string subject_id = 4;
+}
+
+message DeleteRelationTupleRequest {
+  string id = 1;
+}
+
+message ExpandPermissionsRequest {
+  string namespace = 1;
+  string object = 2;
+  string relation = 3;
+}
+
+message ExpandPermissionsResponse {
+  repeated RelationTuple tuples = 1;
+  string tree = 2;
+}
+
+message ListRelationTuplesRequest {
+  string namespace = 1;
+  string object = 2;
+  string relation = 3;
+  PageRequest page = 4;
+}
+
+message ListRelationTuplesResponse {
+  repeated RelationTuple tuples = 1;
+  PageResponse page = 2;
+}
+
+service PermissionService {
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc CreateRelationTuple(CreateRelationTupleRequest) returns (RelationTuple);
+  rpc DeleteRelationTuple(DeleteRelationTupleRequest) returns (google.protobuf.Empty);
+  rpc ExpandPermissions(ExpandPermissionsRequest) returns (ExpandPermissionsResponse);
+  rpc ListRelationTuples(ListRelationTuplesRequest) returns (ListRelationTuplesResponse);
+}

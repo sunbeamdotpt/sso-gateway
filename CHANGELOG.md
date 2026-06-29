@@ -1,0 +1,36 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0-rc.0] - 2026-06-29
+
+### Added
+
+- Initial release of the SSO Gateway.
+- Unified IAM facade over Ory Hydra, Kratos, and Keto via Connect-RPC.
+- Identity, application, permission, federation, SCIM 2.0, and tenant services.
+- SAML 2.0 Service Provider and Identity Provider support.
+- Asynchronous audit logging to Postgres.
+- Multi-tenant JSON schema validation for identities.
+- Full unit and integration test suite with >90% library coverage.
+- Multi-architecture container image (`linux/amd64`, `linux/arm64`).
+- GitHub Actions release workflow for GHCR.
+- Security documentation and deployment guides.
+
+### Security
+
+- Removed OpenSSL from the release build; TLS is provided by `rustls`/`aws-lc`.
+- Replaced production `unwrap()`/`expect()` paths in SAML and SCIM modules.
+- Added request timeout to federation outbound HTTP client.
+- Hardened HTML escape routine to also escape single quotes.
+- Added warning logging for failed audit-log inserts.
+
+### Known Issues
+
+- `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
+  version is available upstream; risk is documented in `docs/security.md`.
+
+[1.0.0-rc.0]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc0

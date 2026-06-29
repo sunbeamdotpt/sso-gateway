@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+message Application {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  repeated string redirect_uris = 4;
+  repeated string grant_types = 5;
+  repeated string response_types = 6;
+  repeated string scope = 7;
+  string token_endpoint_auth_method = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  string client_secret = 11;
+}
+
+message ApplicationSecret {
+  string client_id = 1;
+  string client_secret = 2;
+}
+
+message CreateApplicationRequest {
+  string name = 1;
+  repeated string redirect_uris = 2;
+  repeated string grant_types = 3;
+  repeated string response_types = 4;
+  repeated string scope = 5;
+  string token_endpoint_auth_method = 6;
+}
+
+message GetApplicationRequest {
+  string id = 1;
+}
+
+message ListApplicationsRequest {
+  PageRequest page = 1;
+}
+
+message ListApplicationsResponse {
+  repeated Application applications = 1;
+  PageResponse page = 2;
+}
+
+message UpdateApplicationRequest {
+  string id = 1;
+  string name = 2;
+  repeated string redirect_uris = 3;
+  repeated string grant_types = 4;
+  repeated string response_types = 5;
+  repeated string scope = 6;
+  string token_endpoint_auth_method = 7;
+}
+
+message DeleteApplicationRequest {
+  string id = 1;
+}
+
+message RotateSecretRequest {
+  string id = 1;
+}
+
+service ApplicationService {
+  rpc CreateApplication(CreateApplicationRequest) returns (Application);
+  rpc GetApplication(GetApplicationRequest) returns (Application);
+  rpc ListApplications(ListApplicationsRequest) returns (ListApplicationsResponse);
+  rpc UpdateApplication(UpdateApplicationRequest) returns (Application);
+  rpc DeleteApplication(DeleteApplicationRequest) returns (google.protobuf.Empty);
+  rpc RotateSecret(RotateSecretRequest) returns (ApplicationSecret);
+}
