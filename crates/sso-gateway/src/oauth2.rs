@@ -233,6 +233,7 @@ async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl Int
         "revocation_endpoint": format!("{base}/oauth2/revoke"),
         "response_types_supported": ["code", "token", "id_token", "code token", "code id_token", "token id_token", "code token id_token"],
         "grant_types_supported": ["authorization_code", "implicit", "client_credentials", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
