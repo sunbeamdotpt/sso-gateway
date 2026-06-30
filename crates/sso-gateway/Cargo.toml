@@ -37,6 +37,8 @@ sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
 jsonschema = "0.29"
+hickory-resolver = "0.26"
+async-trait = "0.1"
 
 [dev-dependencies]
 rsa = "0.9"

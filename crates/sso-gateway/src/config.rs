@@ -21,6 +21,8 @@ pub struct Config {
     pub saml_request_ttl_seconds: u64,
     pub saml_require_signed_assertions: bool,
     pub saml_require_signed_responses: bool,
+    pub registration_enabled: bool,
+    pub allowed_return_to_hosts: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -80,6 +82,18 @@ impl Config {
             saml_require_signed_responses: std::env::var("SAML_REQUIRE_SIGNED_RESPONSES")
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            registration_enabled: std::env::var("REGISTRATION_ENABLED")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            allowed_return_to_hosts: std::env::var("ALLOWED_RETURN_TO_HOSTS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -127,6 +141,8 @@ mod tests {
         clear_env("SAML_REQUEST_TTL_SECONDS");
         clear_env("SAML_REQUIRE_SIGNED_ASSERTIONS");
         clear_env("SAML_REQUIRE_SIGNED_RESPONSES");
+        clear_env("REGISTRATION_ENABLED");
+        clear_env("ALLOWED_RETURN_TO_HOSTS");
 
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
@@ -145,6 +161,8 @@ mod tests {
         assert_eq!(config.saml_request_ttl_seconds, 900);
         assert!(config.saml_require_signed_assertions);
         assert!(!config.saml_require_signed_responses);
+        assert!(!config.registration_enabled);
+        assert!(config.allowed_return_to_hosts.is_empty());
     }
 
     #[test]
@@ -166,6 +184,8 @@ mod tests {
         set_env("SAML_REQUEST_TTL_SECONDS", "600");
         set_env("SAML_REQUIRE_SIGNED_ASSERTIONS", "false");
         set_env("SAML_REQUIRE_SIGNED_RESPONSES", "true");
+        set_env("REGISTRATION_ENABLED", "true");
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com, app.example.com");
 
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
@@ -181,6 +201,11 @@ mod tests {
         assert_eq!(config.saml_request_ttl_seconds, 600);
         assert!(!config.saml_require_signed_assertions);
         assert!(config.saml_require_signed_responses);
+        assert!(config.registration_enabled);
+        assert_eq!(
+            config.allowed_return_to_hosts,
+            vec!["example.com".to_string(), "app.example.com".to_string()]
+        );
     }
 
     #[test]
@@ -201,6 +226,25 @@ mod tests {
         let err = Config::from_env().unwrap_err();
         drop(_guard);
         assert!(matches!(err, ConfigError::InvalidSystemTenantUlid(ref s) if s == "not-a-ulid"));
+    }
+
+    #[test]
+    fn config_from_env_parses_allowed_return_to_hosts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com, , app.example.com,");
+        clear_env("BIND_ADDR");
+        clear_env("REGISTRATION_ENABLED");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert_eq!(
+            config.allowed_return_to_hosts,
+            vec!["example.com".to_string(), "app.example.com".to_string()]
+        );
+        assert!(!config.registration_enabled);
     }
 
     #[test]
