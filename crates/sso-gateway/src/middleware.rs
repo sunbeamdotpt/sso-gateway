@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     Extension,
     body::Body,
@@ -7,9 +8,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use connectrpc::RequestContext;
+use serde_json::Value;
 
-use crate::db::{AuditLogRepo, DbError, IdMappingRepo, TenantApiKeyRepo};
-use sso_ory_client::KratosClient;
+use crate::db::{AuditLogRepo, DbError, IdMappingRepo, IdMappingStore, TenantApiKeyRepo, TenantApiKeyStore};
+use sso_ory_client::{KratosClient, error::OryClientError};
 use std::sync::Arc;
 use sunbeam_g2v::error::ServiceError;
 
@@ -26,6 +28,33 @@ pub struct ApiKeyContext {
     pub scopes: Vec<String>,
 }
 
+#[async_trait]
+trait SessionClient: Send + Sync {
+    async fn to_session(
+        &self,
+        cookie: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl SessionClient for KratosClient {
+    async fn to_session(
+        &self,
+        cookie: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        self.to_session(cookie, token).await
+    }
+}
+
+fn is_public_path(path: &str) -> bool {
+    path.starts_with("/.well-known/")
+        || path.starts_with("/oauth2/")
+        || path.starts_with("/scim/")
+        || path.starts_with("/saml/")
+}
+
 pub async fn auth_middleware(
     Extension(api_keys): Extension<TenantApiKeyRepo>,
     Extension(kratos): Extension<Arc<KratosClient>>,
@@ -36,11 +65,7 @@ pub async fn auth_middleware(
     let path = request.uri().path();
     // Public OAuth2/OIDC discovery and browser flows perform their own tenant
     // validation (via client_id or explicit x-tenant-id in handlers).
-    if path.starts_with("/.well-known/")
-        || path.starts_with("/oauth2/")
-        || path.starts_with("/scim/")
-        || path.starts_with("/saml/")
-    {
+    if is_public_path(path) {
         return next.run(request).await;
     }
 
@@ -68,7 +93,7 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     if let Some(cookie) = cookie_value {
-        match authenticate_session_cookie(&kratos, &mappings, cookie).await {
+        match authenticate_session_cookie(kratos.as_ref(), &mappings, cookie).await {
             Ok(tenant_id) => {
                 request.extensions_mut().insert(TenantId(tenant_id));
                 return next.run(request).await;
@@ -101,11 +126,11 @@ pub async fn auth_middleware(
 }
 
 async fn authenticate_session_cookie(
-    kratos: &KratosClient,
-    mappings: &IdMappingRepo,
+    client: &dyn SessionClient,
+    mappings: &dyn IdMappingStore,
     cookie: &str,
 ) -> Result<String, Box<Response>> {
-    let session = kratos.to_session(Some(cookie), None).await.map_err(|_| {
+    let session = client.to_session(Some(cookie), None).await.map_err(|_| {
         Box::new(auth_error(
             StatusCode::UNAUTHORIZED,
             "invalid or expired session cookie",
@@ -141,7 +166,7 @@ async fn authenticate_session_cookie(
 }
 
 async fn authenticate_api_key(
-    repo: &TenantApiKeyRepo,
+    repo: &dyn TenantApiKeyStore,
     key: &str,
 ) -> Result<ApiKeyContext, Box<Response>> {
     let hash = hash_api_key(key);
@@ -195,6 +220,12 @@ fn auth_error(status: StatusCode, message: &'static str) -> Response {
         .into_response()
 }
 
+fn build_audit_metadata(status: StatusCode) -> serde_json::Value {
+    serde_json::json!({
+        "status": status.as_u16(),
+    })
+}
+
 /// Best-effort audit logging middleware.
 ///
 /// Captures the HTTP method, path, resolved tenant, authenticated actor, and
@@ -230,9 +261,7 @@ pub async fn audit_middleware(
     } else {
         "failure"
     };
-    let metadata = serde_json::json!({
-        "status": response.status().as_u16(),
-    });
+    let metadata = build_audit_metadata(response.status());
 
     let repo = repo.clone();
     tokio::spawn(async move {
@@ -270,6 +299,8 @@ pub fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{IdMappingRow, TenantApiKeyRow};
+    use std::sync::Mutex;
 
     #[test]
     fn hash_api_key_is_deterministic_and_hex() {
@@ -336,5 +367,391 @@ mod tests {
                 .unwrap(),
             "application/json"
         );
+    }
+
+    #[test]
+    fn is_public_path_matches_public_prefixes() {
+        assert!(is_public_path("/.well-known/openid-configuration"));
+        assert!(is_public_path("/oauth2/auth"));
+        assert!(is_public_path("/scim/v2/Users"));
+        assert!(is_public_path("/saml/metadata"));
+        assert!(!is_public_path("/iam/v1/tenants"));
+    }
+
+    #[test]
+    fn build_audit_metadata_contains_status() {
+        let metadata = build_audit_metadata(StatusCode::CREATED);
+        assert_eq!(metadata["status"], 201);
+    }
+
+    struct StubApiKeyStore(Mutex<Option<Result<TenantApiKeyRow, DbError>>>);
+
+    #[async_trait]
+    impl TenantApiKeyStore for StubApiKeyStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _name: &str,
+            _key_hash: &str,
+            _scopes: &[String],
+            _expires_at: Option<time::OffsetDateTime>,
+        ) -> Result<TenantApiKeyRow, DbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(DbError::ApiKeyNotFound))
+        }
+
+        async fn get_by_hash(&self, _key_hash: &str) -> Result<TenantApiKeyRow, DbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(DbError::ApiKeyNotFound))
+        }
+    }
+
+    fn dummy_api_key_row() -> TenantApiKeyRow {
+        TenantApiKeyRow {
+            id: "key-1".into(),
+            tenant_id: "tenant-1".into(),
+            key_hash: hash_api_key("secret"),
+            name: "test".into(),
+            scopes: vec!["tenant:read".into()],
+            expires_at: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticate_api_key_returns_context_for_valid_key() {
+        let repo = StubApiKeyStore(Mutex::new(Some(Ok(dummy_api_key_row()))));
+        let ctx = authenticate_api_key(&repo, "secret").await.unwrap();
+        assert_eq!(ctx.key_id, "key-1");
+        assert_eq!(ctx.tenant_id, "tenant-1");
+        assert_eq!(ctx.scopes, vec!["tenant:read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn authenticate_api_key_returns_unauthorized_for_unknown_key() {
+        let repo = StubApiKeyStore(Mutex::new(Some(Err(DbError::ApiKeyNotFound))));
+        let err = authenticate_api_key(&repo, "secret").await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_api_key_returns_internal_for_db_error() {
+        let repo =
+            StubApiKeyStore(Mutex::new(Some(Err(DbError::Sqlx(sqlx::Error::PoolTimedOut)))));
+        let err = authenticate_api_key(&repo, "secret").await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    struct StubSessionClient(Mutex<Option<Result<Value, OryClientError>>>);
+
+    #[async_trait]
+    impl SessionClient for StubSessionClient {
+        async fn to_session(
+            &self,
+            _cookie: Option<&str>,
+            _token: Option<&str>,
+        ) -> Result<Value, OryClientError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(OryClientError::MissingTenant))
+        }
+    }
+
+    struct StubIdMappingStore(Mutex<Option<Result<Option<String>, DbError>>>);
+
+    #[async_trait]
+    impl IdMappingStore for StubIdMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            Ok(IdMappingRow {
+                id: "m1".into(),
+                tenant_id: "tenant-1".into(),
+                backend: "kratos".into(),
+                public_id: "pub".into(),
+                ory_global_id: "ory".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, DbError> {
+            Ok("ory".into())
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            Ok("pub".into())
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    fn session_with_identity(id: &str) -> Value {
+        serde_json::json!({
+            "id": "session-1",
+            "identity": { "id": id }
+        })
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_cookie_resolves_registered_identity() {
+        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
+        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(Some("tenant-1".into())))));
+        let tenant = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+            .await
+            .unwrap();
+        assert_eq!(tenant, "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_cookie_rejects_invalid_session() {
+        let client = StubSessionClient(Mutex::new(Some(Err(OryClientError::Ory {
+            status: 401,
+            message: "no session".into(),
+        }))));
+        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
+        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_cookie_rejects_missing_identity() {
+        let client = StubSessionClient(Mutex::new(Some(Ok(serde_json::json!({ "identity": {} })))));
+        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
+        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_cookie_rejects_unregistered_identity() {
+        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
+        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
+        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_cookie_returns_internal_for_mapping_db_error() {
+        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
+        let mappings = StubIdMappingStore(Mutex::new(Some(Err(DbError::Sqlx(
+            sqlx::Error::PoolTimedOut,
+        )))));
+        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    mod middleware_integration {
+        use axum::{Router, body::Body, http::Request, middleware::from_fn, routing::get};
+        use tower::ServiceExt;
+
+        use super::*;
+        use crate::{
+            db::{IdMappingRepo, TenantApiKeyRepo},
+            test_support::{create_test_tenant, postgres_pool},
+        };
+
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+
+        fn api_key_router(
+            api_keys: TenantApiKeyRepo,
+            kratos: Arc<KratosClient>,
+            mappings: IdMappingRepo,
+        ) -> Router {
+            Router::new()
+                .route("/", get(ok_handler))
+                .route("/protected", get(ok_handler))
+                .route("/.well-known/openid-configuration", get(ok_handler))
+                .layer(from_fn(auth_middleware))
+                .layer(Extension(api_keys))
+                .layer(Extension(kratos))
+                .layer(Extension(mappings))
+        }
+
+        #[tokio::test]
+        async fn public_path_bypasses_auth() {
+            let router = api_key_router(
+                TenantApiKeyRepo::new(postgres_pool().await),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(Request::get("/.well-known/openid-configuration").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn missing_auth_returns_unauthorized() {
+            let router = api_key_router(
+                TenantApiKeyRepo::new(postgres_pool().await),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn valid_api_key_authenticates() {
+            let pool = postgres_pool().await;
+            let tenant = format!("tenant-{}", ulid::Ulid::new());
+            create_test_tenant(&pool, &tenant).await;
+            let api_keys = TenantApiKeyRepo::new(pool);
+            api_keys
+                .create(&tenant, "test-key", &hash_api_key("secret"), &["tenant:read".to_string()], None)
+                .await
+                .unwrap();
+
+            let router = api_key_router(
+                api_keys.clone(),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(
+                    Request::get("/protected")
+                        .header(API_KEY_HEADER, "secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn invalid_api_key_returns_unauthorized() {
+            let router = api_key_router(
+                TenantApiKeyRepo::new(postgres_pool().await),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(
+                    Request::get("/protected")
+                        .header(API_KEY_HEADER, "bad-secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn valid_tenant_header_authenticates() {
+            let tenant = ulid::Ulid::new().to_string();
+            let router = api_key_router(
+                TenantApiKeyRepo::new(postgres_pool().await),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(
+                    Request::get("/protected")
+                        .header(TENANT_ID_HEADER, &tenant)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn invalid_tenant_header_returns_bad_request() {
+            let router = api_key_router(
+                TenantApiKeyRepo::new(postgres_pool().await),
+                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
+                IdMappingRepo::new(postgres_pool().await),
+            );
+            let response = router
+                .oneshot(
+                    Request::get("/protected")
+                        .header(TENANT_ID_HEADER, "not-a-ulid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn audit_middleware_records_and_returns_ok() {
+            let audit = AuditLogRepo::new(postgres_pool().await);
+            let router = Router::new()
+                .route("/", get(ok_handler))
+                .layer(from_fn(audit_middleware))
+                .layer(Extension(audit));
+            let response = router
+                .oneshot(Request::get("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 }

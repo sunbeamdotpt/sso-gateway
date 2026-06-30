@@ -204,4 +204,15 @@ mod tests {
             .await
             .expect("verification should succeed"));
     }
+
+    #[tokio::test]
+    async fn hickory_resolver_new_default_and_lookup_error() {
+        let _ = HickoryDnsResolver::new();
+        let resolver = HickoryDnsResolver::default();
+        let result = resolver.txt_records("does-not-exist.invalid").await;
+        assert!(
+            result.is_err(),
+            "lookup for a non-existent domain should fail"
+        );
+    }
 }

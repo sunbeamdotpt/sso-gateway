@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
@@ -22,10 +23,11 @@ use gamlastan::crypto::{SamlSigner, SamlVerifier};
 use gamlastan::profiles::sso::idp::create_response;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::{SamlSerialize, parse_saml, parse_secure};
-use sso_ory_client::kratos::KratosClient;
+use serde_json::Value;
+use sso_ory_client::{error::OryClientError, kratos::KratosClient};
 use tracing::warn;
 
-use crate::db::{SamlIdpKeyRepo, SamlSpClientRepo};
+use crate::db::{SamlIdpKeyRepo, SamlIdpKeyStore, SamlSpClientRepo, SamlSpClientStore};
 
 const HTML_CONTENT_TYPE: &str = "text/html";
 
@@ -78,12 +80,41 @@ impl From<sunbeam_g2v::error::ServiceError> for SamlIdpError {
     }
 }
 
+/// Async trait for the Kratos operation used by the SAML IdP HTTP handler.
+#[async_trait]
+pub trait SamlIdpKratos: Send + Sync + 'static {
+    async fn whoami(&self, session_token: &str) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl SamlIdpKratos for KratosClient {
+    async fn whoami(&self, session_token: &str) -> Result<Value, OryClientError> {
+        self.whoami(session_token).await
+    }
+}
+
 #[derive(Clone)]
 pub struct SamlIdpState {
-    pub kratos: Arc<KratosClient>,
-    pub idp_keys: SamlIdpKeyRepo,
-    pub sp_clients: SamlSpClientRepo,
-    pub idp_entity_id: String,
+    pub(crate) kratos: Arc<dyn SamlIdpKratos>,
+    pub(crate) idp_keys: Arc<dyn SamlIdpKeyStore>,
+    pub(crate) sp_clients: Arc<dyn SamlSpClientStore>,
+    pub(crate) idp_entity_id: String,
+}
+
+impl SamlIdpState {
+    pub fn new(
+        kratos: Arc<KratosClient>,
+        idp_keys: SamlIdpKeyRepo,
+        sp_clients: SamlSpClientRepo,
+        idp_entity_id: String,
+    ) -> Self {
+        Self {
+            kratos: kratos as Arc<dyn SamlIdpKratos>,
+            idp_keys: Arc::new(idp_keys) as Arc<dyn SamlIdpKeyStore>,
+            sp_clients: Arc::new(sp_clients) as Arc<dyn SamlSpClientStore>,
+            idp_entity_id,
+        }
+    }
 }
 
 pub fn router(state: Arc<SamlIdpState>) -> Router {
@@ -146,6 +177,18 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
             Some((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+fn extract_session_token(req: &Request<Body>) -> Result<&str, SamlIdpError> {
+    req.headers()
+        .get("X-Session-Token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            SamlIdpError::Response(Box::new(idp_error(
+                StatusCode::UNAUTHORIZED,
+                "missing session",
+            )))
+        })
 }
 
 async fn sso(
@@ -246,16 +289,7 @@ async fn sso(
         }
     }
 
-    let session_token = req
-        .headers()
-        .get("X-Session-Token")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            SamlIdpError::Response(Box::new(idp_error(
-                StatusCode::UNAUTHORIZED,
-                "missing session",
-            )))
-        })?;
+    let session_token = extract_session_token(&req)?;
 
     let session = state.kratos.whoami(session_token).await?;
     let identity = session.get("identity").ok_or_else(|| {
@@ -425,7 +459,263 @@ fn idp_error(status: StatusCode, detail: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use http_body_util::BodyExt;
+    use std::sync::Mutex;
+
+    use crate::db::{SamlIdpKeyRow, SamlSpClientRow};
+    use gamlastan::bindings::redirect::{RedirectEncodeParams, redirect_encode};
+    use serde_json::json;
+    use gamlastan::bindings::relay_state::RelayState;
+    use gamlastan::core::assertion::issuer::Issuer;
+    use gamlastan::core::identifiers::SamlVersion;
+    use gamlastan::core::protocol::request::{AuthnRequest, RequestBase};
+
+    #[derive(Clone, Default)]
+    struct StubKratos;
+
+    #[async_trait]
+    impl SamlIdpKratos for StubKratos {
+        async fn whoami(&self, _session_token: &str) -> Result<Value, OryClientError> {
+            unimplemented!("stub whoami not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubIdpKeyStore;
+
+    #[async_trait]
+    impl SamlIdpKeyStore for StubIdpKeyStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _key_id: &str,
+            _private_key_pem: &str,
+            _certificate_pem: &str,
+            _is_active: bool,
+        ) -> Result<crate::db::SamlIdpKeyRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_active(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<crate::db::SamlIdpKeyRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list(&self, _tenant_id: &str) -> Result<Vec<crate::db::SamlIdpKeyRow>, crate::db::DbError> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubSpClientStore {
+        client: Arc<Mutex<Option<Result<SamlSpClientRow, crate::db::DbError>>>>,
+    }
+
+    #[async_trait]
+    impl SamlSpClientStore for StubSpClientStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _entity_id: &str,
+            _acs_url: &str,
+            _certificate_pem: Option<&str>,
+            _authn_requests_signed: bool,
+            _name_id_format: Option<&str>,
+        ) -> Result<SamlSpClientRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get(
+            &self,
+            _tenant_id: &str,
+            _id: &str,
+        ) -> Result<SamlSpClientRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_by_id(&self, _id: &str) -> Result<SamlSpClientRow, crate::db::DbError> {
+            self.client.lock().unwrap().take().expect("stub not configured")
+        }
+
+        async fn get_by_entity_id(
+            &self,
+            _tenant_id: &str,
+            _entity_id: &str,
+        ) -> Result<SamlSpClientRow, crate::db::DbError> {
+            unimplemented!()
+        }
+    }
+
+    fn test_sp_client(entity_id: &str) -> SamlSpClientRow {
+        SamlSpClientRow {
+            id: "sp-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
+            entity_id: entity_id.to_string(),
+            acs_url: "https://sp.example.com/acs".to_string(),
+            certificate_pem: None,
+            authn_requests_signed: false,
+            name_id_format: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn test_state(client: Option<Result<SamlSpClientRow, crate::db::DbError>>) -> Arc<SamlIdpState> {
+        Arc::new(SamlIdpState {
+            kratos: Arc::new(StubKratos),
+            idp_keys: Arc::new(StubIdpKeyStore),
+            sp_clients: Arc::new(StubSpClientStore {
+                client: Arc::new(Mutex::new(client)),
+            }),
+            idp_entity_id: "https://idp.example.com".to_string(),
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct ConfigurableKratos {
+        result: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+    }
+
+    #[async_trait]
+    impl SamlIdpKratos for ConfigurableKratos {
+        async fn whoami(&self, _session_token: &str) -> Result<Value, OryClientError> {
+            self.result.lock().unwrap().take().expect("kratos stub not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ConfigurableIdpKeyStore {
+        result: Arc<Mutex<Option<Result<SamlIdpKeyRow, crate::db::DbError>>>>,
+    }
+
+    #[async_trait]
+    impl SamlIdpKeyStore for ConfigurableIdpKeyStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _key_id: &str,
+            _private_key_pem: &str,
+            _certificate_pem: &str,
+            _is_active: bool,
+        ) -> Result<SamlIdpKeyRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_active(&self, _tenant_id: &str) -> Result<SamlIdpKeyRow, crate::db::DbError> {
+            self.result.lock().unwrap().take().expect("idp key stub not configured")
+        }
+
+        async fn list(&self, _tenant_id: &str) -> Result<Vec<SamlIdpKeyRow>, crate::db::DbError> {
+            unimplemented!()
+        }
+    }
+
+    fn test_state_full(
+        client: Option<Result<SamlSpClientRow, crate::db::DbError>>,
+        kratos: Option<Result<Value, OryClientError>>,
+        idp_key: Option<Result<SamlIdpKeyRow, crate::db::DbError>>,
+    ) -> Arc<SamlIdpState> {
+        Arc::new(SamlIdpState {
+            kratos: Arc::new(ConfigurableKratos {
+                result: Arc::new(Mutex::new(kratos)),
+            }),
+            idp_keys: Arc::new(ConfigurableIdpKeyStore {
+                result: Arc::new(Mutex::new(idp_key)),
+            }),
+            sp_clients: Arc::new(StubSpClientStore {
+                client: Arc::new(Mutex::new(client)),
+            }),
+            idp_entity_id: "https://idp.example.com".to_string(),
+        })
+    }
+
+    fn active_idp_key() -> SamlIdpKeyRow {
+        SamlIdpKeyRow {
+            id: "key-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
+            key_id: "default".to_string(),
+            private_key_pem: std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-key.pem"))
+                .unwrap()
+                .to_string(),
+            certificate_pem: std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
+                .unwrap()
+                .to_string(),
+            is_active: true,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn session_with_email(email: &str) -> Value {
+        json!({"identity": {"id": "identity-1", "traits": {"email": email}}})
+    }
+
+    fn authn_request_url(
+        entity_id: &str,
+        provider_id: &str,
+        signer_key_pem: Option<&[u8]>,
+    ) -> String {
+        let authn_request = AuthnRequest {
+            base: RequestBase {
+                id: "_req_123".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: None,
+                consent: None,
+                issuer: Some(Issuer::entity(entity_id)),
+                has_signature: false,
+            },
+            subject: None,
+            name_id_policy: None,
+            conditions: None,
+            requested_authn_context: None,
+            scoping: None,
+            force_authn: None,
+            is_passive: None,
+            assertion_consumer_service_index: None,
+            assertion_consumer_service_url: Some("https://sp.example.com/acs".to_string()),
+            protocol_binding: None,
+            attribute_consuming_service_index: None,
+            provider_name: None,
+            extensions: None,
+        };
+        let saml_xml = authn_request.to_xml_string().expect("serialize authn request");
+        let destination = format!("/saml/sso?provider_id={provider_id}");
+        let signer = signer_key_pem.map(|pem| {
+            let key_manager = build_idp_keys_manager(pem).expect("load signer key");
+            SamlSigner::new(key_manager)
+        });
+        let signer_ref = signer
+            .as_ref()
+            .map(|s| (s, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
+        let relay_state = RelayState::new("state").ok();
+        let params = RedirectEncodeParams {
+            saml_xml: saml_xml.as_bytes(),
+            is_request: true,
+            destination: &destination,
+            relay_state: relay_state.as_ref(),
+            signer: signer_ref,
+        };
+        redirect_encode(&params).expect("encode authn request")
+    }
+
+    fn sso_request(uri: &str, headers: Vec<(&str, &str)>) -> Request<Body> {
+        let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        for (k, v) in headers {
+            let name = k.parse::<axum::http::HeaderName>().unwrap();
+            let value = HeaderValue::from_str(v).unwrap();
+            req.headers_mut().insert(name, value);
+        }
+        req
+    }
+
+    async fn body_to_string(resp: Response<Body>) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     #[test]
     fn idp_error_builds_json_response() {
@@ -541,9 +831,356 @@ mod tests {
     }
 
     #[test]
+    fn redirect_request_without_query_has_empty_params() {
+        let req = RedirectRequest::from_url("/saml/sso");
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.url(), "/saml/sso");
+        assert_eq!(req.query_param("SAMLRequest"), None);
+        assert!(req.params.is_empty());
+    }
+
+    #[test]
+    fn redirect_request_handles_malformed_query() {
+        // Missing value for a key and an empty pair are tolerated by the parser.
+        let req = RedirectRequest::from_url("/saml/sso?SAMLRequest&=x&RelayState=abc");
+        assert_eq!(req.query_param("SAMLRequest"), Some(""));
+        assert_eq!(req.query_param("RelayState"), Some("abc"));
+    }
+
+    #[test]
     fn response_signature_template_contains_reference() {
         let tpl = response_signature_template("_response_1");
         assert!(tpl.contains("URI=\"#_response_1\""));
         assert!(tpl.contains("rsa-sha256"));
+    }
+
+    #[test]
+    fn extract_session_token_returns_token_when_present() {
+        let req = sso_request("/saml/sso", vec![("X-Session-Token", "session-1")]);
+        assert_eq!(extract_session_token(&req).unwrap(), "session-1");
+    }
+
+    #[test]
+    fn extract_session_token_returns_unauthorized_when_missing() {
+        let req = sso_request("/saml/sso", vec![]);
+        let err = extract_session_token(&req).unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn extract_session_token_returns_unauthorized_when_invalid_utf8() {
+        let mut req = Request::builder().uri("/saml/sso").body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            "X-Session-Token",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let err = extract_session_token(&req).unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_bad_request_when_provider_id_missing() {
+        let state = test_state(None);
+        let req = sso_request("/saml/sso", vec![]);
+        let resp = sso(State(state), Query(HashMap::new()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("missing provider_id"));
+    }
+
+    #[tokio::test]
+    async fn sso_returns_bad_request_when_redirect_decode_fails() {
+        let state = test_state(Some(Ok(test_sp_client("https://sp.example.com"))));
+        let mut params = HashMap::new();
+        params.insert("provider_id".to_string(), "sp-1".to_string());
+        let req = sso_request("/saml/sso?SAMLRequest=not-valid-base64&&RelayState=rs", vec![]);
+        let resp = sso(State(state), Query(params), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid saml request"));
+    }
+
+    fn provider_query() -> HashMap<String, String> {
+        HashMap::from([("provider_id".to_string(), "sp-1".to_string())])
+    }
+
+    #[tokio::test]
+    async fn sso_returns_signed_saml_response_html() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .expect("sso should succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            HTML_CONTENT_TYPE
+        );
+        let body = body_to_string(resp).await;
+        assert!(body.contains("SAMLResponse"));
+        assert!(body.contains("https://sp.example.com/acs"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_issuer_mismatch() {
+        let url = authn_request_url("https://other-sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("issuer mismatch"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_signed_request_when_sp_has_no_certificate() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", Some(include_bytes!("../tests/fixtures/saml-test-key.pem")));
+        let mut client = test_sp_client("https://sp.example.com");
+        client.authn_requests_signed = true;
+        client.certificate_pem = None;
+        let state = test_state_full(
+            Some(Ok(client)),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("signed authn request required but no sp certificate configured"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_invalid_authn_request_signature() {
+        // Sign with a different key than the SP certificate configured in the store.
+        let url = authn_request_url(
+            "https://sp.example.com",
+            "sp-1",
+            Some(include_bytes!("../tests/fixtures/saml-other-key.pem")),
+        );
+        let cert_pem = std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
+            .unwrap()
+            .to_string();
+        let mut client = test_sp_client("https://sp.example.com");
+        client.authn_requests_signed = true;
+        client.certificate_pem = Some(cert_pem);
+        let state = test_state_full(
+            Some(Ok(client)),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid authn request signature"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_missing_session_token() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_session_without_identity() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(json!({}))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("session missing identity"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_session_without_identity_id() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(json!({"identity": {"traits": {"email": "alice@example.com"}}}))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("session missing identity id"));
+    }
+
+    #[tokio::test]
+    async fn sso_returns_not_found_when_idp_key_missing() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Err(crate::db::DbError::SamlIdpKeyNotFound)),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_internal_error_when_idp_key_is_invalid() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let bad_key = SamlIdpKeyRow {
+            private_key_pem: "not a valid key".to_string(),
+            ..active_idp_key()
+        };
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(bad_key)),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_internal_error_when_idp_key_store_fails() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Err(crate::db::DbError::Sqlx(sqlx::Error::PoolTimedOut))),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_malformed_saml_payload_after_decode() {
+        let saml_xml = "<root/>";
+        let destination = "/saml/sso?provider_id=sp-1";
+        let params = RedirectEncodeParams {
+            saml_xml: saml_xml.as_bytes(),
+            is_request: true,
+            destination,
+            relay_state: None,
+            signer: None,
+        };
+        let url = redirect_encode(&params).expect("encode custom xml");
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            None,
+            None,
+        );
+        let req = sso_request(&url, vec![]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid saml request"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_unsigned_request_when_signature_required() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let cert_pem = std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
+            .unwrap()
+            .to_string();
+        let mut client = test_sp_client("https://sp.example.com");
+        client.authn_requests_signed = true;
+        client.certificate_pem = Some(cert_pem);
+        let state = test_state_full(
+            Some(Ok(client)),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid authn request signature"));
+    }
+
+    #[test]
+    fn redirect_request_http_request_trait_returns_defaults() {
+        let req = RedirectRequest::from_url("/saml/sso?a=1");
+        assert_eq!(req.form_param("x"), None);
+        assert_eq!(req.header("x"), None);
+        assert!(req.body().is_empty());
+        assert_eq!(req.remote_addr(), None);
+    }
+
+    #[tokio::test]
+    async fn saml_idp_state_new_stores_dependencies() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
+        let kratos = Arc::new(
+            sso_ory_client::kratos::KratosClient::new_with_public("http://admin", "http://public")
+                .unwrap(),
+        );
+        let idp_keys = SamlIdpKeyRepo::new(pool.clone());
+        let sp_clients = SamlSpClientRepo::new(pool);
+        let state = SamlIdpState::new(
+            kratos,
+            idp_keys,
+            sp_clients,
+            "https://idp.example.com".to_string(),
+        );
+        assert_eq!(state.idp_entity_id, "https://idp.example.com");
     }
 }
