@@ -175,3 +175,109 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for SamlProviderRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgSamlProviderStore {
+        PgSamlProviderStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn saml_provider_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = SamlProviderRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            name: "provider".to_string(),
+            idp_entity_id: "idp".to_string(),
+            idp_sso_url: "https://idp/sso".to_string(),
+            idp_certificate_pem: Some("cert".to_string()),
+            sp_entity_id: "sp".to_string(),
+            acs_url: "https://sp/acs".to_string(),
+            name_id_format: Some("email".to_string()),
+            schema_id: "schema".to_string(),
+            authn_requests_signed: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.name, "provider");
+    }
+
+    #[tokio::test]
+    async fn provider_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let created = store
+            .create(
+                &tenant,
+                "Test Provider",
+                "https://idp/entity",
+                "https://idp/sso",
+                Some("cert-pem"),
+                "https://sp/entity",
+                "https://sp/acs",
+                Some("email"),
+                "default",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.tenant_id, tenant);
+        assert_eq!(created.name, "Test Provider");
+        assert_eq!(created.idp_certificate_pem, Some("cert-pem".to_string()));
+        assert!(created.authn_requests_signed);
+
+        let found = store.get(&tenant, &created.id).await.unwrap();
+        assert_eq!(found.id, created.id);
+
+        let by_id = store.get_by_id(&created.id).await.unwrap();
+        assert_eq!(by_id.tenant_id, tenant);
+
+        assert!(matches!(
+            store.get(&tenant, "missing").await.unwrap_err(),
+            DbError::SamlProviderNotFound
+        ));
+        assert!(matches!(
+            store.get_by_id("missing").await.unwrap_err(),
+            DbError::SamlProviderNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn SamlProviderStore> = Arc::new(PgSamlProviderStore::new(pool));
+
+        let created = store
+            .create(
+                &tenant,
+                "Trait Provider",
+                "https://idp/entity",
+                "https://idp/sso",
+                None,
+                "https://sp/entity",
+                "https://sp/acs",
+                None,
+                "default",
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(store.get(&tenant, &created.id).await.is_ok());
+        assert!(store.get_by_id(&created.id).await.is_ok());
+        assert!(created.idp_certificate_pem.is_none());
+        assert!(!created.authn_requests_signed);
+    }
+}

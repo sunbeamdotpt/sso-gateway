@@ -46,3 +46,59 @@ pub async fn bootstrap_system_tenant(
     info!("bootstrapped system tenant: {}", system_tenant_ulid);
     Ok(system_tenant_ulid.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::test_support::{postgres_pool, postgres_url};
+
+    fn db_url_with_name(base: &str, db_name: &str) -> String {
+        // base looks like postgres://user:pass@host:port/ory?sslmode=disable
+        if let Some(query_start) = base.rfind('?') {
+            let before_query = &base[..query_start];
+            let query = &base[query_start..];
+            if let Some(db_sep) = before_query.rfind('/') {
+                format!("{}{}{}", &before_query[..db_sep + 1], db_name, query)
+            } else {
+                format!("{}/{}", before_query, db_name)
+            }
+        } else if let Some(db_sep) = base.rfind('/') {
+            format!("{}{}", &base[..db_sep + 1], db_name)
+        } else {
+            format!("{}/{}", base, db_name)
+        }
+    }
+
+    #[tokio::test]
+    async fn create_pool_creates_and_migrates_database() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, &format!("ory_pool_{}", Ulid::new().to_string().to_lowercase()));
+        let pool = create_pool(&url).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tenants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_system_tenant_creates_system_tenant() {
+        let pool = postgres_pool().await;
+        let system_id = Ulid::new().to_string();
+        let id = bootstrap_system_tenant(&pool, &system_id).await.unwrap();
+        assert_eq!(id, system_id);
+
+        let slug: String = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(&system_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(slug, "system");
+
+        // Idempotent second call returns existing id.
+        let id2 = bootstrap_system_tenant(&pool, &system_id).await.unwrap();
+        assert_eq!(id2, system_id);
+    }
+}

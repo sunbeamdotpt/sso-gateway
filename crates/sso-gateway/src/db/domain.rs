@@ -161,3 +161,90 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantDomainRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgTenantDomainStore {
+        PgTenantDomainStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn tenant_domain_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = TenantDomainRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            domain: "example.com".to_string(),
+            verification_token: "token".to_string(),
+            is_verified: true,
+            verified_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.domain, "example.com");
+    }
+
+    #[tokio::test]
+    async fn domain_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let domain = format!("domain-{}.example.com", Ulid::new());
+        let created = store.create(&tenant, &domain).await.unwrap();
+        assert_eq!(created.domain, domain);
+        assert!(!created.is_verified);
+        assert!(!created.verification_token.is_empty());
+
+        let found = store.get_by_domain(&domain).await.unwrap();
+        assert_eq!(found.id, created.id);
+
+        let verified = store.mark_verified(&tenant, &created.id).await.unwrap();
+        assert!(verified.is_verified);
+        assert!(verified.verified_at.is_some());
+
+        let list = store.list_by_tenant(&tenant).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].is_verified);
+    }
+
+    #[tokio::test]
+    async fn domain_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.get_by_domain("missing.example.com").await.unwrap_err(),
+            DbError::DomainNotFound
+        ));
+        assert!(matches!(
+            store.mark_verified(&tenant, "missing").await.unwrap_err(),
+            DbError::DomainNotFound
+        ));
+        assert!(store.list_by_tenant(&tenant).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn TenantDomainStore> = Arc::new(PgTenantDomainStore::new(pool));
+
+        let domain = format!("trait-{}.example.com", Ulid::new());
+        let created = store.create(&tenant, &domain).await.unwrap();
+        assert!(store.get_by_domain(&domain).await.is_ok());
+        assert!(store.mark_verified(&tenant, &created.id).await.is_ok());
+        assert_eq!(store.list_by_tenant(&tenant).await.unwrap().len(), 1);
+    }
+}

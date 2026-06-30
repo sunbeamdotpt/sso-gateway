@@ -117,3 +117,62 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::postgres_pool;
+
+    #[test]
+    fn tenant_row_debug_and_clone() {
+        let row = TenantRow {
+            id: "id".to_string(),
+            slug: "slug".to_string(),
+            display_name: "display".to_string(),
+            is_system: false,
+            settings: serde_json::json!({"k": "v"}),
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.slug, "slug");
+    }
+
+    async fn store() -> Arc<dyn TenantStore> {
+        Arc::new(PgTenantStore::new(postgres_pool().await))
+    }
+
+    #[tokio::test]
+    async fn tenant_lifecycle() {
+        let store = store().await;
+        let slug = format!("slug-{}", Ulid::new());
+        let created = store
+            .create(&slug, "Display", serde_json::json!({"k": "v"}))
+            .await
+            .unwrap();
+        assert_eq!(created.slug, slug);
+        assert_eq!(created.display_name, "Display");
+        assert_eq!(created.settings, serde_json::json!({"k": "v"}));
+
+        let found = store.get_by_id(&created.id).await.unwrap();
+        assert_eq!(found.id, created.id);
+
+        let list = store.list().await.unwrap();
+        assert!(list.iter().any(|t| t.id == created.id));
+    }
+
+    #[tokio::test]
+    async fn get_by_id_not_found() {
+        let store = store().await;
+        let err = store.get_by_id("missing").await.unwrap_err();
+        assert!(matches!(err, DbError::TenantNotFound));
+    }
+
+    #[tokio::test]
+    async fn pool_accessor() {
+        let pool = postgres_pool().await;
+        let store = PgTenantStore::new(pool);
+        let _ = store.pool();
+    }
+}

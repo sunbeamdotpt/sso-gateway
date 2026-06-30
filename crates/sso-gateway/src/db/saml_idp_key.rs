@@ -139,3 +139,76 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for SamlIdpKeyRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgSamlIdpKeyStore {
+        PgSamlIdpKeyStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn saml_idp_key_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = SamlIdpKeyRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            key_id: "key".to_string(),
+            private_key_pem: "private".to_string(),
+            certificate_pem: "cert".to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.key_id, "key");
+    }
+
+    #[tokio::test]
+    async fn idp_key_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let key_id = format!("key-{}", Ulid::new());
+        let created = store
+            .create(&tenant, &key_id, "private-pem", "cert-pem", true)
+            .await
+            .unwrap();
+        assert_eq!(created.key_id, key_id);
+        assert!(created.is_active);
+
+        let active = store.get_active(&tenant).await.unwrap();
+        assert_eq!(active.id, created.id);
+
+        let list = store.list(&tenant).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        assert!(matches!(
+            store.get_active("missing-tenant").await.unwrap_err(),
+            DbError::SamlIdpKeyNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn SamlIdpKeyStore> = Arc::new(PgSamlIdpKeyStore::new(pool));
+
+        let key_id = format!("trait-key-{}", Ulid::new());
+        store
+            .create(&tenant, &key_id, "private", "cert", true)
+            .await
+            .unwrap();
+        assert!(store.get_active(&tenant).await.is_ok());
+        assert_eq!(store.list(&tenant).await.unwrap().len(), 1);
+    }
+}

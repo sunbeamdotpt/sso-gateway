@@ -244,3 +244,136 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantLocalAuthRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgTenantLocalAuthStore {
+        PgTenantLocalAuthStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn local_auth_method_as_str() {
+        assert_eq!(LocalAuthMethod::Password.as_str(), "password");
+        assert_eq!(LocalAuthMethod::Code.as_str(), "code");
+    }
+
+    #[test]
+    fn local_auth_method_from_str_valid() {
+        assert_eq!("password".parse::<LocalAuthMethod>().unwrap(), LocalAuthMethod::Password);
+        assert_eq!("code".parse::<LocalAuthMethod>().unwrap(), LocalAuthMethod::Code);
+    }
+
+    #[test]
+    fn local_auth_method_from_str_invalid() {
+        let err: DbError = "unknown".parse::<LocalAuthMethod>().unwrap_err();
+        assert!(matches!(err, DbError::InvalidLocalAuthMethod(s) if s == "unknown"));
+    }
+
+    #[test]
+    fn tenant_local_auth_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = TenantLocalAuthRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            method: LocalAuthMethod::Password,
+            config: serde_json::json!({"k": "v"}),
+            is_enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.method, LocalAuthMethod::Password);
+    }
+
+    #[tokio::test]
+    async fn local_auth_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let created = store
+            .create(&tenant, LocalAuthMethod::Password, serde_json::json!({"min_length": 12}))
+            .await
+            .unwrap();
+        assert_eq!(created.method, LocalAuthMethod::Password);
+        assert!(created.is_enabled);
+
+        let found = store
+            .get_by_tenant_and_method(&tenant, LocalAuthMethod::Password)
+            .await
+            .unwrap();
+        assert_eq!(found.id, created.id);
+
+        let list = store.list_by_tenant(&tenant).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let updated = store
+            .update_config(&tenant, &created.id, serde_json::json!({"min_length": 16}))
+            .await
+            .unwrap();
+        assert_eq!(updated.config, serde_json::json!({"min_length": 16}));
+
+        let disabled = store.set_enabled(&tenant, &created.id, false).await.unwrap();
+        assert!(!disabled.is_enabled);
+
+        let err = store
+            .get_by_tenant_and_method(&tenant, LocalAuthMethod::Password)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::LocalAuthNotFound));
+
+        let enabled = store.set_enabled(&tenant, &created.id, true).await.unwrap();
+        assert!(enabled.is_enabled);
+    }
+
+    #[tokio::test]
+    async fn local_auth_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store
+                .get_by_tenant_and_method(&tenant, LocalAuthMethod::Code)
+                .await
+                .unwrap_err(),
+            DbError::LocalAuthNotFound
+        ));
+        assert!(matches!(
+            store.update_config(&tenant, "missing", serde_json::json!({})).await.unwrap_err(),
+            DbError::LocalAuthNotFound
+        ));
+        assert!(matches!(
+            store.set_enabled(&tenant, "missing", false).await.unwrap_err(),
+            DbError::LocalAuthNotFound
+        ));
+        assert!(store.list_by_tenant(&tenant).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn TenantLocalAuthStore> = Arc::new(PgTenantLocalAuthStore::new(pool));
+
+        let created = store
+            .create(&tenant, LocalAuthMethod::Code, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(store.get_by_tenant_and_method(&tenant, LocalAuthMethod::Code).await.is_ok());
+        assert_eq!(store.list_by_tenant(&tenant).await.unwrap().len(), 1);
+        assert!(store
+            .update_config(&tenant, &created.id, serde_json::json!({"ttl": 300}))
+            .await
+            .is_ok());
+    }
+}

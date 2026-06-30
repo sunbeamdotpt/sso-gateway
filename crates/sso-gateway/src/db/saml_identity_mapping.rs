@@ -135,3 +135,102 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for SamlIdentityMappingRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn create_provider(pool: &DbPool, tenant_id: &str) -> String {
+        let provider_id = Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO saml_providers \
+             (id, tenant_id, name, idp_entity_id, idp_sso_url, sp_entity_id, acs_url, schema_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&provider_id)
+        .bind(tenant_id)
+        .bind("Test Provider")
+        .bind("https://idp/entity")
+        .bind("https://idp/sso")
+        .bind("https://sp/entity")
+        .bind("https://sp/acs")
+        .bind("default")
+        .execute(pool)
+        .await
+        .expect("insert provider");
+        provider_id
+    }
+
+    async fn store() -> PgSamlIdentityMappingStore {
+        PgSamlIdentityMappingStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn saml_identity_mapping_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = SamlIdentityMappingRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            provider_id: "provider".to_string(),
+            name_id: "name".to_string(),
+            identity_public_id: "identity".to_string(),
+            ory_global_id: "ory".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.name_id, "name");
+    }
+
+    #[tokio::test]
+    async fn mapping_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let provider = create_provider(&pool, &tenant).await;
+
+        let created = store
+            .create(&tenant, &provider, "nameid-1", "public-1", "ory-1")
+            .await
+            .unwrap();
+        assert_eq!(created.tenant_id, tenant);
+        assert_eq!(created.provider_id, provider);
+        assert_eq!(created.name_id, "nameid-1");
+
+        let found = store
+            .get_by_name_id(&tenant, &provider, "nameid-1")
+            .await
+            .unwrap();
+        assert_eq!(found.id, created.id);
+
+        assert!(matches!(
+            store
+                .get_by_name_id(&tenant, &provider, "missing")
+                .await
+                .unwrap_err(),
+            DbError::SamlIdentityMappingNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let provider = create_provider(&pool, &tenant).await;
+        let store: Arc<dyn SamlIdentityMappingStore> =
+            Arc::new(PgSamlIdentityMappingStore::new(pool));
+
+        let created = store
+            .create(&tenant, &provider, "nameid-2", "public-2", "ory-2")
+            .await
+            .unwrap();
+        assert!(store.get_by_name_id(&tenant, &provider, "nameid-2").await.is_ok());
+        assert_eq!(created.identity_public_id, "public-2");
+    }
+}

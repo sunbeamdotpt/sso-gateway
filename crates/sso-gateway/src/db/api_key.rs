@@ -125,13 +125,89 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantApiKeyRow {
 
 #[cfg(test)]
 mod tests {
-    use super::TenantApiKeyRow;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgTenantApiKeyStore {
+        PgTenantApiKeyStore::new(postgres_pool().await)
+    }
 
     #[test]
     fn tenant_api_key_row_from_row_requires_all_columns() {
-        // Sanity check that FromRow is derived through the full impl block above.
-        // The trait impl is exercised by repository tests; this just ensures the
-        // struct definition and FromRow impl compile together.
         let _size = std::mem::size_of::<TenantApiKeyRow>();
+    }
+
+    #[test]
+    fn tenant_api_key_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = TenantApiKeyRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            key_hash: "hash".to_string(),
+            name: "name".to_string(),
+            scopes: vec!["read".to_string()],
+            expires_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.name, "name");
+    }
+
+    #[tokio::test]
+    async fn api_key_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let row = store
+            .create(&tenant, "test-key", "deadbeef", &["read".to_string(), "write".to_string()], None)
+            .await
+            .unwrap();
+        assert_eq!(row.tenant_id, tenant);
+        assert_eq!(row.key_hash, "deadbeef");
+        assert_eq!(row.scopes, vec!["read", "write"]);
+
+        let found = store.get_by_hash("deadbeef").await.unwrap();
+        assert_eq!(found.id, row.id);
+
+        let missing = store.get_by_hash("missing").await.unwrap_err();
+        assert!(matches!(missing, DbError::ApiKeyNotFound));
+    }
+
+    #[tokio::test]
+    async fn api_key_expired_returns_not_found() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let expired = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        store
+            .create(&tenant, "expired", "expired-hash", &[], Some(expired))
+            .await
+            .unwrap();
+
+        let err = store.get_by_hash("expired-hash").await.unwrap_err();
+        assert!(matches!(err, DbError::ApiKeyNotFound));
+    }
+
+    #[tokio::test]
+    async fn trait_object_create_and_get() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn TenantApiKeyStore> = Arc::new(PgTenantApiKeyStore::new(pool));
+
+        let row = store
+            .create(&tenant, "trait", "trait-hash", &["admin".to_string()], None)
+            .await
+            .unwrap();
+        assert_eq!(row.name, "trait");
+        assert!(store.get_by_hash("trait-hash").await.is_ok());
     }
 }

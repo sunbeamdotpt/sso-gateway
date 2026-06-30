@@ -69,3 +69,56 @@ impl AuditLogStore for PgAuditLogStore {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    #[tokio::test]
+    async fn insert_audit_log_with_tenant() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store = PgAuditLogStore::new(pool);
+
+        store
+            .insert(
+                Some(&tenant),
+                Some("actor-1"),
+                "create",
+                "tenant",
+                "success",
+                serde_json::json!({"meta": "data"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_audit_log_without_tenant_or_actor() {
+        let store = PgAuditLogStore::new(postgres_pool().await);
+        store
+            .insert(None, None, "login", "session", "success", serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trait_object_insert() {
+        let store: Arc<dyn AuditLogStore> = Arc::new(PgAuditLogStore::new(postgres_pool().await));
+        store
+            .insert(
+                None,
+                Some("actor"),
+                "action",
+                "resource",
+                "success",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+    }
+}

@@ -186,3 +186,107 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PermissionTupleRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgPermissionTupleStore {
+        PgPermissionTupleStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn permission_tuple_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = PermissionTupleRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            namespace: "ns".to_string(),
+            object: "obj".to_string(),
+            relation: "rel".to_string(),
+            subject_id: "sub".to_string(),
+            created_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.namespace, "ns");
+    }
+
+    #[tokio::test]
+    async fn tuple_lifecycle_and_filters() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let created = store
+            .create(&tenant, "app", "doc-1", "owner", "user-1")
+            .await
+            .unwrap();
+        assert_eq!(created.namespace, "app");
+        assert_eq!(created.object, "doc-1");
+        assert_eq!(created.relation, "owner");
+        assert_eq!(created.subject_id, "user-1");
+
+        let found = store.get(&tenant, &created.id).await.unwrap();
+        assert_eq!(found.id, created.id);
+
+        let all = store.list(&tenant, None, None, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        let by_ns = store.list(&tenant, Some("app"), None, None).await.unwrap();
+        assert_eq!(by_ns.len(), 1);
+
+        let by_obj = store.list(&tenant, None, Some("doc-1"), None).await.unwrap();
+        assert_eq!(by_obj.len(), 1);
+
+        let by_rel = store.list(&tenant, None, None, Some("owner")).await.unwrap();
+        assert_eq!(by_rel.len(), 1);
+
+        let combined = store.list(&tenant, Some("app"), Some("doc-1"), Some("owner")).await.unwrap();
+        assert_eq!(combined.len(), 1);
+
+        let no_match = store.list(&tenant, Some("other"), None, None).await.unwrap();
+        assert!(no_match.is_empty());
+
+        store.delete(&tenant, &created.id).await.unwrap();
+        assert!(matches!(
+            store.get(&tenant, &created.id).await.unwrap_err(),
+            DbError::TupleNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn tuple_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.get(&tenant, "missing").await.unwrap_err(),
+            DbError::TupleNotFound
+        ));
+        assert!(matches!(
+            store.delete(&tenant, "missing").await.unwrap_err(),
+            DbError::TupleNotFound
+        ));
+        assert!(store.list(&tenant, None, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn PermissionTupleStore> = Arc::new(PgPermissionTupleStore::new(pool));
+
+        let created = store.create(&tenant, "ns", "obj", "rel", "sub").await.unwrap();
+        assert!(store.get(&tenant, &created.id).await.is_ok());
+        assert_eq!(store.list(&tenant, None, None, None).await.unwrap().len(), 1);
+        assert!(store.delete(&tenant, &created.id).await.is_ok());
+    }
+}

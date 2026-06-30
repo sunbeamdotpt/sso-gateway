@@ -277,3 +277,127 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ScimGroupRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgScimGroupStore {
+        PgScimGroupStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn scim_group_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = ScimGroupRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            display_name: "group".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.display_name, "group");
+    }
+
+    #[tokio::test]
+    async fn group_lifecycle_and_membership() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let created = store.create(&tenant, "Engineering").await.unwrap();
+        assert_eq!(created.display_name, "Engineering");
+
+        let found = store.get(&tenant, &created.id).await.unwrap();
+        assert_eq!(found.id, created.id);
+
+        let list = store.list(&tenant).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let updated = store.update(&tenant, &created.id, "Engineering Renamed").await.unwrap();
+        assert_eq!(updated.display_name, "Engineering Renamed");
+
+        store.add_member(&tenant, &created.id, "user-1").await.unwrap();
+        store.add_member(&tenant, &created.id, "user-2").await.unwrap();
+
+        let members = store.list_members(&created.id).await.unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&"user-1".to_string()));
+        assert!(members.contains(&"user-2".to_string()));
+
+        let user_groups = store.list_user_groups("user-1").await.unwrap();
+        assert_eq!(user_groups, vec![created.id.clone()]);
+
+        store.remove_member(&tenant, &created.id, "user-1").await.unwrap();
+        let members_after = store.list_members(&created.id).await.unwrap();
+        assert_eq!(members_after.len(), 1);
+
+        store.remove_user_from_all_groups("user-2").await.unwrap();
+        assert!(store.list_members(&created.id).await.unwrap().is_empty());
+
+        store.delete(&tenant, &created.id).await.unwrap();
+        assert!(matches!(
+            store.get(&tenant, &created.id).await.unwrap_err(),
+            DbError::TenantNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn group_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.get(&tenant, "missing").await.unwrap_err(),
+            DbError::TenantNotFound
+        ));
+        assert!(matches!(
+            store.update(&tenant, "missing", "x").await.unwrap_err(),
+            DbError::TenantNotFound
+        ));
+        assert!(matches!(
+            store.delete(&tenant, "missing").await.unwrap_err(),
+            DbError::TenantNotFound
+        ));
+        assert!(store.list(&tenant).await.unwrap().is_empty());
+        assert!(store.list_members("missing").await.unwrap().is_empty());
+        assert!(store.list_user_groups("missing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_member_rejects_foreign_group() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.add_member(&tenant, "missing-group", "user").await.unwrap_err(),
+            DbError::TenantNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn ScimGroupStore> = Arc::new(PgScimGroupStore::new(pool));
+
+        let created = store.create(&tenant, "Trait Group").await.unwrap();
+        assert!(store.get(&tenant, &created.id).await.is_ok());
+        assert_eq!(store.list(&tenant).await.unwrap().len(), 1);
+        assert!(store.add_member(&tenant, &created.id, "u").await.is_ok());
+        assert_eq!(store.list_members(&created.id).await.unwrap(), vec!["u".to_string()]);
+        assert!(store.update(&tenant, &created.id, "Renamed").await.is_ok());
+        assert!(store.delete(&tenant, &created.id).await.is_ok());
+    }
+}

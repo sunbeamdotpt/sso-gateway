@@ -249,3 +249,115 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for IdMappingRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    #[test]
+    fn id_mapping_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = IdMappingRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            backend: "hydra".to_string(),
+            public_id: "public".to_string(),
+            ory_global_id: "ory".to_string(),
+            created_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.backend, "hydra");
+    }
+
+    async fn store() -> Arc<dyn IdMappingStore> {
+        Arc::new(PgIdMappingStore::new(postgres_pool().await))
+    }
+
+    #[tokio::test]
+    async fn mapping_lifecycle() {
+        let pool = postgres_pool().await;
+        let store: Arc<dyn IdMappingStore> = Arc::new(PgIdMappingStore::new(pool.clone()));
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let public_id = format!("public-{}", Ulid::new());
+        let ory_id = format!("ory-{}", Ulid::new());
+
+        let row = store
+            .create(&tenant, "kratos", &public_id, &ory_id)
+            .await
+            .unwrap();
+        assert_eq!(row.tenant_id, tenant);
+        assert_eq!(row.public_id, public_id);
+        assert_eq!(row.ory_global_id, ory_id);
+
+        let found_ory = store.get_ory_id(&tenant, "kratos", &public_id).await.unwrap();
+        assert_eq!(found_ory, ory_id);
+
+        let found_public = store.get_public_id(&tenant, "kratos", &ory_id).await.unwrap();
+        assert_eq!(found_public, public_id);
+
+        let tenant_id = store
+            .get_tenant_id_by_ory_id("kratos", &ory_id)
+            .await
+            .unwrap();
+        assert_eq!(tenant_id, Some(tenant.clone()));
+
+        let ids = store.list_public_ids(&tenant, "kratos").await.unwrap();
+        assert_eq!(ids, vec![public_id.clone()]);
+
+        store.delete(&tenant, "kratos", &public_id).await.unwrap();
+        assert!(store.get_ory_id(&tenant, "kratos", &public_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_ory_id_returns_not_found_for_missing() {
+        let store = store().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        let err = store
+            .get_ory_id(&tenant, "kratos", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::MappingNotFound));
+    }
+
+    #[tokio::test]
+    async fn get_public_id_returns_not_found_for_missing() {
+        let store = store().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        let err = store
+            .get_public_id(&tenant, "kratos", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::MappingNotFound));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_returns_not_found() {
+        let store = store().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        let err = store.delete(&tenant, "kratos", "missing").await.unwrap_err();
+        assert!(matches!(err, DbError::MappingNotFound));
+    }
+
+    #[tokio::test]
+    async fn get_tenant_id_by_ory_id_returns_none_for_missing() {
+        let store = store().await;
+        let tenant_id = store
+            .get_tenant_id_by_ory_id("kratos", "missing")
+            .await
+            .unwrap();
+        assert_eq!(tenant_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_public_ids_is_empty_for_unknown_tenant() {
+        let store = store().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        let ids = store.list_public_ids(&tenant, "kratos").await.unwrap();
+        assert!(ids.is_empty());
+    }
+}

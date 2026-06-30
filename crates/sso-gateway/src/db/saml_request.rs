@@ -117,3 +117,113 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for SamlRequestRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+    use ulid::Ulid;
+
+    async fn create_provider(pool: &DbPool, tenant_id: &str) -> String {
+        let provider_id = Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO saml_providers \
+             (id, tenant_id, name, idp_entity_id, idp_sso_url, sp_entity_id, acs_url, schema_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&provider_id)
+        .bind(tenant_id)
+        .bind("Test Provider")
+        .bind("https://idp/entity")
+        .bind("https://idp/sso")
+        .bind("https://sp/entity")
+        .bind("https://sp/acs")
+        .bind("default")
+        .execute(pool)
+        .await
+        .expect("insert provider");
+        provider_id
+    }
+
+    async fn store() -> PgSamlRequestStore {
+        PgSamlRequestStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn saml_request_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = SamlRequestRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            provider_id: "provider".to_string(),
+            relay_state: "state".to_string(),
+            created_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.relay_state, "state");
+    }
+
+    #[tokio::test]
+    async fn request_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let provider = create_provider(&pool, &tenant).await;
+
+        let request_id = format!("req-{}", Ulid::new());
+        let created = store
+            .create(&tenant, &request_id, &provider, "relay-state-1")
+            .await
+            .unwrap();
+        assert_eq!(created.id, request_id);
+        assert_eq!(created.tenant_id, tenant);
+        assert_eq!(created.provider_id, provider);
+
+        let found = store.get(&tenant, &request_id).await.unwrap();
+        assert_eq!(found.relay_state, "relay-state-1");
+
+        store.delete(&tenant, &request_id).await.unwrap();
+        assert!(matches!(
+            store.get(&tenant, &request_id).await.unwrap_err(),
+            DbError::SamlRequestNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.get(&tenant, "missing").await.unwrap_err(),
+            DbError::SamlRequestNotFound
+        ));
+        assert!(matches!(
+            store.delete(&tenant, "missing").await.unwrap_err(),
+            DbError::SamlRequestNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let provider = create_provider(&pool, &tenant).await;
+        let store: Arc<dyn SamlRequestStore> = Arc::new(PgSamlRequestStore::new(pool));
+
+        let request_id = format!("trait-req-{}", Ulid::new());
+        store
+            .create(&tenant, &request_id, &provider, "state")
+            .await
+            .unwrap();
+        assert!(store.get(&tenant, &request_id).await.is_ok());
+        assert!(store.delete(&tenant, &request_id).await.is_ok());
+    }
+}

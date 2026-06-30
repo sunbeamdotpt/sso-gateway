@@ -58,3 +58,45 @@ async fn cleanup_saml_replay_cache(pool: &DbPool) -> Result<(), DbError> {
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use gamlastan::security::ReplayCache;
+
+    use super::*;
+    use crate::test_support::postgres_pool;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_and_insert_new_id_returns_true() {
+        let cache = SamlReplayCache::new(postgres_pool().await);
+        let id = format!("assertion-{}", ulid::Ulid::new());
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert!(cache.check_and_insert(&id, expiry));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_and_insert_duplicate_id_returns_false() {
+        let cache = SamlReplayCache::new(postgres_pool().await);
+        let id = format!("assertion-{}", ulid::Ulid::new());
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert!(cache.check_and_insert(&id, expiry));
+        assert!(!cache.check_and_insert(&id, expiry));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_does_not_panic() {
+        let cache = SamlReplayCache::new(postgres_pool().await);
+        cache.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_and_insert_without_runtime_returns_false() {
+        let cache = SamlReplayCache::new(postgres_pool().await);
+        let id = format!("assertion-{}", ulid::Ulid::new());
+        let handle = std::thread::spawn(move || {
+            let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+            assert!(!cache.check_and_insert(&id, expiry));
+        });
+        handle.join().unwrap();
+    }
+}

@@ -265,3 +265,138 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantConnectionRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{create_test_tenant, postgres_pool};
+
+    async fn store() -> PgTenantConnectionStore {
+        PgTenantConnectionStore::new(postgres_pool().await)
+    }
+
+    #[test]
+    fn connection_type_as_str() {
+        assert_eq!(ConnectionType::Oidc.as_str(), "oidc");
+        assert_eq!(ConnectionType::OAuth2.as_str(), "oauth2");
+        assert_eq!(ConnectionType::Saml.as_str(), "saml");
+    }
+
+    #[test]
+    fn connection_type_from_str_valid() {
+        assert_eq!("oidc".parse::<ConnectionType>().unwrap(), ConnectionType::Oidc);
+        assert_eq!("oauth2".parse::<ConnectionType>().unwrap(), ConnectionType::OAuth2);
+        assert_eq!("saml".parse::<ConnectionType>().unwrap(), ConnectionType::Saml);
+    }
+
+    #[test]
+    fn connection_type_from_str_invalid() {
+        let err: DbError = "unknown".parse::<ConnectionType>().unwrap_err();
+        assert!(matches!(err, DbError::InvalidConnectionType(s) if s == "unknown"));
+    }
+
+    #[test]
+    fn tenant_connection_row_debug_and_clone() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let row = TenantConnectionRow {
+            id: "id".to_string(),
+            tenant_id: "tenant".to_string(),
+            connection_type: ConnectionType::Oidc,
+            domain: "example.com".to_string(),
+            config: serde_json::json!({"k": "v"}),
+            is_enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = format!("{:?}", row);
+        let cloned = row.clone();
+        assert_eq!(cloned.connection_type, ConnectionType::Oidc);
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let domain = format!("conn-{}.example.com", Ulid::new());
+        let created = store
+            .create(&tenant, ConnectionType::Oidc, &domain, serde_json::json!({"issuer": "https://idp"}))
+            .await
+            .unwrap();
+        assert_eq!(created.tenant_id, tenant);
+        assert_eq!(created.connection_type, ConnectionType::Oidc);
+        assert!(created.is_enabled);
+
+        let found_domain = store.get_by_domain(&domain).await.unwrap();
+        assert_eq!(found_domain.id, created.id);
+
+        let found_id = store.get_by_id(&tenant, &created.id).await.unwrap();
+        assert_eq!(found_id.domain, domain);
+
+        let list = store.list_by_tenant(&tenant).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, created.id);
+
+        let updated = store
+            .update_config(&tenant, &created.id, serde_json::json!({"issuer": "https://idp2"}))
+            .await
+            .unwrap();
+        assert_eq!(updated.config, serde_json::json!({"issuer": "https://idp2"}));
+
+        let disabled = store.set_enabled(&tenant, &created.id, false).await.unwrap();
+        assert!(!disabled.is_enabled);
+
+        let err = store.get_by_domain(&domain).await.unwrap_err();
+        assert!(matches!(err, DbError::ConnectionNotFound));
+
+        let enabled = store.set_enabled(&tenant, &created.id, true).await.unwrap();
+        assert!(enabled.is_enabled);
+    }
+
+    #[tokio::test]
+    async fn connection_not_found_cases() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        assert!(matches!(
+            store.get_by_id(&tenant, "missing").await.unwrap_err(),
+            DbError::ConnectionNotFound
+        ));
+        assert!(matches!(
+            store.get_by_domain("missing.example.com").await.unwrap_err(),
+            DbError::ConnectionNotFound
+        ));
+        assert!(matches!(
+            store.update_config(&tenant, "missing", serde_json::json!({})).await.unwrap_err(),
+            DbError::ConnectionNotFound
+        ));
+        assert!(matches!(
+            store.set_enabled(&tenant, "missing", false).await.unwrap_err(),
+            DbError::ConnectionNotFound
+        ));
+        assert!(store.list_by_tenant(&tenant).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trait_object_methods() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let store: Arc<dyn TenantConnectionStore> = Arc::new(PgTenantConnectionStore::new(pool));
+
+        let domain = format!("trait-{}.example.com", Ulid::new());
+        let created = store
+            .create(&tenant, ConnectionType::Saml, &domain, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(store.get_by_domain(&domain).await.is_ok());
+        assert!(store.get_by_id(&tenant, &created.id).await.is_ok());
+        assert_eq!(store.list_by_tenant(&tenant).await.unwrap().len(), 1);
+    }
+}
