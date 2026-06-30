@@ -3,6 +3,7 @@
 pub mod app;
 pub mod config;
 pub mod db;
+pub mod domain_verification;
 pub mod middleware;
 pub mod oauth2;
 pub mod proto;
