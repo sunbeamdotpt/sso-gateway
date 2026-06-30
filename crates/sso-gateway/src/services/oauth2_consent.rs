@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use serde_json::Value;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
@@ -17,14 +19,86 @@ use super::oauth2_consent_mapper::{
     reject_consent_request_to_json, reject_logout_request_to_json,
 };
 
+/// Hydra operations used by the OAuth2 consent service.
+#[async_trait]
+pub trait ConsentHydra: Send + Sync {
+    async fn get_consent_request(&self, challenge: &str) -> Result<Value, OryClientError>;
+    async fn accept_consent_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError>;
+    async fn reject_consent_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError>;
+    async fn get_logout_request(&self, challenge: &str) -> Result<Value, OryClientError>;
+    async fn accept_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError>;
+    async fn reject_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl ConsentHydra for HydraClient {
+    async fn get_consent_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+        self.get_consent_request(challenge).await
+    }
+
+    async fn accept_consent_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.accept_consent_request(challenge, body).await
+    }
+
+    async fn reject_consent_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.reject_consent_request(challenge, body).await
+    }
+
+    async fn get_logout_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+        self.get_logout_request(challenge).await
+    }
+
+    async fn accept_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.accept_logout_request(challenge, body).await
+    }
+
+    async fn reject_logout_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.reject_logout_request(challenge, body).await
+    }
+}
+
 #[derive(Clone)]
 pub struct OAuth2ConsentServiceImpl {
-    hydra: Arc<HydraClient>,
+    hydra: Arc<dyn ConsentHydra>,
 }
 
 impl OAuth2ConsentServiceImpl {
     pub fn new(hydra: Arc<HydraClient>) -> Self {
-        Self { hydra }
+        Self {
+            hydra: hydra as Arc<dyn ConsentHydra>,
+        }
     }
 }
 
@@ -153,10 +227,149 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
-    use sso_ory_client::error::OryClientError;
+    use std::sync::{Arc, Mutex};
+
+    use buffa::Message;
+    use buffa::bytes::Bytes;
+    use buffa::view::{HasMessageView, MessageView};
+    use connectrpc::{RequestContext, ServiceRequest};
+    use http::HeaderMap;
+    use serde_json::Value;
+    use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
 
-    use super::map_ory_error;
+    use crate::proto::iam::v1::{
+        AcceptConsentRequest, AcceptLogoutRequest, GetChallengeRequest, OAuth2ConsentService,
+        RejectConsentRequest, RejectLogoutRequest,
+    };
+
+    use super::{map_ory_error, ConsentHydra, OAuth2ConsentServiceImpl};
+
+    #[derive(Debug, Clone)]
+    enum Call {
+        GetConsent(String),
+        AcceptConsent(String),
+        RejectConsent(String),
+        GetLogout(String),
+        AcceptLogout(String),
+        RejectLogout(String),
+    }
+
+    #[derive(Clone, Default)]
+    struct MockConsentHydra {
+        next_result: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        calls: Arc<Mutex<Vec<Call>>>,
+    }
+
+    impl MockConsentHydra {
+        fn queue(&self, result: Result<Value, OryClientError>) {
+            *self.next_result.lock().unwrap() = Some(result);
+        }
+
+        fn take_result(&self) -> Result<Value, OryClientError> {
+            self.next_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock result not queued")
+        }
+
+        fn take_calls(&self) -> Vec<Call> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConsentHydra for MockConsentHydra {
+        async fn get_consent_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::GetConsent(challenge.to_string()));
+            self.take_result()
+        }
+
+        async fn accept_consent_request(
+            &self,
+            challenge: &str,
+            _body: Value,
+        ) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::AcceptConsent(challenge.to_string()));
+            self.take_result()
+        }
+
+        async fn reject_consent_request(
+            &self,
+            challenge: &str,
+            _body: Value,
+        ) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::RejectConsent(challenge.to_string()));
+            self.take_result()
+        }
+
+        async fn get_logout_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::GetLogout(challenge.to_string()));
+            self.take_result()
+        }
+
+        async fn accept_logout_request(
+            &self,
+            challenge: &str,
+            _body: Value,
+        ) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::AcceptLogout(challenge.to_string()));
+            self.take_result()
+        }
+
+        async fn reject_logout_request(
+            &self,
+            challenge: &str,
+            _body: Value,
+        ) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::RejectLogout(challenge.to_string()));
+            self.take_result()
+        }
+    }
+
+    fn service(hydra: Arc<dyn ConsentHydra>) -> OAuth2ConsentServiceImpl {
+        OAuth2ConsentServiceImpl { hydra }
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext::new(HeaderMap::new())
+    }
+
+    fn decode_request<'a, Req: HasMessageView>(
+        bytes: &'a Bytes,
+    ) -> Result<Req::View<'a>, sunbeam_g2v::error::ServiceError> {
+        <Req::View<'a> as MessageView>::decode_view(bytes)
+            .map_err(|e| sunbeam_g2v::error::ServiceError::Internal(format!(
+                "failed to decode self-encoded request: {e}"
+            )))
+    }
+
+    macro_rules! svc_req {
+        ($id:ident, $req:expr, $ty:ty) => {
+            let bytes = Bytes::from($req.encode_to_vec());
+            let view = decode_request::<$ty>(&bytes).unwrap();
+            let $id = ServiceRequest::<$ty>::from_parts(&view, &bytes);
+        };
+    }
 
     #[test]
     fn map_ory_error_status_codes() {
@@ -193,11 +406,339 @@ mod tests {
         let ser = map_ory_error(OryClientError::Serialization(
             serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
         ));
+        let invalid = map_ory_error(OryClientError::InvalidResponse("bad payload".into()));
         let missing = map_ory_error(OryClientError::MissingTenant);
 
         assert!(matches!(http, ServiceError::Unavailable(_)));
         assert!(matches!(url, ServiceError::Unavailable(_)));
         assert!(matches!(ser, ServiceError::Internal(_)));
+        assert!(matches!(invalid, ServiceError::Internal(_)));
         assert!(matches!(missing, ServiceError::Unauthenticated(_)));
+    }
+
+    #[test]
+    fn oauth2_consent_service_impl_new_stores_hydra() {
+        let hydra = Arc::new(
+            HydraClient::new("http://localhost:1", "http://localhost:1").unwrap(),
+        );
+        let service = OAuth2ConsentServiceImpl::new(hydra);
+        let _cloned = service.clone();
+    }
+
+    #[tokio::test]
+    async fn get_consent_request_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-1",
+            "client": { "client_id": "client-1", "client_name": "App" },
+            "subject": "subject-1",
+            "skip": false,
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "consent-challenge-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_consent_request(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.challenge, "consent-challenge-1");
+        assert_eq!(resp.client_id, "client-1");
+        assert_eq!(resp.subject, "subject-1");
+        assert!(!resp.skip);
+        assert!(matches!(mock.take_calls().as_slice(), [Call::GetConsent(c)] if c == "consent-challenge-1"));
+    }
+
+    #[tokio::test]
+    async fn get_consent_request_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Ory {
+            status: 404,
+            message: "not found".into(),
+        }));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "missing".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let err = svc
+            .get_consent_request(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn accept_consent_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "consent-challenge-2".into(),
+                grant_scope: vec!["openid".into()],
+                remember: true,
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let resp = svc
+            .accept_consent(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/callback");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::AcceptConsent(c)] if c == "consent-challenge-2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_consent_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Ory {
+            status: 400,
+            message: "bad request".into(),
+        }));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "bad-challenge".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err = svc
+            .accept_consent(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn reject_consent_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/denied",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectConsentRequest {
+                challenge: "consent-challenge-3".into(),
+                error: "access_denied".into(),
+                ..Default::default()
+            },
+            RejectConsentRequest
+        );
+        let resp = svc
+            .reject_consent(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/denied");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::RejectConsent(c)] if c == "consent-challenge-3"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_consent_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Ory {
+            status: 403,
+            message: "forbidden".into(),
+        }));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectConsentRequest {
+                challenge: "forbidden-challenge".into(),
+                error: "access_denied".into(),
+                ..Default::default()
+            },
+            RejectConsentRequest
+        );
+        let err = svc
+            .reject_consent(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_logout_request_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "logout-challenge-1",
+            "subject": "subject-1",
+            "client": { "client_id": "client-1" },
+            "request_url": "https://example.com/logout",
+            "post_logout_redirect_uri": "https://example.com/after-logout",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "logout-challenge-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_logout_request(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.challenge, "logout-challenge-1");
+        assert_eq!(resp.subject, "subject-1");
+        assert_eq!(resp.client_id, "client-1");
+        assert_eq!(resp.request_url, "https://example.com/logout");
+        assert_eq!(resp.post_logout_redirect_uri, "https://example.com/after-logout");
+        assert!(matches!(mock.take_calls().as_slice(), [Call::GetLogout(c)] if c == "logout-challenge-1"));
+    }
+
+    #[tokio::test]
+    async fn get_logout_request_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Ory {
+            status: 503,
+            message: "unavailable".into(),
+        }));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "missing-logout".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let err = svc
+            .get_logout_request(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn accept_logout_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/logout-callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptLogoutRequest {
+                challenge: "logout-challenge-2".into(),
+                ..Default::default()
+            },
+            AcceptLogoutRequest
+        );
+        let resp = svc
+            .accept_logout(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/logout-callback");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::AcceptLogout(c)] if c == "logout-challenge-2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_logout_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Http(
+            reqwest::Client::new().get("not-a-url").build().unwrap_err(),
+        )));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptLogoutRequest {
+                challenge: "network-error".into(),
+                ..Default::default()
+            },
+            AcceptLogoutRequest
+        );
+        let err = svc
+            .accept_logout(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn reject_logout_happy_path() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/logout-rejected",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectLogoutRequest {
+                challenge: "logout-challenge-3".into(),
+                error: "invalid_request".into(),
+                ..Default::default()
+            },
+            RejectLogoutRequest
+        );
+        let resp = svc
+            .reject_logout(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/logout-rejected");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::RejectLogout(c)] if c == "logout-challenge-3"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_logout_maps_ory_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Err(OryClientError::Serialization(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        )));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectLogoutRequest {
+                challenge: "bad-response".into(),
+                error: "invalid_request".into(),
+                ..Default::default()
+            },
+            RejectLogoutRequest
+        );
+        let err = svc
+            .reject_logout(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
     }
 }

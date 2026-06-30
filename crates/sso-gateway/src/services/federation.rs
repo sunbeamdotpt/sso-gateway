@@ -27,8 +27,9 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::db::{
-    IdMappingRepo, IdentitySchemaRepo, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
-    SamlProviderRow, SamlRequestRepo,
+    IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
+    SamlIdentityMappingRepo, SamlIdentityMappingStore, SamlIdpKeyRepo, SamlIdpKeyStore,
+    SamlProviderRepo, SamlProviderRow, SamlProviderStore, SamlRequestRepo, SamlRequestStore,
 };
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
@@ -39,19 +40,66 @@ use crate::proto::iam::v1::{
 
 const BACKEND_KRATOS: &str = "kratos";
 
+#[async_trait::async_trait]
+trait FederationKratos: Send + Sync + 'static {
+    async fn create_identity(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, sso_ory_client::error::OryClientError>;
+}
+
+#[async_trait::async_trait]
+impl FederationKratos for KratosClient {
+    async fn create_identity(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, sso_ory_client::error::OryClientError> {
+        self.create_identity(payload).await
+    }
+}
+
+#[async_trait::async_trait]
+trait FederationHydra: Send + Sync + 'static {
+    async fn fetch_discovery(&self, url: &str) -> Result<serde_json::Value, ServiceError>;
+    async fn fetch_jwks(&self, url: &str) -> Result<serde_json::Value, ServiceError>;
+}
+
+#[async_trait::async_trait]
+impl FederationHydra for reqwest::Client {
+    async fn fetch_discovery(&self, url: &str) -> Result<serde_json::Value, ServiceError> {
+        self.get(url)
+            .send()
+            .await
+            .map_err(|e| ServiceError::Unavailable(format!("hydra discovery: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ServiceError::Serialization(format!("hydra discovery json: {e}")))
+    }
+
+    async fn fetch_jwks(&self, url: &str) -> Result<serde_json::Value, ServiceError> {
+        self.get(url)
+            .send()
+            .await
+            .map_err(|e| ServiceError::Unavailable(format!("hydra jwks: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ServiceError::Serialization(format!("hydra jwks json: {e}")))
+    }
+}
+
 #[derive(Clone)]
 pub struct FederationServiceImpl {
-    kratos: Arc<KratosClient>,
-    pub(crate) providers: SamlProviderRepo,
-    requests: SamlRequestRepo,
-    mappings: IdMappingRepo,
-    federation_mappings: SamlIdentityMappingRepo,
-    schemas: IdentitySchemaRepo,
+    kratos: Arc<dyn FederationKratos>,
+    pub(crate) providers: Arc<dyn SamlProviderStore>,
+    requests: Arc<dyn SamlRequestStore>,
+    mappings: Arc<dyn IdMappingStore>,
+    federation_mappings: Arc<dyn SamlIdentityMappingStore>,
+    schemas: Arc<dyn IdentitySchemaStore>,
     #[allow(dead_code)]
-    idp_keys: SamlIdpKeyRepo,
+    idp_keys: Arc<dyn SamlIdpKeyStore>,
     hydra_public_url: String,
     public_base_url: String,
-    http: reqwest::Client,
+    http: Arc<dyn FederationHydra>,
     saml_signer: Option<Arc<SamlSigner>>,
     sp_certificate_pem: Option<String>,
     request_ttl: Duration,
@@ -80,19 +128,22 @@ impl FederationServiceImpl {
         replay_cache: Arc<dyn gamlastan::security::ReplayCache>,
     ) -> Self {
         Self {
-            kratos,
-            providers,
-            requests,
-            mappings,
-            federation_mappings,
-            schemas,
-            idp_keys,
+            kratos: kratos as Arc<dyn FederationKratos>,
+            providers: Arc::new(providers) as Arc<dyn SamlProviderStore>,
+            requests: Arc::new(requests) as Arc<dyn SamlRequestStore>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            federation_mappings: Arc::new(federation_mappings)
+                as Arc<dyn SamlIdentityMappingStore>,
+            schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            idp_keys: Arc::new(idp_keys) as Arc<dyn SamlIdpKeyStore>,
             hydra_public_url,
             public_base_url,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http: Arc::new(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
+            ) as Arc<dyn FederationHydra>,
             saml_signer,
             sp_certificate_pem,
             request_ttl,
@@ -114,15 +165,7 @@ impl FederationService for FederationServiceImpl {
         let discovery_url = format!("{}/.well-known/openid-configuration", self.hydra_public_url);
         debug!(%discovery_url, "fetching hydra openid configuration");
 
-        let value: serde_json::Value = self
-            .http
-            .get(&discovery_url)
-            .send()
-            .await
-            .map_err(|e| ServiceError::Unavailable(format!("hydra discovery: {e}")))?
-            .json()
-            .await
-            .map_err(|e| ServiceError::Serialization(format!("hydra discovery json: {e}")))?;
+        let value: serde_json::Value = self.http.fetch_discovery(&discovery_url).await?;
 
         Ok(Response::new(OpenIDConfiguration {
             issuer: json_str(&value, "issuer"),
@@ -151,15 +194,7 @@ impl FederationService for FederationServiceImpl {
         let jwks_url = format!("{}/oauth2/jwks.json", self.hydra_public_url);
         debug!(%jwks_url, "fetching hydra jwks");
 
-        let value: serde_json::Value = self
-            .http
-            .get(&jwks_url)
-            .send()
-            .await
-            .map_err(|e| ServiceError::Unavailable(format!("hydra jwks: {e}")))?
-            .json()
-            .await
-            .map_err(|e| ServiceError::Serialization(format!("hydra jwks json: {e}")))?;
+        let value: serde_json::Value = self.http.fetch_jwks(&jwks_url).await?;
 
         let keys = value
             .get("keys")
@@ -590,6 +625,412 @@ mod tests {
     use gamlastan::xml::SamlSerialize;
     use serde_json::json;
     use sso_ory_client::error::OryClientError;
+    use std::sync::Mutex;
+
+    use crate::db::{
+        DbError, IdMappingRow, IdentitySchemaRow, SamlIdpKeyRow, SamlIdentityMappingRow,
+        SamlRequestRow,
+    };
+    use base64::Engine;
+    use buffa::Message;
+    use buffa::view::MessageView;
+
+    fn decode_request<'a, Req: buffa::view::HasMessageView>(
+        bytes: &'a buffa::bytes::Bytes,
+    ) -> Result<Req::View<'a>, ServiceError> {
+        Req::View::decode_view(bytes)
+            .map_err(|e| ServiceError::Internal(format!("failed to decode request: {e}")))
+    }
+
+    macro_rules! svc_req {
+        ($id:ident, $req:expr, $ty:ty) => {
+            let bytes = buffa::bytes::Bytes::from($req.encode_to_vec());
+            let view = decode_request::<$ty>(&bytes).expect("decode request");
+            let $id = ServiceRequest::<$ty>::from_parts(&view, &bytes);
+        };
+    }
+
+    fn tenant_context(tenant_id: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.into()));
+        ctx
+    }
+
+    fn test_provider() -> SamlProviderRow {
+        SamlProviderRow {
+            id: "provider-1".into(),
+            tenant_id: "tenant-1".into(),
+            name: "Provider".into(),
+            idp_entity_id: "https://idp.example.com".into(),
+            idp_sso_url: "https://idp.example.com/sso".into(),
+            idp_certificate_pem: None,
+            sp_entity_id: "https://sp.example.com".into(),
+            acs_url: "https://sp.example.com/acs".into(),
+            name_id_format: Some(constants::NAMEID_EMAIL.to_string()),
+            schema_id: "default".into(),
+            authn_requests_signed: false,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn test_schema() -> IdentitySchemaRow {
+        IdentitySchemaRow {
+            id: "schema-1".into(),
+            tenant_id: "tenant-1".into(),
+            schema_id: "default".into(),
+            schema_json: json!({}),
+            is_default: true,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn encode_saml_response(response: &SamlResponse) -> String {
+        let xml = response.to_xml_string().expect("serialize response");
+        base64::engine::general_purpose::STANDARD.encode(xml)
+    }
+
+    #[derive(Clone, Default)]
+    struct StubKratos {
+        create_identity_result: Arc<Mutex<Option<Result<serde_json::Value, OryClientError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FederationKratos for StubKratos {
+        async fn create_identity(
+            &self,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.create_identity_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("kratos stub not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubHydra {
+        discovery_result: Arc<Mutex<Option<Result<serde_json::Value, ServiceError>>>>,
+        jwks_result: Arc<Mutex<Option<Result<serde_json::Value, ServiceError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FederationHydra for StubHydra {
+        async fn fetch_discovery(&self, _url: &str) -> Result<serde_json::Value, ServiceError> {
+            self.discovery_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("hydra discovery stub not configured")
+        }
+
+        async fn fetch_jwks(&self, _url: &str) -> Result<serde_json::Value, ServiceError> {
+            self.jwks_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("hydra jwks stub not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubProviderStore {
+        provider: Arc<Mutex<Option<Result<SamlProviderRow, DbError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SamlProviderStore for StubProviderStore {
+        #[allow(clippy::too_many_arguments)]
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _name: &str,
+            _idp_entity_id: &str,
+            _idp_sso_url: &str,
+            _idp_certificate_pem: Option<&str>,
+            _sp_entity_id: &str,
+            _acs_url: &str,
+            _name_id_format: Option<&str>,
+            _schema_id: &str,
+            _authn_requests_signed: bool,
+        ) -> Result<SamlProviderRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get(&self, _tenant_id: &str, _id: &str) -> Result<SamlProviderRow, DbError> {
+            self.provider
+                .lock()
+                .unwrap()
+                .take()
+                .expect("provider stub not configured")
+        }
+
+        async fn get_by_id(&self, _id: &str) -> Result<SamlProviderRow, DbError> {
+            self.provider
+                .lock()
+                .unwrap()
+                .take()
+                .expect("provider stub not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubRequestStore {
+        create_result: Arc<Mutex<Option<Result<SamlRequestRow, DbError>>>>,
+        get_result: Arc<Mutex<Option<Result<SamlRequestRow, DbError>>>>,
+        delete_ok: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SamlRequestStore for StubRequestStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _request_id: &str,
+            _provider_id: &str,
+            _relay_state: &str,
+        ) -> Result<SamlRequestRow, DbError> {
+            self.create_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request create stub not configured")
+        }
+
+        async fn get(&self, _tenant_id: &str, _request_id: &str) -> Result<SamlRequestRow, DbError> {
+            self.get_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request get stub not configured")
+        }
+
+        async fn delete(&self, _tenant_id: &str, _request_id: &str) -> Result<(), DbError> {
+            if *self.delete_ok.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(DbError::SamlRequestNotFound)
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubMappingStore {
+        create_result: Arc<Mutex<Option<Result<IdMappingRow, DbError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            self.create_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mapping create stub not configured")
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubFederationMappingStore {
+        get_by_name_id_result: Arc<Mutex<Option<Result<SamlIdentityMappingRow, DbError>>>>,
+        create_result: Arc<Mutex<Option<Result<SamlIdentityMappingRow, DbError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SamlIdentityMappingStore for StubFederationMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _provider_id: &str,
+            _name_id: &str,
+            _identity_public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<SamlIdentityMappingRow, DbError> {
+            self.create_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("federation mapping create stub not configured")
+        }
+
+        async fn get_by_name_id(
+            &self,
+            _tenant_id: &str,
+            _provider_id: &str,
+            _name_id: &str,
+        ) -> Result<SamlIdentityMappingRow, DbError> {
+            self.get_by_name_id_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("federation mapping get stub not configured")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubSchemaStore {
+        get_by_schema_id_result: Arc<Mutex<Option<Result<IdentitySchemaRow, DbError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdentitySchemaStore for StubSchemaStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+            _schema_json: serde_json::Value,
+            _is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_by_schema_id(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            self.get_by_schema_id_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("schema stub not configured")
+        }
+
+        async fn list(&self, _tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _tenant_id: &str, _schema_id: &str) -> Result<(), DbError> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+            _schema_json: serde_json::Value,
+            _is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn set_default(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_default(&self, _tenant_id: &str) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubIdpKeys;
+
+    #[async_trait::async_trait]
+    impl SamlIdpKeyStore for StubIdpKeys {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _key_id: &str,
+            _private_key_pem: &str,
+            _certificate_pem: &str,
+            _is_active: bool,
+        ) -> Result<SamlIdpKeyRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_active(&self, _tenant_id: &str) -> Result<SamlIdpKeyRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn list(&self, _tenant_id: &str) -> Result<Vec<SamlIdpKeyRow>, DbError> {
+            unimplemented!()
+        }
+    }
+
+    fn service_with_stubs(
+        kratos: Arc<dyn FederationKratos>,
+        providers: Arc<dyn SamlProviderStore>,
+        requests: Arc<dyn SamlRequestStore>,
+        mappings: Arc<dyn IdMappingStore>,
+        federation_mappings: Arc<dyn SamlIdentityMappingStore>,
+        schemas: Arc<dyn IdentitySchemaStore>,
+        http: Arc<dyn FederationHydra>,
+    ) -> FederationServiceImpl {
+        FederationServiceImpl {
+            kratos,
+            providers,
+            requests,
+            mappings,
+            federation_mappings,
+            schemas,
+            idp_keys: Arc::new(StubIdpKeys),
+            hydra_public_url: "http://hydra".into(),
+            public_base_url: "http://gateway".into(),
+            http,
+            saml_signer: None,
+            sp_certificate_pem: None,
+            request_ttl: Duration::from_secs(900),
+            require_signed_assertions: false,
+            require_signed_responses: false,
+            replay_cache: Arc::new(InMemoryReplayCache::new()),
+        }
+    }
 
     fn build_test_response(request_id: &str, sp_entity_id: &str, acs_url: &str) -> SamlResponse {
         let options = ResponseOptions {
@@ -916,5 +1357,584 @@ mod tests {
         let cert_pem = include_str!("../../tests/fixtures/saml-test-cert.pem");
         let result = verify_saml_signature("<xml/>", Some(cert_pem));
         assert!(result.is_err(), "unsigned xml should fail verification");
+    }
+
+    #[tokio::test]
+    async fn test_federation_service_impl_new() {
+        let pool = crate::db::create_pool("postgres://localhost:5432/unused")
+            .await
+            .unwrap_or_else(|_| {
+                use sqlx::PgPool;
+                PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap()
+            });
+        let service = FederationServiceImpl::new(
+            Arc::new(KratosClient::new_with_public("http://a", "http://b").unwrap()),
+            SamlProviderRepo::new(pool.clone()),
+            SamlRequestRepo::new(pool.clone()),
+            IdMappingRepo::new(pool.clone()),
+            SamlIdentityMappingRepo::new(pool.clone()),
+            IdentitySchemaRepo::new(pool.clone()),
+            SamlIdpKeyRepo::new(pool),
+            "http://hydra".into(),
+            "http://gateway".into(),
+            None,
+            None,
+            std::time::Duration::from_secs(900),
+            true,
+            false,
+            Arc::new(InMemoryReplayCache::new()),
+        );
+        let _cloned = service.clone();
+    }
+
+    fn build_signed_response_xml() -> (String, String) {
+        let request_id = "_request_123";
+        let sp_entity_id = "https://sp.example.com";
+        let acs_url = "https://sp.example.com/acs";
+        let response = build_test_response(request_id, sp_entity_id, acs_url);
+        let response_id = response.base.id.clone();
+        let mut xml = response.to_xml_string().expect("serialize response");
+
+        let template = format!(
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                <ds:Reference URI="#{response_id}">
+                    <ds:Transforms>
+                        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+                    </ds:Transforms>
+                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                    <ds:DigestValue></ds:DigestValue>
+                </ds:Reference>
+            </ds:SignedInfo>
+            <ds:SignatureValue></ds:SignatureValue>
+            <ds:KeyInfo><ds:X509Data/></ds:KeyInfo>
+        </ds:Signature>"##
+        );
+
+        let status_pos = xml
+            .find("<samlp:Status")
+            .expect("status element in serialized response");
+        xml.insert_str(status_pos, &template);
+
+        let key_pem = include_bytes!("../../tests/fixtures/saml-test-key.pem");
+        let key_manager = gamlastan::crypto::keys::build_idp_keys_manager(key_pem)
+            .expect("load saml test key");
+        let signer = gamlastan::crypto::SamlSigner::new(key_manager);
+        let signed_xml = signer.sign_enveloped(&xml).expect("sign saml response");
+
+        (signed_xml, response_id)
+    }
+
+    #[test]
+    fn test_verify_saml_signature_with_valid_signed_xml() {
+        let cert_pem = include_str!("../../tests/fixtures/saml-test-cert.pem");
+        let (signed_xml, response_id) = build_signed_response_xml();
+        let ids = verify_saml_signature(&signed_xml, Some(cert_pem)).expect("verify signed xml");
+        assert_eq!(ids, vec![response_id]);
+    }
+
+    #[tokio::test]
+    async fn test_get_open_id_configuration_ok() {
+        let hydra = Arc::new(StubHydra {
+            discovery_result: Arc::new(Mutex::new(Some(Ok(json!({
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://auth",
+                "token_endpoint": "https://token",
+                "userinfo_endpoint": "https://userinfo",
+                "jwks_uri": "https://jwks",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+                "scopes_supported": ["openid"],
+            }))))),
+            ..Default::default()
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            Arc::new(StubProviderStore::default()),
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            hydra,
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = GetOpenIDConfigurationRequest::default();
+        svc_req!(request, proto_req, GetOpenIDConfigurationRequest);
+
+        let resp = service
+            .get_open_id_configuration(ctx, request)
+            .await
+            .expect("openid configuration");
+
+        assert_eq!(resp.body.issuer, "https://issuer.example.com");
+        assert_eq!(resp.body.authorization_endpoint, "https://auth");
+        assert_eq!(resp.body.scopes_supported, vec!["openid"]);
+        assert_eq!(resp.body.grant_types_supported, vec!["authorization_code"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_open_id_configuration_hydra_error() {
+        let hydra = Arc::new(StubHydra {
+            discovery_result: Arc::new(Mutex::new(Some(Err(ServiceError::Unavailable(
+                "hydra down".into(),
+            ))))),
+            ..Default::default()
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            Arc::new(StubProviderStore::default()),
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            hydra,
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = GetOpenIDConfigurationRequest::default();
+        svc_req!(request, proto_req, GetOpenIDConfigurationRequest);
+
+        let err = service
+            .get_open_id_configuration(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_get_json_web_keys_ok() {
+        let hydra = Arc::new(StubHydra {
+            jwks_result: Arc::new(Mutex::new(Some(Ok(json!({
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "use": "sig",
+                        "kid": "key-1",
+                        "alg": "RS256",
+                        "n": "abc",
+                        "e": "def"
+                    }
+                ]
+            }))))),
+            ..Default::default()
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            Arc::new(StubProviderStore::default()),
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            hydra,
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = GetJSONWebKeysRequest::default();
+        svc_req!(request, proto_req, GetJSONWebKeysRequest);
+
+        let resp = service.get_json_web_keys(ctx, request).await.expect("jwks");
+        assert_eq!(resp.body.keys.len(), 1);
+        let key = &resp.body.keys[0];
+        assert_eq!(key.kid, "key-1");
+        assert_eq!(key.kty, "RSA");
+    }
+
+    #[tokio::test]
+    async fn test_initiate_saml_login_ok() {
+        let provider = test_provider();
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            create_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: "request-id".into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "relay-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+            ..Default::default()
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            requests,
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateSamlLoginRequest {
+            provider_id: provider.id.clone(),
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateSamlLoginRequest);
+
+        let resp = service
+            .initiate_saml_login(ctx, request)
+            .await
+            .expect("initiate login");
+
+        assert!(resp.body.redirect_url.contains("https://idp.example.com/sso"));
+        assert!(!resp.body.request_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_initiate_saml_login_provider_not_found() {
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Err(DbError::SamlProviderNotFound)))),
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateSamlLoginRequest {
+            provider_id: "missing".into(),
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateSamlLoginRequest);
+
+        let err = service
+            .initiate_saml_login(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_saml_login_missing_signer() {
+        let mut provider = test_provider();
+        provider.authn_requests_signed = true;
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider)))),
+        });
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateSamlLoginRequest {
+            provider_id: "provider-1".into(),
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateSamlLoginRequest);
+
+        let err = service
+            .initiate_saml_login(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_existing_mapping() {
+        let provider = test_provider();
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: request_id.into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "relay-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+            delete_ok: Arc::new(Mutex::new(true)),
+            ..Default::default()
+        });
+        let federation_mappings = Arc::new(StubFederationMappingStore {
+            get_by_name_id_result: Arc::new(Mutex::new(Some(Ok(SamlIdentityMappingRow {
+                id: "mapping-1".into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                name_id: "alice@example.com".into(),
+                identity_public_id: "public-1".into(),
+                ory_global_id: "ory-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })))),
+            ..Default::default()
+        });
+        let schemas = Arc::new(StubSchemaStore {
+            get_by_schema_id_result: Arc::new(Mutex::new(Some(Ok(test_schema())))),
+        });
+
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            requests,
+            Arc::new(StubMappingStore::default()),
+            federation_mappings,
+            schemas,
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: encoded,
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let resp = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect("accept assertion");
+
+        assert_eq!(resp.body.identity_id, "public-1");
+        assert_eq!(resp.body.tenant_id, "tenant-1");
+        assert!(resp.body.active);
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_creates_new_identity() {
+        let provider = test_provider();
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: request_id.into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "relay-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+            delete_ok: Arc::new(Mutex::new(true)),
+            ..Default::default()
+        });
+        let federation_mappings = Arc::new(StubFederationMappingStore {
+            get_by_name_id_result: Arc::new(Mutex::new(Some(Err(
+                DbError::SamlIdentityMappingNotFound,
+            )))),
+            create_result: Arc::new(Mutex::new(Some(Ok(SamlIdentityMappingRow {
+                id: "mapping-1".into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                name_id: "alice@example.com".into(),
+                identity_public_id: "public-1".into(),
+                ory_global_id: "ory-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })))),
+        });
+        let mappings = Arc::new(StubMappingStore {
+            create_result: Arc::new(Mutex::new(Some(Ok(IdMappingRow {
+                id: "id-1".into(),
+                tenant_id: "tenant-1".into(),
+                backend: BACKEND_KRATOS.into(),
+                public_id: "public-1".into(),
+                ory_global_id: "ory-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+        });
+        let schemas = Arc::new(StubSchemaStore {
+            get_by_schema_id_result: Arc::new(Mutex::new(Some(Ok(test_schema())))),
+        });
+        let kratos = Arc::new(StubKratos {
+            create_identity_result: Arc::new(Mutex::new(Some(Ok(json!({"id": "ory-1"}))))),
+        });
+
+        let service = service_with_stubs(
+            kratos,
+            providers,
+            requests,
+            mappings,
+            federation_mappings,
+            schemas,
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: encoded,
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let resp = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect("accept assertion");
+
+        assert!(!resp.body.identity_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_invalid_base64() {
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            Arc::new(StubProviderStore::default()),
+            Arc::new(StubRequestStore::default()),
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: "not-valid-base64!!!".into(),
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let err = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_relay_state_mismatch() {
+        let provider = test_provider();
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: request_id.into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "different-state".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+            ..Default::default()
+        });
+
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            requests,
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: encoded,
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let err = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_expired_request() {
+        let provider = test_provider();
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: request_id.into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "relay-1".into(),
+                created_at: time::OffsetDateTime::now_utc() - Duration::from_secs(1000),
+            })))),
+            ..Default::default()
+        });
+
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            providers,
+            requests,
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: encoded,
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let err = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_accept_saml_assertion_request_not_found() {
+        let provider = test_provider();
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Err(DbError::SamlRequestNotFound)))),
+            ..Default::default()
+        });
+
+        let service = service_with_stubs(
+            Arc::new(StubKratos::default()),
+            Arc::new(StubProviderStore::default()),
+            requests,
+            Arc::new(StubMappingStore::default()),
+            Arc::new(StubFederationMappingStore::default()),
+            Arc::new(StubSchemaStore::default()),
+            Arc::new(StubHydra::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = AcceptSamlAssertionRequest {
+            encoded_assertion: encoded,
+            relay_state: "relay-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, AcceptSamlAssertionRequest);
+
+        let err = service
+            .accept_saml_assertion(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
     }
 }

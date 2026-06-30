@@ -560,4 +560,185 @@ mod tests {
         assert_eq!(proto.id, "");
         assert_eq!(proto.logout_url, "");
     }
+
+    #[test]
+    fn ory_ui_node_to_proto_maps_each_node_type() {
+        let value = json!({
+            "type": "input",
+            "group": "password",
+            "attributes": { "node_type": "input", "name": "password" },
+            "messages": [{ "id": 1, "text": "msg", "type": "info" }],
+            "meta": { "label": { "id": 1, "text": "label" } }
+        });
+        let proto = ory_ui_node_to_proto(&value);
+        assert_eq!(proto.r#type, "input");
+        assert_eq!(proto.group, "password");
+        assert_eq!(proto.messages.len(), 1);
+        assert!(proto.meta.is_set());
+        assert!(proto.attributes.is_some());
+
+        let value = json!({ "attributes": { "node_type": "unknown" } });
+        let proto = ory_ui_node_to_proto(&value);
+        assert!(proto.attributes.is_none());
+    }
+
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_maps_fields() {
+        let value = json!({
+            "name": "email",
+            "type": "email",
+            "value": "a@example.com",
+            "required": true,
+            "disabled": false,
+            "autocomplete": "email",
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.name, "email");
+        assert_eq!(proto.r#type, "email");
+        assert_eq!(proto.value, "a@example.com");
+        assert!(proto.required);
+        assert!(!proto.disabled);
+        assert_eq!(proto.autocomplete, "email");
+        assert_eq!(proto.node_type, "input");
+    }
+
+    #[test]
+    fn ory_ui_node_text_attributes_to_proto_maps_fields() {
+        let value = json!({ "id": "1", "text": "hello" });
+        let proto = ory_ui_node_text_attributes_to_proto(&value);
+        assert_eq!(proto.id, "1");
+        assert_eq!(proto.text, "hello");
+    }
+
+    #[test]
+    fn ory_ui_node_anchor_attributes_to_proto_maps_fields() {
+        let value = json!({ "href": "http://x", "title": "x", "id": "2" });
+        let proto = ory_ui_node_anchor_attributes_to_proto(&value);
+        assert_eq!(proto.href, "http://x");
+        assert_eq!(proto.title, "x");
+        assert_eq!(proto.id, "2");
+    }
+
+    #[test]
+    fn ory_ui_node_image_attributes_to_proto_maps_fields() {
+        let value = json!({ "src": "http://i", "width": 100, "height": 200, "id": "3" });
+        let proto = ory_ui_node_image_attributes_to_proto(&value);
+        assert_eq!(proto.src, "http://i");
+        assert_eq!(proto.width, "100");
+        assert_eq!(proto.height, "200");
+        assert_eq!(proto.id, "3");
+    }
+
+    #[test]
+    fn ory_ui_node_script_attributes_to_proto_maps_fields() {
+        let value = json!({
+            "src": "http://s",
+            "async": true,
+            "referrerpolicy": "origin",
+            "crossorigin": "anonymous",
+            "integrity": "sha256-x",
+            "type": "text/javascript",
+            "id": "4",
+            "nonce": "nonce-1"
+        });
+        let proto = ory_ui_node_script_attributes_to_proto(&value);
+        assert_eq!(proto.src, "http://s");
+        assert_eq!(proto.r#async, "true");
+        assert_eq!(proto.referrerpolicy, "origin");
+        assert_eq!(proto.crossorigin, "anonymous");
+        assert_eq!(proto.integrity, "sha256-x");
+        assert_eq!(proto.r#type, "text/javascript");
+        assert_eq!(proto.id, "4");
+        assert_eq!(proto.nonce, "nonce-1");
+    }
+
+    #[test]
+    fn ory_ui_message_to_proto_maps_fields() {
+        let value = json!({
+            "id": "1",
+            "text": "hello",
+            "type": "info",
+            "context": { "foo": "bar", "count": 3 }
+        });
+        let proto = ory_ui_message_to_proto(&value);
+        assert_eq!(proto.id, "1");
+        assert_eq!(proto.text, "hello");
+        assert_eq!(proto.r#type, "info");
+        assert_eq!(proto.context.len(), 2);
+        let contexts: std::collections::HashMap<_, _> = proto
+            .context
+            .iter()
+            .map(|c| (c.key.clone(), c.value.clone()))
+            .collect();
+        assert_eq!(contexts.get("foo").unwrap(), "bar");
+        assert_eq!(contexts.get("count").unwrap(), "3");
+    }
+
+    #[test]
+    fn ory_session_to_proto_handles_missing_optional_fields() {
+        let value = json!({ "id": "session-1" });
+        let proto = ory_session_to_proto(&value);
+        assert_eq!(proto.id, "session-1");
+        assert!(!proto.active);
+        assert!(!proto.expires_at.is_set());
+        assert!(!proto.authenticated_at.is_set());
+        assert!(!proto.issued_at.is_set());
+        assert!(!proto.identity_traits.is_set());
+    }
+
+    #[test]
+    fn ory_flow_to_proto_gap_fill_cases() {
+        let value = json!({
+            "id": "flow-2",
+            "type": "registration",
+            "state": "passed_challenge",
+            "oauth2_login_request": {
+                "challenge": "challenge-2",
+                "client": { "client_id": "client-2", "client_name": "App Two" },
+                "requested_scope": ["openid", "profile"],
+                "requested_access_token_audience": ["aud-1", "aud-2"],
+                "subject": "subject-2",
+                "skip": false
+            },
+            "ui": {
+                "action": "http://action",
+                "method": "POST",
+                "nodes": [
+                    { "type": "text", "group": "default", "attributes": { "node_type": "text", "id": 1, "text": "hello" } }
+                ],
+                "messages": []
+            }
+        });
+        let proto = ory_flow_to_proto(&value);
+        assert_eq!(proto.id, "flow-2");
+        assert!(proto.oauth2_login_request.is_set());
+        let oauth2 = proto.oauth2_login_request.as_option().unwrap();
+        assert_eq!(oauth2.client_name, "App Two");
+        assert_eq!(oauth2.requested_scope, vec!["openid", "profile"]);
+        assert_eq!(oauth2.requested_access_token_audience, vec!["aud-1", "aud-2"]);
+        assert!(!oauth2.skip);
+        let ui = proto.ui.as_option().unwrap();
+        assert_eq!(ui.nodes.len(), 1);
+    }
+
+    #[test]
+    fn ory_oauth2_login_request_to_proto_maps_all_fields() {
+        let value = json!({
+            "challenge": "challenge-3",
+            "client": { "client_id": "client-3", "client_name": "App Three" },
+            "requested_scope": ["openid"],
+            "requested_access_token_audience": ["aud-3"],
+            "subject": "subject-3",
+            "skip": true
+        });
+        let proto = ory_oauth2_login_request_to_proto(&value);
+        assert_eq!(proto.challenge, "challenge-3");
+        assert_eq!(proto.client_id, "client-3");
+        assert_eq!(proto.client_name, "App Three");
+        assert_eq!(proto.requested_scope, vec!["openid"]);
+        assert_eq!(proto.requested_access_token_audience, vec!["aud-3"]);
+        assert_eq!(proto.subject, "subject-3");
+        assert!(proto.skip);
+    }
 }

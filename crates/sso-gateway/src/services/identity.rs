@@ -9,7 +9,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
-    db::{IdMappingRepo, IdentitySchemaRepo, IdentitySchemaRow},
+    db::{IdMappingStore, IdentitySchemaRow, IdentitySchemaStore},
     middleware::TenantId,
     proto::iam::v1::{
         CreateIdentityRequest, CreateIdentitySchemaRequest, CreateLoginFlowRequest,
@@ -24,23 +24,118 @@ use crate::{
 
 const BACKEND_KRATOS: &str = "kratos";
 
+/// Local async trait for the subset of Kratos operations used by identity
+/// service. Keeps the service implementation testable without a real Ory
+/// backend.
+#[async_trait::async_trait]
+pub trait IdentityKratos: Send + Sync + 'static {
+    async fn create_identity(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError>;
+
+    async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
+
+    async fn update_identity(
+        &self,
+        id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError>;
+
+    async fn delete_identity(&self, id: &str) -> Result<(), OryClientError>;
+
+    async fn create_login_flow(
+        &self,
+        return_to: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError>;
+
+    async fn create_registration_flow(
+        &self,
+        return_to: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError>;
+
+    async fn admin_get_session(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
+
+    async fn list_sessions_by_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<serde_json::Value, OryClientError>;
+
+    async fn delete_session(&self, id: &str) -> Result<(), OryClientError>;
+}
+
+#[async_trait::async_trait]
+impl IdentityKratos for KratosClient {
+    async fn create_identity(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.create_identity(payload).await
+    }
+
+    async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+        self.get_identity(id).await
+    }
+
+    async fn update_identity(
+        &self,
+        id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.update_identity(id, payload).await
+    }
+
+    async fn delete_identity(&self, id: &str) -> Result<(), OryClientError> {
+        self.delete_identity(id).await
+    }
+
+    async fn create_login_flow(
+        &self,
+        return_to: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.create_login_flow(return_to).await
+    }
+
+    async fn create_registration_flow(
+        &self,
+        return_to: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.create_registration_flow(return_to).await
+    }
+
+    async fn admin_get_session(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+        self.admin_get_session(id).await
+    }
+
+    async fn list_sessions_by_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.list_sessions_by_identity(identity_id).await
+    }
+
+    async fn delete_session(&self, id: &str) -> Result<(), OryClientError> {
+        self.delete_session(id).await
+    }
+}
+
 #[derive(Clone)]
 pub struct IdentityServiceImpl {
-    kratos: Arc<KratosClient>,
-    mappings: IdMappingRepo,
-    schemas: IdentitySchemaRepo,
+    kratos: Arc<dyn IdentityKratos>,
+    mappings: Arc<dyn IdMappingStore>,
+    schemas: Arc<dyn IdentitySchemaStore>,
 }
 
 impl IdentityServiceImpl {
     pub fn new(
         kratos: Arc<KratosClient>,
-        mappings: IdMappingRepo,
-        schemas: IdentitySchemaRepo,
+        mappings: crate::db::IdMappingRepo,
+        schemas: crate::db::IdentitySchemaRepo,
     ) -> Self {
         Self {
-            kratos,
-            mappings,
-            schemas,
+            kratos: kratos as Arc<dyn IdentityKratos>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
         }
     }
 }
@@ -619,30 +714,476 @@ fn parse_timestamp(value: &str) -> Option<Timestamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::collections::HashMap;
 
-    #[test]
-    fn validate_traits_accepts_valid_email() {
-        let schema = json!({
+    use async_trait::async_trait;
+    use buffa::Message;
+    use buffa::bytes::Bytes;
+    use buffa::view::{HasMessageView, MessageView};
+    use http::HeaderMap;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use crate::db::{DbError, IdMappingRepo, IdMappingRow, IdentitySchemaRepo};
+
+    macro_rules! svc_req {
+        ($id:ident, $req:expr, $ty:ty) => {
+            let bytes = Bytes::from($req.encode_to_vec());
+            let view = decode_request::<$ty>(&bytes).expect("valid encoded request");
+            let $id = ServiceRequest::<$ty>::from_parts(&view, &bytes);
+        };
+    }
+
+    fn decode_request<'a, Req: HasMessageView>(
+        bytes: &'a Bytes,
+    ) -> Result<Req::View<'a>, ServiceError> {
+        Req::View::<'a>::decode_view(bytes)
+            .map_err(|e| ServiceError::Internal(format!("failed to decode request: {e}")))
+    }
+
+    fn request_context(tenant_id: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.to_string()));
+        ctx
+    }
+
+    fn schema_row(
+        tenant_id: &str,
+        schema_id: &str,
+        schema_json: serde_json::Value,
+        is_default: bool,
+    ) -> IdentitySchemaRow {
+        IdentitySchemaRow {
+            id: Ulid::new().to_string(),
+            tenant_id: tenant_id.to_string(),
+            schema_id: schema_id.to_string(),
+            schema_json,
+            is_default,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn email_schema() -> serde_json::Value {
+        json!({
             "type": "object",
             "properties": {
                 "email": { "type": "string", "format": "email" }
             },
             "required": ["email"]
-        });
+        })
+    }
+
+    fn proto_struct(value: serde_json::Value) -> ProtoStruct {
+        serde_json::from_value(value).unwrap_or_default()
+    }
+
+    #[derive(Default)]
+    struct StubKratos {
+        identities: Mutex<HashMap<String, serde_json::Value>>,
+        sessions: Mutex<HashMap<String, serde_json::Value>>,
+        sessions_by_identity: Mutex<HashMap<String, serde_json::Value>>,
+        flows: Mutex<Vec<serde_json::Value>>,
+        error: Mutex<Option<OryClientError>>,
+    }
+
+    impl StubKratos {
+        fn with_identity(id: &str, identity: serde_json::Value) -> Self {
+            let mut map = HashMap::new();
+            map.insert(id.to_string(), identity);
+            Self {
+                identities: Mutex::new(map),
+                ..Default::default()
+            }
+        }
+
+        fn with_error(err: OryClientError) -> Self {
+            Self {
+                error: Mutex::new(Some(err)),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IdentityKratos for StubKratos {
+        async fn create_identity(
+            &self,
+            payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            let id = Ulid::new().to_string();
+            let mut identity = payload.clone();
+            identity["id"] = json!(id);
+            self.identities.lock().await.insert(id.clone(), identity.clone());
+            Ok(identity)
+        }
+
+        async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            self.identities
+                .lock()
+                .await
+                .get(id)
+                .cloned()
+                .ok_or_else(|| OryClientError::Ory {
+                    status: 404,
+                    message: "not found".into(),
+                })
+        }
+
+        async fn update_identity(
+            &self,
+            id: &str,
+            payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            let mut identity = payload;
+            identity["id"] = json!(id);
+            self.identities.lock().await.insert(id.to_string(), identity.clone());
+            Ok(identity)
+        }
+
+        async fn delete_identity(&self, id: &str) -> Result<(), OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            self.identities.lock().await.remove(id);
+            Ok(())
+        }
+
+        async fn create_login_flow(
+            &self,
+            _return_to: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            let flow = json!({
+                "id": "flow-login",
+                "type": "login",
+                "expires_at": "2026-06-28T12:00:00Z",
+                "ui": {"nodes": []}
+            });
+            self.flows.lock().await.push(flow.clone());
+            Ok(flow)
+        }
+
+        async fn create_registration_flow(
+            &self,
+            _return_to: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            let flow = json!({
+                "id": "flow-register",
+                "type": "registration",
+                "expires_at": "2026-06-28T12:00:00Z",
+                "ui": {"nodes": []}
+            });
+            self.flows.lock().await.push(flow.clone());
+            Ok(flow)
+        }
+
+        async fn admin_get_session(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            self.sessions
+                .lock()
+                .await
+                .get(id)
+                .cloned()
+                .ok_or_else(|| OryClientError::Ory {
+                    status: 404,
+                    message: "not found".into(),
+                })
+        }
+
+        async fn list_sessions_by_identity(
+            &self,
+            identity_id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            Ok(self
+                .sessions_by_identity
+                .lock()
+                .await
+                .get(identity_id)
+                .cloned()
+                .unwrap_or_else(|| json!([])))
+        }
+
+        async fn delete_session(&self, _id: &str) -> Result<(), OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct StubMappingStore {
+        rows: Mutex<Vec<IdMappingRow>>,
+    }
+
+    impl StubMappingStore {
+        fn with_mapping(
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Self {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            Self {
+                rows: Mutex::new(vec![row]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().await.push(row.clone());
+            Ok(row)
+        }
+
+        async fn get_ory_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .await
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id && r.backend == backend && r.public_id == public_id
+                })
+                .map(|r| r.ory_global_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .await
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id
+                        && r.backend == backend
+                        && r.ory_global_id == ory_global_id
+                })
+                .map(|r| r.public_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().await;
+            let pos = rows.iter().position(|r| {
+                r.tenant_id == tenant_id && r.backend == backend && r.public_id == public_id
+            });
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn list_public_ids(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            Ok(self
+                .rows
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.tenant_id == tenant_id && r.backend == backend)
+                .map(|r| r.public_id.clone())
+                .collect())
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct StubSchemaStore {
+        rows: Mutex<Vec<IdentitySchemaRow>>,
+    }
+
+    impl StubSchemaStore {
+        fn with_row(row: IdentitySchemaRow) -> Self {
+            Self {
+                rows: Mutex::new(vec![row]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IdentitySchemaStore for StubSchemaStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            schema_id: &str,
+            schema_json: serde_json::Value,
+            is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            let row = schema_row(tenant_id, schema_id, schema_json, is_default);
+            self.rows.lock().await.push(row.clone());
+            Ok(row)
+        }
+
+        async fn get_by_schema_id(
+            &self,
+            tenant_id: &str,
+            schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            self.rows
+                .lock()
+                .await
+                .iter()
+                .find(|r| r.tenant_id == tenant_id && r.schema_id == schema_id)
+                .cloned()
+                .ok_or(DbError::SchemaNotFound)
+        }
+
+        async fn list(&self, tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
+            Ok(self
+                .rows
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.tenant_id == tenant_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn delete(&self, tenant_id: &str, schema_id: &str) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().await;
+            let pos = rows
+                .iter()
+                .position(|r| r.tenant_id == tenant_id && r.schema_id == schema_id);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::SchemaNotFound)
+        }
+
+        async fn update(
+            &self,
+            tenant_id: &str,
+            schema_id: &str,
+            schema_json: serde_json::Value,
+            is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            let mut rows = self.rows.lock().await;
+            let row = rows
+                .iter_mut()
+                .find(|r| r.tenant_id == tenant_id && r.schema_id == schema_id)
+                .ok_or(DbError::SchemaNotFound)?;
+            row.schema_json = schema_json;
+            row.is_default = is_default;
+            row.updated_at = time::OffsetDateTime::now_utc();
+            Ok(row.clone())
+        }
+
+        async fn set_default(
+            &self,
+            tenant_id: &str,
+            schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            let mut rows = self.rows.lock().await;
+            for row in rows.iter_mut() {
+                if row.tenant_id == tenant_id {
+                    row.is_default = row.schema_id == schema_id;
+                    row.updated_at = time::OffsetDateTime::now_utc();
+                }
+            }
+            rows.iter()
+                .find(|r| r.tenant_id == tenant_id && r.schema_id == schema_id)
+                .cloned()
+                .ok_or(DbError::SchemaNotFound)
+        }
+
+        async fn get_default(&self, tenant_id: &str) -> Result<IdentitySchemaRow, DbError> {
+            self.rows
+                .lock()
+                .await
+                .iter()
+                .find(|r| r.tenant_id == tenant_id && r.is_default)
+                .cloned()
+                .ok_or(DbError::SchemaNotFound)
+        }
+    }
+
+    fn make_service(
+        kratos: StubKratos,
+        mappings: StubMappingStore,
+        schemas: StubSchemaStore,
+    ) -> IdentityServiceImpl {
+        IdentityServiceImpl {
+            kratos: Arc::new(kratos),
+            mappings: Arc::new(mappings),
+            schemas: Arc::new(schemas),
+        }
+    }
+
+    #[test]
+    fn validate_traits_accepts_valid_email() {
+        let schema = email_schema();
         let traits = json!({ "email": "alice@example.com" });
         assert!(validate_traits(&schema, &traits).is_ok());
     }
 
     #[test]
     fn validate_traits_rejects_missing_required_field() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "email": { "type": "string", "format": "email" }
-            },
-            "required": ["email"]
-        });
+        let schema = email_schema();
         let traits = json!({});
         assert!(validate_traits(&schema, &traits).is_err());
     }
@@ -752,14 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_schema_uses_default_when_empty() {
-        // Covered by the integration tests; this test exercises the helper
-        // through a mock-like construction is not practical, so we keep the
-        // compile-time assertion that the helper exists and returns a Result.
-        let _ = std::mem::size_of::<IdentitySchemaRow>();
-    }
-
-    #[test]
     fn parse_timestamp_rejects_invalid_rfc3339() {
         assert!(parse_timestamp("not-a-timestamp").is_none());
     }
@@ -819,5 +1352,443 @@ mod tests {
             map_ory_error(OryClientError::MissingTenant),
             ServiceError::Unauthenticated(_)
         ));
+    }
+
+    #[test]
+    fn test_require_tenant_returns_tenant_id() {
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId("tenant-1".into()));
+        assert_eq!(require_tenant(&ctx).unwrap(), "tenant-1");
+    }
+
+    #[test]
+    fn test_require_tenant_missing() {
+        let ctx = RequestContext::new(http::HeaderMap::new());
+        assert!(matches!(
+            require_tenant(&ctx),
+            Err(ServiceError::Unauthenticated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_identity_happy_path() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::with_row(schema_row(
+                "tenant-1",
+                "default",
+                email_schema(),
+                true,
+            )),
+        );
+        let req = CreateIdentityRequest {
+            schema_id: "default".into(),
+            traits: Some(proto_struct(json!({"email": "alice@example.com"}))).into(),
+            password: "secret".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateIdentityRequest);
+        let resp = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap();
+        assert_eq!(resp.body.tenant_id, "tenant-1");
+        assert_eq!(resp.body.schema_id, "default");
+        assert!(!resp.body.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_identity_rejects_invalid_traits() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::with_row(schema_row(
+                "tenant-1",
+                "default",
+                email_schema(),
+                true,
+            )),
+        );
+        let req = CreateIdentityRequest {
+            schema_id: "default".into(),
+            traits: Some(proto_struct(json!({"email": 123}))).into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateIdentityRequest);
+        let err = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, connectrpc::ConnectError { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_identity_propagates_ory_error() {
+        let svc = make_service(
+            StubKratos::with_error(OryClientError::Ory {
+                status: 503,
+                message: "down".into(),
+            }),
+            StubMappingStore::default(),
+            StubSchemaStore::with_row(schema_row(
+                "tenant-1",
+                "default",
+                email_schema(),
+                true,
+            )),
+        );
+        let req = CreateIdentityRequest {
+            schema_id: "default".into(),
+            traits: Some(proto_struct(json!({"email": "alice@example.com"}))).into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateIdentityRequest);
+        let err = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn get_identity_happy_path() {
+        let svc = make_service(
+            StubKratos::with_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@b.com"}}),
+            ),
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetIdentityRequest { id: "pub-1".into(), ..Default::default() };
+        svc_req!(svc_req, req, GetIdentityRequest);
+        let resp = IdentityService::get_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.id, "pub-1");
+        assert_eq!(resp.schema_id, "default");
+    }
+
+    #[tokio::test]
+    async fn get_identity_mapping_not_found() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = GetIdentityRequest { id: "missing".into(), ..Default::default() };
+        svc_req!(svc_req, req, GetIdentityRequest);
+        let err = IdentityService::get_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_identities_returns_resolved_identities() {
+        let kratos = StubKratos::with_identity(
+            "ory-1",
+            json!({"id": "ory-1", "schema_id": "default", "traits": {}}),
+        );
+        let mappings = StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1");
+        let svc = make_service(kratos, mappings, StubSchemaStore::default());
+        let req = ListIdentitiesRequest::default();
+        svc_req!(svc_req, req, ListIdentitiesRequest);
+        let resp = IdentityService::list_identities(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.identities.len(), 1);
+        assert_eq!(resp.identities[0].id, "pub-1");
+    }
+
+    #[tokio::test]
+    async fn update_identity_happy_path() {
+        let kratos = StubKratos::with_identity(
+            "ory-1",
+            json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "old@example.com"}}),
+        );
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::with_row(schema_row(
+                "tenant-1",
+                "default",
+                email_schema(),
+                true,
+            )),
+        );
+        let req = UpdateIdentityRequest {
+            id: "pub-1".into(),
+            schema_id: "default".into(),
+            traits: Some(proto_struct(json!({"email": "new@example.com"}))).into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, UpdateIdentityRequest);
+        let resp = IdentityService::update_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.id, "pub-1");
+        assert_eq!(resp.schema_id, "default");
+    }
+
+    #[tokio::test]
+    async fn delete_identity_happy_path() {
+        let kratos = StubKratos::with_identity("ory-1", json!({"id": "ory-1"}));
+        let mappings = StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1");
+        let svc = make_service(kratos, mappings, StubSchemaStore::default());
+        let req = DeleteIdentityRequest { id: "pub-1".into(), ..Default::default() };
+        svc_req!(svc_req, req, DeleteIdentityRequest);
+        IdentityService::delete_identity(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_schema_lifecycle() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let tenant_id = "tenant-1";
+
+        // create
+        let create_req = CreateIdentitySchemaRequest {
+            schema_id: "custom".into(),
+            schema_json: Some(proto_struct(json!({"type": "object"}))).into(),
+            is_default: false,
+            ..Default::default()
+        };
+        svc_req!(svc_req, create_req, CreateIdentitySchemaRequest);
+        let created = IdentityService::create_identity_schema(
+            &svc,
+            request_context(tenant_id),
+            svc_req,
+        )
+        .await
+        .unwrap()
+        .body;
+        assert_eq!(created.schema_id, "custom");
+
+        // get
+        let get_req = GetIdentitySchemaRequest {
+            schema_id: "custom".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, get_req, GetIdentitySchemaRequest);
+        let got = IdentityService::get_identity_schema(&svc, request_context(tenant_id), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(got.schema_id, "custom");
+
+        // list
+        let list_req = ListIdentitySchemasRequest::default();
+        svc_req!(svc_req, list_req, ListIdentitySchemasRequest);
+        let listed =
+            IdentityService::list_identity_schemas(&svc, request_context(tenant_id), svc_req)
+                .await
+                .unwrap()
+                .body;
+        assert_eq!(listed.schemas.len(), 1);
+
+        // update
+        let update_req = UpdateIdentitySchemaRequest {
+            schema_id: "custom".into(),
+            schema_json: Some(proto_struct(json!({"type": "array"}))).into(),
+            is_default: true,
+            ..Default::default()
+        };
+        svc_req!(svc_req, update_req, UpdateIdentitySchemaRequest);
+        let updated = IdentityService::update_identity_schema(
+            &svc,
+            request_context(tenant_id),
+            svc_req,
+        )
+        .await
+        .unwrap()
+        .body;
+        assert!(updated.is_default);
+
+        // set default
+        let set_req = SetDefaultIdentitySchemaRequest {
+            schema_id: "custom".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, set_req, SetDefaultIdentitySchemaRequest);
+        let defaulted =
+            IdentityService::set_default_identity_schema(&svc, request_context(tenant_id), svc_req)
+                .await
+                .unwrap()
+                .body;
+        assert!(defaulted.is_default);
+
+        // delete
+        let del_req = DeleteIdentitySchemaRequest {
+            schema_id: "custom".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, del_req, DeleteIdentitySchemaRequest);
+        IdentityService::delete_identity_schema(&svc, request_context(tenant_id), svc_req)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_happy_path() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = CreateLoginFlowRequest {
+            return_to: "https://app.example.com/callback".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateLoginFlowRequest);
+        let resp = IdentityService::create_login_flow(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.r#type, "login");
+        assert_eq!(resp.tenant_id, "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn create_registration_flow_happy_path() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = CreateRegistrationFlowRequest {
+            return_to: "https://app.example.com/callback".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateRegistrationFlowRequest);
+        let resp =
+            IdentityService::create_registration_flow(&svc, request_context("tenant-1"), svc_req)
+                .await
+                .unwrap()
+                .body;
+        assert_eq!(resp.r#type, "registration");
+    }
+
+    #[tokio::test]
+    async fn get_session_resolves_identity_id() {
+        let kratos = StubKratos::default();
+        kratos
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), json!({"id": "sess-1", "identity_id": "ory-1", "active": true}));
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetSessionRequest { id: "sess-1".into(), ..Default::default() };
+        svc_req!(svc_req, req, GetSessionRequest);
+        let resp = IdentityService::get_session(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.id, "sess-1");
+        assert_eq!(resp.identity_id, "pub-1");
+        assert!(resp.active);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_requires_identity_id() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = ListSessionsRequest::default();
+        svc_req!(svc_req, req, ListSessionsRequest);
+        let err = IdentityService::list_sessions(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_sessions() {
+        let kratos = StubKratos::default();
+        kratos
+            .sessions_by_identity
+            .lock()
+            .await
+            .insert("ory-1".into(), json!([{"id": "sess-1", "active": true}]));
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = ListSessionsRequest {
+            identity_id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, ListSessionsRequest);
+        let resp = IdentityService::list_sessions(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.sessions.len(), 1);
+        assert_eq!(resp.sessions[0].id, "sess-1");
+    }
+
+    #[tokio::test]
+    async fn delete_session_happy_path() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = DeleteSessionRequest { id: "sess-1".into(), ..Default::default() };
+        svc_req!(svc_req, req, DeleteSessionRequest);
+        IdentityService::delete_session(&svc, request_context("tenant-1"), svc_req)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_tenant_returns_unauthenticated() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = ListIdentitiesRequest::default();
+        svc_req!(svc_req, req, ListIdentitiesRequest);
+        let ctx = RequestContext::new(http::HeaderMap::new());
+        let err = IdentityService::list_identities(&svc, ctx, svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn test_identity_service_impl_new() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
+        let kratos = Arc::new(KratosClient::new_with_public("http://a", "http://b").unwrap());
+        let service = IdentityServiceImpl::new(
+            kratos.clone(),
+            IdMappingRepo::new(pool.clone()),
+            IdentitySchemaRepo::new(pool),
+        );
+        let _cloned = service.clone();
+    }
+
+    #[test]
+    fn service_impl_cloneable() {
+        let svc = IdentityServiceImpl {
+            kratos: Arc::new(StubKratos::default()),
+            mappings: Arc::new(StubMappingStore::default()),
+            schemas: Arc::new(StubSchemaStore::default()),
+        };
+        let _cloned = svc.clone();
     }
 }

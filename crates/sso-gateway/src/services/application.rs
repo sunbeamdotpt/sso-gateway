@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use serde_json::Value;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
-    db::IdMappingRepo,
+    db::{IdMappingRepo, IdMappingStore},
     middleware::TenantId,
     proto::iam::v1::{
         Application, ApplicationSecret, CreateApplicationRequest, DeleteApplicationRequest,
@@ -19,15 +21,51 @@ use crate::{
 
 const BACKEND_HYDRA: &str = "hydra";
 
+/// Async trait abstracting the Hydra operations used by [`ApplicationServiceImpl`].
+#[async_trait]
+pub trait ApplicationHydra: Send + Sync + 'static {
+    async fn create_oauth2_client(&self, payload: Value) -> Result<Value, OryClientError>;
+    async fn get_oauth2_client(&self, id: &str) -> Result<Value, OryClientError>;
+    async fn update_oauth2_client(&self, id: &str, payload: Value) -> Result<Value, OryClientError>;
+    async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError>;
+    async fn rotate_client_secret(&self, id: &str) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl ApplicationHydra for HydraClient {
+    async fn create_oauth2_client(&self, payload: Value) -> Result<Value, OryClientError> {
+        self.create_oauth2_client(payload).await
+    }
+
+    async fn get_oauth2_client(&self, id: &str) -> Result<Value, OryClientError> {
+        self.get_oauth2_client(id).await
+    }
+
+    async fn update_oauth2_client(&self, id: &str, payload: Value) -> Result<Value, OryClientError> {
+        self.update_oauth2_client(id, payload).await
+    }
+
+    async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError> {
+        self.delete_oauth2_client(id).await
+    }
+
+    async fn rotate_client_secret(&self, id: &str) -> Result<Value, OryClientError> {
+        self.rotate_client_secret(id).await
+    }
+}
+
 #[derive(Clone)]
 pub struct ApplicationServiceImpl {
-    hydra: Arc<HydraClient>,
-    mappings: IdMappingRepo,
+    hydra: Arc<dyn ApplicationHydra>,
+    mappings: Arc<dyn IdMappingStore>,
 }
 
 impl ApplicationServiceImpl {
     pub fn new(hydra: Arc<HydraClient>, mappings: IdMappingRepo) -> Self {
-        Self { hydra, mappings }
+        Self {
+            hydra: hydra as Arc<dyn ApplicationHydra>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+        }
     }
 }
 
@@ -294,8 +332,623 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::db::{DbError, IdMappingRow};
+    use crate::proto::iam::v1::ApplicationService;
+    use buffa::bytes::Bytes;
+    use buffa::view::MessageView;
+    use buffa::{HasMessageView, Message};
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    macro_rules! svc_req {
+        ($id:ident, $req:expr, $ty:ty) => {
+            let bytes = Bytes::from($req.encode_to_vec());
+            let view = <$ty as HasMessageView>::View::decode_view(&bytes).unwrap();
+            let $id = ServiceRequest::<$ty>::from_parts(&view, &bytes);
+        };
+    }
+
+    fn tenant_context(tenant_id: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.to_string()));
+        ctx
+    }
+
+    fn mapping_row(
+        tenant_id: &str,
+        backend: &str,
+        public_id: &str,
+        ory_id: &str,
+    ) -> IdMappingRow {
+        IdMappingRow {
+            id: "id".to_string(),
+            tenant_id: tenant_id.to_string(),
+            backend: backend.to_string(),
+            public_id: public_id.to_string(),
+            ory_global_id: ory_id.to_string(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn hydra_client_response() -> Value {
+        json!({
+            "client_id": "ory-123",
+            "client_name": "test-app",
+            "client_secret": "secret-123",
+            "scope": "openid profile",
+            "redirect_uris": ["https://a/callback"],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+    }
+
+    fn ory_not_found() -> OryClientError {
+        OryClientError::Ory {
+            status: 404,
+            message: "not found".into(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stub implementations
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct StubHydra {
+        create_result: Mutex<Option<Result<Value, OryClientError>>>,
+        get_results: Mutex<Vec<Result<Value, OryClientError>>>,
+        update_result: Mutex<Option<Result<Value, OryClientError>>>,
+        delete_result: Mutex<Option<Result<(), OryClientError>>>,
+        rotate_result: Mutex<Option<Result<Value, OryClientError>>>,
+    }
+
+    #[async_trait]
+    impl ApplicationHydra for StubHydra {
+        async fn create_oauth2_client(&self, _payload: Value) -> Result<Value, OryClientError> {
+            self.create_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::InvalidResponse("stub create".into())))
+        }
+
+        async fn get_oauth2_client(&self, _id: &str) -> Result<Value, OryClientError> {
+            let mut results = self.get_results.lock().unwrap();
+            if results.is_empty() {
+                return Err(OryClientError::InvalidResponse("stub get".into()));
+            }
+            results.remove(0)
+        }
+
+        async fn update_oauth2_client(
+            &self,
+            _id: &str,
+            _payload: Value,
+        ) -> Result<Value, OryClientError> {
+            self.update_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::InvalidResponse("stub update".into())))
+        }
+
+        async fn delete_oauth2_client(&self, _id: &str) -> Result<(), OryClientError> {
+            self.delete_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::InvalidResponse("stub delete".into())))
+        }
+
+        async fn rotate_client_secret(&self, _id: &str) -> Result<Value, OryClientError> {
+            self.rotate_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::InvalidResponse("stub rotate".into())))
+        }
+    }
+
+    #[derive(Default)]
+    struct StubMappings {
+        create_result: Mutex<Option<Result<IdMappingRow, DbError>>>,
+        get_ory_id_results: Mutex<Vec<Result<String, DbError>>>,
+        list_public_ids_result: Mutex<Option<Result<Vec<String>, DbError>>>,
+        delete_result: Mutex<Option<Result<(), DbError>>>,
+        get_public_id_result: Mutex<Option<Result<String, DbError>>>,
+        get_tenant_id_result: Mutex<Option<Result<Option<String>, DbError>>>,
+    }
+
+    fn take_result<T>(slot: &Mutex<Option<Result<T, DbError>>>) -> Result<T, DbError> {
+        slot.lock().unwrap().take().unwrap_or(Err(DbError::MappingNotFound))
+    }
+
+    #[async_trait]
+    impl IdMappingStore for StubMappings {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            take_result(&self.create_result)
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, DbError> {
+            let mut results = self.get_ory_id_results.lock().unwrap();
+            if results.is_empty() {
+                return Err(DbError::MappingNotFound);
+            }
+            results.remove(0)
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            take_result(&self.get_public_id_result)
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), DbError> {
+            take_result(&self.delete_result)
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            take_result(&self.list_public_ids_result)
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            take_result(&self.get_tenant_id_result)
+        }
+    }
+
+    fn build_service(
+        hydra: StubHydra,
+        mappings: StubMappings,
+    ) -> ApplicationServiceImpl {
+        ApplicationServiceImpl {
+            hydra: Arc::new(hydra),
+            mappings: Arc::new(mappings),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // create_application
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_application_happy_path() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            create_result: Mutex::new(Some(Ok(mapping_row(
+                "tenant-1", BACKEND_HYDRA, "pub-1", "ory-123",
+            )))),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = CreateApplicationRequest {
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into(), "profile".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let resp = service
+            .create_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.tenant_id, "tenant-1");
+        assert_eq!(resp.name, "test-app");
+        assert_eq!(resp.client_secret, "secret-123");
+        assert_eq!(resp.scope, vec!["openid", "profile"]);
+        assert!(!resp.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_application_missing_tenant() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest::default();
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(RequestContext::new(http::HeaderMap::new()), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::Unauthenticated, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_hydra_error() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Err(ory_not_found()))),
+            ..Default::default()
+        };
+        let service = build_service(hydra, StubMappings::default());
+        let req = CreateApplicationRequest::default();
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_missing_client_id() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(json!({"client_secret": "secret"})))),
+            ..Default::default()
+        };
+        let service = build_service(hydra, StubMappings::default());
+        let req = CreateApplicationRequest::default();
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal, "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_application
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_application_happy_path() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = GetApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, GetApplicationRequest);
+
+        let resp = service
+            .get_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.id, "pub-1");
+        assert_eq!(resp.tenant_id, "tenant-1");
+        assert_eq!(resp.name, "test-app");
+    }
+
+    #[tokio::test]
+    async fn get_application_mapping_not_found() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = GetApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, GetApplicationRequest);
+
+        let err = service
+            .get_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_applications
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_applications_happy_path() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![
+                Ok(hydra_client_response()),
+                Ok(json!({
+                    "client_id": "ory-456",
+                    "client_name": "second-app",
+                    "scope": "",
+                })),
+            ]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            list_public_ids_result: Mutex::new(Some(Ok(vec!["pub-1".into(), "pub-2".into()]))),
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into()), Ok("ory-456".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = ListApplicationsRequest::default();
+        svc_req!(request, req, ListApplicationsRequest);
+
+        let resp = service
+            .list_applications(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.applications.len(), 2);
+        assert_eq!(resp.applications[0].name, "test-app");
+        assert_eq!(resp.applications[1].name, "second-app");
+    }
+
+    #[tokio::test]
+    async fn list_applications_skips_unresolvable_clients() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            list_public_ids_result: Mutex::new(Some(Ok(vec!["pub-1".into(), "pub-2".into()]))),
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into()), Err(DbError::MappingNotFound)]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = ListApplicationsRequest::default();
+        svc_req!(request, req, ListApplicationsRequest);
+
+        let resp = service
+            .list_applications(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.applications.len(), 1);
+        assert_eq!(resp.applications[0].id, "pub-1");
+    }
+
+    #[tokio::test]
+    async fn list_applications_skips_hydra_failures() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![
+                Err(ory_not_found()),
+                Ok(hydra_client_response()),
+            ]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            list_public_ids_result: Mutex::new(Some(Ok(vec!["pub-1".into(), "pub-2".into()]))),
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into()), Ok("ory-456".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = ListApplicationsRequest::default();
+        svc_req!(request, req, ListApplicationsRequest);
+
+        let resp = service
+            .list_applications(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.applications.len(), 1);
+        assert_eq!(resp.applications[0].id, "pub-2");
+    }
+
+    // -----------------------------------------------------------------------
+    // update_application
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_application_happy_path() {
+        let hydra = StubHydra {
+            update_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            name: "updated".into(),
+            redirect_uris: vec!["https://b/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let resp = service
+            .update_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.id, "pub-1");
+        assert_eq!(resp.name, "test-app");
+    }
+
+    #[tokio::test]
+    async fn update_application_mapping_not_found() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let err = service
+            .update_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_application
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_application_happy_path() {
+        let hydra = StubHydra {
+            delete_result: Mutex::new(Some(Ok(()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            delete_result: Mutex::new(Some(Ok(()))),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = DeleteApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, DeleteApplicationRequest);
+
+        service
+            .delete_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_application_hydra_error() {
+        let hydra = StubHydra {
+            delete_result: Mutex::new(Some(Err(ory_not_found()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = DeleteApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, DeleteApplicationRequest);
+
+        let err = service
+            .delete_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // rotate_secret
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_secret_happy_path() {
+        let hydra = StubHydra {
+            rotate_result: Mutex::new(Some(Ok(json!({
+                "client_id": "ory-123",
+                "client_secret": "rotated-secret",
+            })))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = RotateSecretRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, RotateSecretRequest);
+
+        let resp = service
+            .rotate_secret(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.client_id, "ory-123");
+        assert_eq!(resp.client_secret, "rotated-secret");
+    }
+
+    #[tokio::test]
+    async fn rotate_secret_missing_secret() {
+        let hydra = StubHydra {
+            rotate_result: Mutex::new(Some(Ok(json!({"client_id": "ory-123"})))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = RotateSecretRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, RotateSecretRequest);
+
+        let err = service
+            .rotate_secret(tenant_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal, "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing pure-function tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn build_hydra_payload_maps_fields() {
@@ -386,5 +1039,74 @@ mod tests {
                 "status {status}"
             );
         }
+    }
+
+    #[test]
+    fn map_ory_error_maps_non_ory_variants() {
+        let err = map_ory_error(OryClientError::Http(
+            reqwest::Client::new().get("not-a-url").build().unwrap_err(),
+        ));
+        assert!(matches!(err, ServiceError::Unavailable(_)), "{err:?}");
+
+        let err = map_ory_error(OryClientError::Serialization(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        ));
+        assert!(matches!(err, ServiceError::Serialization(_)), "{err:?}");
+
+        let err = map_ory_error(OryClientError::Url(
+            reqwest::Url::parse("not a url").unwrap_err(),
+        ));
+        assert!(matches!(err, ServiceError::Configuration(_)), "{err:?}");
+
+        let err = map_ory_error(OryClientError::InvalidResponse("bad body".into()));
+        assert!(matches!(err, ServiceError::Internal(_)), "{err:?}");
+
+        let err = map_ory_error(OryClientError::MissingTenant);
+        assert!(matches!(err, ServiceError::Unauthenticated(_)), "{err:?}");
+    }
+
+    #[test]
+    fn require_tenant_returns_tenant_id_when_present() {
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId("tenant-1".into()));
+        assert_eq!(require_tenant(&ctx).unwrap(), "tenant-1");
+    }
+
+    #[test]
+    fn require_tenant_errors_when_missing() {
+        let ctx = RequestContext::new(http::HeaderMap::new());
+        assert!(matches!(
+            require_tenant(&ctx),
+            Err(ServiceError::Unauthenticated(_))
+        ));
+    }
+
+    #[test]
+    fn hydra_to_application_handles_missing_fields() {
+        let client = json!({"scope": ""});
+        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        assert_eq!(app.id, "pub-1");
+        assert_eq!(app.tenant_id, "tenant-1");
+        assert!(app.name.is_empty());
+        assert!(app.redirect_uris.is_empty());
+        assert!(app.grant_types.is_empty());
+        assert!(app.response_types.is_empty());
+        assert!(app.scope.is_empty());
+        assert!(app.token_endpoint_auth_method.is_empty());
+    }
+
+    #[test]
+    fn hydra_to_application_skips_non_string_array_items() {
+        let client = json!({
+            "redirect_uris": ["https://a", 1, null],
+            "grant_types": [true, "authorization_code"],
+            "response_types": ["code", {"nested": 1}],
+            "scope": "openid profile"
+        });
+        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        assert_eq!(app.redirect_uris, vec!["https://a"]);
+        assert_eq!(app.grant_types, vec!["authorization_code"]);
+        assert_eq!(app.response_types, vec!["code"]);
+        assert_eq!(app.scope, vec!["openid", "profile"]);
     }
 }

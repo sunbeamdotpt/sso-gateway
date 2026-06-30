@@ -107,6 +107,8 @@ pub fn ory_logout_request_to_proto(value: &Value) -> LogoutRequest {
     let client = value.get("client").cloned().unwrap_or_default();
     let client_id = if client.is_object() {
         json_str(&client, "client_id")
+    } else if client.is_null() {
+        String::new()
     } else {
         json_value_to_string(&client)
     };
@@ -289,5 +291,95 @@ mod tests {
         assert_eq!(value["error_description"], "bad");
         assert_eq!(value["error_hint"], "hint");
         assert_eq!(value["status_code"], 400);
+    }
+
+    #[test]
+    fn ory_consent_request_to_proto_defaults_missing_fields() {
+        let proto = ory_consent_request_to_proto(&serde_json::json!({}));
+        assert_eq!(proto.challenge, "");
+        assert_eq!(proto.client_id, "");
+        assert_eq!(proto.client_name, "");
+        assert_eq!(proto.subject, "");
+        assert!(!proto.skip);
+        assert!(proto.requested_scope.is_empty());
+        assert!(proto.requested_access_token_audience.is_empty());
+        assert!(!proto.oidc_context.is_set());
+    }
+
+    #[test]
+    fn ory_consent_response_to_proto_defaults_missing_redirect_to() {
+        let proto = ory_consent_response_to_proto(&serde_json::json!({}));
+        assert_eq!(proto.redirect_to, "");
+    }
+
+    #[test]
+    fn accept_consent_request_to_json_omits_session_when_none() {
+        let req = AcceptConsentRequest {
+            grant_scope: vec!["openid".to_string()],
+            remember: false,
+            ..Default::default()
+        };
+        let value = accept_consent_request_to_json(&req);
+        assert!(value.get("session").is_none());
+    }
+
+    #[test]
+    fn accept_consent_request_to_json_omits_remember_for_when_zero() {
+        let req = AcceptConsentRequest {
+            grant_scope: vec!["openid".to_string()],
+            remember: true,
+            remember_for: 0,
+            ..Default::default()
+        };
+        let value = accept_consent_request_to_json(&req);
+        assert!(value.get("remember_for").is_none());
+    }
+
+    #[test]
+    fn reject_consent_request_to_json_empty() {
+        let req = RejectConsentRequest {
+            challenge: "challenge-1".to_string(),
+            ..Default::default()
+        };
+        let value = reject_consent_request_to_json(&req);
+        assert!(value.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ory_logout_request_to_proto_defaults_missing_client() {
+        let proto = ory_logout_request_to_proto(&serde_json::json!({"challenge": "c1"}));
+        assert_eq!(proto.challenge, "c1");
+        assert_eq!(proto.client_id, "");
+        assert_eq!(proto.subject, "");
+        assert_eq!(proto.request_url, "");
+        assert_eq!(proto.post_logout_redirect_uri, "");
+    }
+
+    #[test]
+    fn ory_logout_request_to_proto_handles_null_client() {
+        let value = serde_json::json!({
+            "challenge": "c1",
+            "client": null,
+            "subject": "subject-1"
+        });
+        let proto = ory_logout_request_to_proto(&value);
+        assert_eq!(proto.client_id, "");
+        assert_eq!(proto.subject, "subject-1");
+    }
+
+    #[test]
+    fn ory_logout_response_to_proto_defaults_missing_redirect_to() {
+        let proto = ory_logout_response_to_proto(&serde_json::json!({}));
+        assert_eq!(proto.redirect_to, "");
+    }
+
+    #[test]
+    fn reject_logout_request_to_json_empty() {
+        let req = RejectLogoutRequest {
+            challenge: "challenge-1".to_string(),
+            ..Default::default()
+        };
+        let value = reject_logout_request_to_json(&req);
+        assert!(value.as_object().unwrap().is_empty());
     }
 }
