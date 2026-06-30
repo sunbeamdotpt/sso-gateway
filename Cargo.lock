@@ -5436,7 +5436,7 @@ dependencies = [
 
 [[package]]
 name = "sso-gateway"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -5479,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "sso-ory-client"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "axum",
  "rand 0.8.6",
