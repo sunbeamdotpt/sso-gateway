@@ -36,6 +36,13 @@ pub async fn start_postgres()
 pub async fn start_hydra()
 -> Result<(ContainerAsync<GenericImage>, String, String), Box<dyn std::error::Error + Send + Sync>>
 {
+    start_hydra_with_issuer("http://localhost:4444").await
+}
+
+pub async fn start_hydra_with_issuer(
+    self_issuer: &str,
+) -> Result<(ContainerAsync<GenericImage>, String, String), Box<dyn std::error::Error + Send + Sync>>
+{
     const PUBLIC_PORT: u16 = 4444;
     const ADMIN_PORT: u16 = 4445;
 
@@ -48,7 +55,7 @@ pub async fn start_hydra()
         .with_cmd(["serve", "all", "--dev"])
         .with_env_var("DSN", "memory")
         .with_env_var("SECRETS_SYSTEM", "some-long-secret-key-for-tests")
-        .with_env_var("URLS_SELF_ISSUER", "http://localhost:4444")
+        .with_env_var("URLS_SELF_ISSUER", self_issuer)
         .with_startup_timeout(Duration::from_secs(120))
         .start()
         .await?;
