@@ -5393,6 +5393,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ulid",
