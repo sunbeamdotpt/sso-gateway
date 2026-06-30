@@ -712,9 +712,7 @@ async fn federation_saml_metadata_endpoint() {
         replay_cache,
     ));
 
-    let saml_state = Arc::new(SamlState {
-        service: federation_service,
-    });
+    let saml_state = Arc::new(SamlState::new(federation_service));
 
     let app = axum::Router::new().merge(saml_router(saml_state));
 

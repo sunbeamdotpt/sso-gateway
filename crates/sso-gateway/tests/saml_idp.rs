@@ -197,12 +197,12 @@ async fn start_idp_server(
 
     let idp_entity_id = "https://gateway.example.com/saml/idp".to_string();
 
-    let state = Arc::new(SamlIdpState {
+    let state = Arc::new(SamlIdpState::new(
         kratos,
         idp_keys,
         sp_clients,
-        idp_entity_id: idp_entity_id.clone(),
-    });
+        idp_entity_id.clone(),
+    ));
 
     let router = saml_idp_router(state);
 

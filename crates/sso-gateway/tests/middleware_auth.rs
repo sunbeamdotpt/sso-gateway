@@ -71,11 +71,11 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         HydraClient::new("http://localhost:1", "http://localhost:1")
             .expect("fake hydra client should build"),
     );
-    let oauth_state = Arc::new(Oauth2State {
+    let oauth_state = Arc::new(Oauth2State::new(
         hydra,
-        mappings: IdMappingRepo::new(pool.clone()),
-        public_base_url: "http://localhost".to_string(),
-    });
+        IdMappingRepo::new(pool.clone()),
+        "http://localhost".to_string(),
+    ));
     let audit_repo = AuditLogRepo::new(pool.clone());
     let mappings = IdMappingRepo::new(pool.clone());
     let kratos = Arc::new(

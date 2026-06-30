@@ -45,11 +45,7 @@ fn scim_state(pool: DbPool, hydra: Arc<HydraClient>) -> Arc<ScimState> {
         schemas,
         groups,
     ));
-    Arc::new(ScimState {
-        service,
-        hydra,
-        mappings,
-    })
+    Arc::new(ScimState::new(service, hydra, mappings))
 }
 
 async fn serve(

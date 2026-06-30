@@ -93,16 +93,16 @@ async fn scim_users_and_groups_round_trip() {
         .expect("random port should bind");
     let base = format!("http://{addr}");
 
-    let oauth_state = Arc::new(Oauth2State {
-        hydra: hydra.clone(),
-        mappings: mappings.clone(),
-        public_base_url: base.clone(),
-    });
-    let scim_state = Arc::new(ScimState {
-        service: scim_service.clone(),
-        hydra: hydra.clone(),
-        mappings: mappings.clone(),
-    });
+    let oauth_state = Arc::new(Oauth2State::new(
+        hydra.clone(),
+        mappings.clone(),
+        base.clone(),
+    ));
+    let scim_state = Arc::new(ScimState::new(
+        scim_service.clone(),
+        hydra.clone(),
+        mappings.clone(),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)

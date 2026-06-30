@@ -60,11 +60,11 @@ async fn oauth2_public_endpoints_round_trip() {
         .expect("random port should bind");
     let base = format!("http://{addr}");
 
-    let oauth_state = Arc::new(Oauth2State {
+    let oauth_state = Arc::new(Oauth2State::new(
         hydra,
-        mappings: mappings.clone(),
-        public_base_url: base.clone(),
-    });
+        mappings.clone(),
+        base.clone(),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -307,11 +307,11 @@ async fn oauth2_missing_client_id_is_rejected() {
         .expect("random port should bind");
     let base = format!("http://{addr}");
 
-    let oauth_state = Arc::new(Oauth2State {
+    let oauth_state = Arc::new(Oauth2State::new(
         hydra,
-        mappings: mappings.clone(),
-        public_base_url: base.clone(),
-    });
+        mappings.clone(),
+        base.clone(),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
