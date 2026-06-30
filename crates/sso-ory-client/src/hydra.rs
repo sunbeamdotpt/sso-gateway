@@ -325,12 +325,12 @@ impl HydraClient {
         handle_response(response).await
     }
 
-    /// Call Hydra's public `/oauth2/userinfo` endpoint.
+    /// Call Hydra's public `/userinfo` endpoint.
     #[instrument(skip(self))]
     pub async fn userinfo(&self, token: &str) -> Result<Value, OryClientError> {
         let url = self
             .public_url
-            .join("oauth2/userinfo")
+            .join("userinfo")
             .map_err(OryClientError::Url)?;
         debug!(%url, "fetching userinfo");
         let response = self
