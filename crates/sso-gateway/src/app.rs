@@ -391,4 +391,45 @@ mod tests {
         let result = run(config).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn build_app_returns_error_for_invalid_hydra_url() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, &format!("app_hydra_url_{}", Ulid::new().to_string().to_lowercase()));
+        let pool = create_pool(&url).await.unwrap();
+        let mut config = test_config(url, Ulid::new().to_string());
+        config.hydra_admin_url = "not a valid url".to_string();
+        assert!(build_app(&config, pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_app_returns_error_for_invalid_kratos_url() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, &format!("app_kratos_url_{}", Ulid::new().to_string().to_lowercase()));
+        let pool = create_pool(&url).await.unwrap();
+        let mut config = test_config(url, Ulid::new().to_string());
+        config.kratos_admin_url = "not a valid url".to_string();
+        assert!(build_app(&config, pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_app_returns_error_for_invalid_keto_url() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, &format!("app_keto_url_{}", Ulid::new().to_string().to_lowercase()));
+        let pool = create_pool(&url).await.unwrap();
+        let mut config = test_config(url, Ulid::new().to_string());
+        config.keto_read_url = "not a valid url".to_string();
+        assert!(build_app(&config, pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_app_returns_error_for_invalid_saml_certificate_file() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, &format!("app_cert_{}", Ulid::new().to_string().to_lowercase()));
+        let pool = create_pool(&url).await.unwrap();
+        let mut config = test_config(url, Ulid::new().to_string());
+        config.saml_sp_private_key_pem_path = Some("tests/fixtures/saml-test-key.pem".into());
+        config.saml_sp_certificate_pem_path = Some("tests/fixtures/does-not-exist.pem".into());
+        assert!(build_app(&config, pool).await.is_err());
+    }
 }

@@ -1183,4 +1183,128 @@ mod tests {
         );
         assert_eq!(state.idp_entity_id, "https://idp.example.com");
     }
+
+    #[tokio::test]
+    async fn sso_returns_not_found_when_sp_client_missing() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Err(crate::db::DbError::SamlSpClientNotFound)),
+            None,
+            None,
+        );
+        let req = sso_request(&url, vec![]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_bad_request_for_invalid_utf8_saml_xml() {
+        let destination = "/saml/sso?provider_id=sp-1";
+        let params = RedirectEncodeParams {
+            saml_xml: &[0x80, 0x81, 0x82],
+            is_request: true,
+            destination,
+            relay_state: None,
+            signer: None,
+        };
+        let url = redirect_encode(&params).expect("encode invalid bytes");
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            None,
+            None,
+        );
+        let req = sso_request(&url, vec![]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid saml request"));
+    }
+
+    #[tokio::test]
+    async fn sso_returns_bad_request_for_non_saml_xml() {
+        let destination = "/saml/sso?provider_id=sp-1";
+        let params = RedirectEncodeParams {
+            saml_xml: "<not-a-saml-request/>".as_bytes(),
+            is_request: true,
+            destination,
+            relay_state: None,
+            signer: None,
+        };
+        let url = redirect_encode(&params).expect("encode custom xml");
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            None,
+            None,
+        );
+        let req = sso_request(&url, vec![]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid saml request"));
+    }
+
+    #[tokio::test]
+    async fn sso_returns_unauthorized_when_kratos_session_invalid() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Err(OryClientError::Ory {
+                status: 401,
+                message: "no session".into(),
+            })),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "bad-token")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_internal_error_when_kratos_returns_forbidden() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Err(OryClientError::Ory {
+                status: 403,
+                message: "forbidden".into(),
+            })),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "bad-token")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sso_returns_internal_error_for_non_ory_kratos_error() {
+        let url = authn_request_url("https://sp.example.com", "sp-1", None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Err(OryClientError::Http(
+                reqwest::get("http://localhost:1").await.unwrap_err(),
+            ))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "bad-token")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::proto::iam::v1::{
     AcceptConsentRequest, AcceptLogoutRequest, ConsentRequest, ConsentResponse, LogoutRequest,
-    LogoutResponse, RejectConsentRequest, RejectLogoutRequest,
+    LogoutResponse, OAuth2Client, RejectConsentRequest, RejectLogoutRequest,
 };
 
 use super::proto_util::{
@@ -36,7 +36,39 @@ pub fn ory_consent_request_to_proto(value: &Value) -> ConsentRequest {
             .and_then(json_to_struct)
             .map(Into::into)
             .unwrap_or_default(),
+        client: client
+            .as_object()
+            .map(|_| OAuth2Client::from(&client))
+            .map(Into::into)
+            .unwrap_or_default(),
         ..Default::default()
+    }
+}
+
+impl From<&Value> for OAuth2Client {
+    fn from(value: &Value) -> Self {
+        OAuth2Client {
+            client_id: json_str(value, "client_id"),
+            client_name: json_str(value, "client_name"),
+            client_uri: json_str(value, "client_uri"),
+            logo_uri: json_str(value, "logo_uri"),
+            redirect_uris: json_array_to_strings(value.get("redirect_uris").unwrap_or(&Value::Null)),
+            skip_consent: json_bool(value, "skip_consent"),
+            skip_logout_consent: json_bool(value, "skip_logout_consent"),
+            grant_types: json_array_to_strings(value.get("grant_types").unwrap_or(&Value::Null)),
+            response_types: json_array_to_strings(value.get("response_types").unwrap_or(&Value::Null)),
+            scope: json_str(value, "scope"),
+            policy_uri: json_str(value, "policy_uri"),
+            tos_uri: json_str(value, "tos_uri"),
+            jwks_uri: json_str(value, "jwks_uri"),
+            metadata: value
+                .get("metadata")
+                .cloned()
+                .and_then(json_to_struct)
+                .map(Into::into)
+                .unwrap_or_default(),
+            ..Default::default()
+        }
     }
 }
 
@@ -118,6 +150,11 @@ pub fn ory_logout_request_to_proto(value: &Value) -> LogoutRequest {
         client_id,
         request_url: json_str(value, "request_url"),
         post_logout_redirect_uri: json_str(value, "post_logout_redirect_uri"),
+        client: client
+            .as_object()
+            .map(|_| OAuth2Client::from(&client))
+            .map(Into::into)
+            .unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -169,7 +206,12 @@ mod tests {
     fn ory_consent_request_to_proto_maps_fields() {
         let value = json!({
             "challenge": "challenge-1",
-            "client": { "client_id": "client-1", "client_name": "App" },
+            "client": {
+                "client_id": "client-1",
+                "client_name": "App",
+                "skip_consent": true,
+                "skip_logout_consent": false
+            },
             "subject": "subject-1",
             "skip": true,
             "requested_scope": ["openid", "profile"],
@@ -186,6 +228,10 @@ mod tests {
         assert_eq!(proto.requested_scope, vec!["openid", "profile"]);
         assert_eq!(proto.requested_access_token_audience, vec!["aud"]);
         assert!(proto.oidc_context.is_set());
+        assert!(proto.client.is_set());
+        let client = proto.client.as_option().unwrap();
+        assert!(client.skip_consent);
+        assert!(!client.skip_logout_consent);
     }
 
     #[test]
@@ -232,7 +278,12 @@ mod tests {
         let value = json!({
             "challenge": "logout-challenge-1",
             "subject": "subject-1",
-            "client": { "client_id": "client-1" },
+            "client": {
+                "client_id": "client-1",
+                "client_name": "App",
+                "skip_consent": false,
+                "skip_logout_consent": true
+            },
             "request_url": "http://request",
             "post_logout_redirect_uri": "http://redirect"
         });
@@ -243,6 +294,10 @@ mod tests {
         assert_eq!(proto.client_id, "client-1");
         assert_eq!(proto.request_url, "http://request");
         assert_eq!(proto.post_logout_redirect_uri, "http://redirect");
+        assert!(proto.client.is_set());
+        let client = proto.client.as_option().unwrap();
+        assert!(!client.skip_consent);
+        assert!(client.skip_logout_consent);
     }
 
     #[test]
@@ -371,6 +426,33 @@ mod tests {
     fn ory_logout_response_to_proto_defaults_missing_redirect_to() {
         let proto = ory_logout_response_to_proto(&serde_json::json!({}));
         assert_eq!(proto.redirect_to, "");
+    }
+
+    #[test]
+    fn ory_oauth2_client_to_proto_maps_all_fields() {
+        let value = json!({
+            "client_id": "client-1",
+            "client_name": "App",
+            "client_uri": "http://app",
+            "logo_uri": "http://logo",
+            "redirect_uris": ["http://callback"],
+            "skip_consent": true,
+            "skip_logout_consent": true,
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid profile",
+            "policy_uri": "http://policy",
+            "tos_uri": "http://tos",
+            "jwks_uri": "http://jwks",
+            "metadata": { "custom": "value" }
+        });
+        let proto = OAuth2Client::from(&value);
+        assert_eq!(proto.client_id, "client-1");
+        assert_eq!(proto.client_name, "App");
+        assert_eq!(proto.redirect_uris, vec!["http://callback"]);
+        assert!(proto.skip_consent);
+        assert!(proto.skip_logout_consent);
+        assert!(proto.metadata.is_set());
     }
 
     #[test]

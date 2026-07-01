@@ -315,6 +315,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use serde_json::json;
 
     use super::*;
     use crate::db::{
@@ -335,7 +336,7 @@ mod tests {
             _domain: &str,
             _config: Value,
         ) -> Result<TenantConnectionRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn get_by_domain(&self, domain: &str) -> Result<TenantConnectionRow, DbError> {
@@ -352,14 +353,14 @@ mod tests {
             _tenant_id: &str,
             _id: &str,
         ) -> Result<TenantConnectionRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn list_by_tenant(
             &self,
             _tenant_id: &str,
         ) -> Result<Vec<TenantConnectionRow>, DbError> {
-            unimplemented!()
+            Ok(vec![])
         }
 
         async fn update_config(
@@ -368,7 +369,7 @@ mod tests {
             _id: &str,
             _config: Value,
         ) -> Result<TenantConnectionRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn set_enabled(
@@ -377,7 +378,7 @@ mod tests {
             _id: &str,
             _is_enabled: bool,
         ) -> Result<TenantConnectionRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
     }
 
@@ -386,11 +387,11 @@ mod tests {
     #[async_trait]
     impl TenantDomainStore for MockTenantDomainStore {
         async fn create(&self, _tenant_id: &str, _domain: &str) -> Result<TenantDomainRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn get_by_domain(&self, _domain: &str) -> Result<TenantDomainRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn mark_verified(
@@ -398,14 +399,14 @@ mod tests {
             _tenant_id: &str,
             _id: &str,
         ) -> Result<TenantDomainRow, DbError> {
-            unimplemented!()
+            Err(DbError::ConnectionNotFound)
         }
 
         async fn list_by_tenant(
             &self,
             _tenant_id: &str,
         ) -> Result<Vec<TenantDomainRow>, DbError> {
-            unimplemented!()
+            Ok(vec![])
         }
     }
 
@@ -429,11 +430,11 @@ mod tests {
             _schema_id: &str,
             _authn_requests_signed: bool,
         ) -> Result<SamlProviderRow, DbError> {
-            unimplemented!()
+            Err(DbError::SamlProviderNotFound)
         }
 
         async fn get(&self, _tenant_id: &str, _id: &str) -> Result<SamlProviderRow, DbError> {
-            unimplemented!()
+            Err(DbError::SamlProviderNotFound)
         }
 
         async fn get_by_id(&self, id: &str) -> Result<SamlProviderRow, DbError> {
@@ -808,5 +809,275 @@ mod tests {
                 std::mem::discriminant(&expected)
             );
         }
+    }
+
+    #[test]
+    fn hrd_error_database_into_service_error() {
+        use sunbeam_g2v::error::ServiceError;
+        let db_err = DbError::Sqlx(sqlx::Error::PoolTimedOut);
+        let err = HrdError::Database(db_err);
+        let actual: ServiceError = err.into();
+        assert!(matches!(actual, ServiceError::Database(_)));
+    }
+
+    #[test]
+    fn build_oidc_url_requires_issuer() {
+        let config = json!({"client_id": "c", "redirect_uri": "r", "scopes": ["openid"]});
+        let err = build_oidc_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing issuer"
+        ));
+    }
+
+    #[test]
+    fn build_oidc_url_requires_client_id() {
+        let config = json!({"issuer": "i", "redirect_uri": "r", "scopes": ["openid"]});
+        let err = build_oidc_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing client_id"
+        ));
+    }
+
+    #[test]
+    fn build_oidc_url_requires_redirect_uri() {
+        let config = json!({"issuer": "i", "client_id": "c", "scopes": ["openid"]});
+        let err = build_oidc_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing redirect_uri"
+        ));
+    }
+
+    #[test]
+    fn build_oidc_url_requires_scopes() {
+        let config = json!({"issuer": "i", "client_id": "c", "redirect_uri": "r"});
+        let err = build_oidc_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing scopes"
+        ));
+    }
+
+    #[test]
+    fn build_oidc_url_rejects_empty_scopes() {
+        let config = json!({"issuer": "i", "client_id": "c", "redirect_uri": "r", "scopes": [""]});
+        let err = build_oidc_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "empty scopes"
+        ));
+    }
+
+    #[test]
+    fn build_oidc_url_uses_https_prefix_when_missing() {
+        let config = json!({
+            "issuer": "accounts.google.com",
+            "client_id": "c",
+            "redirect_uri": "r",
+            "scopes": ["openid"],
+        });
+        let url = build_oidc_url(&config, "https://app.example.com").unwrap();
+        assert!(url.starts_with("https://accounts.google.com/oauth2/authorize?"));
+    }
+
+    #[test]
+    fn build_oauth2_url_requires_authorization_url() {
+        let config = json!({"client_id": "c", "redirect_uri": "r", "scopes": ["user"]});
+        let err = build_oauth2_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing authorization_url"
+        ));
+    }
+
+    #[test]
+    fn build_oauth2_url_requires_client_id() {
+        let config = json!({"authorization_url": "https://example.com/auth", "redirect_uri": "r", "scopes": ["user"]});
+        let err = build_oauth2_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing client_id"
+        ));
+    }
+
+    #[test]
+    fn build_oauth2_url_requires_redirect_uri() {
+        let config = json!({"authorization_url": "https://example.com/auth", "client_id": "c", "scopes": ["user"]});
+        let err = build_oauth2_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing redirect_uri"
+        ));
+    }
+
+    #[test]
+    fn build_oauth2_url_requires_scopes() {
+        let config = json!({"authorization_url": "https://example.com/auth", "client_id": "c", "redirect_uri": "r"});
+        let err = build_oauth2_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing scopes"
+        ));
+    }
+
+    #[test]
+    fn build_oauth2_url_rejects_empty_scopes() {
+        let config = json!({"authorization_url": "https://example.com/auth", "client_id": "c", "redirect_uri": "r", "scopes": [""]});
+        let err = build_oauth2_url(&config, "https://app.example.com").unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "empty scopes"
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_saml_redirect_requires_provider_id() {
+        let store = MockSamlProviderStore {
+            providers: Mutex::new(HashMap::new()),
+        };
+        let config = json!({});
+        let err = build_saml_redirect("tenant-1", &config, "https://app.example.com", &store)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HrdError::InvalidConnectionConfig(ref m) if m == "missing provider_id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_saml_redirect_returns_not_found_for_missing_provider() {
+        let store = MockSamlProviderStore {
+            providers: Mutex::new(HashMap::new()),
+        };
+        let config = json!({"provider_id": "MISSING"});
+        let err = build_saml_redirect("tenant-1", &config, "https://app.example.com", &store)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HrdError::SamlProviderNotFound));
+    }
+
+    #[tokio::test]
+    async fn build_saml_redirect_maps_db_error() {
+        struct FailingSamlProviderStore;
+        #[async_trait]
+        impl SamlProviderStore for FailingSamlProviderStore {
+            async fn create(
+                &self,
+                _tenant_id: &str,
+                _name: &str,
+                _idp_entity_id: &str,
+                _idp_sso_url: &str,
+                _idp_certificate_pem: Option<&str>,
+                _sp_entity_id: &str,
+                _acs_url: &str,
+                _name_id_format: Option<&str>,
+                _schema_id: &str,
+                _authn_requests_signed: bool,
+            ) -> Result<SamlProviderRow, DbError> {
+                unimplemented!()
+            }
+            async fn get(&self, _tenant_id: &str, _id: &str) -> Result<SamlProviderRow, DbError> {
+                unimplemented!()
+            }
+            async fn get_by_id(&self, _id: &str) -> Result<SamlProviderRow, DbError> {
+                Err(DbError::Sqlx(sqlx::Error::PoolTimedOut))
+            }
+        }
+        let config = json!({"provider_id": "P1"});
+        let err = build_saml_redirect("tenant-1", &config, "https://app.example.com", &FailingSamlProviderStore)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HrdError::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn discover_maps_database_error() {
+        struct FailingConnectionStore;
+        #[async_trait]
+        impl TenantConnectionStore for FailingConnectionStore {
+            async fn create(
+                &self,
+                _tenant_id: &str,
+                _connection_type: ConnectionType,
+                _domain: &str,
+                _config: Value,
+            ) -> Result<TenantConnectionRow, DbError> {
+                unimplemented!()
+            }
+            async fn get_by_domain(&self, _domain: &str) -> Result<TenantConnectionRow, DbError> {
+                Err(DbError::Sqlx(sqlx::Error::PoolTimedOut))
+            }
+            async fn get_by_id(
+                &self,
+                _tenant_id: &str,
+                _id: &str,
+            ) -> Result<TenantConnectionRow, DbError> {
+                unimplemented!()
+            }
+            async fn list_by_tenant(
+                &self,
+                _tenant_id: &str,
+            ) -> Result<Vec<TenantConnectionRow>, DbError> {
+                unimplemented!()
+            }
+            async fn update_config(
+                &self,
+                _tenant_id: &str,
+                _id: &str,
+                _config: Value,
+            ) -> Result<TenantConnectionRow, DbError> {
+                unimplemented!()
+            }
+            async fn set_enabled(
+                &self,
+                _tenant_id: &str,
+                _id: &str,
+                _is_enabled: bool,
+            ) -> Result<TenantConnectionRow, DbError> {
+                unimplemented!()
+            }
+        }
+        let hrd = Hrd::new(
+            Arc::new(FailingConnectionStore),
+            Arc::new(MockTenantDomainStore),
+            Arc::new(MockSamlProviderStore {
+                providers: Mutex::new(HashMap::new()),
+            }),
+            "https://gateway.example.com".to_string(),
+        );
+        let err = hrd
+            .discover("alice@example.com", "https://app.example.com")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HrdError::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn mock_store_methods_are_callable() {
+        let conn_store = MockTenantConnectionStore {
+            connections: Mutex::new(HashMap::new()),
+        };
+        let _ = conn_store.create("t", ConnectionType::Oidc, "example.com", json!({})).await;
+        let _ = conn_store.get_by_id("t", "id").await;
+        let _ = conn_store.list_by_tenant("t").await;
+        let _ = conn_store.update_config("t", "id", json!({})).await;
+        let _ = conn_store.set_enabled("t", "id", true).await;
+
+        let domain_store = MockTenantDomainStore;
+        let _ = domain_store.create("t", "example.com").await;
+        let _ = domain_store.get_by_domain("example.com").await;
+        let _ = domain_store.mark_verified("t", "id").await;
+        let _ = domain_store.list_by_tenant("t").await;
+
+        let provider_store = MockSamlProviderStore {
+            providers: Mutex::new(HashMap::new()),
+        };
+        let _ = provider_store
+            .create("t", "n", "e", "u", None, "sp", "acs", None, "s", false)
+            .await;
+        let _ = provider_store.get("t", "id").await;
     }
 }

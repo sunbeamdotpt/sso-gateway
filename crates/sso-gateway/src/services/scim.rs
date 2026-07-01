@@ -1855,4 +1855,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::Unauthenticated);
     }
+
+    #[tokio::test]
+    async fn kratos_client_as_scim_kratos_delegates() {
+        let client = Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn ScimKratos>;
+        assert!(client.create_identity(json!({})).await.is_err());
+        assert!(client.get_identity("id").await.is_err());
+        assert!(client.update_identity("id", json!({})).await.is_err());
+        assert!(client.delete_identity("id").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn keto_client_as_scim_keto_delegates() {
+        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ScimKeto>;
+        assert!(client.create_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+        assert!(client.delete_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+    }
 }

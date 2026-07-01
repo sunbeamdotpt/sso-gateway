@@ -1154,4 +1154,13 @@ mod tests {
         assert_eq!(object_filter("ns:obj"), Some("ns:obj"));
         assert_eq!(relation_filter("member"), Some("member"));
     }
+
+    #[tokio::test]
+    async fn keto_client_as_permission_keto_delegates() {
+        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn PermissionKeto>;
+        assert!(client.check_permission("ns", "obj", "rel", "subject").await.is_err());
+        assert!(client.create_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+        assert!(client.delete_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+        assert!(client.expand("ns", "obj", "rel").await.is_err());
+    }
 }

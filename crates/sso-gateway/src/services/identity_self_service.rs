@@ -96,13 +96,13 @@ pub trait KratosSelfService: Send + Sync {
 
     async fn create_login_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError>;
 
     async fn create_registration_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError>;
 
@@ -235,18 +235,18 @@ impl KratosSelfService for KratosClient {
 
     async fn create_login_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_login_browser_flow(return_to, cookie).await
+        self.create_login_browser_flow(query, cookie).await
     }
 
     async fn create_registration_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_registration_browser_flow(return_to, cookie).await
+        self.create_registration_browser_flow(query, cookie).await
     }
 
     async fn create_settings_browser_flow(
@@ -526,14 +526,31 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
-        let return_to = if req.return_to.is_empty() {
-            None
-        } else {
-            Some(req.return_to.as_str())
-        };
+        let mut query = Vec::<(&str, &str)>::new();
+        if !req.return_to.is_empty() {
+            query.push(("return_to", req.return_to.as_str()));
+        }
+        if !req.aal.is_empty() {
+            query.push(("aal", req.aal.as_str()));
+        }
+        if req.refresh {
+            query.push(("refresh", "true"));
+        }
+        if !req.organization.is_empty() {
+            query.push(("organization", req.organization.as_str()));
+        }
+        if !req.via.is_empty() {
+            query.push(("via", req.via.as_str()));
+        }
+        if !req.login_challenge.is_empty() {
+            query.push(("login_challenge", req.login_challenge.as_str()));
+        }
+        if !req.identity_schema.is_empty() {
+            query.push(("identity_schema", req.identity_schema.as_str()));
+        }
         let flow = self
             .kratos
-            .create_login_browser_flow(return_to, cookie.as_deref())
+            .create_login_browser_flow(&query, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_flow_to_proto(&flow)))
@@ -547,14 +564,19 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
-        let return_to = if req.return_to.is_empty() {
-            None
-        } else {
-            Some(req.return_to.as_str())
-        };
+        let mut query = Vec::<(&str, &str)>::new();
+        if !req.return_to.is_empty() {
+            query.push(("return_to", req.return_to.as_str()));
+        }
+        if !req.login_challenge.is_empty() {
+            query.push(("login_challenge", req.login_challenge.as_str()));
+        }
+        if !req.identity_schema.is_empty() {
+            query.push(("identity_schema", req.identity_schema.as_str()));
+        }
         let flow = self
             .kratos
-            .create_registration_browser_flow(return_to, cookie.as_deref())
+            .create_registration_browser_flow(&query, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_flow_to_proto(&flow)))
@@ -967,24 +989,24 @@ mod tests {
 
         async fn create_login_browser_flow(
             &self,
-            return_to: Option<&str>,
+            query: &[(&str, &str)],
             cookie: Option<&str>,
         ) -> Result<Value, OryClientError> {
             self.record(format!(
-                "create_login_browser_flow(return_to={:?}, cookie={:?})",
-                return_to, cookie
+                "create_login_browser_flow(query={:?}, cookie={:?})",
+                query, cookie
             ));
             self.take_flow()
         }
 
         async fn create_registration_browser_flow(
             &self,
-            return_to: Option<&str>,
+            query: &[(&str, &str)],
             cookie: Option<&str>,
         ) -> Result<Value, OryClientError> {
             self.record(format!(
-                "create_registration_browser_flow(return_to={:?}, cookie={:?})",
-                return_to, cookie
+                "create_registration_browser_flow(query={:?}, cookie={:?})",
+                query, cookie
             ));
             self.take_flow()
         }
@@ -1305,8 +1327,39 @@ mod tests {
         assert_eq!(resp.body.id, "flow-1");
         assert!(
             fake.calls.lock().unwrap()[0]
-                .starts_with("create_login_browser_flow(return_to=Some(\"http://return\"), cookie=Some(")
+                .starts_with("create_login_browser_flow(query=[(\"return_to\", \"http://return\")], cookie=Some(")
         );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_forwards_all_query_params() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(CreateLoginFlowRequest {
+            return_to: "http://return".to_string(),
+            aal: "aal2".to_string(),
+            refresh: true,
+            organization: "org-1".to_string(),
+            via: "email".to_string(),
+            login_challenge: "challenge-1".to_string(),
+            identity_schema: "default".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        let call = &fake.calls.lock().unwrap()[0];
+        assert!(call.starts_with("create_login_browser_flow(query=["));
+        assert!(call.contains("(\"return_to\", \"http://return\")"));
+        assert!(call.contains("(\"aal\", \"aal2\")"));
+        assert!(call.contains("(\"refresh\", \"true\")"));
+        assert!(call.contains("(\"organization\", \"org-1\")"));
+        assert!(call.contains("(\"via\", \"email\")"));
+        assert!(call.contains("(\"login_challenge\", \"challenge-1\")"));
+        assert!(call.contains("(\"identity_schema\", \"default\")"));
     }
 
     #[tokio::test]
@@ -1524,7 +1577,7 @@ mod tests {
         });
         let resp = svc.create_registration_flow(ctx, create_req).await.unwrap();
         assert_eq!(resp.body.id, "flow-1");
-        assert_flow_call!(fake, "create_registration_browser_flow(return_to=Some(\"http://return\"), cookie=None)");
+        assert_flow_call!(fake, "create_registration_browser_flow(query=[(\"return_to\", \"http://return\")], cookie=None)");
     }
 
     #[tokio::test]
@@ -1825,5 +1878,30 @@ mod tests {
                 .code,
             ErrorCode::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn kratos_client_as_self_service_trait_delegates() {
+        let client = Arc::new(KratosClient::new_with_public("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn KratosSelfService>;
+        assert!(client.to_session(None, None).await.is_err());
+        assert!(client.get_login_flow("id", None).await.is_err());
+        assert!(client.get_registration_flow("id", None).await.is_err());
+        assert!(client.get_settings_flow("id", None).await.is_err());
+        assert!(client.get_recovery_flow("id", None).await.is_err());
+        assert!(client.get_verification_flow("id", None).await.is_err());
+        assert!(client.submit_login_flow("id", None, json!({})).await.is_err());
+        assert!(client.submit_registration_flow("id", None, json!({})).await.is_err());
+        assert!(client.submit_settings_flow("id", None, json!({})).await.is_err());
+        assert!(client.submit_recovery_flow("id", None, json!({})).await.is_err());
+        assert!(client.submit_verification_flow("id", None, json!({})).await.is_err());
+        assert!(client.create_login_browser_flow(&[], None).await.is_err());
+        assert!(client.create_registration_browser_flow(&[], None).await.is_err());
+        assert!(client.create_settings_browser_flow(None, None).await.is_err());
+        assert!(client.create_recovery_browser_flow(None, None).await.is_err());
+        assert!(client.create_verification_flow(None, None).await.is_err());
+        assert!(client.create_logout_flow(None, None).await.is_err());
+        assert!(client.submit_logout_flow("token", None, None).await.is_err());
+        assert!(client.get_flow_error("id").await.is_err());
+        assert!(client.get_webauthn_js().await.is_err());
     }
 }

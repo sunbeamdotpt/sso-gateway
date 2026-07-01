@@ -623,8 +623,10 @@ mod tests {
     use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
     use gamlastan::security::InMemoryReplayCache;
     use gamlastan::xml::SamlSerialize;
+    use axum::{Json, Router, routing::get};
     use serde_json::json;
     use sso_ory_client::error::OryClientError;
+    use sso_ory_client::kratos::KratosClient;
     use std::sync::Mutex;
 
     use crate::db::{
@@ -1936,5 +1938,60 @@ mod tests {
             .await
             .expect_err("should fail");
         assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    async fn start_hydra_server() -> (tokio::task::JoinHandle<()>, String) {
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(|| async {
+                    Json(json!({
+                        "issuer": "https://issuer.example.com",
+                        "authorization_endpoint": "https://auth",
+                        "token_endpoint": "https://token",
+                        "userinfo_endpoint": "https://userinfo",
+                        "jwks_uri": "https://jwks",
+                    }))
+                }),
+            )
+            .route(
+                "/oauth2/jwks.json",
+                get(|| async {
+                    Json(json!({
+                        "keys": [{
+                            "kty": "RSA",
+                            "use": "sig",
+                            "kid": "key-1",
+                            "alg": "RS256",
+                            "n": "abc",
+                            "e": "def"
+                        }]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (handle, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_client_as_federation_hydra_hits_server() {
+        let (_handle, url) = start_hydra_server().await;
+        let client = reqwest::Client::new();
+        let discovery = client.fetch_discovery(&format!("{url}/.well-known/openid-configuration")).await.unwrap();
+        assert_eq!(discovery["issuer"], "https://issuer.example.com");
+
+        let jwks = client.fetch_jwks(&format!("{url}/oauth2/jwks.json")).await.unwrap();
+        assert_eq!(jwks["keys"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_kratos_client_as_federation_kratos_delegates() {
+        let client = Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn FederationKratos>;
+        let err = client.create_identity(json!({"traits": {}})).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Http(_)));
     }
 }

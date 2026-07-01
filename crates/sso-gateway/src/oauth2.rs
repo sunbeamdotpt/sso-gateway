@@ -707,7 +707,7 @@ mod tests {
             _public_id: &str,
             _ory_global_id: &str,
         ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
-            unimplemented!()
+            Err(crate::db::DbError::ConnectionNotFound)
         }
 
         async fn get_ory_id(
@@ -716,7 +716,7 @@ mod tests {
             _backend: &str,
             _public_id: &str,
         ) -> Result<String, crate::db::DbError> {
-            unimplemented!()
+            Err(crate::db::DbError::ConnectionNotFound)
         }
 
         async fn get_public_id(
@@ -725,7 +725,7 @@ mod tests {
             _backend: &str,
             _ory_global_id: &str,
         ) -> Result<String, crate::db::DbError> {
-            unimplemented!()
+            Err(crate::db::DbError::ConnectionNotFound)
         }
 
         async fn delete(
@@ -734,7 +734,7 @@ mod tests {
             _backend: &str,
             _public_id: &str,
         ) -> Result<(), crate::db::DbError> {
-            unimplemented!()
+            Err(crate::db::DbError::ConnectionNotFound)
         }
 
         async fn list_public_ids(
@@ -742,7 +742,7 @@ mod tests {
             _tenant_id: &str,
             _backend: &str,
         ) -> Result<Vec<String>, crate::db::DbError> {
-            unimplemented!()
+            Ok(vec![])
         }
 
         async fn get_tenant_id_by_ory_id(
@@ -1411,5 +1411,429 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn hydra_err() -> OryClientError {
+        OryClientError::Ory {
+            status: 500,
+            message: "hydra error".into(),
+        }
+    }
+
+    /// Hydra stub that always returns an OryClientError for every operation.
+    #[derive(Clone, Default)]
+    struct AlwaysErrHydra;
+
+    #[async_trait]
+    impl HydraOperations for AlwaysErrHydra {
+        async fn authorize(
+            &self,
+            _query: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn token(
+            &self,
+            _form: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn userinfo(&self, _token: &str) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn introspect_token(
+            &self,
+            _token: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn get_login_request(
+            &self,
+            _challenge: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn accept_login_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn reject_login_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn get_consent_request(
+            &self,
+            _challenge: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn accept_consent_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn reject_consent_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn get_logout_request(
+            &self,
+            _challenge: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn accept_logout_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn reject_logout_request(
+            &self,
+            _challenge: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn get_json(
+            &self,
+            _url: reqwest::Url,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        fn public_url(&self) -> &reqwest::Url {
+            static URL: std::sync::OnceLock<reqwest::Url> = std::sync::OnceLock::new();
+            URL.get_or_init(|| reqwest::Url::parse("http://127.0.0.1:4444").unwrap())
+        }
+    }
+
+    fn err_state(tenant: Option<String>) -> Oauth2State {
+        Oauth2State {
+            hydra: Arc::new(AlwaysErrHydra),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(tenant.map(|t| Ok(Some(t))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let resp = jwks(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_HEADER, HeaderValue::from_static("tenant-1"));
+        let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
+        let resp = authorize(State(state), headers, Query(params)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn token_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_HEADER, HeaderValue::from_static("tenant-1"));
+        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
+        let resp = token(State(state), headers, Form(form)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn userinfo_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
+        let resp = userinfo(State(state), headers).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn introspect_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_HEADER, HeaderValue::from_static("tenant-1"));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), headers, Form(form)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn revoke_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = revoke(State(state), Form(form)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn get_login_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("login_challenge".to_string(), "ch-1".to_string())]);
+        let resp = get_login(State(state), Query(params)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn accept_login_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("login_challenge".to_string(), "ch-1".to_string())]);
+        let resp = accept_login(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reject_login_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("login_challenge".to_string(), "ch-1".to_string())]);
+        let resp = reject_login(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn get_consent_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("consent_challenge".to_string(), "ch-1".to_string())]);
+        let resp = get_consent(State(state), Query(params)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn accept_consent_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("consent_challenge".to_string(), "ch-1".to_string())]);
+        let resp = accept_consent(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reject_consent_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("consent_challenge".to_string(), "ch-1".to_string())]);
+        let resp = reject_consent(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn get_logout_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("logout_challenge".to_string(), "ch-1".to_string())]);
+        let resp = get_logout(State(state), Query(params)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn accept_logout_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("logout_challenge".to_string(), "ch-1".to_string())]);
+        let resp = accept_logout(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reject_logout_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(None));
+        let params = HashMap::from([("logout_challenge".to_string(), "ch-1".to_string())]);
+        let resp = reject_logout(State(state), Query(params), axum::extract::Json(json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn hydra_client_as_hydra_operations_delegates() {
+        let client = Arc::new(
+            HydraClient::new("http://localhost:1", "http://localhost:1").unwrap(),
+        ) as Arc<dyn HydraOperations>;
+        assert!(client.authorize(vec![]).await.is_err());
+        assert!(client.token(vec![]).await.is_err());
+        assert!(client.userinfo("token").await.is_err());
+        assert!(client.introspect_token("token").await.is_err());
+        assert!(client.revoke(vec![]).await.is_err());
+        assert!(client.get_login_request("ch").await.is_err());
+        assert!(client.accept_login_request("ch", json!({})).await.is_err());
+        assert!(client.reject_login_request("ch", json!({})).await.is_err());
+        assert!(client.get_consent_request("ch").await.is_err());
+        assert!(client.accept_consent_request("ch", json!({})).await.is_err());
+        assert!(client.reject_consent_request("ch", json!({})).await.is_err());
+        assert!(client.get_logout_request("ch").await.is_err());
+        assert!(client.accept_logout_request("ch", json!({})).await.is_err());
+        assert!(client.reject_logout_request("ch", json!({})).await.is_err());
+        assert!(client
+            .get_json(reqwest::Url::parse("http://localhost:1").unwrap())
+            .await
+            .is_err());
+        assert_eq!(
+            client.public_url().as_str(),
+            "http://localhost:1/"
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_mapping_store_methods_are_callable() {
+        let store = StubMappingStore {
+            tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let _ = store.create("t", "hydra", "pub", "ory").await;
+        let _ = store.get_ory_id("t", "hydra", "pub").await;
+        let _ = store.get_public_id("t", "hydra", "ory").await;
+        let _ = store.delete("t", "hydra", "pub").await;
+        let _ = store.list_public_ids("t", "hydra").await;
+    }
+
+    #[tokio::test]
+    async fn jwks_returns_bad_gateway_when_url_join_fails() {
+        struct BadUrlHydra;
+        #[async_trait]
+        impl HydraOperations for BadUrlHydra {
+            async fn authorize(
+                &self,
+                _query: Vec<(String, String)>,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn token(
+                &self,
+                _form: Vec<(String, String)>,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn userinfo(&self, _token: &str) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn introspect_token(
+                &self,
+                _token: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
+                unimplemented!()
+            }
+            async fn get_login_request(
+                &self,
+                _challenge: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn accept_login_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn reject_login_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn get_consent_request(
+                &self,
+                _challenge: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn accept_consent_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn reject_consent_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn get_logout_request(
+                &self,
+                _challenge: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn accept_logout_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn reject_logout_request(
+                &self,
+                _challenge: &str,
+                _body: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn get_json(
+                &self,
+                _url: reqwest::Url,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            fn public_url(&self) -> &reqwest::Url {
+                static URL: std::sync::OnceLock<reqwest::Url> = std::sync::OnceLock::new();
+                URL.get_or_init(|| reqwest::Url::parse("data:text/html,hello").unwrap())
+            }
+        }
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(BadUrlHydra),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+        });
+        let resp = jwks(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

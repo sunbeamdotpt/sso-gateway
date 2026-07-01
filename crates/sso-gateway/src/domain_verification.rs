@@ -215,4 +215,30 @@ mod tests {
             "lookup for a non-existent domain should fail"
         );
     }
+
+    struct FailingResolver;
+
+    impl DnsResolver for FailingResolver {
+        async fn txt_records(
+            &self,
+            _domain: &str,
+        ) -> Result<Vec<String>, DomainVerificationError> {
+            Err(DomainVerificationError::DnsLookup("dns failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_domain_propagates_resolver_error() {
+        let resolver = FailingResolver;
+        let result = verify_domain(&resolver, "example.com", "token").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn domain_verification_error_display() {
+        let err = DomainVerificationError::DnsLookup("dns failure".into());
+        assert_eq!(err.to_string(), "dns lookup failed: dns failure");
+        let err = DomainVerificationError::InvalidDomain("bad".into());
+        assert_eq!(err.to_string(), "invalid domain: bad");
+    }
 }

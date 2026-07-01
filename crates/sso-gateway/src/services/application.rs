@@ -1109,4 +1109,14 @@ mod tests {
         assert_eq!(app.response_types, vec!["code"]);
         assert_eq!(app.scope, vec!["openid", "profile"]);
     }
+
+    #[tokio::test]
+    async fn hydra_client_as_application_hydra_delegates() {
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ApplicationHydra>;
+        assert!(client.create_oauth2_client(json!({})).await.is_err());
+        assert!(client.get_oauth2_client("id").await.is_err());
+        assert!(client.update_oauth2_client("id", json!({})).await.is_err());
+        assert!(client.delete_oauth2_client("id").await.is_err());
+        assert!(client.rotate_client_secret("id").await.is_err());
+    }
 }

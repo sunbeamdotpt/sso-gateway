@@ -1230,4 +1230,160 @@ mod tests {
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn resolve_tenant_returns_unauthorized_on_introspection_error() {
+        let state = test_state(
+            Some(Err(OryClientError::Ory {
+                status: 401,
+                message: "invalid token".into(),
+            })),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        let err = resolve_tenant(&state, &headers).await.unwrap_err();
+        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
+    }
+
+    fn route_state_with_service_and_auth(
+        service: Arc<dyn ScimServiceOps>,
+        introspect: Result<Value, OryClientError>,
+        mapping: Result<Option<String>, crate::db::DbError>,
+    ) -> Arc<ScimState> {
+        Arc::new(ScimState {
+            service,
+            hydra: Arc::new(StubHydra {
+                introspect_result: Arc::new(Mutex::new(Some(introspect))),
+            }),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(Mutex::new(Some(mapping))),
+            }),
+        })
+    }
+
+    async fn assert_route_maps_service_error(
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        service: Arc<dyn ScimServiceOps>,
+    ) {
+        let state = route_state_with_service_and_auth(
+            service,
+            Ok(json!({"active": true, "sub": "sub-1"})),
+            Ok(Some("tenant-1".to_string())),
+        );
+        let mut router = router(state);
+        let req = authenticated_request(method, uri, body);
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_users_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            list_users: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("GET", "/scim/v2/Users", None, service).await;
+    }
+
+    #[tokio::test]
+    async fn create_user_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            create_user: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("POST", "/scim/v2/Users", Some(json!({"userName": "alice"})), service).await;
+    }
+
+    #[tokio::test]
+    async fn update_user_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            update_user: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("PUT", "/scim/v2/Users/u1", Some(json!({"userName": "alison"})), service).await;
+    }
+
+    #[tokio::test]
+    async fn delete_user_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            delete_user: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("DELETE", "/scim/v2/Users/u1", None, service).await;
+    }
+
+    #[tokio::test]
+    async fn list_groups_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            list_groups: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("GET", "/scim/v2/Groups", None, service).await;
+    }
+
+    #[tokio::test]
+    async fn create_group_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            create_group: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("POST", "/scim/v2/Groups", Some(json!({"displayName": "admins"})), service).await;
+    }
+
+    #[tokio::test]
+    async fn update_group_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            update_group: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("PUT", "/scim/v2/Groups/g1", Some(json!({"displayName": "super-admins"})), service).await;
+    }
+
+    #[tokio::test]
+    async fn delete_group_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            delete_group: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("DELETE", "/scim/v2/Groups/g1", None, service).await;
+    }
+
+    #[tokio::test]
+    async fn get_group_route_maps_service_error() {
+        let service = Arc::new(StubService {
+            get_group: Arc::new(Mutex::new(Some(Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::NotFound,
+                "not found",
+            ))))),
+            ..Default::default()
+        });
+        assert_route_maps_service_error("GET", "/scim/v2/Groups/g1", None, service).await;
+    }
 }

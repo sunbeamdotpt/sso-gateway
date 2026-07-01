@@ -234,7 +234,7 @@ mod tests {
     use buffa::view::{HasMessageView, MessageView};
     use connectrpc::{RequestContext, ServiceRequest};
     use http::HeaderMap;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
 
@@ -740,5 +740,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn hydra_client_as_consent_hydra_delegates() {
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ConsentHydra>;
+        assert!(client.get_consent_request("challenge").await.is_err());
+        assert!(client.accept_consent_request("challenge", json!({})).await.is_err());
+        assert!(client.reject_consent_request("challenge", json!({})).await.is_err());
+        assert!(client.get_logout_request("challenge").await.is_err());
+        assert!(client.accept_logout_request("challenge", json!({})).await.is_err());
+        assert!(client.reject_logout_request("challenge", json!({})).await.is_err());
     }
 }

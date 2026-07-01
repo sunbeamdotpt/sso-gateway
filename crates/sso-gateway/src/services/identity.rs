@@ -46,12 +46,12 @@ pub trait IdentityKratos: Send + Sync + 'static {
 
     async fn create_login_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
     ) -> Result<serde_json::Value, OryClientError>;
 
     async fn create_registration_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
     ) -> Result<serde_json::Value, OryClientError>;
 
     async fn admin_get_session(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
@@ -91,16 +91,16 @@ impl IdentityKratos for KratosClient {
 
     async fn create_login_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
     ) -> Result<serde_json::Value, OryClientError> {
-        self.create_login_flow(return_to).await
+        self.create_login_flow(query).await
     }
 
     async fn create_registration_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
     ) -> Result<serde_json::Value, OryClientError> {
-        self.create_registration_flow(return_to).await
+        self.create_registration_flow(query).await
     }
 
     async fn admin_get_session(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
@@ -399,14 +399,31 @@ impl IdentityService for IdentityServiceImpl {
     ) -> ServiceResult<Flow> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let return_to = if req.return_to.is_empty() {
-            None
-        } else {
-            Some(req.return_to.as_str())
-        };
+        let mut query = Vec::<(&str, &str)>::new();
+        if !req.return_to.is_empty() {
+            query.push(("return_to", req.return_to.as_str()));
+        }
+        if !req.aal.is_empty() {
+            query.push(("aal", req.aal.as_str()));
+        }
+        if req.refresh {
+            query.push(("refresh", "true"));
+        }
+        if !req.organization.is_empty() {
+            query.push(("organization", req.organization.as_str()));
+        }
+        if !req.via.is_empty() {
+            query.push(("via", req.via.as_str()));
+        }
+        if !req.login_challenge.is_empty() {
+            query.push(("login_challenge", req.login_challenge.as_str()));
+        }
+        if !req.identity_schema.is_empty() {
+            query.push(("identity_schema", req.identity_schema.as_str()));
+        }
         let flow = self
             .kratos
-            .create_login_flow(return_to)
+            .create_login_flow(&query)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(kratos_flow_to_flow(&flow, &tenant_id)))
@@ -420,14 +437,19 @@ impl IdentityService for IdentityServiceImpl {
     ) -> ServiceResult<Flow> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let return_to = if req.return_to.is_empty() {
-            None
-        } else {
-            Some(req.return_to.as_str())
-        };
+        let mut query = Vec::<(&str, &str)>::new();
+        if !req.return_to.is_empty() {
+            query.push(("return_to", req.return_to.as_str()));
+        }
+        if !req.login_challenge.is_empty() {
+            query.push(("login_challenge", req.login_challenge.as_str()));
+        }
+        if !req.identity_schema.is_empty() {
+            query.push(("identity_schema", req.identity_schema.as_str()));
+        }
         let flow = self
             .kratos
-            .create_registration_flow(return_to)
+            .create_registration_flow(&query)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(kratos_flow_to_flow(&flow, &tenant_id)))
@@ -860,7 +882,7 @@ mod tests {
 
         async fn create_login_flow(
             &self,
-            _return_to: Option<&str>,
+            _query: &[(&str, &str)],
         ) -> Result<serde_json::Value, OryClientError> {
             if let Some(err) = self.error.lock().await.take() {
                 return Err(err);
@@ -877,7 +899,7 @@ mod tests {
 
         async fn create_registration_flow(
             &self,
-            _return_to: Option<&str>,
+            _query: &[(&str, &str)],
         ) -> Result<serde_json::Value, OryClientError> {
             if let Some(err) = self.error.lock().await.take() {
                 return Err(err);
@@ -1790,5 +1812,19 @@ mod tests {
             schemas: Arc::new(StubSchemaStore::default()),
         };
         let _cloned = svc.clone();
+    }
+
+    #[tokio::test]
+    async fn kratos_client_as_identity_kratos_delegates() {
+        let client = Arc::new(KratosClient::new_with_public("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn IdentityKratos>;
+        assert!(client.create_identity(json!({})).await.is_err());
+        assert!(client.get_identity("id").await.is_err());
+        assert!(client.update_identity("id", json!({})).await.is_err());
+        assert!(client.delete_identity("id").await.is_err());
+        assert!(client.create_login_flow(&[]).await.is_err());
+        assert!(client.create_registration_flow(&[]).await.is_err());
+        assert!(client.admin_get_session("id").await.is_err());
+        assert!(client.list_sessions_by_identity("id").await.is_err());
+        assert!(client.delete_session("id").await.is_err());
     }
 }
