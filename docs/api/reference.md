@@ -82,6 +82,46 @@ All Connect-RPC methods accept JSON-encoded messages over HTTP/1.1 or HTTP/2.
 | `ListGroups` | SCIM list groups. |
 | `GetGroup` | SCIM get group. |
 
+### `iam.v1.IdentitySelfService`
+
+Browser-facing Kratos self-service flows. See [`self-service-api.md`](./self-service-api.md) for flow details and cookie handling.
+
+| Method | Description |
+|---|---|
+| `ToSession` | Introspect the browser session from cookie or token. |
+| `CreateLoginFlow` | Start a login flow. |
+| `CreateRegistrationFlow` | Start a registration flow. |
+| `CreateSettingsFlow` | Start a settings flow. |
+| `CreateRecoveryFlow` | Start a recovery flow. |
+| `CreateVerificationFlow` | Start a verification flow. |
+| `CreateLogoutFlow` | Start a logout flow. |
+| `GetLoginFlow` | Get an existing login flow. |
+| `GetRegistrationFlow` | Get an existing registration flow. |
+| `GetSettingsFlow` | Get an existing settings flow. |
+| `GetRecoveryFlow` | Get an existing recovery flow. |
+| `GetVerificationFlow` | Get an existing verification flow. |
+| `SubmitLoginFlow` | Submit a login form. |
+| `SubmitRegistrationFlow` | Submit a registration form. |
+| `SubmitSettingsFlow` | Submit a settings form. |
+| `SubmitRecoveryFlow` | Submit a recovery form. |
+| `SubmitVerificationFlow` | Submit a verification form. |
+| `SubmitLogoutFlow` | Submit a logout request. |
+| `GetFlowError` | Fetch a flow error by ID. |
+| `GetWebAuthnJavaScript` | Return the WebAuthn JS bundle content. |
+
+### `iam.v1.OAuth2ConsentService`
+
+Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-service-api.md`](./self-service-api.md).
+
+| Method | Description |
+|---|---|
+| `GetConsentRequest` | Fetch a consent request by challenge. |
+| `AcceptConsent` | Accept the requested scopes and audiences. |
+| `RejectConsent` | Reject a consent request. |
+| `GetLogoutRequest` | Fetch a logout request by challenge. |
+| `AcceptLogout` | Accept a logout request. |
+| `RejectLogout` | Reject a logout request. |
+
 ## Protocol endpoints
 
 | Path | Purpose |
