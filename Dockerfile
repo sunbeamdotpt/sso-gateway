@@ -57,7 +57,7 @@ LABEL org.opencontainers.image.title="sso-gateway" \
       org.opencontainers.image.url="https://github.com/sunbeamdotpt/sso-gateway" \
       org.opencontainers.image.source="https://github.com/sunbeamdotpt/sso-gateway" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       org.opencontainers.image.documentation="https://github.com/sunbeamdotpt/sso-gateway/tree/mainline/docs"
 
 COPY --from=builder /app/sso-gateway /usr/local/bin/sso-gateway

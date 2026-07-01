@@ -88,4 +88,5 @@ docker buildx build -f Dockerfile -t sso-gateway:local .
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
