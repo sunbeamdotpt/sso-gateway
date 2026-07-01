@@ -1,0 +1,39 @@
+name: Protobuf
+
+on:
+  push:
+    branches:
+      - mainline
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: 1.50.0
+
+      - name: Lint protobufs
+        run: buf lint
+
+      - name: Detect breaking changes
+        if: github.event_name == 'pull_request'
+        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=mainline"
