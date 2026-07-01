@@ -53,9 +53,9 @@ ARG VERSION
 
 # OCI annotations so GHCR autolinks the image to the repository.
 LABEL org.opencontainers.image.title="sso-gateway" \
-      org.opencontainers.image.description="Sunbeam unified IAM gateway" \
+      org.opencontainers.image.description="Sunbeam Studios Unified IAM gateway" \
       org.opencontainers.image.url="https://github.com/sunbeamdotpt/sso-gateway" \
-      org.opencontainers.image.source="https://github.com/sunbeamdotpt/sso-gateway.git" \
+      org.opencontainers.image.source="https://github.com/sunbeamdotpt/sso-gateway" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.documentation="https://github.com/sunbeamdotpt/sso-gateway/tree/mainline/docs"
