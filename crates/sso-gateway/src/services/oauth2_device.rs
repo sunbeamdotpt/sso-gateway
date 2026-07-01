@@ -1,0 +1,368 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use serde_json::Value;
+use sso_ory_client::{error::OryClientError, hydra::HydraClient};
+use sunbeam_g2v::error::ServiceError;
+use tracing::instrument;
+
+use crate::proto::iam::v1::{
+    DeviceAuthorizationRequest, DeviceAuthorizationResponse, DeviceTokenRequest,
+    DeviceTokenResponse, OAuth2DeviceService,
+};
+
+/// Hydra operations used by the OAuth2 device service.
+#[async_trait]
+pub trait DeviceHydra: Send + Sync {
+    async fn device(
+        &self,
+        path: String,
+        form: Vec<(String, String)>,
+    ) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl DeviceHydra for HydraClient {
+    async fn device(
+        &self,
+        path: String,
+        form: Vec<(String, String)>,
+    ) -> Result<Value, OryClientError> {
+        self.device(&path, form).await
+    }
+}
+
+#[derive(Clone)]
+pub struct OAuth2DeviceServiceImpl {
+    hydra: Arc<dyn DeviceHydra>,
+}
+
+impl OAuth2DeviceServiceImpl {
+    pub fn new(hydra: Arc<HydraClient>) -> Self {
+        Self {
+            hydra: hydra as Arc<dyn DeviceHydra>,
+        }
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
+    #[instrument(skip(self, request))]
+    async fn authorize_device(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, DeviceAuthorizationRequest>,
+    ) -> ServiceResult<DeviceAuthorizationResponse> {
+        let req = request.to_owned_message();
+        let mut form = vec![("client_id", req.client_id)];
+        if !req.scope.is_empty() {
+            form.push(("scope", req.scope.join(" ")));
+        }
+        let value = self
+            .hydra
+            .device("auth".to_string(), form.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+            .await
+            .map_err(map_ory_error)?;
+        Ok(Response::new(ory_device_auth_to_proto(&value)))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn get_device_token(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, DeviceTokenRequest>,
+    ) -> ServiceResult<DeviceTokenResponse> {
+        let req = request.to_owned_message();
+        let form = vec![
+            ("grant_type".to_string(), "urn:ietf:params:oauth:grant-type:device_code".to_string()),
+            ("client_id".to_string(), req.client_id),
+            ("device_code".to_string(), req.device_code),
+        ];
+        let value = self
+            .hydra
+            .device("token".to_string(), form)
+            .await
+            .map_err(map_ory_error)?;
+        Ok(Response::new(ory_token_to_proto(&value)))
+    }
+}
+
+fn ory_device_auth_to_proto(value: &Value) -> DeviceAuthorizationResponse {
+    DeviceAuthorizationResponse {
+        device_code: json_str(value, "device_code"),
+        user_code: json_str(value, "user_code"),
+        verification_uri: json_str(value, "verification_uri"),
+        verification_uri_complete: json_str(value, "verification_uri_complete"),
+        expires_in: json_i32(value, "expires_in"),
+        interval: json_i32(value, "interval"),
+        ..Default::default()
+    }
+}
+
+fn ory_token_to_proto(value: &Value) -> DeviceTokenResponse {
+    DeviceTokenResponse {
+        access_token: json_str(value, "access_token"),
+        token_type: json_str(value, "token_type"),
+        expires_in: json_i32(value, "expires_in"),
+        refresh_token: json_str(value, "refresh_token"),
+        scope: json_str(value, "scope"),
+        id_token: json_str(value, "id_token"),
+        ..Default::default()
+    }
+}
+
+fn json_str(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_i32(value: &Value, key: &str) -> i32 {
+    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
+}
+
+fn map_ory_error(err: OryClientError) -> ServiceError {
+    use sso_ory_client::error::OryClientError;
+    match err {
+        OryClientError::Ory { status, message } => match status {
+            400 => ServiceError::InvalidArgument(message),
+            401 => ServiceError::Unauthenticated(message),
+            403 => ServiceError::PermissionDenied(message),
+            404 => ServiceError::NotFound(message),
+            409 => ServiceError::AlreadyExists(message),
+            503 => ServiceError::Unavailable(message),
+            _ => ServiceError::Internal(message),
+        },
+        OryClientError::Http(_) | OryClientError::Url(_) => {
+            ServiceError::Unavailable("upstream identity service unreachable".into())
+        }
+        OryClientError::Serialization(_) | OryClientError::InvalidResponse(_) => {
+            ServiceError::Internal("invalid upstream response".into())
+        }
+        OryClientError::MissingTenant => ServiceError::Unauthenticated("missing tenant".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use buffa::{bytes::Bytes, HasMessageView, Message, MessageView};
+    use connectrpc::{ErrorCode, RequestContext, ServiceRequest};
+    use http::HeaderMap;
+    use serde_json::{json, Value};
+    use sso_ory_client::{error::OryClientError, hydra::HydraClient};
+    use sunbeam_g2v::error::ServiceError;
+
+    use crate::proto::iam::v1::{
+        DeviceAuthorizationRequest, DeviceTokenRequest, OAuth2DeviceService,
+    };
+
+    use super::{DeviceHydra, OAuth2DeviceServiceImpl, map_ory_error};
+
+    fn service_request<Req>(msg: Req) -> ServiceRequest<'static, Req>
+    where
+        Req: Message + HasMessageView,
+    {
+        let bytes = Bytes::from(msg.encode_to_vec());
+        let bytes: &'static Bytes = Box::leak(Box::new(bytes));
+        let view = Req::View::decode_view(bytes).unwrap();
+        let view: &'static Req::View<'static> = Box::leak(Box::new(view));
+        ServiceRequest::from_parts(view, bytes)
+    }
+
+    #[derive(Default, Clone)]
+    struct FakeHydra {
+        device_auth: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        device_token: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl DeviceHydra for FakeHydra {
+        async fn device(
+            &self,
+            path: String,
+            form: Vec<(String, String)>,
+        ) -> Result<Value, OryClientError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("device(path={path}, form={form:?})"));
+            if path == "auth" {
+                self.device_auth
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or_else(|| Err(OryClientError::MissingTenant))
+            } else {
+                self.device_token
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or_else(|| Err(OryClientError::MissingTenant))
+            }
+        }
+    }
+
+    fn service(hydra: FakeHydra) -> OAuth2DeviceServiceImpl {
+        OAuth2DeviceServiceImpl {
+            hydra: Arc::new(hydra),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_device_happy_path() {
+        let fake = FakeHydra {
+            device_auth: Arc::new(Mutex::new(Some(Ok(json!({
+                "device_code": "device-1",
+                "user_code": "user-1",
+                "verification_uri": "https://gateway.example.com/device",
+                "verification_uri_complete": "https://gateway.example.com/device?user_code=user-1",
+                "expires_in": 600,
+                "interval": 5,
+            }))))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = RequestContext::new(HeaderMap::new());
+        let req = service_request(DeviceAuthorizationRequest {
+            client_id: "client-1".to_string(),
+            scope: vec!["openid".to_string(), "profile".to_string()],
+            ..Default::default()
+        });
+
+        let resp = svc.authorize_device(ctx, req).await.unwrap();
+        assert_eq!(resp.body.device_code, "device-1");
+        assert_eq!(resp.body.user_code, "user-1");
+        assert_eq!(resp.body.expires_in, 600);
+        assert_eq!(resp.body.interval, 5);
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        let call = &fake.calls.lock().unwrap()[0];
+        assert!(call.contains("path=auth"));
+        assert!(call.contains("client_id"));
+        assert!(call.contains("scope"));
+    }
+
+    #[tokio::test]
+    async fn authorize_device_error_path() {
+        let fake = FakeHydra {
+            device_auth: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 400,
+                message: "invalid client".into(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service(fake);
+        let ctx = RequestContext::new(HeaderMap::new());
+        let req = service_request(DeviceAuthorizationRequest::default());
+
+        let err = svc.authorize_device(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_device_token_happy_path() {
+        let fake = FakeHydra {
+            device_token: Arc::new(Mutex::new(Some(Ok(json!({
+                "access_token": "access-1",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "refresh-1",
+                "scope": "openid profile",
+                "id_token": "id-1",
+            }))))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = RequestContext::new(HeaderMap::new());
+        let req = service_request(DeviceTokenRequest {
+            client_id: "client-1".to_string(),
+            device_code: "device-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.get_device_token(ctx, req).await.unwrap();
+        assert_eq!(resp.body.access_token, "access-1");
+        assert_eq!(resp.body.token_type, "Bearer");
+        assert_eq!(resp.body.expires_in, 3600);
+        assert_eq!(resp.body.refresh_token, "refresh-1");
+        assert_eq!(resp.body.scope, "openid profile");
+        assert_eq!(resp.body.id_token, "id-1");
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        let call = &fake.calls.lock().unwrap()[0];
+        assert!(call.contains("path=token"));
+        assert!(call.contains("grant_type"));
+    }
+
+    #[tokio::test]
+    async fn get_device_token_error_path() {
+        let fake = FakeHydra {
+            device_token: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 401,
+                message: "unauthorized".into(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service(fake);
+        let ctx = RequestContext::new(HeaderMap::new());
+        let req = service_request(DeviceTokenRequest::default());
+
+        let err = svc.get_device_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unauthenticated);
+    }
+
+    #[test]
+    fn map_ory_error_status_codes() {
+        let cases = vec![
+            (400, "InvalidArgument"),
+            (401, "Unauthenticated"),
+            (403, "PermissionDenied"),
+            (404, "NotFound"),
+            (409, "AlreadyExists"),
+            (503, "Unavailable"),
+            (500, "Internal"),
+        ];
+        for (status, expected) in cases {
+            let err = map_ory_error(OryClientError::Ory {
+                status,
+                message: "msg".into(),
+            });
+            let name = format!("{err:?}");
+            assert!(
+                name.contains(expected),
+                "status {status} should map to {expected}, got {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_ory_error_transport_and_serialization() {
+        let http = map_ory_error(OryClientError::Http(
+            reqwest::Client::new().get("not-a-url").build().unwrap_err(),
+        ));
+        let url = map_ory_error(OryClientError::Url(
+            reqwest::Url::parse("not a url").unwrap_err(),
+        ));
+        let ser = map_ory_error(OryClientError::Serialization(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        ));
+        let missing = map_ory_error(OryClientError::MissingTenant);
+
+        assert!(matches!(http, ServiceError::Unavailable(_)));
+        assert!(matches!(url, ServiceError::Unavailable(_)));
+        assert!(matches!(ser, ServiceError::Internal(_)));
+        assert!(matches!(missing, ServiceError::Unauthenticated(_)));
+    }
+
+    #[tokio::test]
+    async fn hydra_client_as_device_hydra_delegates() {
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn DeviceHydra>;
+        assert!(client.device("auth".to_string(), vec![]).await.is_err());
+        assert!(client.device("token".to_string(), vec![]).await.is_err());
+    }
+}

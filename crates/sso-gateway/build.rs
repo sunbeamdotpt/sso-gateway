@@ -16,6 +16,7 @@ fn main() -> io::Result<()> {
             proto_dir.join("iam/v1/scim.proto"),
             proto_dir.join("iam/v1/identity_self_service.proto"),
             proto_dir.join("iam/v1/oauth2_consent.proto"),
+            proto_dir.join("iam/v1/oauth2_device.proto"),
         ])
         .includes(&[&proto_dir])
         .compile()

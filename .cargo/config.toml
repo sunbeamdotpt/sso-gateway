@@ -1,0 +1,2 @@
+[env]
+DOCKER_HOST = "unix:///Users/sienna/.lima/docker/sock/docker.sock"

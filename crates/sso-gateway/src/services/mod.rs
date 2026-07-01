@@ -5,6 +5,7 @@ pub mod identity_self_service;
 pub mod identity_self_service_mapper;
 pub mod oauth2_consent;
 pub mod oauth2_consent_mapper;
+pub mod oauth2_device;
 pub mod permission;
 pub mod proto_util;
 pub mod scim;

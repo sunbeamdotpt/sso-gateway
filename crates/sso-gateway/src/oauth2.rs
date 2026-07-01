@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    extract::{Form, Query, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,6 +27,11 @@ pub trait HydraOperations: Send + Sync + 'static {
         query: Vec<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError>;
     async fn token(&self, form: Vec<(String, String)>) -> Result<serde_json::Value, OryClientError>;
+    async fn device(
+        &self,
+        path: &str,
+        form: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, OryClientError>;
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError>;
@@ -83,6 +88,14 @@ impl HydraOperations for HydraClient {
         form: Vec<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError> {
         self.token(form).await
+    }
+
+    async fn device(
+        &self,
+        path: &str,
+        form: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.device(path, form).await
     }
 
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError> {
@@ -199,6 +212,7 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth2/auth", get(authorize))
         .route("/oauth2/token", post(token))
+        .route("/oauth2/device/{*path}", post(device))
         .route("/oauth2/userinfo", get(userinfo))
         .route("/oauth2/introspect", post(introspect))
         .route("/oauth2/revoke", post(revoke))
@@ -227,12 +241,13 @@ async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl Int
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth2/auth"),
         "token_endpoint": format!("{base}/oauth2/token"),
+        "device_authorization_endpoint": format!("{base}/oauth2/device/auth"),
         "userinfo_endpoint": format!("{base}/oauth2/userinfo"),
         "jwks_uri": format!("{base}/.well-known/jwks.json"),
         "introspection_endpoint": format!("{base}/oauth2/introspect"),
         "revocation_endpoint": format!("{base}/oauth2/revoke"),
         "response_types_supported": ["code", "token", "id_token", "code token", "code id_token", "token id_token", "code token id_token"],
-        "grant_types_supported": ["authorization_code", "implicit", "client_credentials", "refresh_token"],
+        "grant_types_supported": ["authorization_code", "implicit", "client_credentials", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
@@ -286,6 +301,23 @@ async fn token(
     }
 
     match state.hydra.token(form.into_iter().collect()).await {
+        Ok(value) => json_response(value),
+        Err(err) => map_ory_error(err),
+    }
+}
+
+async fn device(
+    State(state): State<Arc<Oauth2State>>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let client_id = form.get("client_id").cloned().unwrap_or_default();
+    if let Err(err) = validate_public_client(&state, &headers, &client_id).await {
+        return *err;
+    }
+
+    match state.hydra.device(&path, form.into_iter().collect()).await {
         Ok(value) => json_response(value),
         Err(err) => map_ory_error(err),
     }
@@ -594,6 +626,14 @@ mod tests {
             _form: Vec<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub token not configured")
+        }
+
+        async fn device(
+            &self,
+            _path: &str,
+            _form: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!("stub device not configured")
         }
 
         async fn userinfo(&self, _token: &str) -> Result<serde_json::Value, OryClientError> {
@@ -1147,6 +1187,10 @@ mod tests {
             "https://gateway.example.com/oauth2/token"
         );
         assert_eq!(
+            value["device_authorization_endpoint"],
+            "https://gateway.example.com/oauth2/device/auth"
+        );
+        assert_eq!(
             value["userinfo_endpoint"],
             "https://gateway.example.com/oauth2/userinfo"
         );
@@ -1175,6 +1219,14 @@ mod tests {
 
         async fn token(
             &self,
+            _form: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(self.response.clone())
+        }
+
+        async fn device(
+            &self,
+            _path: &str,
             _form: Vec<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
@@ -1317,6 +1369,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_succeeds_for_valid_client() {
+        let state = Arc::new(ok_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_HEADER, HeaderValue::from_static("tenant-1"));
+        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
+        let resp = device(State(state), headers, Path("auth".to_string()), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn userinfo_succeeds_with_token() {
         let state = Arc::new(ok_state(None));
         let mut headers = HeaderMap::new();
@@ -1435,6 +1499,14 @@ mod tests {
 
         async fn token(
             &self,
+            _form: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn device(
+            &self,
+            _path: &str,
             _form: Vec<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
@@ -1575,6 +1647,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_HEADER, HeaderValue::from_static("tenant-1"));
+        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
+        let resp = device(State(state), headers, Path("auth".to_string()), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
     async fn userinfo_returns_bad_gateway_on_hydra_error() {
         let state = Arc::new(err_state(None));
         let mut headers = HeaderMap::new();
@@ -1692,6 +1776,7 @@ mod tests {
         ) as Arc<dyn HydraOperations>;
         assert!(client.authorize(vec![]).await.is_err());
         assert!(client.token(vec![]).await.is_err());
+        assert!(client.device("auth", vec![]).await.is_err());
         assert!(client.userinfo("token").await.is_err());
         assert!(client.introspect_token("token").await.is_err());
         assert!(client.revoke(vec![]).await.is_err());
@@ -1739,6 +1824,13 @@ mod tests {
             }
             async fn token(
                 &self,
+                _form: Vec<(String, String)>,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn device(
+                &self,
+                _path: &str,
                 _form: Vec<(String, String)>,
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()

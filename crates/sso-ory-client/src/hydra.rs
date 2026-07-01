@@ -362,6 +362,30 @@ impl HydraClient {
         handle_response(response).await
     }
 
+    /// Proxy a device-authorization request to Hydra's public
+    /// `/oauth2/device/{path}` endpoint.
+    #[instrument(skip(self, form))]
+    pub async fn device(
+        &self,
+        path: &str,
+        form: Vec<(String, String)>,
+    ) -> Result<Value, OryClientError> {
+        let url = self
+            .public_url
+            .join(&format!("oauth2/device/{path}"))
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "proxying device request");
+        let response = self
+            .client
+            .post(url)
+            .form(&form)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
     /// Revoke a token at Hydra's public `/oauth2/revoke` endpoint.
     #[instrument(skip(self, form))]
     pub async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError> {
@@ -499,6 +523,7 @@ mod tests {
             )
             .route("/oauth2/auth", get(authorize))
             .route("/oauth2/token", post(token))
+            .route("/oauth2/device/{*path}", post(device))
             .route("/userinfo", get(userinfo))
             .route("/oauth2/revoke", post(revoke))
             .route("/proxy-json", get(proxy_json))
@@ -639,6 +664,26 @@ mod tests {
             "access_token": form.get("code").cloned().unwrap_or_default(),
             "token_type": "Bearer",
         }))
+    }
+
+    async fn device(
+        axum::extract::Path(path): axum::extract::Path<String>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<Value> {
+        if path == "auth" {
+            Json(json!({
+                "device_code": form.get("client_id").cloned().unwrap_or_default(),
+                "user_code": "USER-CODE",
+                "verification_uri": "https://gateway.example.com/device",
+                "expires_in": 600,
+                "interval": 5,
+            }))
+        } else {
+            Json(json!({
+                "access_token": format!("token-for-{path}"),
+                "token_type": "Bearer",
+            }))
+        }
     }
 
     async fn userinfo(headers: axum::http::HeaderMap) -> Json<Value> {
@@ -877,6 +922,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_auth_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .device(
+                "auth",
+                vec![
+                    ("client_id".to_string(), "client-1".to_string()),
+                    ("scope".to_string(), "openid".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["device_code"], "client-1");
+        assert_eq!(resp["user_code"], "USER-CODE");
+        assert_eq!(resp["expires_in"], 600);
+        assert_eq!(resp["interval"], 5);
+    }
+
+    #[tokio::test]
+    async fn device_token_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .device(
+                "token",
+                vec![("grant_type".to_string(), "device_code".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["access_token"], "token-for-token");
+        assert_eq!(resp["token_type"], "Bearer");
+    }
+
+    #[tokio::test]
     async fn revoke_round_trip() {
         let (_handle, url) = start_server().await;
         let client = HydraClient::new(&url, &url).unwrap();
@@ -993,6 +1073,20 @@ mod tests {
         let client =
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client.token(vec![]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn device_error() {
+        let app = Router::new().route("/oauth2/device/{*path}", post(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.device("auth", vec![]).await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 

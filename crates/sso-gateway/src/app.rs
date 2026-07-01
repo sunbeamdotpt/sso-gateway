@@ -13,7 +13,8 @@ use crate::{
     oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{
         ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
-        OAuth2ConsentServiceExt, PermissionServiceExt, ScimServiceExt, TenantServiceExt,
+        OAuth2ConsentServiceExt, OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt,
+        TenantServiceExt,
     },
     saml::{SamlState, router as saml_router},
     saml_idp::{SamlIdpState, router as saml_idp_router},
@@ -21,8 +22,8 @@ use crate::{
     services::{
         application::ApplicationServiceImpl, federation::FederationServiceImpl,
         identity::IdentityServiceImpl, identity_self_service::IdentitySelfServiceImpl,
-        oauth2_consent::OAuth2ConsentServiceImpl, permission::PermissionServiceImpl,
-        scim::ScimServiceImpl, tenant::TenantServiceImpl,
+        oauth2_consent::OAuth2ConsentServiceImpl, oauth2_device::OAuth2DeviceServiceImpl,
+        permission::PermissionServiceImpl, scim::ScimServiceImpl, tenant::TenantServiceImpl,
     },
 };
 use axum::{Extension, Router as AxumRouter, middleware::from_fn, routing::get};
@@ -138,6 +139,7 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
     let scim_mappings = mappings.clone();
     let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
+    let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(hydra.clone()));
 
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),
@@ -183,6 +185,7 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
     let connect_router: ConnectRouter = federation_service.register(connect_router);
     let connect_router: ConnectRouter = self_service.register(connect_router);
     let connect_router: ConnectRouter = oauth2_consent_service.register(connect_router);
+    let connect_router: ConnectRouter = oauth2_device_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
 
     let public_routes = AxumRouter::new()

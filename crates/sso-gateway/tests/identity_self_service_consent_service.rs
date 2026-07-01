@@ -63,46 +63,87 @@ async fn kratos_whoami(headers: axum::http::HeaderMap) -> Json<serde_json::Value
 
 async fn kratos_get_flow(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "id": params.get("id").cloned().unwrap_or_else(|| "flow-1".into()),
-        "type": "login",
-        "state": "choose_method",
-        "ui": {
-            "action": "http://action",
-            "method": "POST",
-            "nodes": [
-                {
-                    "type": "input",
-                    "group": "password",
-                    "attributes": {
-                        "node_type": "input",
-                        "name": "password",
-                        "type": "password"
+) -> (
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    Json<serde_json::Value>,
+) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "set-cookie",
+        "ory_kratos_session=mock; Path=/; HttpOnly".parse().unwrap(),
+    );
+    (
+        axum::http::StatusCode::OK,
+        headers,
+        Json(json!({
+            "id": params.get("id").cloned().unwrap_or_else(|| "flow-1".into()),
+            "type": "login",
+            "state": "choose_method",
+            "ui": {
+                "action": "http://action",
+                "method": "POST",
+                "nodes": [
+                    {
+                        "type": "input",
+                        "group": "password",
+                        "attributes": {
+                            "node_type": "input",
+                            "name": "password",
+                            "type": "password"
+                        }
                     }
-                }
-            ]
-        }
-    }))
+                ]
+            }
+        })),
+    )
 }
 
 async fn kratos_submit_flow(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(_body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "id": params.get("flow").cloned().unwrap_or_else(|| "flow-1".into()),
-        "type": "login",
-        "state": "passed_challenge"
-    }))
+) -> (
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    Json<serde_json::Value>,
+) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "set-cookie",
+        "ory_kratos_session=mock; Path=/; HttpOnly".parse().unwrap(),
+    );
+    (
+        axum::http::StatusCode::OK,
+        headers,
+        Json(json!({
+            "id": params.get("flow").cloned().unwrap_or_else(|| "flow-1".into()),
+            "type": "login",
+            "state": "passed_challenge"
+        })),
+    )
 }
 
-async fn kratos_create_logout_flow() -> Json<serde_json::Value> {
-    Json(json!({
-        "id": "logout-1",
-        "logout_url": "http://logout",
-        "logout_token": "token-1"
-    }))
+async fn kratos_create_logout_flow() -> (
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    Json<serde_json::Value>,
+) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "set-cookie",
+        "ory_kratos_session=; Path=/; Max-Age=0; HttpOnly"
+            .parse()
+            .unwrap(),
+    );
+    (
+        axum::http::StatusCode::OK,
+        headers,
+        Json(json!({
+            "id": "logout-1",
+            "logout_url": "http://logout",
+            "logout_token": "token-1"
+        })),
+    )
 }
 
 async fn kratos_submit_logout_flow() -> axum::http::StatusCode {
@@ -301,6 +342,13 @@ async fn self_service_and_consent_round_trip() {
         "get_login_flow failed: {}",
         resp.text().await.unwrap_or_default()
     );
+    assert!(
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
+        "get_login_flow should propagate Set-Cookie headers"
+    );
 
     // IdentitySelfService::SubmitLoginFlow
     let resp = client
@@ -317,6 +365,13 @@ async fn self_service_and_consent_round_trip() {
         "submit_login_flow failed: {}",
         resp.text().await.unwrap_or_default()
     );
+    assert!(
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
+        "submit_login_flow should propagate Set-Cookie headers"
+    );
 
     // IdentitySelfService::CreateLoginFlow
     let resp = client
@@ -332,6 +387,13 @@ async fn self_service_and_consent_round_trip() {
         resp.status().is_success(),
         "create_login_flow failed: {}",
         resp.text().await.unwrap_or_default()
+    );
+    let set_cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
+        "create_login_flow should propagate Set-Cookie headers"
     );
 
     // IdentitySelfService::CreateRegistrationFlow
@@ -562,6 +624,13 @@ async fn self_service_and_consent_round_trip() {
         resp.status().is_success(),
         "create_logout_flow failed: {}",
         resp.text().await.unwrap_or_default()
+    );
+    assert!(
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
+        "create_logout_flow should propagate Set-Cookie headers"
     );
 
     // IdentitySelfService::SubmitLogoutFlow

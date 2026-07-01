@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] - 2026-07-01
+
+### Added
+
+- OAuth 2.0 Device Authorization Grant support.
+  - New public HTTP proxy route `/oauth2/device/{*path}` forwards device
+    authorization and token requests to Ory Hydra.
+  - OIDC discovery document now advertises `device_authorization_endpoint` and
+    the `urn:ietf:params:oauth:grant-type:device_code` grant type.
+  - New `OAuth2DeviceService` Connect-RPC API with `AuthorizeDevice` and
+    `GetDeviceToken` methods.
+
+### Fixed
+
+- Propagate `Set-Cookie` headers from Ory Kratos through the gateway on
+  self-service browser flow creation, get, and submission. The UI already
+  forwards these cookies; the gateway now emits them in Connect-RPC response
+  metadata so the browser agent can send them back on subsequent requests.
+
+## [1.0.0-rc.5] - 2026-07-01
+
+### Fixed
+
+- Health check endpoints (`/health/*`) are no longer auth-gated.
+
 ## [1.0.0-rc.4] - 2026-07-01
 
 ## [1.0.0-rc.3] - 2026-07-01

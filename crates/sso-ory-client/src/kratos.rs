@@ -1,8 +1,17 @@
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Method, Url};
 use serde_json::Value;
 use tracing::{debug, instrument};
 
 use crate::error::OryClientError;
+
+/// A successful Kratos response, carrying both the JSON body and the response
+/// headers so that caller can propagate cookies (e.g. `Set-Cookie`).
+#[derive(Debug, Clone)]
+pub struct KratosResponse {
+    pub body: Value,
+    pub headers: HeaderMap,
+}
 
 /// Internal client for Ory Kratos (admin and public endpoints).
 #[derive(Debug, Clone)]
@@ -189,7 +198,7 @@ impl KratosClient {
         &self,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.get_flow("login", id, cookie).await
     }
 
@@ -199,7 +208,7 @@ impl KratosClient {
         &self,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.get_flow("registration", id, cookie).await
     }
 
@@ -209,7 +218,7 @@ impl KratosClient {
         &self,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.get_flow("settings", id, cookie).await
     }
 
@@ -219,7 +228,7 @@ impl KratosClient {
         &self,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.get_flow("recovery", id, cookie).await
     }
 
@@ -229,7 +238,7 @@ impl KratosClient {
         &self,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.get_flow("verification", id, cookie).await
     }
 
@@ -238,7 +247,7 @@ impl KratosClient {
         flow_type: &str,
         id: &str,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let public_url = self
             .public_url
             .as_ref()
@@ -253,7 +262,7 @@ impl KratosClient {
             request = request.header("Cookie", cookie);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
-        handle_response(response).await
+        handle_response_with_headers(response).await
     }
 
     /// Submit a self-service login flow.
@@ -263,7 +272,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.submit_flow("login", id, cookie, body).await
     }
 
@@ -274,7 +283,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.submit_flow("registration", id, cookie, body).await
     }
 
@@ -285,7 +294,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.submit_flow("settings", id, cookie, body).await
     }
 
@@ -296,7 +305,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.submit_flow("recovery", id, cookie, body).await
     }
 
@@ -307,7 +316,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.submit_flow("verification", id, cookie, body).await
     }
 
@@ -317,7 +326,7 @@ impl KratosClient {
         id: &str,
         cookie: Option<&str>,
         body: Value,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let public_url = self
             .public_url
             .as_ref()
@@ -333,7 +342,7 @@ impl KratosClient {
             request = request.header("Cookie", cookie);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
-        handle_response(response).await
+        handle_response_with_headers(response).await
     }
 
     /// Create a browser logout flow.
@@ -342,7 +351,7 @@ impl KratosClient {
         &self,
         return_to: Option<&str>,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let public_url = self
             .public_url
             .as_ref()
@@ -356,7 +365,7 @@ impl KratosClient {
             request = request.header("Cookie", cookie);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
-        handle_response(response).await
+        handle_response_with_headers(response).await
     }
 
     /// Submit a logout flow using the token returned by `create_logout_flow`.
@@ -397,7 +406,7 @@ impl KratosClient {
         &self,
         return_to: Option<&str>,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
         self.create_browser_flow("verification", &query, cookie)
             .await
@@ -409,7 +418,7 @@ impl KratosClient {
         &self,
         query: &[(&str, &str)],
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.create_browser_flow("login", query, cookie).await
     }
 
@@ -419,7 +428,7 @@ impl KratosClient {
         &self,
         query: &[(&str, &str)],
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         self.create_browser_flow("registration", query, cookie)
             .await
     }
@@ -430,7 +439,7 @@ impl KratosClient {
         &self,
         return_to: Option<&str>,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
         self.create_browser_flow("settings", &query, cookie).await
     }
@@ -441,7 +450,7 @@ impl KratosClient {
         &self,
         return_to: Option<&str>,
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
         self.create_browser_flow("recovery", &query, cookie).await
     }
@@ -452,7 +461,7 @@ impl KratosClient {
         flow: &str,
         query: &[(&str, &str)],
         cookie: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    ) -> Result<KratosResponse, OryClientError> {
         let public_url = self
             .public_url
             .as_ref()
@@ -466,7 +475,7 @@ impl KratosClient {
             request = request.header("Cookie", cookie);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
-        handle_response(response).await
+        handle_response_with_headers(response).await
     }
 
     /// Get a self-service flow error by id.
@@ -551,8 +560,16 @@ fn parse_base_url(url: &str) -> Result<Url, OryClientError> {
 }
 
 async fn handle_response(response: reqwest::Response) -> Result<Value, OryClientError> {
+    Ok(handle_response_with_headers(response).await?.body)
+}
+
+async fn handle_response_with_headers(
+    response: reqwest::Response,
+) -> Result<KratosResponse, OryClientError> {
     if response.status().is_success() {
-        response.json().await.map_err(OryClientError::Http)
+        let headers = response.headers().clone();
+        let body = response.json().await.map_err(OryClientError::Http)?;
+        Ok(KratosResponse { body, headers })
     } else {
         Err(ory_error(response).await)
     }
@@ -664,12 +681,23 @@ mod tests {
     async fn create_browser_flow(
         axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
-    ) -> Json<Value> {
-        Json(json!({
-            "id": format!("{flow}-1"),
-            "type": flow,
-            "return_to": params.get("return_to").cloned().unwrap_or_default()
-        }))
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            format!("ory_kratos_session={flow}; Path=/; HttpOnly")
+                .parse()
+                .unwrap(),
+        );
+        (
+            axum::http::StatusCode::OK,
+            headers,
+            Json(json!({
+                "id": format!("{flow}-1"),
+                "type": flow,
+                "return_to": params.get("return_to").cloned().unwrap_or_default()
+            })),
+        )
     }
 
     async fn whoami(headers: axum::http::HeaderMap) -> Json<Value> {
@@ -693,36 +721,69 @@ mod tests {
     async fn get_flow(
         axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
-    ) -> Json<Value> {
-        Json(json!({
-            "id": params.get("id").cloned().unwrap_or_default(),
-            "type": flow,
-            "state": "choose_method"
-        }))
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            format!("ory_kratos_session={flow}; Path=/; HttpOnly")
+                .parse()
+                .unwrap(),
+        );
+        (
+            axum::http::StatusCode::OK,
+            headers,
+            Json(json!({
+                "id": params.get("id").cloned().unwrap_or_default(),
+                "type": flow,
+                "state": "choose_method"
+            })),
+        )
     }
 
     async fn submit_flow(
         axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
         Json(body): Json<Value>,
-    ) -> Json<Value> {
-        Json(json!({
-            "id": params.get("flow").cloned().unwrap_or_default(),
-            "type": flow,
-            "state": "passed_challenge",
-            "body": body
-        }))
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            format!("ory_kratos_session={flow}; Path=/; HttpOnly")
+                .parse()
+                .unwrap(),
+        );
+        (
+            axum::http::StatusCode::OK,
+            headers,
+            Json(json!({
+                "id": params.get("flow").cloned().unwrap_or_default(),
+                "type": flow,
+                "state": "passed_challenge",
+                "body": body
+            })),
+        )
     }
 
     async fn create_logout_flow(
         Query(params): Query<std::collections::HashMap<String, String>>,
-    ) -> Json<Value> {
-        Json(json!({
-            "id": "logout-1",
-            "logout_url": "http://logout",
-            "logout_token": "token-1",
-            "return_to": params.get("return_to").cloned().unwrap_or_default()
-        }))
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            "ory_kratos_session=; Path=/; Max-Age=0; HttpOnly"
+                .parse()
+                .unwrap(),
+        );
+        (
+            axum::http::StatusCode::OK,
+            headers,
+            Json(json!({
+                "id": "logout-1",
+                "logout_url": "http://logout",
+                "logout_token": "token-1",
+                "return_to": params.get("return_to").cloned().unwrap_or_default()
+            })),
+        )
     }
 
     async fn submit_logout_flow(
@@ -834,8 +895,16 @@ mod tests {
             .get_login_flow("flow-1", Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "login");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "login");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=login")
+        );
     }
 
     #[tokio::test]
@@ -846,9 +915,17 @@ mod tests {
             .submit_login_flow("flow-1", Some("cookie"), json!({ "identifier": "a" }))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["state"], "passed_challenge");
-        assert_eq!(resp["body"]["identifier"], "a");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["state"], "passed_challenge");
+        assert_eq!(resp.body["body"]["identifier"], "a");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=login")
+        );
     }
 
     #[tokio::test]
@@ -859,9 +936,17 @@ mod tests {
             .create_login_browser_flow(&[("return_to", "http://return")], Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "login-1");
-        assert_eq!(resp["type"], "login");
-        assert_eq!(resp["return_to"], "http://return");
+        assert_eq!(resp.body["id"], "login-1");
+        assert_eq!(resp.body["type"], "login");
+        assert_eq!(resp.body["return_to"], "http://return");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=login")
+        );
     }
 
     #[tokio::test]
@@ -872,8 +957,16 @@ mod tests {
             .create_registration_browser_flow(&[("return_to", "http://return")], Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "registration-1");
-        assert_eq!(resp["type"], "registration");
+        assert_eq!(resp.body["id"], "registration-1");
+        assert_eq!(resp.body["type"], "registration");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=registration")
+        );
     }
 
     #[tokio::test]
@@ -884,8 +977,16 @@ mod tests {
             .create_settings_browser_flow(Some("http://return"), Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "settings-1");
-        assert_eq!(resp["type"], "settings");
+        assert_eq!(resp.body["id"], "settings-1");
+        assert_eq!(resp.body["type"], "settings");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=settings")
+        );
     }
 
     #[tokio::test]
@@ -896,8 +997,16 @@ mod tests {
             .create_recovery_browser_flow(Some("http://return"), Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "recovery-1");
-        assert_eq!(resp["type"], "recovery");
+        assert_eq!(resp.body["id"], "recovery-1");
+        assert_eq!(resp.body["type"], "recovery");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=recovery")
+        );
     }
 
     #[tokio::test]
@@ -908,8 +1017,11 @@ mod tests {
             .create_logout_flow(Some("http://return"), Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "logout-1");
-        assert_eq!(resp["return_to"], "http://return");
+        assert_eq!(resp.body["id"], "logout-1");
+        assert_eq!(resp.body["return_to"], "http://return");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].to_str().unwrap().contains("ory_kratos_session="));
     }
 
     #[tokio::test]
@@ -1004,8 +1116,16 @@ mod tests {
             .get_registration_flow("flow-1", Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "registration");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "registration");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=registration")
+        );
     }
 
     #[tokio::test]
@@ -1016,8 +1136,16 @@ mod tests {
             .get_settings_flow("flow-1", Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "settings");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "settings");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=settings")
+        );
     }
 
     #[tokio::test]
@@ -1028,8 +1156,16 @@ mod tests {
             .get_recovery_flow("flow-1", Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "recovery");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "recovery");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=recovery")
+        );
     }
 
     #[tokio::test]
@@ -1040,8 +1176,16 @@ mod tests {
             .get_verification_flow("flow-1", Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "verification");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "verification");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=verification")
+        );
     }
 
     #[tokio::test]
@@ -1052,8 +1196,16 @@ mod tests {
             .submit_registration_flow("flow-1", Some("cookie"), json!({ "traits": {} }))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "registration");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "registration");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=registration")
+        );
     }
 
     #[tokio::test]
@@ -1064,8 +1216,16 @@ mod tests {
             .submit_settings_flow("flow-1", Some("cookie"), json!({ "method": "password" }))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "settings");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "settings");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=settings")
+        );
     }
 
     #[tokio::test]
@@ -1080,8 +1240,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "recovery");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "recovery");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=recovery")
+        );
     }
 
     #[tokio::test]
@@ -1096,8 +1264,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp["id"], "flow-1");
-        assert_eq!(resp["type"], "verification");
+        assert_eq!(resp.body["id"], "flow-1");
+        assert_eq!(resp.body["type"], "verification");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=verification")
+        );
     }
 
     #[tokio::test]
@@ -1108,8 +1284,16 @@ mod tests {
             .create_verification_flow(Some("http://return"), Some("cookie"))
             .await
             .unwrap();
-        assert_eq!(resp["id"], "verification-1");
-        assert_eq!(resp["type"], "verification");
+        assert_eq!(resp.body["id"], "verification-1");
+        assert_eq!(resp.body["type"], "verification");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=verification")
+        );
     }
 
     #[tokio::test]
@@ -1497,6 +1681,41 @@ mod tests {
                 .unwrap();
         let err = client.get_webauthn_js().await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_login_browser_flow_preserves_multiple_set_cookie_headers() {
+        async fn multi_cookie_login() -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>)
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.append(
+                "set-cookie",
+                "ory_kratos_session=a; Path=/; HttpOnly".parse().unwrap(),
+            );
+            headers.append(
+                "set-cookie",
+                "ory_kratos_continuity=b; Path=/; HttpOnly".parse().unwrap(),
+            );
+            (
+                axum::http::StatusCode::OK,
+                headers,
+                Json(json!({ "id": "login-1", "type": "login" })),
+            )
+        }
+
+        let app = Router::new().route("/self-service/login/browser", get(multi_cookie_login));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let resp = client.create_login_browser_flow(&[], None).await.unwrap();
+        assert_eq!(resp.body["id"], "login-1");
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
     }
 
     #[tokio::test]
