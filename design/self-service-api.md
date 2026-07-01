@@ -2,7 +2,11 @@
 
 ## Status
 
-Draft — ready for review.
+Implemented. The API shipped as `IdentitySelfService` and `OAuth2ConsentService`
+under `iam.v1`. The flow message strategy was changed from the original
+`google.protobuf.Struct` passthrough proposal to a strongly-typed model in order
+to preserve the gateway's vendor-agnostic boundary (see Flow message strategy
+below).
 
 ## Context
 
@@ -156,9 +160,19 @@ The existing REST OAuth2 router (`src/oauth2.rs`) keeps the spec-mandatory endpo
 
 ### 3. `Flow` message strategy
 
-The current `iam.v1.Flow` is too thin for UI use. Rather than expand it, keep it for the admin `CreateLoginFlow`/`CreateRegistrationFlow` RPCs, and use `google.protobuf.Struct` in `SelfServiceService` for the UI-facing flows.
+The current `iam.v1.Flow` is too thin for UI use. Admin `CreateLoginFlow`/
+`CreateRegistrationFlow` RPCs continue to return `iam.v1.Flow`.
 
-If later we want a strongly-typed internal representation, we can introduce `SelfServiceFlow` incrementally without breaking the UI passthrough.
+For browser-facing flows, the service returns a strongly-typed `SelfServiceFlow`
+message with a complete `UiContainer` / `UiNode` / `UiMessage` model. The gateway
+maps Ory Kratos JSON into this vendor-neutral contract, and the browser client
+translates it into the shape `@ory/elements-markup` expects.
+
+This differs from the original draft's `google.protobuf.Struct` passthrough
+recommendation. Passthrough would have made the UI depend directly on Ory's
+JSON schema, undermining the gateway's goal of hiding the backend. The typed
+model keeps the UI backend-agnostic at the cost of a small translation layer
+in the browser client.
 
 ## Implementation plan
 
