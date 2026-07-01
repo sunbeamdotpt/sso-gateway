@@ -21,7 +21,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 
 - `crates/sso-gateway/` — main binary, service implementations, middleware, config.
 - `crates/sso-ory-client/` — thin internal HTTP clients for Hydra/Kratos/Keto.
-- `proto/iam/v1/` — Connect-RPC service definitions.
+- `proto/iam/v1/` — Connect-RPC service definitions, linted with `buf` and published to `buf.build/sunbeamdotpt/sso-gateway`.
 - `migrations/` — `sqlx` migrations for the gateway metadata store.
 - `deploy/` — Ory config files used by `docker-compose.yml`.
 - `Dockerfile` / `.dockerignore` / `sunbeam.yaml` — container build and Sunbeam targets.
@@ -46,6 +46,12 @@ DOCKER_HOST=unix:///var/run/docker.sock cargo test -p sso-ory-client --all-targe
 
 # Linting
 cargo clippy -p sso-gateway --all-targets --all-features -- -D warnings
+
+# Protobuf linting
+buf lint
+
+# Detect breaking proto changes against mainline
+buf breaking --against "https://github.com/sunbeamdotpt/sso-gateway.git#branch=mainline"
 ```
 
 ## Ory backend naming
