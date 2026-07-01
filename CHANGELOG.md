@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.0.0-rc.3] - 2026-07-01
+
+### Added
+
+- Extended `CreateLoginFlowRequest` and `CreateRegistrationFlowRequest` with
+  query parameters needed by the browser UI:
+  `aal`, `refresh`, `organization`, `via`, `login_challenge`, and `identity_schema`.
+- Added `BrowserIdentity`, `VerifiableAddress`, and `RecoveryAddress` messages;
+  `BrowserSession` now exposes the full identity object alongside the existing
+  flattened `identity_traits`.
+- Added `OAuth2Client` message and embedded it in `ConsentRequest` and
+  `LogoutRequest`, exposing `skip_consent` and `skip_logout_consent`.
+- Enriched the typed self-service flow model (`SelfServiceFlow`, `UiNode` input/
+  text/anchor/image/script attributes, `UiNodeMeta`, `UiMessage`) so the browser
+  client can translate it for `@ory/elements-markup` while keeping the gateway
+  contract vendor-agnostic.
+
+### Changed
+
+- `KratosClient` browser and API flow creation methods now accept a query
+  parameter slice instead of only `return_to`.
+
 ## [1.0.0-rc.2] - 2026-06-30
 
 ### Added
