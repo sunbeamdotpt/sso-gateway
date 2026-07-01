@@ -187,7 +187,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::Query,
-        routing::{get, patch},
+        routing::{delete, get, patch},
     };
     use serde_json::json;
 
@@ -223,6 +223,14 @@ mod tests {
 
     async fn delete_tuple() -> axum::http::StatusCode {
         axum::http::StatusCode::NO_CONTENT
+    }
+
+    async fn error_handler() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
+    }
+
+    async fn forbidden_handler() -> axum::http::StatusCode {
+        axum::http::StatusCode::FORBIDDEN
     }
 
     async fn start_server() -> (tokio::task::JoinHandle<()>, String) {
@@ -274,5 +282,89 @@ mod tests {
         let client = KetoClient::new(&url, &url).unwrap();
         let resp = client.expand("app", "doc-1", "read").await.unwrap();
         assert!(resp["children"].is_array());
+    }
+
+    #[tokio::test]
+    async fn check_permission_denied() {
+        let app = Router::new().route("/relation-tuples/check", get(forbidden_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        assert!(
+            !client
+                .check_permission("app", "doc-1", "read", "alice")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn check_permission_error() {
+        let app = Router::new().route("/relation-tuples/check", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .check_permission("app", "doc-1", "read", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_relation_tuple_error() {
+        let app = Router::new().route("/admin/relation-tuples", patch(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .create_relation_tuple("app", "doc-1", "read", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_relation_tuple_error() {
+        let app = Router::new().route("/admin/relation-tuples", delete(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .delete_relation_tuple("app", "doc-1", "read", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn expand_error() {
+        let app = Router::new().route("/relation-tuples/expand", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.expand("app", "doc-1", "read").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn new_with_invalid_url() {
+        let err = KetoClient::new("not-a-url", "http://example.com/").unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
     }
 }

@@ -127,18 +127,15 @@ impl KratosClient {
 
     /// Create a self-service login flow via the public API.
     #[instrument(skip(self))]
-    pub async fn create_login_flow(
-        &self,
-        return_to: Option<&str>,
-    ) -> Result<Value, OryClientError> {
+    pub async fn create_login_flow(&self, query: &[(&str, &str)]) -> Result<Value, OryClientError> {
         let public_url = self
             .public_url
             .as_ref()
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
         let url = public_url.join("self-service/login/api")?;
         let mut request = self.client.get(url).header("accept", "application/json");
-        if let Some(return_to) = return_to {
-            request = request.query(&[("return_to", return_to)]);
+        if !query.is_empty() {
+            request = request.query(query);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
         handle_response(response).await
@@ -148,7 +145,7 @@ impl KratosClient {
     #[instrument(skip(self))]
     pub async fn create_registration_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
     ) -> Result<Value, OryClientError> {
         let public_url = self
             .public_url
@@ -156,8 +153,8 @@ impl KratosClient {
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
         let url = public_url.join("self-service/registration/api")?;
         let mut request = self.client.get(url).header("accept", "application/json");
-        if let Some(return_to) = return_to {
-            request = request.query(&[("return_to", return_to)]);
+        if !query.is_empty() {
+            request = request.query(query);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
         handle_response(response).await
@@ -401,7 +398,8 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_browser_flow("verification", return_to, cookie)
+        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        self.create_browser_flow("verification", &query, cookie)
             .await
     }
 
@@ -409,20 +407,20 @@ impl KratosClient {
     #[instrument(skip(self, cookie))]
     pub async fn create_login_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_browser_flow("login", return_to, cookie).await
+        self.create_browser_flow("login", query, cookie).await
     }
 
     /// Create a browser registration flow.
     #[instrument(skip(self, cookie))]
     pub async fn create_registration_browser_flow(
         &self,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_browser_flow("registration", return_to, cookie)
+        self.create_browser_flow("registration", query, cookie)
             .await
     }
 
@@ -433,8 +431,8 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_browser_flow("settings", return_to, cookie)
-            .await
+        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        self.create_browser_flow("settings", &query, cookie).await
     }
 
     /// Create a browser recovery flow.
@@ -444,15 +442,15 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
-        self.create_browser_flow("recovery", return_to, cookie)
-            .await
+        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        self.create_browser_flow("recovery", &query, cookie).await
     }
 
     #[instrument(skip(self, cookie))]
     async fn create_browser_flow(
         &self,
         flow: &str,
-        return_to: Option<&str>,
+        query: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, OryClientError> {
         let public_url = self
@@ -461,8 +459,8 @@ impl KratosClient {
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
         let url = public_url.join(&format!("self-service/{flow}/browser"))?;
         let mut request = self.client.get(url).header("accept", "application/json");
-        if let Some(return_to) = return_to {
-            request = request.query(&[("return_to", return_to)]);
+        if !query.is_empty() {
+            request = request.query(query);
         }
         if let Some(cookie) = cookie {
             request = request.header("Cookie", cookie);
@@ -574,7 +572,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::Query,
-        routing::{get, post},
+        routing::{delete, get, post, put},
     };
     use serde_json::json;
 
@@ -589,16 +587,22 @@ mod tests {
                     .put(update_identity)
                     .delete(delete_identity),
             )
+            .route("/admin/sessions", get(list_sessions))
+            .route(
+                "/admin/sessions/{id}",
+                get(get_session).delete(delete_session),
+            )
             .route("/schemas/{id}", get(get_schema));
 
         let public = Router::new()
             .route("/sessions/whoami", get(whoami))
+            .route("/self-service/{flow}/api", get(create_api_flow))
             .route("/self-service/{flow}/browser", get(create_browser_flow))
-            .route("/self-service/login/flows", get(get_login_flow))
-            .route("/self-service/login", post(submit_login_flow))
-            .route("/self-service/logout/browser", get(create_logout_flow))
+            .route("/self-service/{flow}/flows", get(get_flow))
             .route("/self-service/logout", get(submit_logout_flow))
+            .route("/self-service/logout/browser", get(create_logout_flow))
             .route("/self-service/errors", get(get_flow_error))
+            .route("/self-service/{flow}", post(submit_flow))
             .route("/.well-known/ory/webauthn.js", get(webauthn_js));
 
         Router::new().merge(admin).merge(public)
@@ -630,6 +634,33 @@ mod tests {
         Json(json!({ "id": id, "schema": "{}" }))
     }
 
+    async fn list_sessions(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(json!({
+            "identity_id": params.get("identity_id").cloned().unwrap_or_default(),
+            "sessions": []
+        }))
+    }
+
+    async fn get_session(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+        Json(json!({ "id": id, "active": true }))
+    }
+
+    async fn delete_session() -> axum::http::StatusCode {
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    async fn create_api_flow(
+        axum::extract::Path(flow): axum::extract::Path<String>,
+    ) -> Json<Value> {
+        Json(json!({
+            "id": format!("{flow}-1"),
+            "type": flow,
+            "state": "choose_method"
+        }))
+    }
+
     async fn create_browser_flow(
         axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
@@ -659,23 +690,25 @@ mod tests {
         }))
     }
 
-    async fn get_login_flow(
+    async fn get_flow(
+        axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
     ) -> Json<Value> {
         Json(json!({
             "id": params.get("id").cloned().unwrap_or_default(),
-            "type": "login",
+            "type": flow,
             "state": "choose_method"
         }))
     }
 
-    async fn submit_login_flow(
+    async fn submit_flow(
+        axum::extract::Path(flow): axum::extract::Path<String>,
         Query(params): Query<std::collections::HashMap<String, String>>,
         Json(body): Json<Value>,
     ) -> Json<Value> {
         Json(json!({
             "id": params.get("flow").cloned().unwrap_or_default(),
-            "type": "login",
+            "type": flow,
             "state": "passed_challenge",
             "body": body
         }))
@@ -711,6 +744,10 @@ mod tests {
 
     async fn webauthn_js() -> (axum::http::StatusCode, &'static str) {
         (axum::http::StatusCode::OK, "console.log('webauthn');")
+    }
+
+    async fn error_handler() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
     }
 
     async fn start_server() -> (tokio::task::JoinHandle<()>, String) {
@@ -819,7 +856,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client
-            .create_login_browser_flow(Some("http://return"), Some("cookie"))
+            .create_login_browser_flow(&[("return_to", "http://return")], Some("cookie"))
             .await
             .unwrap();
         assert_eq!(resp["id"], "login-1");
@@ -832,7 +869,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client
-            .create_registration_browser_flow(Some("http://return"), Some("cookie"))
+            .create_registration_browser_flow(&[("return_to", "http://return")], Some("cookie"))
             .await
             .unwrap();
         assert_eq!(resp["id"], "registration-1");
@@ -899,5 +936,572 @@ mod tests {
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client.get_webauthn_js().await.unwrap();
         assert_eq!(resp, "console.log('webauthn');");
+    }
+
+    #[tokio::test]
+    async fn admin_get_session_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client.admin_get_session("session-1").await.unwrap();
+        assert_eq!(resp["id"], "session-1");
+        assert_eq!(resp["active"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_session_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        client.delete_session("session-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_by_identity_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .list_sessions_by_identity("identity-1")
+            .await
+            .unwrap();
+        assert_eq!(resp["identity_id"], "identity-1");
+        assert!(resp["sessions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn whoami_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client.whoami("token-1").await.unwrap();
+        assert_eq!(resp["id"], "session-1");
+        assert_eq!(resp["token"], "token-1");
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client.create_login_flow(&[]).await.unwrap();
+        assert_eq!(resp["id"], "login-1");
+        assert_eq!(resp["type"], "login");
+    }
+
+    #[tokio::test]
+    async fn create_registration_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_registration_flow(&[("return_to", "http://return")])
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "registration-1");
+        assert_eq!(resp["type"], "registration");
+    }
+
+    #[tokio::test]
+    async fn get_registration_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .get_registration_flow("flow-1", Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "registration");
+    }
+
+    #[tokio::test]
+    async fn get_settings_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .get_settings_flow("flow-1", Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "settings");
+    }
+
+    #[tokio::test]
+    async fn get_recovery_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .get_recovery_flow("flow-1", Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "recovery");
+    }
+
+    #[tokio::test]
+    async fn get_verification_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .get_verification_flow("flow-1", Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "verification");
+    }
+
+    #[tokio::test]
+    async fn submit_registration_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_registration_flow("flow-1", Some("cookie"), json!({ "traits": {} }))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "registration");
+    }
+
+    #[tokio::test]
+    async fn submit_settings_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_settings_flow("flow-1", Some("cookie"), json!({ "method": "password" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "settings");
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_recovery_flow(
+                "flow-1",
+                Some("cookie"),
+                json!({ "email": "a@example.com" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "recovery");
+    }
+
+    #[tokio::test]
+    async fn submit_verification_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_verification_flow(
+                "flow-1",
+                Some("cookie"),
+                json!({ "email": "a@example.com" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "flow-1");
+        assert_eq!(resp["type"], "verification");
+    }
+
+    #[tokio::test]
+    async fn create_verification_flow_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .create_verification_flow(Some("http://return"), Some("cookie"))
+            .await
+            .unwrap();
+        assert_eq!(resp["id"], "verification-1");
+        assert_eq!(resp["type"], "verification");
+    }
+
+    #[tokio::test]
+    async fn whoami_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.whoami("token-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.create_login_flow(&[]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_registration_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.create_registration_flow(&[]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn to_session_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.to_session(None, None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_login_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.get_login_flow("flow-1", None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_registration_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .get_registration_flow("flow-1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_settings_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.get_settings_flow("flow-1", None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_recovery_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.get_recovery_flow("flow-1", None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_verification_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .get_verification_flow("flow-1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_login_flow("flow-1", None, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_registration_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_registration_flow("flow-1", None, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_settings_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_settings_flow("flow-1", None, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_recovery_flow("flow-1", None, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_verification_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_verification_flow("flow-1", None, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_logout_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.create_logout_flow(None, None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_logout_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .submit_logout_flow("token-1", None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_verification_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .create_verification_flow(None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_login_browser_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .create_login_browser_flow(&[], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_registration_browser_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .create_registration_browser_flow(&[], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_settings_browser_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .create_settings_browser_flow(None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_recovery_browser_flow_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client
+            .create_recovery_browser_flow(None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_flow_error_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.get_flow_error("error-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_webauthn_js_missing_public_url() {
+        let client = KratosClient::new("http://example.com/").unwrap();
+        let err = client.get_webauthn_js().await.unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn create_identity_error() {
+        let app = Router::new().route("/admin/identities", post(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.create_identity(json!({})).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_identity_error() {
+        let app = Router::new().route("/admin/identities/{id}", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.get_identity("identity-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn update_identity_error() {
+        let app = Router::new().route("/admin/identities/{id}", put(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client
+            .update_identity("identity-1", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_identity_error() {
+        let app = Router::new().route("/admin/identities/{id}", delete(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.delete_identity("identity-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_identity_schema_error() {
+        let app = Router::new().route("/schemas/{id}", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.get_identity_schema("default").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn admin_get_session_error() {
+        let app = Router::new().route("/admin/sessions/{id}", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.admin_get_session("session-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_session_error() {
+        let app = Router::new().route("/admin/sessions/{id}", delete(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client.delete_session("session-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn whoami_error() {
+        let app = Router::new().route("/sessions/whoami", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client.whoami("token-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_error() {
+        let app = Router::new().route("/self-service/login/api", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client.create_login_flow(&[]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_logout_flow_error() {
+        let app = Router::new().route("/self-service/logout/browser", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client.create_logout_flow(None, None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn submit_logout_flow_error() {
+        let app = Router::new().route("/self-service/logout", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client
+            .submit_logout_flow("token-1", None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_flow_error_error() {
+        let app = Router::new().route("/self-service/errors", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client.get_flow_error("error-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_webauthn_js_error() {
+        let app = Router::new().route("/.well-known/ory/webauthn.js", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            KratosClient::new_with_public(&format!("http://{addr}"), &format!("http://{addr}"))
+                .unwrap();
+        let err = client.get_webauthn_js().await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn new_with_invalid_url() {
+        let err = KratosClient::new("not-a-url").unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
     }
 }

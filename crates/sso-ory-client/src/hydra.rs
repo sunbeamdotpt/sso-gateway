@@ -450,7 +450,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::{Form, Query},
-        routing::{get, post, put},
+        routing::{delete, get, post, put},
     };
     use serde_json::json;
 
@@ -464,6 +464,27 @@ mod tests {
                 get(get_client).put(update_client).delete(delete_client),
             )
             .route("/oauth2/introspect", post(introspect))
+            .route("/admin/oauth2/auth/requests/login", get(get_login_request))
+            .route(
+                "/admin/oauth2/auth/requests/login/accept",
+                put(accept_login_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/login/reject",
+                put(reject_login_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/consent",
+                get(get_consent_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/consent/accept",
+                put(accept_consent_request),
+            )
+            .route(
+                "/admin/oauth2/auth/requests/consent/reject",
+                put(reject_consent_request),
+            )
             .route(
                 "/admin/oauth2/auth/requests/logout",
                 get(get_logout_request),
@@ -476,6 +497,11 @@ mod tests {
                 "/admin/oauth2/auth/requests/logout/reject",
                 put(reject_logout_request),
             )
+            .route("/oauth2/auth", get(authorize))
+            .route("/oauth2/token", post(token))
+            .route("/userinfo", get(userinfo))
+            .route("/oauth2/revoke", post(revoke))
+            .route("/proxy-json", get(proxy_json))
     }
 
     async fn create_client(Json(body): Json<Value>) -> Json<Value> {
@@ -511,6 +537,66 @@ mod tests {
         }))
     }
 
+    async fn get_login_request(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("login_challenge").cloned().unwrap_or_default(),
+            "subject": "subject-1",
+            "client": { "client_id": "client-1" }
+        }))
+    }
+
+    async fn accept_login_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("login_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
+        }))
+    }
+
+    async fn reject_login_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("login_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
+        }))
+    }
+
+    async fn get_consent_request(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("consent_challenge").cloned().unwrap_or_default(),
+            "subject": "subject-1",
+            "client": { "client_id": "client-1" }
+        }))
+    }
+
+    async fn accept_consent_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("consent_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
+        }))
+    }
+
+    async fn reject_consent_request(
+        Query(params): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        Json(json!({
+            "challenge": params.get("consent_challenge").cloned().unwrap_or_default(),
+            "redirect_to": "http://redirect",
+            "body": body
+        }))
+    }
+
     async fn get_logout_request(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
         Json(json!({
             "challenge": params.get("logout_challenge").cloned().unwrap_or_default(),
@@ -539,6 +625,40 @@ mod tests {
             "redirect_to": "http://redirect",
             "body": body
         }))
+    }
+
+    async fn authorize(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "redirect_to": params.get("redirect_uri").cloned().unwrap_or_default(),
+            "state": params.get("state").cloned().unwrap_or_default(),
+        }))
+    }
+
+    async fn token(Form(form): Form<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "access_token": form.get("code").cloned().unwrap_or_default(),
+            "token_type": "Bearer",
+        }))
+    }
+
+    async fn userinfo(headers: axum::http::HeaderMap) -> Json<Value> {
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        Json(json!({ "sub": token.strip_prefix("Bearer ").unwrap_or("") }))
+    }
+
+    async fn revoke() -> axum::http::StatusCode {
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    async fn proxy_json() -> Json<Value> {
+        Json(json!({ "proxied": true }))
+    }
+
+    async fn error_handler() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
     }
 
     async fn start_server() -> (tokio::task::JoinHandle<()>, String) {
@@ -657,5 +777,271 @@ mod tests {
             .unwrap();
         assert_eq!(resp["redirect_to"], "http://redirect");
         assert_eq!(resp["body"]["error"], "denied");
+    }
+
+    #[tokio::test]
+    async fn get_login_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client.get_login_request("challenge-1").await.unwrap();
+        assert_eq!(resp["challenge"], "challenge-1");
+        assert_eq!(resp["subject"], "subject-1");
+    }
+
+    #[tokio::test]
+    async fn accept_login_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .accept_login_request("challenge-1", json!({ "subject": "subject-1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["redirect_to"], "http://redirect");
+        assert_eq!(resp["challenge"], "challenge-1");
+    }
+
+    #[tokio::test]
+    async fn reject_login_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .reject_login_request("challenge-1", json!({ "error": "denied" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["body"]["error"], "denied");
+    }
+
+    #[tokio::test]
+    async fn get_consent_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client.get_consent_request("challenge-1").await.unwrap();
+        assert_eq!(resp["challenge"], "challenge-1");
+    }
+
+    #[tokio::test]
+    async fn accept_consent_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .accept_consent_request("challenge-1", json!({ "grant_scope": ["openid"] }))
+            .await
+            .unwrap();
+        assert_eq!(resp["redirect_to"], "http://redirect");
+    }
+
+    #[tokio::test]
+    async fn reject_consent_request_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .reject_consent_request("challenge-1", json!({ "error": "denied" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["body"]["error"], "denied");
+    }
+
+    #[tokio::test]
+    async fn authorize_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .authorize(vec![
+                ("redirect_uri".to_string(), "http://return".to_string()),
+                ("state".to_string(), "state-1".to_string()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(resp["redirect_to"], "http://return");
+        assert_eq!(resp["state"], "state-1");
+    }
+
+    #[tokio::test]
+    async fn token_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .token(vec![("code".to_string(), "code-1".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(resp["access_token"], "code-1");
+        assert_eq!(resp["token_type"], "Bearer");
+    }
+
+    #[tokio::test]
+    async fn userinfo_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client.userinfo("token-1").await.unwrap();
+        assert_eq!(resp["sub"], "token-1");
+    }
+
+    #[tokio::test]
+    async fn revoke_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        client
+            .revoke(vec![("token".to_string(), "token-1".to_string())])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_json_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let url = client.public_url().join("proxy-json").unwrap();
+        let resp = client.get_json(url).await.unwrap();
+        assert_eq!(resp["proxied"], true);
+    }
+
+    #[tokio::test]
+    async fn get_oauth2_client_error() {
+        let app = Router::new().route("/admin/clients/{id}", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.get_oauth2_client("client-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_oauth2_client_error() {
+        let app = Router::new().route("/admin/clients/{id}", delete(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.delete_oauth2_client("client-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn update_oauth2_client_error() {
+        let app = Router::new().route("/admin/clients/{id}", put(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .update_oauth2_client("client-1", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn introspect_token_error() {
+        let app = Router::new().route("/oauth2/introspect", post(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.introspect_token("token-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_login_request_error() {
+        let app = Router::new().route("/admin/oauth2/auth/requests/login", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.get_login_request("challenge-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn authorize_error() {
+        let app = Router::new().route("/oauth2/auth", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.authorize(vec![]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn token_error() {
+        let app = Router::new().route("/oauth2/token", post(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.token(vec![]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn userinfo_error() {
+        let app = Router::new().route("/userinfo", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.userinfo("token-1").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn revoke_error() {
+        let app = Router::new().route("/oauth2/revoke", post(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.revoke(vec![]).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn get_json_error() {
+        let app = Router::new().route("/proxy-json", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let url = client.public_url().join("proxy-json").unwrap();
+        let err = client.get_json(url).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn new_with_invalid_url() {
+        let err = HydraClient::new("not-a-url", "http://example.com/").unwrap_err();
+        assert!(matches!(err, OryClientError::InvalidResponse(_)));
     }
 }
