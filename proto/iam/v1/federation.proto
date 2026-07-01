@@ -2,62 +2,102 @@ syntax = "proto3";
 
 package iam.v1;
 
-import "google/protobuf/struct.proto";
 import "iam/v1/identity.proto";
 
 option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
 
+// OpenIDConfiguration exposes the OIDC discovery document.
 message OpenIDConfiguration {
+  // OIDC issuer identifier.
   string issuer = 1;
+  // URL of the OAuth2 authorization endpoint.
   string authorization_endpoint = 2;
+  // URL of the OAuth2 token endpoint.
   string token_endpoint = 3;
+  // URL of the OIDC userinfo endpoint.
   string userinfo_endpoint = 4;
+  // URL of the JSON Web Key Set endpoint.
   string jwks_uri = 5;
+  // Response types supported by the authorization server.
   repeated string response_types_supported = 6;
+  // Grant types supported by the authorization server.
   repeated string grant_types_supported = 7;
+  // Subject identifier types supported.
   repeated string subject_types_supported = 8;
+  // Signing algorithms supported for ID tokens.
   repeated string id_token_signing_alg_values_supported = 9;
+  // Scopes supported by the authorization server.
   repeated string scopes_supported = 10;
 }
 
+// JSONWebKey represents a single public key in a JWKS.
 message JSONWebKey {
+  // Key type, e.g. RSA or EC.
   string kty = 1;
+  // Intended use of the key, e.g. sig or enc.
   string use = 2;
+  // Key identifier.
   string kid = 3;
+  // Algorithm intended for use with the key.
   string alg = 4;
+  // RSA modulus.
   string n = 5;
+  // RSA public exponent.
   string e = 6;
+  // EC x coordinate.
   string x = 7;
+  // EC y coordinate.
   string y = 8;
+  // EC curve name.
   string crv = 9;
 }
 
+// JSONWebKeySet is a collection of JSON Web Keys.
 message JSONWebKeySet {
+  // Public keys exposed by the gateway.
   repeated JSONWebKey keys = 1;
 }
 
+// GetOpenIDConfigurationRequest fetches the OIDC discovery document.
 message GetOpenIDConfigurationRequest {}
+
+// GetJSONWebKeysRequest fetches the public signing keys.
 message GetJSONWebKeysRequest {}
 
+// SamlLoginResponse is returned when a SAML login is initiated.
 message SamlLoginResponse {
+  // URL to redirect the browser to for authentication.
   string redirect_url = 1;
+  // Identifier for the SAML authentication request.
   string request_id = 2;
 }
 
+// InitiateSamlLoginRequest starts a SAML login via an external provider.
 message InitiateSamlLoginRequest {
+  // Gateway identifier of the SAML provider.
   string provider_id = 1;
+  // Opaque state returned to the ACS endpoint.
   string relay_state = 2;
 }
 
+// AcceptSamlAssertionRequest validates an incoming SAML assertion.
 message AcceptSamlAssertionRequest {
+  // Gateway identifier of the SAML provider.
   string provider_id = 1;
+  // Base64-encoded SAML assertion from the identity provider.
   string encoded_assertion = 2;
+  // Opaque state from the authentication request.
   string relay_state = 3;
 }
 
+// FederationService exposes OIDC discovery, JWKS, and SAML login flows.
 service FederationService {
+  // GetOpenIDConfiguration returns the OIDC discovery document.
   rpc GetOpenIDConfiguration(GetOpenIDConfigurationRequest) returns (OpenIDConfiguration);
+  // GetJSONWebKeys returns the public signing keys.
   rpc GetJSONWebKeys(GetJSONWebKeysRequest) returns (JSONWebKeySet);
+  // InitiateSamlLogin redirects the browser to an external SAML identity provider.
   rpc InitiateSamlLogin(InitiateSamlLoginRequest) returns (SamlLoginResponse);
+  // AcceptSamlAssertion validates a SAML assertion and creates a session.
   rpc AcceptSamlAssertion(AcceptSamlAssertionRequest) returns (Session);
 }

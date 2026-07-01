@@ -2,59 +2,93 @@ syntax = "proto3";
 
 package iam.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "iam/v1/common.proto";
 
 option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
 
+// Tenant is an isolated organization in the gateway.
 message Tenant {
+  // Gateway identifier for the tenant.
   string id = 1;
+  // URL-safe identifier for the tenant.
   string slug = 2;
+  // Human-readable display name.
   string display_name = 3;
+  // Timestamp when the tenant was created.
   google.protobuf.Timestamp created_at = 4;
+  // Tenant-specific settings as key-value pairs.
   map<string, string> settings = 5;
 }
 
+// ApiKey is a tenant-scoped API credential.
 message ApiKey {
+  // Gateway identifier for the API key.
   string id = 1;
+  // Tenant that owns the API key.
   string tenant_id = 2;
+  // Human-readable name for the API key.
   string name = 3;
+  // Scopes granted to the API key.
   repeated string scopes = 4;
+  // Plaintext secret shown only immediately after creation or rotation.
   string plaintext = 5;
+  // Timestamp when the API key expires.
   google.protobuf.Timestamp expires_at = 6;
+  // Timestamp when the API key was created.
   google.protobuf.Timestamp created_at = 7;
 }
 
+// CreateTenantRequest is the input for creating a new tenant.
 message CreateTenantRequest {
+  // URL-safe identifier for the tenant.
   string slug = 1;
+  // Human-readable display name.
   string display_name = 2;
+  // Initial tenant-specific settings.
   map<string, string> settings = 3;
 }
 
+// GetTenantRequest identifies a tenant to fetch.
 message GetTenantRequest {
+  // Gateway identifier for the tenant.
   string id = 1;
 }
 
+// ListTenantsRequest is the input for paginating tenants.
 message ListTenantsRequest {
+  // Pagination parameters.
   PageRequest page = 1;
 }
 
+// ListTenantsResponse is the output of a paginated tenant list.
 message ListTenantsResponse {
+  // Tenants on the current page.
   repeated Tenant tenants = 1;
+  // Pagination metadata.
   PageResponse page = 2;
 }
 
+// RotateApiKeyRequest is the input for rotating a tenant API key.
 message RotateApiKeyRequest {
+  // Tenant that owns the API key.
   string tenant_id = 1;
+  // Human-readable name for the new API key.
   string name = 2;
+  // Scopes granted to the new API key.
   repeated string scopes = 3;
+  // Expiration timestamp for the new API key.
   google.protobuf.Timestamp expires_at = 4;
 }
 
+// TenantService manages tenants and their API credentials.
 service TenantService {
+  // CreateTenant creates a new tenant.
   rpc CreateTenant(CreateTenantRequest) returns (Tenant);
+  // GetTenant retrieves an existing tenant.
   rpc GetTenant(GetTenantRequest) returns (Tenant);
+  // ListTenants returns a paginated list of tenants.
   rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  // RotateApiKey generates a new API key for the tenant.
   rpc RotateApiKey(RotateApiKeyRequest) returns (ApiKey);
 }

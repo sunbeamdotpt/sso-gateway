@@ -8,68 +8,114 @@ import "iam/v1/common.proto";
 
 option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
 
+// RelationTuple is a single permission relation stored for a tenant.
 message RelationTuple {
+  // Gateway identifier for the tuple.
   string id = 1;
+  // Tenant that owns the tuple.
   string tenant_id = 2;
+  // Namespace of the object.
   string namespace = 3;
+  // Identifier of the object.
   string object = 4;
+  // Relation between the object and the subject.
   string relation = 5;
+  // Direct subject identifier, if the subject is a concrete identity.
   string subject_id = 6;
+  // Namespace of a subject set, if the subject is a set.
   string subject_set_namespace = 7;
+  // Object of a subject set, if the subject is a set.
   string subject_set_object = 8;
+  // Relation of a subject set, if the subject is a set.
   string subject_set_relation = 9;
+  // Timestamp when the tuple was created.
   google.protobuf.Timestamp created_at = 10;
 }
 
+// CheckPermissionRequest asks whether a subject has a relation on an object.
 message CheckPermissionRequest {
+  // Namespace of the object.
   string namespace = 1;
+  // Identifier of the object.
   string object = 2;
+  // Relation to check.
   string relation = 3;
+  // Direct subject identifier.
   string subject_id = 4;
 }
 
+// CheckPermissionResponse is the result of a permission check.
 message CheckPermissionResponse {
+  // Whether the subject is allowed the requested relation.
   bool allowed = 1;
 }
 
+// CreateRelationTupleRequest is the input for creating a relation tuple.
 message CreateRelationTupleRequest {
+  // Namespace of the object.
   string namespace = 1;
+  // Identifier of the object.
   string object = 2;
+  // Relation between the object and the subject.
   string relation = 3;
+  // Direct subject identifier.
   string subject_id = 4;
 }
 
+// DeleteRelationTupleRequest identifies a relation tuple to delete.
 message DeleteRelationTupleRequest {
+  // Gateway identifier for the tuple.
   string id = 1;
 }
 
+// ExpandPermissionsRequest expands all tuples for an object relation.
 message ExpandPermissionsRequest {
+  // Namespace of the object.
   string namespace = 1;
+  // Identifier of the object.
   string object = 2;
+  // Relation to expand.
   string relation = 3;
 }
 
+// ExpandPermissionsResponse is the result of expanding a permission tree.
 message ExpandPermissionsResponse {
+  // Relation tuples included in the expansion.
   repeated RelationTuple tuples = 1;
+  // String representation of the permission tree.
   string tree = 2;
 }
 
+// ListRelationTuplesRequest is the input for paginating relation tuples.
 message ListRelationTuplesRequest {
+  // Filter by namespace.
   string namespace = 1;
+  // Filter by object.
   string object = 2;
+  // Filter by relation.
   string relation = 3;
+  // Pagination parameters.
   PageRequest page = 4;
 }
 
+// ListRelationTuplesResponse is the output of a paginated tuple list.
 message ListRelationTuplesResponse {
+  // Relation tuples on the current page.
   repeated RelationTuple tuples = 1;
+  // Pagination metadata.
   PageResponse page = 2;
 }
 
+// PermissionService manages relation tuples and checks permissions.
 service PermissionService {
+  // CheckPermission returns whether a subject has a relation on an object.
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  // CreateRelationTuple creates a new relation tuple.
   rpc CreateRelationTuple(CreateRelationTupleRequest) returns (RelationTuple);
+  // DeleteRelationTuple removes a relation tuple.
   rpc DeleteRelationTuple(DeleteRelationTupleRequest) returns (google.protobuf.Empty);
+  // ExpandPermissions returns the expanded permission tree for an object relation.
   rpc ExpandPermissions(ExpandPermissionsRequest) returns (ExpandPermissionsResponse);
+  // ListRelationTuples returns a paginated list of relation tuples.
   rpc ListRelationTuples(ListRelationTuplesRequest) returns (ListRelationTuplesResponse);
 }
