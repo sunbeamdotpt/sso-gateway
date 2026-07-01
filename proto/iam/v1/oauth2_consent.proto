@@ -6,6 +6,24 @@ import "google/protobuf/struct.proto";
 
 option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
 
+// OAuth2Client surfaces the client metadata relevant to consent/logout decisions.
+message OAuth2Client {
+  string client_id = 1;
+  string client_name = 2;
+  string client_uri = 3;
+  string logo_uri = 4;
+  repeated string redirect_uris = 5;
+  bool skip_consent = 6;
+  bool skip_logout_consent = 7;
+  repeated string grant_types = 8;
+  repeated string response_types = 9;
+  string scope = 10;
+  string policy_uri = 11;
+  string tos_uri = 12;
+  string jwks_uri = 13;
+  google.protobuf.Struct metadata = 14;
+}
+
 // ConsentRequest is the gateway's view of a Hydra OAuth2 consent request.
 message ConsentRequest {
   string challenge = 1;
@@ -16,6 +34,7 @@ message ConsentRequest {
   repeated string requested_scope = 6;
   repeated string requested_access_token_audience = 7;
   google.protobuf.Struct oidc_context = 8;
+  OAuth2Client client = 9;
 }
 
 message AcceptConsentRequest {
@@ -46,6 +65,7 @@ message LogoutRequest {
   string client_id = 3;
   string request_url = 4;
   string post_logout_redirect_uri = 5;
+  OAuth2Client client = 6;
 }
 
 message AcceptLogoutRequest {

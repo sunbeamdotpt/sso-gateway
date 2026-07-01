@@ -6,8 +6,40 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "iam/v1/identity.proto";
+import "iam/v1/oauth2_consent.proto";
 
 option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// BrowserIdentity is the gateway's view of an identity inside a browser session.
+// It is intentionally separate from the admin Identity message in identity.proto.
+message BrowserIdentity {
+  string id = 1;
+  google.protobuf.Struct traits = 2;
+  repeated VerifiableAddress verifiable_addresses = 3;
+  repeated RecoveryAddress recovery_addresses = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  string schema_id = 7;
+}
+
+message VerifiableAddress {
+  string id = 1;
+  string value = 2;
+  bool verified = 3;
+  string via = 4;
+  string status = 5;
+  google.protobuf.Timestamp verified_at = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message RecoveryAddress {
+  string id = 1;
+  string value = 2;
+  string via = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
 
 // BrowserSession is the gateway's view of an authenticated session.
 // It is intentionally separate from the admin Session message in identity.proto.
@@ -21,6 +53,7 @@ message BrowserSession {
   google.protobuf.Timestamp issued_at = 7;
   string authenticator_assurance_level = 8;
   google.protobuf.Struct identity_traits = 9;
+  BrowserIdentity identity = 10;
 }
 
 // SelfServiceFlow is the gateway's opaque representation of a Kratos self-service
@@ -37,6 +70,8 @@ message SelfServiceFlow {
   string identity_schema_id = 9;
   OAuth2LoginRequest oauth2_login_request = 10;
   UiContainer ui = 11;
+  bool refresh = 12;
+  string requested_aal = 13;
 }
 
 // UiContainer carries the action, method, nodes and messages rendered by the UI.
@@ -62,9 +97,20 @@ message UiNode {
   }
 }
 
+message UiText {
+  string id = 1;
+  string text = 2;
+  string type = 3;
+  google.protobuf.Struct context = 4;
+}
+
 message UiNodeMeta {
-  string label_id = 1;
-  string label_text = 2;
+  UiText label = 1;
+  string label_id = 2;
+  string label_text = 3;
+  string brand = 4;
+  string name = 5;
+  string title = 6;
 }
 
 message UiNodeInputAttributes {
@@ -75,47 +121,59 @@ message UiNodeInputAttributes {
   bool disabled = 5;
   string autocomplete = 6;
   string node_type = 7;
+  UiText label = 8;
+  string pattern = 9;
+  int64 maxlength = 10;
+  int64 minlength = 11;
+  string placeholder = 12;
+  string onclick = 13;
+  string src = 14;
+  string nonce = 15;
+  string crossorigin = 16;
+  string integrity = 17;
+  bool async = 18;
+  string referrerpolicy = 19;
+  bool multiple = 20;
+  string step = 21;
 }
 
 message UiNodeTextAttributes {
-  string id = 1;
-  string text = 2;
+  string node_type = 1;
+  UiText text = 2;
 }
 
 message UiNodeAnchorAttributes {
   string href = 1;
   string title = 2;
   string id = 3;
+  string node_type = 4;
 }
 
 message UiNodeImageAttributes {
   string src = 1;
-  string width = 2;
-  string height = 3;
+  int64 width = 2;
+  int64 height = 3;
   string id = 4;
+  string node_type = 5;
 }
 
 message UiNodeScriptAttributes {
   string src = 1;
-  string async = 2;
+  bool async = 2;
   string referrerpolicy = 3;
   string crossorigin = 4;
   string integrity = 5;
   string type = 6;
   string id = 7;
   string nonce = 8;
+  string node_type = 9;
 }
 
 message UiMessage {
   string id = 1;
   string text = 2;
   string type = 3;
-  repeated UiMessageContext context = 4;
-}
-
-message UiMessageContext {
-  string key = 1;
-  string value = 2;
+  google.protobuf.Struct context = 4;
 }
 
 // OAuth2LoginRequest surfaces the OIDC login request embedded in a login flow.
@@ -127,6 +185,7 @@ message OAuth2LoginRequest {
   repeated string requested_access_token_audience = 5;
   string subject = 6;
   bool skip = 7;
+  iam.v1.OAuth2Client client = 8;
 }
 
 // LogoutFlow is returned when a browser logout flow is created.

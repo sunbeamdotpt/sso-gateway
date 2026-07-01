@@ -110,10 +110,18 @@ message SetDefaultIdentitySchemaRequest {
 
 message CreateLoginFlowRequest {
   string return_to = 1;
+  string aal = 2;
+  bool refresh = 3;
+  string organization = 4;
+  string via = 5;
+  string login_challenge = 6;
+  string identity_schema = 7;
 }
 
 message CreateRegistrationFlowRequest {
   string return_to = 1;
+  string login_challenge = 2;
+  string identity_schema = 3;
 }
 
 message GetSessionRequest {
