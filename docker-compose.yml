@@ -15,16 +15,6 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   hydra-migrate:
     image: oryd/hydra:v2.2.0
     environment:
@@ -116,7 +106,6 @@ services:
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgres://ory:ory@postgres:5432/ory?sslmode=disable
-      REDIS_URL: redis://redis:6379
       HYDRA_ADMIN_URL: http://hydra:4445
       HYDRA_PUBLIC_URL: http://hydra:4444
       KRATOS_ADMIN_URL: http://kratos:4434
@@ -125,13 +114,17 @@ services:
       KETO_WRITE_URL: http://keto:4467
       KETO_GRPC_URL: http://keto:4469
       BIND_ADDR: 0.0.0.0:8080
+      SYSTEM_TENANT_ULID: 01HZY9JTKKHK3Y6XJJYHZ9Q5TV
+      SYSTEM_BOOTSTRAP_CLIENT_ID: system-bootstrap-client
+      SYSTEM_BOOTSTRAP_CLIENT_SECRET: system-bootstrap-secret
+      STATE_COOKIE_SECRET: change-me-in-production-cookie-secret
+      ALLOWED_RETURN_TO_HOSTS: localhost
     ports:
       - "8080:8080"
     depends_on:
       - hydra
       - kratos
       - keto
-      - redis
 
 volumes:
   postgres-data:

@@ -22,7 +22,6 @@ deps:
     - hydra
     - kratos
     - keto
-    - redis
 tenant:
   namespace: sso-gateway
 outputs:

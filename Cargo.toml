@@ -21,8 +21,6 @@ sunbeam-g2v = { version = "0.3.3", default-features = false, features = [
     "jwt",
     "keto",
     "vault",
-    "election",
-    "redis",
     "tls",
 ] }
 connectrpc = { version = "0.7" }
