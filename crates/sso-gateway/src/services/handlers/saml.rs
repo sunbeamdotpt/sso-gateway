@@ -147,7 +147,13 @@ mod tests {
     #[async_trait]
     impl SamlMetadataService for StubMetadataService {
         async fn generate_metadata(&self, _provider_id: &str) -> Result<String, SamlError> {
-            match self.result.lock().unwrap().take().expect("stub not configured") {
+            match self
+                .result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stub not configured")
+            {
                 StubMetadataResult::Ok(xml) => Ok(xml),
                 StubMetadataResult::Db(err) => Err(err.into()),
                 StubMetadataResult::Service(err) => Err(err.into()),
@@ -231,7 +237,10 @@ mod tests {
     async fn metadata_returns_bad_request_when_provider_id_missing() {
         let state = test_state(None);
         let params = HashMap::new();
-        let resp = metadata(State(state), Query(params)).await.unwrap_err().into_response();
+        let resp = metadata(State(state), Query(params))
+            .await
+            .unwrap_err()
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_to_string(resp).await;
         assert!(body.contains("missing provider_id"));

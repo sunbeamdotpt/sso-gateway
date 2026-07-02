@@ -4,22 +4,19 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    extract::{Json, Path, Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    extract::{Extension, Json, Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::{Value, json};
-use sso_ory_client::{error::OryClientError, hydra::HydraClient};
-use tracing::warn;
 
 use crate::{
-    db::{IdMappingRepo, IdMappingStore},
+    auth::{AuthContext, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ},
     proto::iam::v1::{ScimGroup, ScimUser},
     services::scim::ScimServiceImpl,
 };
 
-const BACKEND_HYDRA: &str = "hydra";
 const SCIM_CONTENT_TYPE: &str = "application/scim+json";
 
 /// A boxed SCIM error response keeps the `Result` error variant small.
@@ -42,26 +39,16 @@ impl From<connectrpc::ConnectError> for ScimError {
     }
 }
 
-/// Async trait for the Hydra operations used by the SCIM HTTP handlers.
-#[async_trait]
-pub trait ScimHydra: Send + Sync + 'static {
-    async fn introspect_token(&self, token: &str) -> Result<Value, OryClientError>;
-}
-
-#[async_trait]
-impl ScimHydra for HydraClient {
-    async fn introspect_token(&self, token: &str) -> Result<Value, OryClientError> {
-        self.introspect_token(token).await
-    }
-}
-
 /// Async trait for the SCIM service operations used by the HTTP handlers.
 #[async_trait]
 pub trait ScimServiceOps: Send + Sync + 'static {
     async fn list_users_http(
         &self,
         tenant_id: String,
-    ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>, connectrpc::ConnectError>;
+    ) -> Result<
+        connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>,
+        connectrpc::ConnectError,
+    >;
     async fn create_user_http(
         &self,
         tenant_id: String,
@@ -86,7 +73,10 @@ pub trait ScimServiceOps: Send + Sync + 'static {
     async fn list_groups_http(
         &self,
         tenant_id: String,
-    ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>, connectrpc::ConnectError>;
+    ) -> Result<
+        connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>,
+        connectrpc::ConnectError,
+    >;
     async fn create_group_http(
         &self,
         tenant_id: String,
@@ -115,8 +105,10 @@ impl ScimServiceOps for ScimServiceImpl {
     async fn list_users_http(
         &self,
         tenant_id: String,
-    ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>, connectrpc::ConnectError>
-    {
+    ) -> Result<
+        connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>,
+        connectrpc::ConnectError,
+    > {
         self.list_users_http(tenant_id).await
     }
 
@@ -157,8 +149,10 @@ impl ScimServiceOps for ScimServiceImpl {
     async fn list_groups_http(
         &self,
         tenant_id: String,
-    ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>, connectrpc::ConnectError>
-    {
+    ) -> Result<
+        connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>,
+        connectrpc::ConnectError,
+    > {
         self.list_groups_http(tenant_id).await
     }
 
@@ -200,16 +194,12 @@ impl ScimServiceOps for ScimServiceImpl {
 #[derive(Clone)]
 pub struct ScimState {
     pub(crate) service: Arc<dyn ScimServiceOps>,
-    pub(crate) hydra: Arc<dyn ScimHydra>,
-    pub(crate) mappings: Arc<dyn IdMappingStore>,
 }
 
 impl ScimState {
-    pub fn new(service: Arc<ScimServiceImpl>, hydra: Arc<HydraClient>, mappings: IdMappingRepo) -> Self {
+    pub fn new(service: Arc<ScimServiceImpl>) -> Self {
         Self {
             service: service as Arc<dyn ScimServiceOps>,
-            hydra: hydra as Arc<dyn ScimHydra>,
-            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
         }
     }
 }
@@ -233,60 +223,6 @@ pub fn router(state: Arc<ScimState>) -> Router {
             get(get_group).put(update_group).delete(delete_group),
         )
         .with_state(state)
-}
-
-async fn resolve_tenant(state: &ScimState, headers: &HeaderMap) -> Result<String, ScimError> {
-    let token = match bearer_token(headers) {
-        Some(t) => t,
-        None => {
-            return Err(ScimError::Response(Box::new(scim_error(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-            ))));
-        }
-    };
-
-    let introspect = state.hydra.introspect_token(token).await.map_err(|e| {
-        warn!("token introspection failed: {}", e);
-        ScimError::Response(Box::new(scim_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-        )))
-    })?;
-
-    if !introspect["active"].as_bool().unwrap_or(false) {
-        return Err(ScimError::Response(Box::new(scim_error(
-            StatusCode::UNAUTHORIZED,
-            "token inactive",
-        ))));
-    }
-
-    let sub = introspect["sub"].as_str().ok_or_else(|| {
-        ScimError::Response(Box::new(scim_error(
-            StatusCode::UNAUTHORIZED,
-            "missing subject",
-        )))
-    })?;
-
-    let tenant_id = state
-        .mappings
-        .get_tenant_id_by_ory_id(BACKEND_HYDRA, sub)
-        .await
-        .map_err(|e| {
-            warn!("tenant lookup failed for subject {}: {}", sub, e);
-            ScimError::Response(Box::new(scim_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-            )))
-        })?;
-
-    match tenant_id {
-        Some(t) => Ok(t),
-        None => Err(ScimError::Response(Box::new(scim_error(
-            StatusCode::UNAUTHORIZED,
-            "unknown client",
-        )))),
-    }
 }
 
 async fn service_provider_config() -> impl IntoResponse {
@@ -329,11 +265,11 @@ async fn schemas() -> impl IntoResponse {
 
 async fn list_users(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Query(_params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.list_users_http(tenant_id).await?;
+    require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
+    let resp = state.service.list_users_http(auth_ctx.tenant_id).await?;
     let users: Vec<Value> = resp
         .body
         .users
@@ -345,11 +281,14 @@ async fn list_users(
 
 async fn create_user(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Json(user): Json<ScimUser>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.create_user_http(tenant_id, user).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
+    let resp = state
+        .service
+        .create_user_http(auth_ctx.tenant_id, user)
+        .await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
     ))
@@ -357,11 +296,11 @@ async fn create_user(
 
 async fn get_user(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.get_user_http(tenant_id, id).await?;
+    require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
+    let resp = state.service.get_user_http(auth_ctx.tenant_id, id).await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
     ))
@@ -369,12 +308,15 @@ async fn get_user(
 
 async fn update_user(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
     Json(user): Json<ScimUser>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.update_user_http(tenant_id, id, user).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
+    let resp = state
+        .service
+        .update_user_http(auth_ctx.tenant_id, id, user)
+        .await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
     ))
@@ -382,21 +324,24 @@ async fn update_user(
 
 async fn delete_user(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let _ = state.service.delete_user_http(tenant_id, id).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
+    let _ = state
+        .service
+        .delete_user_http(auth_ctx.tenant_id, id)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn list_groups(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Query(_params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.list_groups_http(tenant_id).await?;
+    require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
+    let resp = state.service.list_groups_http(auth_ctx.tenant_id).await?;
     let groups: Vec<Value> = resp
         .body
         .groups
@@ -408,11 +353,14 @@ async fn list_groups(
 
 async fn create_group(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Json(group): Json<ScimGroup>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.create_group_http(tenant_id, group).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
+    let resp = state
+        .service
+        .create_group_http(auth_ctx.tenant_id, group)
+        .await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
     ))
@@ -420,11 +368,11 @@ async fn create_group(
 
 async fn get_group(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let resp = state.service.get_group_http(tenant_id, id).await?;
+    require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
+    let resp = state.service.get_group_http(auth_ctx.tenant_id, id).await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
     ))
@@ -432,14 +380,14 @@ async fn get_group(
 
 async fn update_group(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
     Json(group): Json<ScimGroup>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
     let resp = state
         .service
-        .update_group_http(tenant_id, id, group)
+        .update_group_http(auth_ctx.tenant_id, id, group)
         .await?;
     Ok(scim_json(
         serde_json::to_value(resp.body).unwrap_or_default(),
@@ -448,19 +396,15 @@ async fn update_group(
 
 async fn delete_group(
     State(state): State<Arc<ScimState>>,
-    headers: HeaderMap,
+    Extension(auth_ctx): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Response<Body>, ScimError> {
-    let tenant_id = resolve_tenant(&state, &headers).await?;
-    let _ = state.service.delete_group_http(tenant_id, id).await?;
+    require_scope(&auth_ctx, SCOPE_SCIM_ADMIN)?;
+    let _ = state
+        .service
+        .delete_group_http(auth_ctx.tenant_id, id)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
 }
 
 fn list_response(items: Vec<Value>) -> Value {
@@ -495,6 +439,26 @@ fn scim_error(status: StatusCode, detail: &str) -> Response<Body> {
         .into_response()
 }
 
+fn require_scope(auth_ctx: &AuthContext, scope: &str) -> Result<(), ScimError> {
+    if !auth_ctx.scopes.iter().any(|s| s == scope) {
+        return Err(ScimError::Response(Box::new(scim_error(
+            StatusCode::FORBIDDEN,
+            &format!("missing required scope: {scope}"),
+        ))));
+    }
+    Ok(())
+}
+
+fn require_scope_any(auth_ctx: &AuthContext, scopes: &[&str]) -> Result<(), ScimError> {
+    if !auth_ctx.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ScimError::Response(Box::new(scim_error(
+            StatusCode::FORBIDDEN,
+            &format!("missing required scope: one of {}", scopes.join(", ")),
+        ))));
+    }
+    Ok(())
+}
+
 fn map_service_error(err: connectrpc::ConnectError) -> Response<Body> {
     let status = match err.code {
         connectrpc::ErrorCode::InvalidArgument => StatusCode::BAD_REQUEST,
@@ -510,28 +474,38 @@ fn map_service_error(err: connectrpc::ConnectError) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::extract::Request;
+    use axum::http::header::AUTHORIZATION;
     use http_body_util::BodyExt;
     use std::sync::Mutex;
 
-    use axum::extract::Request;
+    use crate::auth::{IntrospectionResult, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, TokenIntrospector};
+    use crate::db::{IdMappingStore, SessionStore};
+    use crate::middleware::auth_middleware;
 
     #[derive(Clone, Default)]
-    struct StubHydra {
-        introspect_result: Arc<std::sync::Mutex<Option<Result<Value, OryClientError>>>>,
+    struct StubIntrospector {
+        result: Arc<Mutex<Option<Result<IntrospectionResult, crate::auth::AuthError>>>>,
     }
 
     #[async_trait]
-    impl ScimHydra for StubHydra {
-        async fn introspect_token(&self, _token: &str) -> Result<Value, OryClientError> {
-            self.introspect_result.lock().unwrap().take().expect("stub not configured")
+    impl TokenIntrospector for StubIntrospector {
+        async fn introspect(
+            &self,
+            _token: &str,
+        ) -> Result<IntrospectionResult, crate::auth::AuthError> {
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(crate::auth::AuthError::InactiveToken))
         }
     }
 
     #[derive(Clone, Default)]
     struct StubMappingStore {
         #[allow(clippy::type_complexity)]
-        tenant_by_ory_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
+        tenant_by_ory_id: Arc<Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
     }
 
     #[async_trait]
@@ -586,129 +560,86 @@ mod tests {
             _backend: &str,
             _ory_global_id: &str,
         ) -> Result<Option<String>, crate::db::DbError> {
-            self.tenant_by_ory_id.lock().unwrap().take().expect("stub not configured")
+            self.tenant_by_ory_id
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stub not configured")
         }
     }
 
-    fn test_state(
-        hydra_result: Option<Result<Value, OryClientError>>,
-        mapping_result: Option<Result<Option<String>, crate::db::DbError>>,
-    ) -> ScimState {
-        #[derive(Default)]
-        struct NoOpService;
+    fn test_introspector() -> Arc<dyn TokenIntrospector> {
+        introspector_with_scopes(vec![SCOPE_SCIM_READ.into(), SCOPE_SCIM_ADMIN.into()])
+    }
 
-        #[async_trait]
-        impl ScimServiceOps for NoOpService {
-            async fn list_users_http(
-                &self,
-                _tenant_id: String,
-            ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>, connectrpc::ConnectError>
-            {
-                unimplemented!()
-            }
-            async fn create_user_http(
-                &self,
-                _tenant_id: String,
-                _user: ScimUser,
-            ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn get_user_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-            ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn update_user_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-                _user: ScimUser,
-            ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn delete_user_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-            ) -> Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError>
-            {
-                unimplemented!()
-            }
-            async fn list_groups_http(
-                &self,
-                _tenant_id: String,
-            ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>, connectrpc::ConnectError>
-            {
-                unimplemented!()
-            }
-            async fn create_group_http(
-                &self,
-                _tenant_id: String,
-                _group: ScimGroup,
-            ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn get_group_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-            ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn update_group_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-                _group: ScimGroup,
-            ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-                unimplemented!()
-            }
-            async fn delete_group_http(
-                &self,
-                _tenant_id: String,
-                _id: String,
-            ) -> Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError>
-            {
-                unimplemented!()
-            }
+    fn introspector_with_scopes(scopes: Vec<String>) -> Arc<dyn TokenIntrospector> {
+        Arc::new(StubIntrospector {
+            result: Arc::new(Mutex::new(Some(Ok(IntrospectionResult {
+                active: true,
+                sub: Some("sub-1".into()),
+                scope: scopes,
+                exp: None,
+            })))),
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct StubSessionStore;
+
+    #[async_trait]
+    impl SessionStore for StubSessionStore {
+        async fn create(
+            &self,
+            _session_id: &str,
+            _sub: &str,
+            _tenant_id: &str,
+            _amr: &str,
+            _expires_at: time::OffsetDateTime,
+        ) -> Result<(), crate::db::DbError> {
+            Ok(())
         }
 
-        ScimState {
-            service: Arc::new(NoOpService),
-            hydra: Arc::new(StubHydra {
-                introspect_result: Arc::new(std::sync::Mutex::new(hydra_result)),
-            }),
-            mappings: Arc::new(StubMappingStore {
-                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(mapping_result)),
-            }),
+        async fn is_active(&self, _session_id: &str) -> Result<bool, crate::db::DbError> {
+            Ok(true)
+        }
+
+        async fn revoke(&self, _session_id: &str) -> Result<(), crate::db::DbError> {
+            Ok(())
+        }
+
+        async fn revoke_all_for_subject(&self, _sub: &str) -> Result<(), crate::db::DbError> {
+            Ok(())
         }
     }
 
-    fn error_status(err: &ScimError) -> StatusCode {
-        match err {
-            ScimError::Response(resp) => resp.status(),
-        }
+    fn test_session_store() -> Arc<dyn SessionStore> {
+        Arc::new(StubSessionStore)
+    }
+
+    fn test_mappings() -> Arc<dyn IdMappingStore> {
+        Arc::new(StubMappingStore {
+            tenant_by_ory_id: Arc::new(Mutex::new(Some(Ok(Some("tenant-1".to_string()))))),
+        })
+    }
+
+    fn auth_router(state: Arc<ScimState>) -> Router {
+        router(state)
+            .layer(axum::middleware::from_fn(auth_middleware))
+            .layer(axum::Extension(test_introspector()))
+            .layer(axum::Extension(
+                crate::session_token::SessionTokenSigner::new(
+                    "test-secret-that-is-at-least-32-bytes-long",
+                    3600,
+                    "https://gateway.example.com",
+                ),
+            ))
+            .layer(axum::Extension(test_mappings()))
+            .layer(axum::Extension(test_session_store()))
     }
 
     async fn body_to_json(resp: Response<Body>) -> Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    #[test]
-    fn bearer_token_extracts_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer scim-token"));
-        assert_eq!(bearer_token(&headers), Some("scim-token"));
-    }
-
-    #[test]
-    fn bearer_token_rejects_non_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
-        assert_eq!(bearer_token(&headers), None);
     }
 
     #[test]
@@ -803,94 +734,32 @@ mod tests {
         let body = body_to_json(resp).await;
         assert_eq!(body["totalResults"], 2);
         let resources = body["Resources"].as_array().unwrap();
-        assert!(resources.iter().any(|r| r["id"] == "urn:ietf:params:scim:schemas:core:2.0:User"));
-        assert!(resources.iter().any(|r| r["id"] == "urn:ietf:params:scim:schemas:core:2.0:Group"));
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_rejects_missing_authorization() {
-        let state = test_state(None, None);
-        let headers = HeaderMap::new();
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_rejects_inactive_token() {
-        let state = test_state(
-            Some(Ok(json!({"active": false}))),
-            None,
+        assert!(
+            resources
+                .iter()
+                .any(|r| r["id"] == "urn:ietf:params:scim:schemas:core:2.0:User")
         );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
-        let body = body_to_json(err.into_response()).await;
-        assert!(body["detail"].as_str().unwrap().contains("inactive"));
+        assert!(
+            resources
+                .iter()
+                .any(|r| r["id"] == "urn:ietf:params:scim:schemas:core:2.0:Group")
+        );
     }
 
-    #[tokio::test]
-    async fn resolve_tenant_rejects_missing_subject() {
-        let state = test_state(
-            Some(Ok(json!({"active": true}))),
-            None,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_rejects_unknown_client() {
-        let state = test_state(
-            Some(Ok(json!({"active": true, "sub": "sub-1"}))),
-            Some(Ok(None)),
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
-        let body = body_to_json(err.into_response()).await;
-        assert!(body["detail"].as_str().unwrap().contains("unknown client"));
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_maps_db_error_to_internal() {
-        let state = test_state(
-            Some(Ok(json!({"active": true, "sub": "sub-1"}))),
-            Some(Err(crate::db::DbError::Sqlx(sqlx::Error::PoolTimedOut))),
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_succeeds_for_active_known_token() {
-        let state = test_state(
-            Some(Ok(json!({"active": true, "sub": "sub-1"}))),
-            Some(Ok(Some("tenant-1".to_string()))),
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let tenant = resolve_tenant(&state, &headers).await.unwrap();
-        assert_eq!(tenant, "tenant-1");
-    }
+    type OptResp<T> = Arc<Mutex<Option<Result<connectrpc::Response<T>, connectrpc::ConnectError>>>>;
 
     #[derive(Clone, Default)]
     struct StubService {
-        list_users: Arc<Mutex<Option<Result<connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>, connectrpc::ConnectError>>>>,
-        create_user: Arc<Mutex<Option<Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError>>>>,
-        get_user: Arc<Mutex<Option<Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError>>>>,
-        update_user: Arc<Mutex<Option<Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError>>>>,
-        delete_user: Arc<Mutex<Option<Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError>>>>,
-        list_groups: Arc<Mutex<Option<Result<connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>, connectrpc::ConnectError>>>>,
-        create_group: Arc<Mutex<Option<Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError>>>>,
-        get_group: Arc<Mutex<Option<Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError>>>>,
-        update_group: Arc<Mutex<Option<Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError>>>>,
-        delete_group: Arc<Mutex<Option<Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError>>>>,
+        list_users: OptResp<crate::proto::iam::v1::ScimListUsersResponse>,
+        create_user: OptResp<ScimUser>,
+        get_user: OptResp<ScimUser>,
+        update_user: OptResp<ScimUser>,
+        delete_user: OptResp<buffa_types::google::protobuf::Empty>,
+        list_groups: OptResp<crate::proto::iam::v1::ScimListGroupsResponse>,
+        create_group: OptResp<ScimGroup>,
+        get_group: OptResp<ScimGroup>,
+        update_group: OptResp<ScimGroup>,
+        delete_group: OptResp<buffa_types::google::protobuf::Empty>,
     }
 
     #[async_trait]
@@ -898,22 +767,37 @@ mod tests {
         async fn list_users_http(
             &self,
             _tenant_id: String,
-        ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>, connectrpc::ConnectError> {
-            self.list_users.lock().unwrap().take().expect("list_users stub not configured")
+        ) -> Result<
+            connectrpc::Response<crate::proto::iam::v1::ScimListUsersResponse>,
+            connectrpc::ConnectError,
+        > {
+            self.list_users
+                .lock()
+                .unwrap()
+                .take()
+                .expect("list_users stub not configured")
         }
         async fn create_user_http(
             &self,
             _tenant_id: String,
             _user: ScimUser,
         ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-            self.create_user.lock().unwrap().take().expect("create_user stub not configured")
+            self.create_user
+                .lock()
+                .unwrap()
+                .take()
+                .expect("create_user stub not configured")
         }
         async fn get_user_http(
             &self,
             _tenant_id: String,
             _id: String,
         ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-            self.get_user.lock().unwrap().take().expect("get_user stub not configured")
+            self.get_user
+                .lock()
+                .unwrap()
+                .take()
+                .expect("get_user stub not configured")
         }
         async fn update_user_http(
             &self,
@@ -921,34 +805,60 @@ mod tests {
             _id: String,
             _user: ScimUser,
         ) -> Result<connectrpc::Response<ScimUser>, connectrpc::ConnectError> {
-            self.update_user.lock().unwrap().take().expect("update_user stub not configured")
+            self.update_user
+                .lock()
+                .unwrap()
+                .take()
+                .expect("update_user stub not configured")
         }
         async fn delete_user_http(
             &self,
             _tenant_id: String,
             _id: String,
-        ) -> Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError> {
-            self.delete_user.lock().unwrap().take().expect("delete_user stub not configured")
+        ) -> Result<
+            connectrpc::Response<buffa_types::google::protobuf::Empty>,
+            connectrpc::ConnectError,
+        > {
+            self.delete_user
+                .lock()
+                .unwrap()
+                .take()
+                .expect("delete_user stub not configured")
         }
         async fn list_groups_http(
             &self,
             _tenant_id: String,
-        ) -> Result<connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>, connectrpc::ConnectError> {
-            self.list_groups.lock().unwrap().take().expect("list_groups stub not configured")
+        ) -> Result<
+            connectrpc::Response<crate::proto::iam::v1::ScimListGroupsResponse>,
+            connectrpc::ConnectError,
+        > {
+            self.list_groups
+                .lock()
+                .unwrap()
+                .take()
+                .expect("list_groups stub not configured")
         }
         async fn create_group_http(
             &self,
             _tenant_id: String,
             _group: ScimGroup,
         ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-            self.create_group.lock().unwrap().take().expect("create_group stub not configured")
+            self.create_group
+                .lock()
+                .unwrap()
+                .take()
+                .expect("create_group stub not configured")
         }
         async fn get_group_http(
             &self,
             _tenant_id: String,
             _id: String,
         ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-            self.get_group.lock().unwrap().take().expect("get_group stub not configured")
+            self.get_group
+                .lock()
+                .unwrap()
+                .take()
+                .expect("get_group stub not configured")
         }
         async fn update_group_http(
             &self,
@@ -956,27 +866,30 @@ mod tests {
             _id: String,
             _group: ScimGroup,
         ) -> Result<connectrpc::Response<ScimGroup>, connectrpc::ConnectError> {
-            self.update_group.lock().unwrap().take().expect("update_group stub not configured")
+            self.update_group
+                .lock()
+                .unwrap()
+                .take()
+                .expect("update_group stub not configured")
         }
         async fn delete_group_http(
             &self,
             _tenant_id: String,
             _id: String,
-        ) -> Result<connectrpc::Response<buffa_types::google::protobuf::Empty>, connectrpc::ConnectError> {
-            self.delete_group.lock().unwrap().take().expect("delete_group stub not configured")
+        ) -> Result<
+            connectrpc::Response<buffa_types::google::protobuf::Empty>,
+            connectrpc::ConnectError,
+        > {
+            self.delete_group
+                .lock()
+                .unwrap()
+                .take()
+                .expect("delete_group stub not configured")
         }
     }
 
     fn route_state_with_service(service: Arc<dyn ScimServiceOps>) -> Arc<ScimState> {
-        Arc::new(ScimState {
-            service,
-            hydra: Arc::new(StubHydra {
-                introspect_result: Arc::new(Mutex::new(Some(Ok(json!({"active": true, "sub": "sub-1"}))))),
-            }),
-            mappings: Arc::new(StubMappingStore {
-                tenant_by_ory_id: Arc::new(Mutex::new(Some(Ok(Some("tenant-1".to_string()))))),
-            }),
-        })
+        Arc::new(ScimState { service })
     }
 
     fn authenticated_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -1001,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn router_exposes_service_provider_config() {
         let state = route_state_with_service(Arc::new(StubService::default()));
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/ServiceProviderConfig", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1010,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn router_exposes_resource_types() {
         let state = route_state_with_service(Arc::new(StubService::default()));
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/ResourceTypes", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1019,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn router_exposes_schemas() {
         let state = route_state_with_service(Arc::new(StubService::default()));
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Schemas", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1040,7 +953,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Users", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1058,8 +971,9 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
-        let req = authenticated_request("POST", "/scim/v2/Users", Some(json!({"userName": "alice"})));
+        let mut router = auth_router(state);
+        let req =
+            authenticated_request("POST", "/scim/v2/Users", Some(json!({"userName": "alice"})));
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_json(resp).await;
@@ -1077,7 +991,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Users/u1", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1096,8 +1010,12 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
-        let req = authenticated_request("PUT", "/scim/v2/Users/u1", Some(json!({"userName": "alison"})));
+        let mut router = auth_router(state);
+        let req = authenticated_request(
+            "PUT",
+            "/scim/v2/Users/u1",
+            Some(json!({"userName": "alison"})),
+        );
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_json(resp).await;
@@ -1113,7 +1031,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("DELETE", "/scim/v2/Users/u1", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1135,7 +1053,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Groups", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1154,8 +1072,12 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
-        let req = authenticated_request("POST", "/scim/v2/Groups", Some(json!({"displayName": "admins"})));
+        let mut router = auth_router(state);
+        let req = authenticated_request(
+            "POST",
+            "/scim/v2/Groups",
+            Some(json!({"displayName": "admins"})),
+        );
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_json(resp).await;
@@ -1173,7 +1095,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Groups/g1", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1192,8 +1114,12 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
-        let req = authenticated_request("PUT", "/scim/v2/Groups/g1", Some(json!({"displayName": "super-admins"})));
+        let mut router = auth_router(state);
+        let req = authenticated_request(
+            "PUT",
+            "/scim/v2/Groups/g1",
+            Some(json!({"displayName": "super-admins"})),
+        );
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_json(resp).await;
@@ -1209,7 +1135,7 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("DELETE", "/scim/v2/Groups/g1", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1225,41 +1151,10 @@ mod tests {
             ..Default::default()
         });
         let state = route_state_with_service(service);
-        let mut router = router(state);
+        let mut router = auth_router(state);
         let req = authenticated_request("GET", "/scim/v2/Users/missing", None);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn resolve_tenant_returns_unauthorized_on_introspection_error() {
-        let state = test_state(
-            Some(Err(OryClientError::Ory {
-                status: 401,
-                message: "invalid token".into(),
-            })),
-            None,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
-        let err = resolve_tenant(&state, &headers).await.unwrap_err();
-        assert_eq!(error_status(&err), StatusCode::UNAUTHORIZED);
-    }
-
-    fn route_state_with_service_and_auth(
-        service: Arc<dyn ScimServiceOps>,
-        introspect: Result<Value, OryClientError>,
-        mapping: Result<Option<String>, crate::db::DbError>,
-    ) -> Arc<ScimState> {
-        Arc::new(ScimState {
-            service,
-            hydra: Arc::new(StubHydra {
-                introspect_result: Arc::new(Mutex::new(Some(introspect))),
-            }),
-            mappings: Arc::new(StubMappingStore {
-                tenant_by_ory_id: Arc::new(Mutex::new(Some(mapping))),
-            }),
-        })
     }
 
     async fn assert_route_maps_service_error(
@@ -1268,12 +1163,8 @@ mod tests {
         body: Option<Value>,
         service: Arc<dyn ScimServiceOps>,
     ) {
-        let state = route_state_with_service_and_auth(
-            service,
-            Ok(json!({"active": true, "sub": "sub-1"})),
-            Ok(Some("tenant-1".to_string())),
-        );
-        let mut router = router(state);
+        let state = route_state_with_service(service);
+        let mut router = auth_router(state);
         let req = authenticated_request(method, uri, body);
         let resp = call(&mut router, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1300,7 +1191,13 @@ mod tests {
             ))))),
             ..Default::default()
         });
-        assert_route_maps_service_error("POST", "/scim/v2/Users", Some(json!({"userName": "alice"})), service).await;
+        assert_route_maps_service_error(
+            "POST",
+            "/scim/v2/Users",
+            Some(json!({"userName": "alice"})),
+            service,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1312,7 +1209,13 @@ mod tests {
             ))))),
             ..Default::default()
         });
-        assert_route_maps_service_error("PUT", "/scim/v2/Users/u1", Some(json!({"userName": "alison"})), service).await;
+        assert_route_maps_service_error(
+            "PUT",
+            "/scim/v2/Users/u1",
+            Some(json!({"userName": "alison"})),
+            service,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1348,7 +1251,13 @@ mod tests {
             ))))),
             ..Default::default()
         });
-        assert_route_maps_service_error("POST", "/scim/v2/Groups", Some(json!({"displayName": "admins"})), service).await;
+        assert_route_maps_service_error(
+            "POST",
+            "/scim/v2/Groups",
+            Some(json!({"displayName": "admins"})),
+            service,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1360,7 +1269,13 @@ mod tests {
             ))))),
             ..Default::default()
         });
-        assert_route_maps_service_error("PUT", "/scim/v2/Groups/g1", Some(json!({"displayName": "super-admins"})), service).await;
+        assert_route_maps_service_error(
+            "PUT",
+            "/scim/v2/Groups/g1",
+            Some(json!({"displayName": "super-admins"})),
+            service,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1385,5 +1300,90 @@ mod tests {
             ..Default::default()
         });
         assert_route_maps_service_error("GET", "/scim/v2/Groups/g1", None, service).await;
+    }
+
+    fn auth_router_with_scopes(state: Arc<ScimState>, scopes: Vec<String>) -> Router {
+        router(state)
+            .layer(axum::middleware::from_fn(auth_middleware))
+            .layer(axum::Extension(introspector_with_scopes(scopes)))
+            .layer(axum::Extension(
+                crate::session_token::SessionTokenSigner::new(
+                    "test-secret-that-is-at-least-32-bytes-long",
+                    3600,
+                    "https://gateway.example.com",
+                ),
+            ))
+            .layer(axum::Extension(test_mappings()))
+            .layer(axum::Extension(test_session_store()))
+    }
+
+    #[tokio::test]
+    async fn create_user_route_rejects_read_only_scope() {
+        let state = route_state_with_service(Arc::new(StubService::default()));
+        let mut router = auth_router_with_scopes(state, vec![SCOPE_SCIM_READ.into()]);
+        let req =
+            authenticated_request("POST", "/scim/v2/Users", Some(json!({"userName": "alice"})));
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn delete_user_route_rejects_read_only_scope() {
+        let state = route_state_with_service(Arc::new(StubService::default()));
+        let mut router = auth_router_with_scopes(state, vec![SCOPE_SCIM_READ.into()]);
+        let req = authenticated_request("DELETE", "/scim/v2/Users/u1", None);
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn update_group_route_rejects_read_only_scope() {
+        let state = route_state_with_service(Arc::new(StubService::default()));
+        let mut router = auth_router_with_scopes(state, vec![SCOPE_SCIM_READ.into()]);
+        let req = authenticated_request(
+            "PUT",
+            "/scim/v2/Groups/g1",
+            Some(json!({"displayName": "super-admins"})),
+        );
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_group_route_accepts_admin_scope() {
+        let service = Arc::new(StubService {
+            create_group: Arc::new(Mutex::new(Some(Ok(connectrpc::Response::new(ScimGroup {
+                id: "g1".into(),
+                display_name: "admins".into(),
+                ..Default::default()
+            }))))),
+            ..Default::default()
+        });
+        let state = route_state_with_service(service);
+        let mut router = auth_router_with_scopes(state, vec![SCOPE_SCIM_ADMIN.into()]);
+        let req = authenticated_request(
+            "POST",
+            "/scim/v2/Groups",
+            Some(json!({"displayName": "admins"})),
+        );
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_user_route_accepts_read_scope() {
+        let service = Arc::new(StubService {
+            get_user: Arc::new(Mutex::new(Some(Ok(connectrpc::Response::new(ScimUser {
+                id: "u1".into(),
+                user_name: "alice".into(),
+                ..Default::default()
+            }))))),
+            ..Default::default()
+        });
+        let state = route_state_with_service(service);
+        let mut router = auth_router_with_scopes(state, vec![SCOPE_SCIM_READ.into()]);
+        let req = authenticated_request("GET", "/scim/v2/Users/u1", None);
+        let resp = call(&mut router, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

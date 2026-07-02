@@ -1,5 +1,6 @@
 pub mod application;
 pub mod federation;
+pub mod handlers;
 pub mod identity;
 pub mod identity_self_service;
 pub mod identity_self_service_mapper;

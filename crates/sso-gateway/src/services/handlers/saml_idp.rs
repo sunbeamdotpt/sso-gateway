@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -27,7 +28,9 @@ use serde_json::Value;
 use sso_ory_client::{error::OryClientError, kratos::KratosClient};
 use tracing::warn;
 
-use crate::db::{SamlIdpKeyRepo, SamlIdpKeyStore, SamlSpClientRepo, SamlSpClientStore};
+use crate::db::{
+    SamlIdpKeyRepo, SamlIdpKeyStore, SamlRequestStore, SamlSpClientRepo, SamlSpClientStore,
+};
 
 const HTML_CONTENT_TYPE: &str = "text/html";
 
@@ -49,6 +52,7 @@ impl From<crate::db::DbError> for SamlIdpError {
         let status = match err {
             crate::db::DbError::SamlSpClientNotFound => StatusCode::NOT_FOUND,
             crate::db::DbError::SamlIdpKeyNotFound => StatusCode::NOT_FOUND,
+            crate::db::DbError::SamlRequestReplay => StatusCode::BAD_REQUEST,
             _ => {
                 warn!("saml idp db error: {}", err);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -93,12 +97,17 @@ impl SamlIdpKratos for KratosClient {
     }
 }
 
+const DEFAULT_REQUEST_TTL: Duration = Duration::from_secs(900);
+
 #[derive(Clone)]
 pub struct SamlIdpState {
     pub(crate) kratos: Arc<dyn SamlIdpKratos>,
     pub(crate) idp_keys: Arc<dyn SamlIdpKeyStore>,
     pub(crate) sp_clients: Arc<dyn SamlSpClientStore>,
+    pub(crate) requests: Option<Arc<dyn SamlRequestStore>>,
     pub(crate) idp_entity_id: String,
+    pub(crate) sso_endpoint_url: String,
+    pub(crate) request_ttl: Duration,
 }
 
 impl SamlIdpState {
@@ -108,12 +117,26 @@ impl SamlIdpState {
         sp_clients: SamlSpClientRepo,
         idp_entity_id: String,
     ) -> Self {
+        let sso_endpoint_url = format!("{}/saml/sso", idp_entity_id.trim_end_matches('/'));
         Self {
             kratos: kratos as Arc<dyn SamlIdpKratos>,
             idp_keys: Arc::new(idp_keys) as Arc<dyn SamlIdpKeyStore>,
             sp_clients: Arc::new(sp_clients) as Arc<dyn SamlSpClientStore>,
+            requests: None,
             idp_entity_id,
+            sso_endpoint_url,
+            request_ttl: DEFAULT_REQUEST_TTL,
         }
+    }
+
+    pub fn with_request_store(mut self, requests: crate::db::SamlRequestRepo) -> Self {
+        self.requests = Some(Arc::new(requests) as Arc<dyn SamlRequestStore>);
+        self
+    }
+
+    pub fn with_sso_endpoint_url(mut self, url: String) -> Self {
+        self.sso_endpoint_url = url;
+        self
     }
 }
 
@@ -249,7 +272,26 @@ async fn sso(
         ))));
     }
 
+    let Some(destination) = authn_request.base.destination.as_ref() else {
+        return Err(SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::BAD_REQUEST,
+            "missing saml destination",
+        ))));
+    };
+    if destination != &state.sso_endpoint_url {
+        return Err(SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::BAD_REQUEST,
+            "destination mismatch",
+        ))));
+    }
+
     if sp_client.authn_requests_signed {
+        if decoded.signature.is_none() {
+            return Err(SamlIdpError::Response(Box::new(idp_error(
+                StatusCode::BAD_REQUEST,
+                "signed authn request required",
+            ))));
+        }
         let Some(cert_pem) = sp_client.certificate_pem.as_deref() else {
             return Err(SamlIdpError::Response(Box::new(idp_error(
                 StatusCode::BAD_REQUEST,
@@ -287,6 +329,18 @@ async fn sso(
                 "invalid authn request signature",
             ))));
         }
+    }
+
+    // Persist the inbound request ID to reject replays.
+    if let Some(requests) = &state.requests {
+        requests
+            .create_inbound(
+                &sp_client.tenant_id,
+                &sp_client.id,
+                &authn_request.base.id,
+                state.request_ttl,
+            )
+            .await?;
     }
 
     let session_token = extract_session_token(&req)?;
@@ -465,11 +519,11 @@ mod tests {
 
     use crate::db::{SamlIdpKeyRow, SamlSpClientRow};
     use gamlastan::bindings::redirect::{RedirectEncodeParams, redirect_encode};
-    use serde_json::json;
     use gamlastan::bindings::relay_state::RelayState;
     use gamlastan::core::assertion::issuer::Issuer;
     use gamlastan::core::identifiers::SamlVersion;
     use gamlastan::core::protocol::request::{AuthnRequest, RequestBase};
+    use serde_json::json;
 
     #[derive(Clone, Default)]
     struct StubKratos;
@@ -504,7 +558,10 @@ mod tests {
             unimplemented!()
         }
 
-        async fn list(&self, _tenant_id: &str) -> Result<Vec<crate::db::SamlIdpKeyRow>, crate::db::DbError> {
+        async fn list(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<Vec<crate::db::SamlIdpKeyRow>, crate::db::DbError> {
             unimplemented!()
         }
     }
@@ -537,7 +594,11 @@ mod tests {
         }
 
         async fn get_by_id(&self, _id: &str) -> Result<SamlSpClientRow, crate::db::DbError> {
-            self.client.lock().unwrap().take().expect("stub not configured")
+            self.client
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stub not configured")
         }
 
         async fn get_by_entity_id(
@@ -563,14 +624,19 @@ mod tests {
         }
     }
 
-    fn test_state(client: Option<Result<SamlSpClientRow, crate::db::DbError>>) -> Arc<SamlIdpState> {
+    fn test_state(
+        client: Option<Result<SamlSpClientRow, crate::db::DbError>>,
+    ) -> Arc<SamlIdpState> {
         Arc::new(SamlIdpState {
             kratos: Arc::new(StubKratos),
             idp_keys: Arc::new(StubIdpKeyStore),
             sp_clients: Arc::new(StubSpClientStore {
                 client: Arc::new(Mutex::new(client)),
             }),
+            requests: None,
             idp_entity_id: "https://idp.example.com".to_string(),
+            sso_endpoint_url: "https://idp.example.com/saml/sso".to_string(),
+            request_ttl: DEFAULT_REQUEST_TTL,
         })
     }
 
@@ -582,7 +648,11 @@ mod tests {
     #[async_trait]
     impl SamlIdpKratos for ConfigurableKratos {
         async fn whoami(&self, _session_token: &str) -> Result<Value, OryClientError> {
-            self.result.lock().unwrap().take().expect("kratos stub not configured")
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("kratos stub not configured")
         }
     }
 
@@ -605,7 +675,11 @@ mod tests {
         }
 
         async fn get_active(&self, _tenant_id: &str) -> Result<SamlIdpKeyRow, crate::db::DbError> {
-            self.result.lock().unwrap().take().expect("idp key stub not configured")
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("idp key stub not configured")
         }
 
         async fn list(&self, _tenant_id: &str) -> Result<Vec<SamlIdpKeyRow>, crate::db::DbError> {
@@ -628,7 +702,10 @@ mod tests {
             sp_clients: Arc::new(StubSpClientStore {
                 client: Arc::new(Mutex::new(client)),
             }),
+            requests: None,
             idp_entity_id: "https://idp.example.com".to_string(),
+            sso_endpoint_url: "https://idp.example.com/saml/sso".to_string(),
+            request_ttl: DEFAULT_REQUEST_TTL,
         })
     }
 
@@ -637,12 +714,16 @@ mod tests {
             id: "key-1".to_string(),
             tenant_id: "tenant-1".to_string(),
             key_id: "default".to_string(),
-            private_key_pem: std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-key.pem"))
-                .unwrap()
-                .to_string(),
-            certificate_pem: std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
-                .unwrap()
-                .to_string(),
+            private_key_pem: std::str::from_utf8(include_bytes!(
+                "../../../tests/fixtures/saml-test-key.pem"
+            ))
+            .unwrap()
+            .to_string(),
+            certificate_pem: std::str::from_utf8(include_bytes!(
+                "../../../tests/fixtures/saml-test-cert.pem"
+            ))
+            .unwrap()
+            .to_string(),
             is_active: true,
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),
@@ -658,12 +739,13 @@ mod tests {
         provider_id: &str,
         signer_key_pem: Option<&[u8]>,
     ) -> String {
+        let destination = format!("/saml/sso?provider_id={provider_id}");
         let authn_request = AuthnRequest {
             base: RequestBase {
                 id: "_req_123".to_string(),
                 version: SamlVersion::V2_0,
                 issue_instant: Utc::now(),
-                destination: None,
+                destination: Some("https://idp.example.com/saml/sso".to_string()),
                 consent: None,
                 issuer: Some(Issuer::entity(entity_id)),
                 has_signature: false,
@@ -682,21 +764,108 @@ mod tests {
             provider_name: None,
             extensions: None,
         };
-        let saml_xml = authn_request.to_xml_string().expect("serialize authn request");
-        let destination = format!("/saml/sso?provider_id={provider_id}");
-        let signer = signer_key_pem.map(|pem| {
-            let key_manager = build_idp_keys_manager(pem).expect("load signer key");
-            SamlSigner::new(key_manager)
-        });
-        let signer_ref = signer
-            .as_ref()
-            .map(|s| (s, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
+        let saml_xml = authn_request
+            .to_xml_string()
+            .expect("serialize authn request");
+        let signer_key_pem = signer_key_pem
+            .unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
+        let key_manager = build_idp_keys_manager(signer_key_pem).expect("load signer key");
+        let signer = SamlSigner::new(key_manager);
+        let signer_ref = Some((&signer, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
         let relay_state = RelayState::new("state").ok();
         let params = RedirectEncodeParams {
             saml_xml: saml_xml.as_bytes(),
             is_request: true,
             destination: &destination,
             relay_state: relay_state.as_ref(),
+            signer: signer_ref,
+        };
+        redirect_encode(&params).expect("encode authn request")
+    }
+
+    fn unsigned_authn_request_url(entity_id: &str, provider_id: &str) -> String {
+        let destination = format!("/saml/sso?provider_id={provider_id}");
+        let authn_request = AuthnRequest {
+            base: RequestBase {
+                id: "_req_123".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: Some("https://idp.example.com/saml/sso".to_string()),
+                consent: None,
+                issuer: Some(Issuer::entity(entity_id)),
+                has_signature: false,
+            },
+            subject: None,
+            name_id_policy: None,
+            conditions: None,
+            requested_authn_context: None,
+            scoping: None,
+            force_authn: None,
+            is_passive: None,
+            assertion_consumer_service_index: None,
+            assertion_consumer_service_url: Some("https://sp.example.com/acs".to_string()),
+            protocol_binding: None,
+            attribute_consuming_service_index: None,
+            provider_name: None,
+            extensions: None,
+        };
+        let saml_xml = authn_request
+            .to_xml_string()
+            .expect("serialize authn request");
+        let params = RedirectEncodeParams {
+            saml_xml: saml_xml.as_bytes(),
+            is_request: true,
+            destination: &destination,
+            relay_state: None,
+            signer: None,
+        };
+        redirect_encode(&params).expect("encode unsigned authn request")
+    }
+
+    fn authn_request_url_with_destination(
+        entity_id: &str,
+        provider_id: &str,
+        destination: Option<String>,
+        signer_key_pem: Option<&[u8]>,
+    ) -> String {
+        let query_destination = format!("/saml/sso?provider_id={provider_id}");
+        let authn_request = AuthnRequest {
+            base: RequestBase {
+                id: "_req_123".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination,
+                consent: None,
+                issuer: Some(Issuer::entity(entity_id)),
+                has_signature: false,
+            },
+            subject: None,
+            name_id_policy: None,
+            conditions: None,
+            requested_authn_context: None,
+            scoping: None,
+            force_authn: None,
+            is_passive: None,
+            assertion_consumer_service_index: None,
+            assertion_consumer_service_url: Some("https://sp.example.com/acs".to_string()),
+            protocol_binding: None,
+            attribute_consuming_service_index: None,
+            provider_name: None,
+            extensions: None,
+        };
+        let saml_xml = authn_request
+            .to_xml_string()
+            .expect("serialize authn request");
+        let signer_key_pem = signer_key_pem
+            .unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
+        let key_manager = build_idp_keys_manager(signer_key_pem).expect("load signer key");
+        let signer = SamlSigner::new(key_manager);
+        let signer_ref = Some((&signer, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
+        let params = RedirectEncodeParams {
+            saml_xml: saml_xml.as_bytes(),
+            is_request: true,
+            destination: &query_destination,
+            relay_state: None,
             signer: signer_ref,
         };
         redirect_encode(&params).expect("encode authn request")
@@ -869,11 +1038,12 @@ mod tests {
 
     #[test]
     fn extract_session_token_returns_unauthorized_when_invalid_utf8() {
-        let mut req = Request::builder().uri("/saml/sso").body(Body::empty()).unwrap();
-        req.headers_mut().insert(
-            "X-Session-Token",
-            HeaderValue::from_bytes(b"\xff").unwrap(),
-        );
+        let mut req = Request::builder()
+            .uri("/saml/sso")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("X-Session-Token", HeaderValue::from_bytes(b"\xff").unwrap());
         let err = extract_session_token(&req).unwrap_err();
         assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
     }
@@ -896,7 +1066,10 @@ mod tests {
         let state = test_state(Some(Ok(test_sp_client("https://sp.example.com"))));
         let mut params = HashMap::new();
         params.insert("provider_id".to_string(), "sp-1".to_string());
-        let req = sso_request("/saml/sso?SAMLRequest=not-valid-base64&&RelayState=rs", vec![]);
+        let req = sso_request(
+            "/saml/sso?SAMLRequest=not-valid-base64&&RelayState=rs",
+            vec![],
+        );
         let resp = sso(State(state), Query(params), req)
             .await
             .unwrap_err()
@@ -953,8 +1126,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sso_rejects_missing_destination() {
+        let url = authn_request_url_with_destination("https://sp.example.com", "sp-1", None, None);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("missing saml destination"));
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_destination_mismatch() {
+        let url = authn_request_url_with_destination(
+            "https://sp.example.com",
+            "sp-1",
+            Some("https://other-idp.example.com/saml/sso".to_string()),
+            None,
+        );
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("destination mismatch"));
+    }
+
+    #[tokio::test]
     async fn sso_rejects_signed_request_when_sp_has_no_certificate() {
-        let url = authn_request_url("https://sp.example.com", "sp-1", Some(include_bytes!("../tests/fixtures/saml-test-key.pem")));
+        let url = authn_request_url(
+            "https://sp.example.com",
+            "sp-1",
+            Some(include_bytes!("../../../tests/fixtures/saml-test-key.pem")),
+        );
         let mut client = test_sp_client("https://sp.example.com");
         client.authn_requests_signed = true;
         client.certificate_pem = None;
@@ -979,11 +1197,12 @@ mod tests {
         let url = authn_request_url(
             "https://sp.example.com",
             "sp-1",
-            Some(include_bytes!("../tests/fixtures/saml-other-key.pem")),
+            Some(include_bytes!("../../../tests/fixtures/saml-other-key.pem")),
         );
-        let cert_pem = std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
-            .unwrap()
-            .to_string();
+        let cert_pem =
+            std::str::from_utf8(include_bytes!("../../../tests/fixtures/saml-test-cert.pem"))
+                .unwrap()
+                .to_string();
         let mut client = test_sp_client("https://sp.example.com");
         client.authn_requests_signed = true;
         client.certificate_pem = Some(cert_pem);
@@ -1041,7 +1260,9 @@ mod tests {
         let url = authn_request_url("https://sp.example.com", "sp-1", None);
         let state = test_state_full(
             Some(Ok(test_sp_client("https://sp.example.com"))),
-            Some(Ok(json!({"identity": {"traits": {"email": "alice@example.com"}}}))),
+            Some(Ok(
+                json!({"identity": {"traits": {"email": "alice@example.com"}}}),
+            )),
             Some(Ok(active_idp_key())),
         );
         let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
@@ -1134,11 +1355,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sso_rejects_unsigned_request_when_signature_required() {
-        let url = authn_request_url("https://sp.example.com", "sp-1", None);
-        let cert_pem = std::str::from_utf8(include_bytes!("../tests/fixtures/saml-test-cert.pem"))
-            .unwrap()
-            .to_string();
+    async fn sso_rejects_unsigned_request() {
+        let url = unsigned_authn_request_url("https://sp.example.com", "sp-1");
+        let cert_pem =
+            std::str::from_utf8(include_bytes!("../../../tests/fixtures/saml-test-cert.pem"))
+                .unwrap()
+                .to_string();
         let mut client = test_sp_client("https://sp.example.com");
         client.authn_requests_signed = true;
         client.certificate_pem = Some(cert_pem);
@@ -1154,7 +1376,7 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_to_string(resp).await;
-        assert!(body.contains("invalid authn request signature"));
+        assert!(body.contains("signed authn request required"));
     }
 
     #[test]
