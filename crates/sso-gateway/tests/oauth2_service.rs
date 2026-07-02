@@ -3,11 +3,12 @@ use std::sync::Arc;
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::session_token::SessionTokenSigner;
 use sso_gateway::{
-    db::{IdMappingRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
-    oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
+    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
     services::{application::ApplicationServiceImpl, tenant::TenantServiceImpl},
 };
 use sso_ory_client::{HydraClient, KratosClient};
@@ -27,7 +28,7 @@ async fn oauth2_public_endpoints_round_trip() {
     let (_hydra, hydra_admin_url, hydra_public_url) =
         support::start_hydra().await.expect("hydra should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -35,17 +36,16 @@ async fn oauth2_public_endpoints_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let hydra = Arc::new(
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
     let mappings = IdMappingRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool);
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let application_service =
@@ -60,11 +60,7 @@ async fn oauth2_public_endpoints_round_trip() {
         .expect("random port should bind");
     let base = format!("http://{addr}");
 
-    let oauth_state = Arc::new(Oauth2State::new(
-        hydra,
-        mappings.clone(),
-        base.clone(),
-    ));
+    let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -81,9 +77,17 @@ async fn oauth2_public_endpoints_round_trip() {
         .app()
         .merge(oauth2_router(oauth_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings.clone()));
+        .layer(Extension(
+            Arc::new(mappings.clone()) as Arc<dyn IdMappingStore>
+        ));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -102,11 +106,11 @@ async fn oauth2_public_endpoints_round_trip() {
         .post(format!(
             "{base}/iam.v1.ApplicationService/CreateApplication"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "name": "oauth-test-app",
-            "redirectUris": ["http://localhost/callback"],
+            "redirectUris": ["https://localhost/callback"],
             "grantTypes": ["client_credentials"],
             "responseTypes": ["token"],
             "scope": ["openid"],
@@ -131,7 +135,7 @@ async fn oauth2_public_endpoints_round_trip() {
     // The Hydra client_id is exposed through the RotateSecret RPC.
     let rotate_resp = client
         .post(format!("{base}/iam.v1.ApplicationService/RotateSecret"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": app_id }))
         .send()
@@ -196,10 +200,10 @@ async fn oauth2_public_endpoints_round_trip() {
         .as_str()
         .expect("access_token should exist");
 
-    // Introspection requires an explicit tenant header for backend calls.
+    // Introspection is an admin endpoint; authenticate with the test token.
     let introspect_resp = client
         .post(format!("{base}/oauth2/introspect"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .form(&[("token", access_token)])
         .send()
         .await
@@ -210,25 +214,6 @@ async fn oauth2_public_endpoints_round_trip() {
         .await
         .expect("introspect should be json");
     assert_eq!(introspect["active"], true);
-
-    // Tenant mismatch on the token endpoint is rejected.
-    let other_tenant = ulid::Ulid::new().to_string();
-    let mismatch_resp = client
-        .post(format!("{base}/oauth2/token"))
-        .header("x-tenant-id", &other_tenant)
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("scope", "openid"),
-        ])
-        .send()
-        .await
-        .expect("mismatch token request should complete");
-    assert!(
-        mismatch_resp.status().is_client_error(),
-        "tenant mismatch should be rejected"
-    );
 
     // Unknown client_id is rejected.
     let unknown_auth_resp = client
@@ -274,7 +259,7 @@ async fn oauth2_missing_client_id_is_rejected() {
     let (_hydra, hydra_admin_url, hydra_public_url) =
         support::start_hydra().await.expect("hydra should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -282,17 +267,16 @@ async fn oauth2_missing_client_id_is_rejected() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let hydra = Arc::new(
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
     let mappings = IdMappingRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool);
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let application_service =
@@ -307,11 +291,7 @@ async fn oauth2_missing_client_id_is_rejected() {
         .expect("random port should bind");
     let base = format!("http://{addr}");
 
-    let oauth_state = Arc::new(Oauth2State::new(
-        hydra,
-        mappings.clone(),
-        base.clone(),
-    ));
+    let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -328,9 +308,17 @@ async fn oauth2_missing_client_id_is_rejected() {
         .app()
         .merge(oauth2_router(oauth_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings.clone()));
+        .layer(Extension(
+            Arc::new(mappings.clone()) as Arc<dyn IdMappingStore>
+        ));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {

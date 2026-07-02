@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use axum::{Extension, Router, middleware::from_fn, response::IntoResponse, routing::get};
 use sso_gateway::{
-    db::{AuditLogRepo, IdMappingRepo, TenantApiKeyRepo, bootstrap_system_tenant, create_pool},
-    middleware::{TenantId, audit_middleware, auth_middleware, hash_api_key},
-    oauth2::{Oauth2State, router as oauth2_router},
+    db::{AuditLogRepo, IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
+    middleware::{TenantId, audit_middleware, auth_middleware},
+    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::{HydraClient, KratosClient};
 use tokio::net::TcpListener;
@@ -45,7 +46,7 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -54,18 +55,7 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .await
         .expect("system tenant should bootstrap");
 
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
-    let api_key_secret = "integration-test-api-key";
-    api_keys
-        .create(
-            &tenant_id,
-            "test-key",
-            &hash_api_key(api_key_secret),
-            &[],
-            None,
-        )
-        .await
-        .expect("api key should be created");
+    support::bootstrap_test_subject_mapping(&pool, &tenant_id).await;
 
     let hydra = Arc::new(
         HydraClient::new("http://localhost:1", "http://localhost:1")
@@ -88,10 +78,16 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .merge(oauth2_router(oauth_state))
         .layer(from_fn(audit_middleware))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(audit_repo))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (handle, base, shutdown_tx) = serve(app).await;
     let client = reqwest::Client::new();
@@ -112,56 +108,36 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .expect("missing creds request should complete");
     assert_eq!(missing_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // Invalid API key is rejected.
-    let bad_key_resp = client
+    // Invalid bearer token is rejected.
+    let bad_token_resp = client
         .get(format!("{base}/echo"))
-        .header("x-api-key", "not-the-secret")
+        .header("authorization", "Bearer invalid-token")
         .send()
         .await
-        .expect("bad key request should complete");
-    assert_eq!(bad_key_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        .expect("bad token request should complete");
+    assert_eq!(bad_token_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // Valid API key resolves the tenant and reaches the handler.
-    let key_resp = client
+    // Valid bearer token resolves the tenant and reaches the handler.
+    let token_resp = client
         .get(format!("{base}/echo"))
-        .header("x-api-key", api_key_secret)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .send()
         .await
-        .expect("valid key request should complete");
-    assert_eq!(key_resp.status(), reqwest::StatusCode::OK);
+        .expect("valid token request should complete");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        key_resp.text().await.expect("body should be text"),
+        token_resp.text().await.expect("body should be text"),
         tenant_id
     );
 
-    // Explicit tenant header is accepted.
+    // Legacy tenant header is no longer accepted on its own.
     let tenant_resp = client
         .get(format!("{base}/echo"))
         .header("x-tenant-id", &tenant_id)
         .send()
         .await
         .expect("tenant header request should complete");
-    assert_eq!(tenant_resp.status(), reqwest::StatusCode::OK);
-
-    // Invalid or empty tenant header is rejected at the middleware layer.
-    let invalid_tenant_resp = client
-        .get(format!("{base}/echo"))
-        .header("x-tenant-id", "not-a-ulid")
-        .send()
-        .await
-        .expect("invalid tenant request should complete");
-    assert_eq!(
-        invalid_tenant_resp.status(),
-        reqwest::StatusCode::BAD_REQUEST
-    );
-
-    let empty_tenant_resp = client
-        .get(format!("{base}/echo"))
-        .header("x-tenant-id", "")
-        .send()
-        .await
-        .expect("empty tenant request should complete");
-    assert_eq!(empty_tenant_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(tenant_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // Give the audit middleware's spawned insert task time to complete.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

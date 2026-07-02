@@ -6,16 +6,17 @@ use gamlastan::security::InMemoryReplayCache;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdentitySchemaRepo, SamlIdentityMappingRepo, SamlIdpKeyRepo,
-        SamlProviderRepo, SamlReplayCache, SamlRequestRepo, TenantApiKeyRepo, TenantRepo,
-        bootstrap_system_tenant, create_pool,
+        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, LoginStateRepo, SamlIdentityMappingRepo,
+        SamlIdpKeyRepo, SamlProviderRepo, SamlReplayCache, SamlReplayCacheTrait, SamlRequestRepo,
+        TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{FederationServiceExt, IdentityServiceExt, TenantServiceExt},
-    saml::{SamlState, router as saml_router},
+    services::handlers::saml::{SamlState, router as saml_router},
     services::{
         federation::FederationServiceImpl, identity::IdentityServiceImpl, tenant::TenantServiceImpl,
     },
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
@@ -109,7 +110,7 @@ async fn federation_saml_login_round_trip() {
     let (_kratos, kratos_admin_url, _kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -117,6 +118,7 @@ async fn federation_saml_login_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let schemas = IdentitySchemaRepo::new(pool.clone());
     schemas
@@ -178,14 +180,14 @@ async fn federation_saml_login_round_trip() {
     let requests = SamlRequestRepo::new(pool.clone());
     let federation_mappings = SamlIdentityMappingRepo::new(pool.clone());
     let idp_keys = SamlIdpKeyRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
-    let replay_cache: Arc<dyn gamlastan::security::ReplayCache> =
-        Arc::new(InMemoryReplayCache::new());
+    let connections = TenantConnectionRepo::new(pool.clone());
+    let domains = TenantDomainRepo::new(pool.clone());
+    let login_state = LoginStateRepo::new(pool.clone());
+    let tenant_repo = TenantRepo::new(pool);
+    let replay_cache: Arc<dyn SamlReplayCacheTrait> = Arc::new(InMemoryReplayCache::new());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
@@ -201,6 +203,9 @@ async fn federation_saml_login_round_trip() {
         federation_mappings,
         schemas,
         idp_keys,
+        connections,
+        domains,
+        login_state,
         // hydra_public_url is not used by the SAML flow; point it at kratos public to keep the
         // service constructible in this test.
         _kratos_public_url.clone(),
@@ -227,9 +232,15 @@ async fn federation_saml_login_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys.clone()))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -251,7 +262,7 @@ async fn federation_saml_login_round_trip() {
     // Initiate SAML login.
     let initiate_resp = client
         .post(format!("{base}/iam.v1.FederationService/InitiateSamlLogin"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "providerId": provider.id,
@@ -297,7 +308,7 @@ async fn federation_saml_login_round_trip() {
         .post(format!(
             "{base}/iam.v1.FederationService/AcceptSamlAssertion"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "providerId": provider.id,
@@ -324,7 +335,7 @@ async fn federation_saml_login_round_trip() {
     let identity_id = session["identityId"].as_str().unwrap();
     let get_resp = client
         .post(format!("{base}/iam.v1.IdentityService/GetIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": identity_id }))
         .send()
@@ -349,7 +360,7 @@ async fn federation_saml_signed_login_is_idempotent() {
     let (_kratos, kratos_admin_url, _kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -357,6 +368,7 @@ async fn federation_saml_signed_login_is_idempotent() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let schemas = IdentitySchemaRepo::new(pool.clone());
     schemas
@@ -433,14 +445,14 @@ async fn federation_saml_signed_login_is_idempotent() {
     let requests = SamlRequestRepo::new(pool.clone());
     let federation_mappings = SamlIdentityMappingRepo::new(pool.clone());
     let idp_keys = SamlIdpKeyRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
-    let replay_cache: Arc<dyn gamlastan::security::ReplayCache> =
-        Arc::new(InMemoryReplayCache::new());
+    let connections = TenantConnectionRepo::new(pool.clone());
+    let domains = TenantDomainRepo::new(pool.clone());
+    let login_state = LoginStateRepo::new(pool.clone());
+    let tenant_repo = TenantRepo::new(pool);
+    let replay_cache: Arc<dyn SamlReplayCacheTrait> = Arc::new(InMemoryReplayCache::new());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
@@ -456,6 +468,9 @@ async fn federation_saml_signed_login_is_idempotent() {
         federation_mappings,
         schemas,
         idp_keys,
+        connections,
+        domains,
+        login_state,
         _kratos_public_url.clone(),
         _kratos_public_url.clone(),
         Some(signer.clone()),
@@ -480,9 +495,15 @@ async fn federation_saml_signed_login_is_idempotent() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys.clone()))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -503,7 +524,7 @@ async fn federation_saml_signed_login_is_idempotent() {
 
     let initiate_resp = client
         .post(format!("{base}/iam.v1.FederationService/InitiateSamlLogin"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "providerId": provider.id,
@@ -550,7 +571,7 @@ async fn federation_saml_signed_login_is_idempotent() {
         .post(format!(
             "{base}/iam.v1.FederationService/AcceptSamlAssertion"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "providerId": provider.id,
@@ -579,7 +600,7 @@ async fn federation_saml_signed_login_is_idempotent() {
     // identity (idempotent JIT provisioning) without creating a duplicate.
     let initiate_resp2 = client
         .post(format!("{base}/iam.v1.FederationService/InitiateSamlLogin"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({"providerId": provider.id, "relayState": "after-login"}))
         .send()
@@ -609,7 +630,7 @@ async fn federation_saml_signed_login_is_idempotent() {
         .post(format!(
             "{base}/iam.v1.FederationService/AcceptSamlAssertion"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "providerId": provider.id,
@@ -642,7 +663,7 @@ async fn federation_saml_metadata_endpoint() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -692,6 +713,9 @@ async fn federation_saml_metadata_endpoint() {
     let federation_mappings = SamlIdentityMappingRepo::new(pool.clone());
     let idp_keys = SamlIdpKeyRepo::new(pool.clone());
     let schemas = IdentitySchemaRepo::new(pool.clone());
+    let connections = TenantConnectionRepo::new(pool.clone());
+    let domains = TenantDomainRepo::new(pool.clone());
+    let login_state = LoginStateRepo::new(pool.clone());
     let replay_cache = Arc::new(SamlReplayCache::new(pool));
 
     let federation_service = Arc::new(FederationServiceImpl::new(
@@ -702,6 +726,9 @@ async fn federation_saml_metadata_endpoint() {
         federation_mappings,
         schemas,
         idp_keys,
+        connections,
+        domains,
+        login_state,
         "http://127.0.0.1:4444".to_string(),
         "http://gateway.example.com".to_string(),
         Some(signer),
@@ -762,22 +789,27 @@ async fn federation_saml_metadata_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn federation_saml_db_replay_cache_rejects_duplicates() {
-    use gamlastan::security::ReplayCache;
-
     let (_pg, database_url) = support::start_postgres()
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
     let cache = SamlReplayCache::new(pool);
     let expiry = chrono::Utc::now() + chrono::Duration::seconds(300);
 
-    assert!(cache.check_and_insert("_assertion_1", expiry));
-    assert!(!cache.check_and_insert("_assertion_1", expiry));
-    assert!(cache.check_and_insert("_assertion_2", expiry));
-
-    cache.cleanup();
+    assert!(cache
+        .check_and_insert("_assertion_1", expiry)
+        .await
+        .unwrap());
+    assert!(!cache
+        .check_and_insert("_assertion_1", expiry)
+        .await
+        .unwrap());
+    assert!(cache
+        .check_and_insert("_assertion_2", expiry)
+        .await
+        .unwrap());
 }

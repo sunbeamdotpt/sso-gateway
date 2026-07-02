@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Extension, Router, middleware::from_fn};
 use reqwest::StatusCode;
 use serde_json::json;
 use sso_gateway::{
+    auth::{HydraTokenIntrospector, TokenIntrospector},
     db::{
-        DbPool, IdMappingRepo, IdentitySchemaRepo, ScimGroupRepo, bootstrap_system_tenant,
-        create_pool,
+        DbPool, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, PgSessionStore, ScimGroupRepo,
+        SessionStore, bootstrap_system_tenant, create_pool,
     },
-    scim::{ScimState, router as scim_router},
+    middleware::auth_middleware,
+    services::handlers::scim::{ScimState, router as scim_router},
     services::scim::ScimServiceImpl,
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
 use tokio::net::TcpListener;
@@ -34,18 +37,31 @@ fn fake_keto() -> Arc<KetoClient> {
     )
 }
 
-fn scim_state(pool: DbPool, hydra: Arc<HydraClient>) -> Arc<ScimState> {
-    let mappings = IdMappingRepo::new(pool.clone());
+fn scim_app(pool: DbPool, hydra: Arc<HydraClient>) -> Router {
+    let mappings_repo = IdMappingRepo::new(pool.clone());
+    let mappings: Arc<dyn IdMappingStore> = Arc::new(mappings_repo.clone());
     let schemas = IdentitySchemaRepo::new(pool.clone());
-    let groups = ScimGroupRepo::new(pool);
+    let groups = ScimGroupRepo::new(pool.clone());
+    let sessions: Arc<dyn SessionStore> = Arc::new(PgSessionStore::new(pool));
     let service = Arc::new(ScimServiceImpl::new(
         fake_kratos(),
         fake_keto(),
-        mappings.clone(),
+        mappings_repo,
         schemas,
         groups,
     ));
-    Arc::new(ScimState::new(service, hydra, mappings))
+    let state = Arc::new(ScimState::new(service));
+    let introspector: Arc<dyn TokenIntrospector> = Arc::new(HydraTokenIntrospector::new(hydra));
+    scim_router(state)
+        .layer(from_fn(auth_middleware))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(introspector))
+        .layer(Extension(sessions))
+        .layer(Extension(mappings))
 }
 
 async fn serve(
@@ -93,7 +109,7 @@ async fn scim_auth_error_branches() {
     let (_hydra, hydra_admin_url, hydra_public_url) =
         support::start_hydra().await.expect("hydra should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -146,8 +162,7 @@ async fn scim_auth_error_branches() {
         .as_str()
         .expect("access_token should exist");
 
-    let state = scim_state(pool.clone(), hydra.clone());
-    let app = scim_router(state);
+    let app = scim_app(pool.clone(), hydra.clone());
     let (handle, base, shutdown_tx) = serve(app).await;
 
     // Missing authorization header.
@@ -213,8 +228,7 @@ async fn scim_auth_error_branches() {
     handle.await.expect("server task should finish");
 
     // A separate router with an unreachable Hydra covers the introspection-failure branch.
-    let broken_state = scim_state(pool, broken_hydra());
-    let broken_app = scim_router(broken_state);
+    let broken_app = scim_app(pool, broken_hydra());
     let (broken_handle, broken_base, broken_shutdown_tx) = serve(broken_app).await;
 
     assert_eq!(

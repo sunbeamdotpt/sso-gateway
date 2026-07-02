@@ -53,7 +53,10 @@ async fn saml_metadata_returns_valid_sp_metadata() {
         .await
         .expect("metadata request should succeed");
 
-    assert!(resp.status().is_success(), "metadata request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "metadata request should succeed"
+    );
     assert_eq!(
         resp.headers()
             .get("content-type")
@@ -97,9 +100,18 @@ async fn saml_sso_returns_signed_response_html() {
         .create_saml_sp_client(entity_id, acs_url, None, false, Some(NAME_ID_FORMAT))
         .await;
 
-    let (_identity_id, session_token) = gateway.create_kratos_identity("saml-user@example.com").await;
+    let (_identity_id, session_token) = gateway
+        .create_kratos_identity("saml-user@example.com")
+        .await;
 
-    let url = build_authn_request_url(&gateway.base_url, &provider_id, entity_id, acs_url);
+    let saml_destination = format!("{}/saml/sso", gateway.base_url);
+    let url = build_authn_request_url(
+        &gateway.base_url,
+        &provider_id,
+        entity_id,
+        acs_url,
+        Some(&saml_destination),
+    );
 
     let resp = gateway
         .http
@@ -145,7 +157,14 @@ async fn saml_sso_rejects_missing_session_token() {
         .create_saml_sp_client(entity_id, acs_url, None, false, Some(NAME_ID_FORMAT))
         .await;
 
-    let url = build_authn_request_url(&gateway.base_url, &provider_id, entity_id, acs_url);
+    let saml_destination = format!("{}/saml/sso", gateway.base_url);
+    let url = build_authn_request_url(
+        &gateway.base_url,
+        &provider_id,
+        entity_id,
+        acs_url,
+        Some(&saml_destination),
+    );
 
     let resp = gateway
         .http
@@ -174,12 +193,17 @@ async fn saml_sso_rejects_malformed_authn_request() {
         .create_saml_sp_client(entity_id, acs_url, None, false, Some(NAME_ID_FORMAT))
         .await;
 
-    let (_identity_id, session_token) = gateway.create_kratos_identity("saml-user@example.com").await;
+    let (_identity_id, session_token) = gateway
+        .create_kratos_identity("saml-user@example.com")
+        .await;
 
     let resp = gateway
         .http
         .get(format!("{}/saml/sso", gateway.base_url))
-        .query(&[("provider_id", provider_id.as_str()), ("SAMLRequest", "not-valid-base64")])
+        .query(&[
+            ("provider_id", provider_id.as_str()),
+            ("SAMLRequest", "not-valid-base64"),
+        ])
         .header("X-Session-Token", session_token)
         .send()
         .await
@@ -198,13 +222,14 @@ fn build_authn_request_url(
     provider_id: &str,
     entity_id: &str,
     acs_url: &str,
+    saml_destination: Option<&str>,
 ) -> String {
     let authn_request = AuthnRequest {
         base: RequestBase {
             id: "_conformance_req_1".to_string(),
             version: SamlVersion::V2_0,
             issue_instant: chrono::Utc::now(),
-            destination: None,
+            destination: saml_destination.map(|s| s.to_string()),
             consent: None,
             issuer: Some(Issuer::entity(entity_id)),
             has_signature: false,

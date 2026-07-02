@@ -5,12 +5,13 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, PermissionTupleRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant,
+        IdMappingRepo, IdMappingStore, PermissionTupleRepo, TenantRepo, bootstrap_system_tenant,
         create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{PermissionServiceExt, TenantServiceExt},
     services::{permission::PermissionServiceImpl, tenant::TenantServiceImpl},
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::{KetoClient, KratosClient};
 use sunbeam_g2v::{
@@ -29,7 +30,7 @@ async fn permission_service_round_trip() {
     let (_keto, keto_read_url, keto_write_url) =
         support::start_keto().await.expect("keto should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -37,17 +38,16 @@ async fn permission_service_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let keto = Arc::new(
         KetoClient::new(&keto_read_url, &keto_write_url).expect("keto client should build"),
     );
     let tuples = PermissionTupleRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(keto, tuples));
@@ -71,9 +71,15 @@ async fn permission_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -95,7 +101,7 @@ async fn permission_service_round_trip() {
     // Initially Alice has no access.
     let check_resp = client
         .post(format!("{base}/iam.v1.PermissionService/CheckPermission"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "namespace": "app",
@@ -120,7 +126,7 @@ async fn permission_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.PermissionService/CreateRelationTuple"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "namespace": "app",
@@ -147,7 +153,7 @@ async fn permission_service_round_trip() {
     // Alice can now read; Bob still cannot.
     let check_resp = client
         .post(format!("{base}/iam.v1.PermissionService/CheckPermission"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "namespace": "app",
@@ -165,7 +171,7 @@ async fn permission_service_round_trip() {
 
     let check_bob_resp = client
         .post(format!("{base}/iam.v1.PermissionService/CheckPermission"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "namespace": "app",
@@ -186,7 +192,7 @@ async fn permission_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.PermissionService/ListRelationTuples"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -207,7 +213,7 @@ async fn permission_service_round_trip() {
     // Expand permissions.
     let expand_resp = client
         .post(format!("{base}/iam.v1.PermissionService/ExpandPermissions"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "namespace": "app",
@@ -227,7 +233,7 @@ async fn permission_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.PermissionService/DeleteRelationTuple"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": tuple_id }))
         .send()

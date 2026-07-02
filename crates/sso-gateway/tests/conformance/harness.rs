@@ -3,9 +3,7 @@ use std::time::Duration;
 use sso_gateway::{
     app::build_app,
     config::Config,
-    db::{
-        PgSamlIdpKeyStore, PgSamlProviderStore, PgSamlSpClientStore, create_pool,
-    },
+    db::{PgSamlIdpKeyStore, PgSamlProviderStore, PgSamlSpClientStore, create_pool},
 };
 use sunbeam_g2v::server::axum::bind_random_port;
 use testcontainers::ContainerAsync;
@@ -18,6 +16,7 @@ mod shared_support;
 pub struct Gateway {
     pub base_url: String,
     pub system_tenant_ulid: String,
+    pub admin_token: String,
     pub http: reqwest::Client,
     pub hydra_admin_url: String,
     pub hydra_public_url: String,
@@ -48,7 +47,7 @@ impl Gateway {
             .await
             .expect("keto should start");
 
-        let pool = create_pool(&database_url)
+        let pool = create_pool(&database_url, false)
             .await
             .expect("database pool should be created");
 
@@ -70,7 +69,6 @@ impl Gateway {
             bind_addr: addr,
             system_tenant_ulid: system_tenant_ulid.clone(),
             database_url,
-            redis_url: "redis://127.0.0.1:6379".to_string(),
             hydra_admin_url: hydra_admin_url.clone(),
             hydra_public_url: hydra_public_url.clone(),
             kratos_admin_url: kratos_admin_url.clone(),
@@ -85,7 +83,21 @@ impl Gateway {
             saml_require_signed_assertions: true,
             saml_require_signed_responses: false,
             registration_enabled: false,
-            allowed_return_to_hosts: vec![],
+            allowed_return_to_hosts: vec!["app.example.com".to_string()],
+            system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
+            system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
+            state_cookie_secret: "conformance-test-secret-key-at-least-32-bytes-long".into(),
+            cookie_secure: false,
+            cookie_samesite: "Lax".to_string(),
+            saml_idp_key_encryption_key: Some(vec![0u8; 32]),
+            tenant_connection_encryption_key: None,
+            database_ssl_required: false,
+            database_max_connections: 25,
+            database_acquire_timeout_seconds: 10,
+            database_idle_timeout_seconds: 600,
+            database_max_lifetime_seconds: 1800,
+            database_statement_timeout_seconds: 30,
+            token_introspection_cache_ttl_seconds: 30,
         };
 
         let app = build_app(&config, pool.clone())
@@ -107,13 +119,29 @@ impl Gateway {
             .build()
             .expect("http client should build");
 
-        wait_for_ok(&http, &format!("{public_base_url}/.well-known/openid-configuration"))
-            .await
-            .expect("gateway health endpoint should be ready");
+        wait_for_ok(
+            &http,
+            &format!("{public_base_url}/.well-known/openid-configuration"),
+        )
+        .await
+        .expect("gateway health endpoint should be ready");
+
+        let admin_token = fetch_bootstrap_token(
+            &http,
+            &public_base_url,
+            config.system_bootstrap_client_id.as_deref().unwrap_or(""),
+            config
+                .system_bootstrap_client_secret
+                .as_deref()
+                .unwrap_or(""),
+        )
+        .await
+        .expect("bootstrap admin token should be fetched");
 
         Self {
             base_url: public_base_url,
             system_tenant_ulid,
+            admin_token,
             http,
             hydra_admin_url,
             hydra_public_url,
@@ -144,8 +172,11 @@ impl Gateway {
     ) -> serde_json::Value {
         let resp = self
             .http
-            .post(format!("{}/iam.v1.ApplicationService/CreateApplication", self.base_url))
-            .header("x-tenant-id", &self.system_tenant_ulid)
+            .post(format!(
+                "{}/iam.v1.ApplicationService/CreateApplication",
+                self.base_url
+            ))
+            .header("authorization", format!("Bearer {}", self.admin_token))
             .header("content-type", "application/json")
             .json(&serde_json::json!({
                 "name": name,
@@ -165,15 +196,20 @@ impl Gateway {
             resp.text().await.unwrap_or_default()
         );
 
-        resp.json().await.expect("application response should be json")
+        resp.json()
+            .await
+            .expect("application response should be json")
     }
 
     /// Rotate an application's secret and return `(client_id, client_secret)`.
     pub async fn rotate_secret(&self, app_id: &str) -> (String, String) {
         let resp = self
             .http
-            .post(format!("{}/iam.v1.ApplicationService/RotateSecret", self.base_url))
-            .header("x-tenant-id", &self.system_tenant_ulid)
+            .post(format!(
+                "{}/iam.v1.ApplicationService/RotateSecret",
+                self.base_url
+            ))
+            .header("authorization", format!("Bearer {}", self.admin_token))
             .header("content-type", "application/json")
             .json(&serde_json::json!({ "id": app_id }))
             .send()
@@ -187,7 +223,10 @@ impl Gateway {
         );
 
         let body: serde_json::Value = resp.json().await.expect("rotate secret should be json");
-        let client_id = body["clientId"].as_str().expect("client_id should exist").to_string();
+        let client_id = body["clientId"]
+            .as_str()
+            .expect("client_id should exist")
+            .to_string();
         let client_secret = body["clientSecret"]
             .as_str()
             .expect("client_secret should exist")
@@ -244,7 +283,10 @@ impl Gateway {
             .expect("submit registration request should succeed");
 
         let status = resp.status();
-        let text = resp.text().await.expect("registration submit body should be text");
+        let text = resp
+            .text()
+            .await
+            .expect("registration submit body should be text");
         assert!(
             status.is_success(),
             "registration submit failed: {status} {text}"
@@ -344,7 +386,8 @@ impl Gateway {
         let certificate_pem = cert.pem();
         let key_id = ulid::Ulid::new().to_string();
 
-        let store = PgSamlIdpKeyStore::new(self.pool.clone());
+        let store =
+            PgSamlIdpKeyStore::with_encryption_key(self.pool.clone(), vec![0u8; 32]);
         store
             .create(
                 &self.system_tenant_ulid,
@@ -358,6 +401,34 @@ impl Gateway {
 
         (key_id, private_key_pem, certificate_pem)
     }
+}
+
+async fn fetch_bootstrap_token(
+    client: &reqwest::Client,
+    base_url: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client
+        .post(format!("{base_url}/oauth2/token"))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "tenant:admin application:admin"),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("token request failed: {}", resp.status()).into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let token = body["access_token"]
+        .as_str()
+        .ok_or("missing access_token in token response")?;
+    Ok(token.to_string())
 }
 
 async fn wait_for_ok(

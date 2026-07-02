@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use axum::Router;
 use gamlastan::bindings::RelayState;
 use gamlastan::bindings::redirect::{RedirectEncodeParams, redirect_encode};
 use gamlastan::core::assertion::issuer::IssuerRef;
@@ -10,7 +9,7 @@ use gamlastan::core::identifiers::SamlVersion;
 use gamlastan::core::protocol::request::{AuthnRequestRef, RequestBaseRef};
 use gamlastan::xml::SamlSerialize;
 use sso_gateway::db::{SamlIdpKeyRepo, SamlSpClientRepo, bootstrap_system_tenant, create_pool};
-use sso_gateway::saml_idp::{SamlIdpState, router as saml_idp_router};
+use sso_gateway::services::handlers::saml_idp::{SamlIdpState, router as saml_idp_router};
 use sso_ory_client::kratos::KratosClient;
 use sunbeam_g2v::server::axum::bind_random_port;
 
@@ -161,8 +160,8 @@ async fn start_idp_server(
     database_url: &str,
     kratos_admin_url: &str,
     kratos_public_url: &str,
-) -> (String, Router, String, String) {
-    let pool = create_pool(database_url)
+) -> (String, SamlIdpState, String, String) {
+    let pool = create_pool(database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -182,7 +181,7 @@ async fn start_idp_server(
     ))
     .expect("read saml test cert");
 
-    let idp_keys = SamlIdpKeyRepo::new(pool.clone());
+    let idp_keys = SamlIdpKeyRepo::with_encryption_key(pool.clone(), vec![0u8; 32]);
     idp_keys
         .create(&system_tenant_ulid, "key-1", &key_pem, &cert_pem, true)
         .await
@@ -197,16 +196,14 @@ async fn start_idp_server(
 
     let idp_entity_id = "https://gateway.example.com/saml/idp".to_string();
 
-    let state = Arc::new(SamlIdpState::new(
+    let state = SamlIdpState::new(
         kratos,
         idp_keys,
         sp_clients,
         idp_entity_id.clone(),
-    ));
+    );
 
-    let router = saml_idp_router(state);
-
-    (system_tenant_ulid, router, idp_entity_id, cert_pem)
+    (system_tenant_ulid, state, idp_entity_id, cert_pem)
 }
 
 #[tokio::test]
@@ -217,11 +214,11 @@ async fn saml_idp_sso_round_trip_unsigned_request() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -244,6 +241,11 @@ async fn saml_idp_sso_round_trip_unsigned_request() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -258,7 +260,7 @@ async fn saml_idp_sso_round_trip_unsigned_request() {
     let request_xml = build_authn_request_xml(
         "_req_unsigned_1",
         &sp_client.entity_id,
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, None, "after-login");
@@ -294,7 +296,7 @@ async fn saml_idp_sso_signed_request_verifies_signature() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let sp_cert = std::fs::read_to_string(concat!(
@@ -304,7 +306,7 @@ async fn saml_idp_sso_signed_request_verifies_signature() {
     .expect("read sp cert");
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -327,6 +329,11 @@ async fn saml_idp_sso_signed_request_verifies_signature() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -342,7 +349,7 @@ async fn saml_idp_sso_signed_request_verifies_signature() {
     let request_xml = build_authn_request_xml(
         "_req_signed_1",
         &sp_client.entity_id,
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, Some(&signer), "signed-state");
@@ -377,11 +384,11 @@ async fn saml_idp_sso_rejects_issuer_mismatch() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -404,6 +411,11 @@ async fn saml_idp_sso_rejects_issuer_mismatch() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -418,7 +430,7 @@ async fn saml_idp_sso_rejects_issuer_mismatch() {
     let request_xml = build_authn_request_xml(
         "_req_issuer_1",
         "https://evil.example.com",
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, None, "state");
@@ -447,11 +459,11 @@ async fn saml_idp_sso_rejects_missing_session() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -471,6 +483,11 @@ async fn saml_idp_sso_rejects_missing_session() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -485,7 +502,7 @@ async fn saml_idp_sso_rejects_missing_session() {
     let request_xml = build_authn_request_xml(
         "_req_session_1",
         &sp_client.entity_id,
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, None, "state");
@@ -511,11 +528,11 @@ async fn saml_idp_sso_rejects_signed_request_without_sp_certificate() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -538,6 +555,11 @@ async fn saml_idp_sso_rejects_signed_request_without_sp_certificate() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -553,7 +575,7 @@ async fn saml_idp_sso_rejects_signed_request_without_sp_certificate() {
     let request_xml = build_authn_request_xml(
         "_req_no_cert_1",
         &sp_client.entity_id,
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, Some(&signer), "state");
@@ -582,7 +604,7 @@ async fn saml_idp_sso_rejects_invalid_signature() {
     let (_kratos, kratos_admin_url, kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let (tenant_id, app, _idp_entity_id, _idp_cert) =
+    let (tenant_id, state, _idp_entity_id, _idp_cert) =
         start_idp_server(&database_url, &kratos_admin_url, &kratos_public_url).await;
 
     let other_cert_pem = std::fs::read_to_string(concat!(
@@ -592,7 +614,7 @@ async fn saml_idp_sso_rejects_invalid_signature() {
     .expect("read cert");
 
     let sp_clients = SamlSpClientRepo::new(
-        sso_gateway::db::create_pool(&database_url)
+        sso_gateway::db::create_pool(&database_url, false)
             .await
             .expect("pool"),
     );
@@ -615,6 +637,11 @@ async fn saml_idp_sso_rejects_invalid_signature() {
         .await
         .expect("random port should bind");
 
+    let saml_destination = format!("http://{addr}/saml/sso");
+    let app = saml_idp_router(Arc::new(
+        state.with_sso_endpoint_url(saml_destination.clone()),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -631,7 +658,7 @@ async fn saml_idp_sso_rejects_invalid_signature() {
     let request_xml = build_authn_request_xml(
         "_req_bad_sig_1",
         &sp_client.entity_id,
-        &destination,
+        &saml_destination,
         &sp_client.acs_url,
     );
     let redirect_url = encode_redirect(&destination, &request_xml, Some(&signer), "state");

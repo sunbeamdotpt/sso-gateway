@@ -12,7 +12,10 @@ async fn oidc_discovery_has_oidc_required_fields() {
 
     let discovery: serde_json::Value = gateway
         .http
-        .get(format!("{}/.well-known/openid-configuration", gateway.base_url))
+        .get(format!(
+            "{}/.well-known/openid-configuration",
+            gateway.base_url
+        ))
         .send()
         .await
         .expect("discovery request should succeed")
@@ -68,13 +71,19 @@ async fn oidc_authorization_code_flow_returns_id_token() {
         .expect("id_token is required for OIDC authorization_code");
 
     let claims = decode_jwt_payload(id_token);
-    assert_eq!(claims["iss"], gateway.base_url, "id_token iss must match issuer");
+    assert_eq!(
+        claims["iss"], gateway.base_url,
+        "id_token iss must match issuer"
+    );
     assert_eq!(
         claims["sub"], "conformance-user",
         "id_token sub must match the authenticated subject"
     );
     assert!(
-        claims["aud"].as_array().map(|a| a.iter().any(|v| v == &client_id)).unwrap_or(false),
+        claims["aud"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v == &client_id))
+            .unwrap_or(false),
         "id_token aud must include the requesting client"
     );
     assert!(
@@ -149,7 +158,7 @@ async fn oidc_userinfo_rejects_missing_bearer() {
 /// Perform a full OIDC authorization-code flow against Hydra through the gateway
 /// and return `(client_id, token_response)`.
 async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Value) {
-    let redirect_uri = "http://127.0.0.1:9999/callback";
+    let redirect_uri = "https://127.0.0.1:9999/callback";
     let app = gateway
         .create_application(
             "oidc-auth-code-conformance",
@@ -198,7 +207,10 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
 
     // 2. Accept the login request.
     let login_accept: serde_json::Value = no_redirect
-        .put(format!("{}/admin/oauth2/auth/requests/login/accept", gateway.hydra_admin_url))
+        .put(format!(
+            "{}/admin/oauth2/auth/requests/login/accept",
+            gateway.hydra_admin_url
+        ))
         .query(&[("login_challenge", &login_challenge)])
         .json(&json!({
             "subject": "conformance-user",
@@ -233,14 +245,21 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         .get("location")
         .and_then(|h| h.to_str().ok())
         .expect("consent location header should exist");
-    let consent_location = resolve_hydra_url(consent_location, &gateway.base_url, &gateway.hydra_public_url);
+    let consent_location = resolve_hydra_url(
+        consent_location,
+        &gateway.base_url,
+        &gateway.hydra_public_url,
+    );
     let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
         .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
         .expect("consent_challenge or consent_verifier should be present");
 
     // 4. Accept the consent request.
     let consent_accept: serde_json::Value = no_redirect
-        .put(format!("{}/admin/oauth2/auth/requests/consent/accept", gateway.hydra_admin_url))
+        .put(format!(
+            "{}/admin/oauth2/auth/requests/consent/accept",
+            gateway.hydra_admin_url
+        ))
         .query(&[("consent_challenge", &consent_challenge)])
         .json(&json!({
             "grant_scope": ["openid", "profile"],
@@ -277,7 +296,8 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
 
     // 6. Extract the authorization code from the final redirect URI.
     let code = extract_query_param(final_location, "code").expect("redirect should contain code");
-    let state = extract_query_param(final_location, "state").expect("redirect should contain state");
+    let state =
+        extract_query_param(final_location, "state").expect("redirect should contain state");
     assert_eq!(state, "conformance-state");
 
     // 6. Exchange the code at the gateway token endpoint.

@@ -12,7 +12,7 @@ async fn tenant_connection_repo_round_trip() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -26,6 +26,16 @@ async fn tenant_connection_repo_round_trip() {
         .create("acme", "Acme Corp", json!({}))
         .await
         .expect("tenant should be created");
+
+    let domains = TenantDomainRepo::new(pool.clone());
+    let domain = domains
+        .create(&tenant.id, "auth.acme.com")
+        .await
+        .expect("domain should be created");
+    domains
+        .mark_verified(&tenant.id, &domain.id)
+        .await
+        .expect("domain should be verified");
 
     let connections = TenantConnectionRepo::new(pool.clone());
     let created = connections
@@ -62,7 +72,11 @@ async fn tenant_connection_repo_round_trip() {
     assert_eq!(listed.len(), 1);
 
     let updated = connections
-        .update_config(&tenant.id, &created.id, json!({"issuer": "https://idp.acme.com"}))
+        .update_config(
+            &tenant.id,
+            &created.id,
+            json!({"issuer": "https://idp.acme.com"}),
+        )
         .await
         .expect("config should be updated");
     assert_eq!(updated.config["issuer"], "https://idp.acme.com");
@@ -74,10 +88,7 @@ async fn tenant_connection_repo_round_trip() {
     assert!(!disabled.is_enabled);
 
     assert!(
-        connections
-            .get_by_domain("auth.acme.com")
-            .await
-            .is_err(),
+        connections.get_by_domain("auth.acme.com").await.is_err(),
         "disabled connection should not be returned by domain lookup"
     );
 
@@ -87,10 +98,7 @@ async fn tenant_connection_repo_round_trip() {
         .expect("connection should be re-enabled");
     assert!(reenabled.is_enabled);
     assert!(
-        connections
-            .get_by_domain("auth.acme.com")
-            .await
-            .is_ok(),
+        connections.get_by_domain("auth.acme.com").await.is_ok(),
         "re-enabled connection should be returned by domain lookup"
     );
 }
@@ -101,7 +109,7 @@ async fn tenant_connection_repo_errors_for_missing_rows() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -129,7 +137,13 @@ async fn tenant_connection_repo_errors_for_missing_rows() {
             .await
             .is_err()
     );
-    assert!(connections.list_by_tenant(&tenant.id).await.unwrap().is_empty());
+    assert!(
+        connections
+            .list_by_tenant(&tenant.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -138,7 +152,7 @@ async fn tenant_local_auth_repo_round_trip() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -208,7 +222,7 @@ async fn tenant_domain_repo_round_trip() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -262,7 +276,7 @@ async fn tenant_domain_repo_unique_domain() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -292,7 +306,10 @@ async fn tenant_domain_repo_unique_domain() {
         .await
         .expect_err("duplicate domain should fail");
     assert!(
-        matches!(err, sso_gateway::db::DbError::Sqlx(sqlx::Error::Database(_))),
+        matches!(
+            err,
+            sso_gateway::db::DbError::Sqlx(sqlx::Error::Database(_))
+        ),
         "expected unique violation, got {err:?}"
     );
 }

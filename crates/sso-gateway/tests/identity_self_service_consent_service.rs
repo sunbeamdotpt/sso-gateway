@@ -6,12 +6,13 @@ use axum::{
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{IdMappingRepo, TenantApiKeyRepo, bootstrap_system_tenant, create_pool},
+    db::{IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::{IdentitySelfServiceExt, OAuth2ConsentServiceExt},
     services::{
         identity_self_service::IdentitySelfServiceImpl, oauth2_consent::OAuth2ConsentServiceImpl,
     },
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
@@ -252,7 +253,7 @@ async fn self_service_and_consent_round_trip() {
     let (_kratos_handle, kratos_url) = start_mock_kratos().await;
     let (_hydra_handle, hydra_url) = start_mock_hydra().await;
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
     let system_tenant_ulid = ulid::Ulid::new().to_string();
@@ -271,7 +272,7 @@ async fn self_service_and_consent_round_trip() {
         .create(&system_tenant_ulid, "kratos", "public-1", "identity-1")
         .await
         .expect("mapping should be created");
-    let api_keys = TenantApiKeyRepo::new(pool);
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
     let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
@@ -289,9 +290,15 @@ async fn self_service_and_consent_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -309,12 +316,11 @@ async fn self_service_and_consent_round_trip() {
 
     let client = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let tenant_header = &system_tenant_ulid;
 
     // IdentitySelfService::ToSession
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/ToSession"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({}))
@@ -330,7 +336,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::GetLoginFlow
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/GetLoginFlow"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1" }))
@@ -353,7 +359,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::SubmitLoginFlow
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/SubmitLoginFlow"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1", "body": { "identifier": "a" } }))
@@ -376,7 +382,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::CreateLoginFlow
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/CreateLoginFlow"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -401,7 +407,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/CreateRegistrationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -419,7 +425,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/CreateSettingsFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -437,7 +443,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/CreateRecoveryFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -455,7 +461,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/GetRegistrationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1" }))
@@ -473,7 +479,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/SubmitRegistrationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1", "body": { "traits": { "email": "a@b.com" } } }))
@@ -489,7 +495,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::GetSettingsFlow
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/GetSettingsFlow"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1" }))
@@ -507,7 +513,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/SubmitSettingsFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1", "body": { "traits": {} } }))
@@ -523,7 +529,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::GetRecoveryFlow
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/GetRecoveryFlow"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1" }))
@@ -541,7 +547,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/SubmitRecoveryFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1", "body": { "email": "a@b.com" } }))
@@ -559,7 +565,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/GetVerificationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1" }))
@@ -577,7 +583,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/SubmitVerificationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "id": "flow-1", "body": { "code": "123456" } }))
@@ -595,7 +601,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/CreateVerificationFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -613,7 +619,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/CreateLogoutFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "returnTo": "http://return" }))
@@ -638,7 +644,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/SubmitLogoutFlow"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "token": "token-1" }))
@@ -654,7 +660,7 @@ async fn self_service_and_consent_round_trip() {
     // IdentitySelfService::GetFlowError
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/GetFlowError"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": "error-1" }))
         .send()
@@ -671,7 +677,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentitySelfService/GetWebAuthnJavaScript"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -688,7 +694,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.OAuth2ConsentService/GetConsentRequest"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "challenge-1" }))
         .send()
@@ -703,7 +709,7 @@ async fn self_service_and_consent_round_trip() {
     // OAuth2ConsentService::AcceptConsent
     let resp = client
         .post(format!("{base}/iam.v1.OAuth2ConsentService/AcceptConsent"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "challenge-1", "grantScope": ["openid"] }))
         .send()
@@ -718,7 +724,7 @@ async fn self_service_and_consent_round_trip() {
     // OAuth2ConsentService::RejectConsent
     let resp = client
         .post(format!("{base}/iam.v1.OAuth2ConsentService/RejectConsent"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "challenge-1", "error": "access_denied" }))
         .send()
@@ -735,7 +741,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!(
             "{base}/iam.v1.OAuth2ConsentService/GetLogoutRequest"
         ))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "logout-1" }))
         .send()
@@ -750,7 +756,7 @@ async fn self_service_and_consent_round_trip() {
     // OAuth2ConsentService::AcceptLogout
     let resp = client
         .post(format!("{base}/iam.v1.OAuth2ConsentService/AcceptLogout"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "logout-1" }))
         .send()
@@ -765,7 +771,7 @@ async fn self_service_and_consent_round_trip() {
     // OAuth2ConsentService::RejectLogout
     let resp = client
         .post(format!("{base}/iam.v1.OAuth2ConsentService/RejectLogout"))
-        .header("x-tenant-id", tenant_header)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "challenge": "logout-1", "error": "invalid_request" }))
         .send()

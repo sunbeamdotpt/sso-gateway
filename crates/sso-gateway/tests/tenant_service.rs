@@ -4,10 +4,11 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{IdMappingRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::TenantServiceExt,
     services::tenant::TenantServiceImpl,
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
@@ -24,7 +25,7 @@ async fn tenant_service_round_trip() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -32,19 +33,15 @@ async fn tenant_service_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
     let mappings = IdMappingRepo::new(pool.clone());
     let kratos = Arc::new(
         KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
             .expect("fake kratos client should build"),
     );
-    let tenant_service = Arc::new(TenantServiceImpl::new(
-        repo,
-        api_keys.clone(),
-        system_tenant_ulid.clone(),
-    ));
+    let tenant_service = Arc::new(TenantServiceImpl::new(repo, system_tenant_ulid.clone()));
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let service_router = ServiceRouter::from_router(connect_router);
 
@@ -57,9 +54,15 @@ async fn tenant_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -81,7 +84,7 @@ async fn tenant_service_round_trip() {
     // Create a tenant.
     let create_resp = client
         .post(format!("{base}/iam.v1.TenantService/CreateTenant"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "slug": "acme",
@@ -107,7 +110,7 @@ async fn tenant_service_round_trip() {
     // Get the tenant by id.
     let get_resp = client
         .post(format!("{base}/iam.v1.TenantService/GetTenant"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": tenant_id }))
         .send()
@@ -121,7 +124,7 @@ async fn tenant_service_round_trip() {
     // List tenants should include the system tenant and the created tenant.
     let list_resp = client
         .post(format!("{base}/iam.v1.TenantService/ListTenants"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -138,7 +141,7 @@ async fn tenant_service_round_trip() {
         .expect("tenants array should exist");
     assert!(tenants.len() >= 2, "should list system + created tenants");
 
-    // Missing x-tenant-id should be rejected before reaching the service.
+    // Missing authorization header should be rejected before reaching the service.
     let no_header_resp = client
         .post(format!("{base}/iam.v1.TenantService/ListTenants"))
         .header("content-type", "application/json")
@@ -147,159 +150,6 @@ async fn tenant_service_round_trip() {
         .await
         .expect("request should complete");
     assert_eq!(no_header_resp.status(), 401);
-
-    let _ = shutdown_tx.send(());
-    handle.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn tenant_api_key_auth_round_trip() {
-    let (_pg, database_url) = support::start_postgres()
-        .await
-        .expect("postgres should start");
-
-    let pool = create_pool(&database_url)
-        .await
-        .expect("database pool should be created");
-
-    let system_tenant_ulid = ulid::Ulid::new().to_string();
-    bootstrap_system_tenant(&pool, &system_tenant_ulid)
-        .await
-        .expect("system tenant should bootstrap");
-
-    let repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
-    let mappings = IdMappingRepo::new(pool.clone());
-    let kratos = Arc::new(
-        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
-            .expect("fake kratos client should build"),
-    );
-    let tenant_service = Arc::new(TenantServiceImpl::new(
-        repo,
-        api_keys.clone(),
-        system_tenant_ulid.clone(),
-    ));
-    let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
-    let service_router = ServiceRouter::from_router(connect_router);
-
-    let server = ServerBuilder::new()
-        .with_router(service_router)
-        .with_health(HealthRouter::new())
-        .build_axum()
-        .expect("server should build");
-
-    let app = server
-        .app()
-        .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
-        .layer(Extension(kratos))
-        .layer(Extension(mappings));
-
-    let (listener, addr) = bind_random_port("127.0.0.1")
-        .await
-        .expect("random port should bind");
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("server should run");
-    });
-
-    let client = reqwest::Client::new();
-    let base = format!("http://{addr}");
-
-    // Rotate an admin API key for the system tenant.
-    let rotate_resp = client
-        .post(format!("{base}/iam.v1.TenantService/RotateApiKey"))
-        .header("x-tenant-id", &system_tenant_ulid)
-        .header("content-type", "application/json")
-        .json(&json!({
-            "tenantId": system_tenant_ulid,
-            "name": "admin",
-            "scopes": ["tenant:admin"]
-        }))
-        .send()
-        .await
-        .expect("rotate api key request should succeed");
-
-    assert!(
-        rotate_resp.status().is_success(),
-        "rotate api key failed: {}",
-        rotate_resp.text().await.unwrap_or_default()
-    );
-    let key: serde_json::Value = rotate_resp.json().await.expect("api key should be json");
-    let plaintext = key["plaintext"].as_str().expect("plaintext should exist");
-    assert_eq!(key["tenantId"], system_tenant_ulid);
-    assert_eq!(key["name"], "admin");
-
-    // Use the API key to call GetTenant without an x-tenant-id header.
-    let get_resp = client
-        .post(format!("{base}/iam.v1.TenantService/GetTenant"))
-        .header("x-api-key", plaintext)
-        .header("content-type", "application/json")
-        .json(&json!({ "id": system_tenant_ulid }))
-        .send()
-        .await
-        .expect("get tenant with api key should succeed");
-
-    assert!(
-        get_resp.status().is_success(),
-        "get tenant with api key failed: {}",
-        get_resp.text().await.unwrap_or_default()
-    );
-    let fetched: serde_json::Value = get_resp.json().await.expect("tenant should be json");
-    assert_eq!(fetched["id"], system_tenant_ulid);
-
-    // A read-only key cannot rotate keys.
-    let rotate_read_resp = client
-        .post(format!("{base}/iam.v1.TenantService/RotateApiKey"))
-        .header("x-tenant-id", &system_tenant_ulid)
-        .header("content-type", "application/json")
-        .json(&json!({
-            "tenantId": system_tenant_ulid,
-            "name": "reader",
-            "scopes": ["tenant:read"]
-        }))
-        .send()
-        .await
-        .expect("rotate reader key request should succeed");
-    assert!(rotate_read_resp.status().is_success());
-    let reader_key: serde_json::Value = rotate_read_resp
-        .json()
-        .await
-        .expect("reader key should be json");
-    let reader_plaintext = reader_key["plaintext"]
-        .as_str()
-        .expect("reader plaintext should exist");
-
-    let forbidden_resp = client
-        .post(format!("{base}/iam.v1.TenantService/RotateApiKey"))
-        .header("x-api-key", reader_plaintext)
-        .header("content-type", "application/json")
-        .json(&json!({
-            "tenantId": system_tenant_ulid,
-            "name": "other",
-            "scopes": ["tenant:admin"]
-        }))
-        .send()
-        .await
-        .expect("rotate with reader key request should complete");
-    assert_eq!(forbidden_resp.status(), 403);
-
-    // An unknown API key is rejected.
-    let unknown_resp = client
-        .post(format!("{base}/iam.v1.TenantService/GetTenant"))
-        .header("x-api-key", "not-a-real-key")
-        .header("content-type", "application/json")
-        .json(&json!({ "id": system_tenant_ulid }))
-        .send()
-        .await
-        .expect("request with unknown key should complete");
-    assert_eq!(unknown_resp.status(), 401);
 
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");

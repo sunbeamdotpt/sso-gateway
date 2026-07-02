@@ -5,17 +5,18 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdentitySchemaRepo, ScimGroupRepo, TenantApiKeyRepo, TenantRepo,
+        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, ScimGroupRepo, TenantRepo,
         bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
-    oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt},
-    scim::{ScimState, router as scim_router},
+    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
+    services::handlers::scim::{ScimState, router as scim_router},
     services::{
         application::ApplicationServiceImpl, identity::IdentityServiceImpl, scim::ScimServiceImpl,
         tenant::TenantServiceImpl,
     },
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
 use sunbeam_g2v::{
@@ -38,7 +39,7 @@ async fn scim_users_and_groups_round_trip() {
     let (_keto, keto_read_url, keto_write_url) =
         support::start_keto().await.expect("keto should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -46,6 +47,7 @@ async fn scim_users_and_groups_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     let hydra = Arc::new(
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
@@ -60,11 +62,9 @@ async fn scim_users_and_groups_round_trip() {
     let schemas = IdentitySchemaRepo::new(pool.clone());
     let groups = ScimGroupRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let application_service =
@@ -98,11 +98,7 @@ async fn scim_users_and_groups_round_trip() {
         mappings.clone(),
         base.clone(),
     ));
-    let scim_state = Arc::new(ScimState::new(
-        scim_service.clone(),
-        hydra.clone(),
-        mappings.clone(),
-    ));
+    let scim_state = Arc::new(ScimState::new(scim_service.clone()));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -115,9 +111,15 @@ async fn scim_users_and_groups_round_trip() {
         .merge(oauth2_router(oauth_state))
         .merge(scim_router(scim_state))
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -134,7 +136,7 @@ async fn scim_users_and_groups_round_trip() {
     // Create a tenant that will own the SCIM resources.
     let create_resp = client
         .post(format!("{base}/iam.v1.TenantService/CreateTenant"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "slug": "scim-tenant",
@@ -149,62 +151,14 @@ async fn scim_users_and_groups_round_trip() {
         "create tenant failed: {}",
         create_resp.text().await.unwrap_or_default()
     );
-    let tenant: serde_json::Value = create_resp.json().await.expect("tenant should be json");
-    let tenant_id = tenant["id"].as_str().expect("tenant id should exist");
-
-    // Create an OAuth2 client for bearer-token authentication.
-    let app_resp = client
-        .post(format!(
-            "{base}/iam.v1.ApplicationService/CreateApplication"
-        ))
-        .header("x-tenant-id", tenant_id)
-        .header("content-type", "application/json")
-        .json(&json!({
-            "name": "scim-client",
-            "redirectUris": ["http://localhost/callback"],
-            "grantTypes": ["client_credentials"],
-            "responseTypes": ["token"],
-            "scope": ["openid"],
-            "tokenEndpointAuthMethod": "client_secret_post"
-        }))
-        .send()
-        .await
-        .expect("create application request should succeed");
-    assert!(
-        app_resp.status().is_success(),
-        "create application failed: {}",
-        app_resp.text().await.unwrap_or_default()
-    );
-    let app: serde_json::Value = app_resp.json().await.expect("application should be json");
-    let app_id = app["id"].as_str().expect("application id should exist");
-
-    let rotate_resp = client
-        .post(format!("{base}/iam.v1.ApplicationService/RotateSecret"))
-        .header("x-tenant-id", tenant_id)
-        .header("content-type", "application/json")
-        .json(&json!({ "id": app_id }))
-        .send()
-        .await
-        .expect("rotate secret request should succeed");
-    assert!(
-        rotate_resp.status().is_success(),
-        "rotate secret failed: {}",
-        rotate_resp.text().await.unwrap_or_default()
-    );
-    let rotated: serde_json::Value = rotate_resp.json().await.expect("secret should be json");
-    let client_id = rotated["clientId"]
-        .as_str()
-        .expect("client_id should exist");
-    let client_secret = rotated["clientSecret"]
-        .as_str()
-        .expect("client_secret should exist");
+    let _tenant: serde_json::Value = create_resp.json().await.expect("tenant should be json");
 
     // Create and default an identity schema so SCIM users validate.
     let schema_resp = client
         .post(format!(
             "{base}/iam.v1.IdentityService/CreateIdentitySchema"
         ))
-        .header("x-tenant-id", tenant_id)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "schemaId": "default",
@@ -233,7 +187,7 @@ async fn scim_users_and_groups_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"
         ))
-        .header("x-tenant-id", tenant_id)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "schemaId": "default" }))
         .send()
@@ -245,33 +199,12 @@ async fn scim_users_and_groups_round_trip() {
         set_default_resp.text().await.unwrap_or_default()
     );
 
-    // Obtain an access token for the SCIM client.
-    let token_resp = client
-        .post(format!("{base}/oauth2/token"))
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("scope", "openid"),
-        ])
-        .send()
-        .await
-        .expect("token request should succeed");
-    assert!(
-        token_resp.status().is_success(),
-        "token request failed: {}",
-        token_resp.text().await.unwrap_or_default()
-    );
-    let token: serde_json::Value = token_resp.json().await.expect("token should be json");
-    let access_token = token["access_token"]
-        .as_str()
-        .expect("access_token should exist");
-
+    // SCIM requests use the test introspector token.
     let scim_headers = || {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
-            format!("Bearer {access_token}").parse().unwrap(),
+            format!("Bearer {}", support::TEST_TOKEN).parse().unwrap(),
         );
         headers.insert(
             reqwest::header::CONTENT_TYPE,

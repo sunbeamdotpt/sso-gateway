@@ -5,12 +5,13 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdentitySchemaRepo, TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant,
+        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, TenantRepo, bootstrap_system_tenant,
         create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{IdentityServiceExt, TenantServiceExt},
     services::{identity::IdentityServiceImpl, tenant::TenantServiceImpl},
+    session_token::SessionTokenSigner,
 };
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
@@ -29,7 +30,7 @@ async fn identity_service_round_trip() {
     let (_kratos, kratos_admin_url, _kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -37,6 +38,7 @@ async fn identity_service_round_trip() {
     bootstrap_system_tenant(&pool, &system_tenant_ulid)
         .await
         .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
     // Register the default identity schema for this tenant so the service accepts it.
     let schemas = IdentitySchemaRepo::new(pool.clone());
@@ -80,11 +82,9 @@ async fn identity_service_round_trip() {
     );
     let mappings = IdMappingRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool);
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         system_tenant_ulid.clone(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
@@ -106,9 +106,15 @@ async fn identity_service_round_trip() {
     let app = server
         .app()
         .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
         .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
         .await
@@ -130,7 +136,7 @@ async fn identity_service_round_trip() {
     // Create an identity.
     let create_resp = client
         .post(format!("{base}/iam.v1.IdentityService/CreateIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "schemaId": "default",
@@ -155,7 +161,7 @@ async fn identity_service_round_trip() {
     // Get the identity.
     let get_resp = client
         .post(format!("{base}/iam.v1.IdentityService/GetIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "id": identity_id }))
         .send()
@@ -170,7 +176,7 @@ async fn identity_service_round_trip() {
     // Update the identity.
     let update_resp = client
         .post(format!("{base}/iam.v1.IdentityService/UpdateIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "id": identity_id,
@@ -188,7 +194,7 @@ async fn identity_service_round_trip() {
     // List identities.
     let list_resp = client
         .post(format!("{base}/iam.v1.IdentityService/ListIdentities"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -209,7 +215,7 @@ async fn identity_service_round_trip() {
     // Create an identity using the default schema when schemaId is omitted.
     let default_resp = client
         .post(format!("{base}/iam.v1.IdentityService/CreateIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "traits": { "email": "default@example.com" },
@@ -234,7 +240,7 @@ async fn identity_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentityService/CreateIdentitySchema"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "schemaId": "custom",
@@ -261,7 +267,7 @@ async fn identity_service_round_trip() {
 
     let get_schema_resp = client
         .post(format!("{base}/iam.v1.IdentityService/GetIdentitySchema"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "schemaId": "custom" }))
         .send()
@@ -273,7 +279,7 @@ async fn identity_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentityService/UpdateIdentitySchema"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "schemaId": "custom",
@@ -298,7 +304,7 @@ async fn identity_service_round_trip() {
 
     let list_schema_resp = client
         .post(format!("{base}/iam.v1.IdentityService/ListIdentitySchemas"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -326,7 +332,7 @@ async fn identity_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentityService/SetDefaultIdentitySchema"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({ "schemaId": "custom" }))
         .send()
@@ -340,7 +346,7 @@ async fn identity_service_round_trip() {
     // Self-service flows are backed by Kratos public API.
     let login_resp = client
         .post(format!("{base}/iam.v1.IdentityService/CreateLoginFlow"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -359,7 +365,7 @@ async fn identity_service_round_trip() {
         .post(format!(
             "{base}/iam.v1.IdentityService/CreateRegistrationFlow"
         ))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({}))
         .send()
@@ -380,7 +386,7 @@ async fn identity_service_round_trip() {
     // Trait validation rejects traits that do not match the registered schema.
     let invalid_resp = client
         .post(format!("{base}/iam.v1.IdentityService/CreateIdentity"))
-        .header("x-tenant-id", &system_tenant_ulid)
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .json(&json!({
             "schemaId": "custom",
@@ -398,7 +404,7 @@ async fn identity_service_round_trip() {
     for id in [identity_id, default_identity["id"].as_str().unwrap()] {
         let delete_resp = client
             .post(format!("{base}/iam.v1.IdentityService/DeleteIdentity"))
-            .header("x-tenant-id", &system_tenant_ulid)
+            .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
             .header("content-type", "application/json")
             .json(&json!({ "id": id }))
             .send()

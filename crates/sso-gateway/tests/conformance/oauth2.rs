@@ -6,7 +6,10 @@ async fn oauth2_discovery_returns_required_fields() {
 
     let discovery: serde_json::Value = gateway
         .http
-        .get(format!("{}/.well-known/openid-configuration", gateway.base_url))
+        .get(format!(
+            "{}/.well-known/openid-configuration",
+            gateway.base_url
+        ))
         .send()
         .await
         .expect("discovery request should succeed")
@@ -32,15 +35,24 @@ async fn oauth2_discovery_returns_required_fields() {
         "jwks_uri is required"
     );
     assert!(
-        discovery["scopes_supported"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        discovery["scopes_supported"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "scopes_supported is required"
     );
     assert!(
-        discovery["response_types_supported"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        discovery["response_types_supported"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "response_types_supported is required"
     );
     assert!(
-        discovery["grant_types_supported"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        discovery["grant_types_supported"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "grant_types_supported is required"
     );
     assert!(
@@ -69,7 +81,10 @@ async fn oauth2_jwks_returns_key_set() {
         .expect("jwks should be json");
 
     assert!(
-        jwks["keys"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        jwks["keys"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "jwks keys must be a non-empty array"
     );
 
@@ -82,7 +97,7 @@ async fn oauth2_client_credentials_returns_access_token() {
     let app = gateway
         .create_application(
             "oauth2-cc-conformance",
-            &["http://localhost/callback"],
+            &["https://localhost/callback"],
             &["client_credentials"],
             &["token"],
             &["openid"],
@@ -129,7 +144,7 @@ async fn oauth2_introspection_and_revocation_are_consistent() {
     let app = gateway
         .create_application(
             "oauth2-revoke-conformance",
-            &["http://localhost/callback"],
+            &["https://localhost/callback"],
             &["client_credentials"],
             &["token"],
             &["openid"],
@@ -158,7 +173,7 @@ async fn oauth2_introspection_and_revocation_are_consistent() {
     let introspect: serde_json::Value = gateway
         .http
         .post(format!("{}/oauth2/introspect", gateway.base_url))
-        .header("x-tenant-id", &gateway.system_tenant_ulid)
+        .bearer_auth(&gateway.admin_token)
         .form(&[("token", access_token)])
         .send()
         .await
@@ -186,7 +201,7 @@ async fn oauth2_introspection_and_revocation_are_consistent() {
     let after_revoke: serde_json::Value = gateway
         .http
         .post(format!("{}/oauth2/introspect", gateway.base_url))
-        .header("x-tenant-id", &gateway.system_tenant_ulid)
+        .bearer_auth(&gateway.admin_token)
         .form(&[("token", access_token)])
         .send()
         .await
@@ -230,7 +245,7 @@ async fn oauth2_invalid_grant_type_is_rejected() {
     let app = gateway
         .create_application(
             "oauth2-grant-conformance",
-            &["http://localhost/callback"],
+            &["https://localhost/callback"],
             &["client_credentials"],
             &["token"],
             &["openid"],

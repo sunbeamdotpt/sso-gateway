@@ -1,6 +1,6 @@
 use sso_gateway::db::{
-    DbError, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, ScimGroupRepo,
-    TenantApiKeyRepo, TenantRepo, bootstrap_system_tenant, create_pool,
+    DbError, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, ScimGroupRepo, TenantRepo,
+    bootstrap_system_tenant, create_pool,
 };
 
 mod support;
@@ -11,7 +11,7 @@ async fn db_edge_cases() {
         .await
         .expect("postgres should start");
 
-    let pool = create_pool(&database_url)
+    let pool = create_pool(&database_url, false)
         .await
         .expect("database pool should be created");
 
@@ -33,26 +33,6 @@ async fn db_edge_cases() {
     assert!(matches!(
         tenants.get_by_id("not-a-tenant").await.unwrap_err(),
         DbError::TenantNotFound
-    ));
-
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
-    api_keys
-        .create(
-            &tenant_id,
-            "expired",
-            "expired-hash",
-            &[],
-            Some(time::OffsetDateTime::now_utc() - time::Duration::hours(1)),
-        )
-        .await
-        .expect("expired key should be created");
-    assert!(matches!(
-        api_keys.get_by_hash("expired-hash").await.unwrap_err(),
-        DbError::ApiKeyNotFound
-    ));
-    assert!(matches!(
-        api_keys.get_by_hash("no-such-hash").await.unwrap_err(),
-        DbError::ApiKeyNotFound
     ));
 
     let mappings = IdMappingRepo::new(pool.clone());
