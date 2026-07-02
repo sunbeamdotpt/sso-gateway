@@ -5,7 +5,8 @@ tags:
   - security
   - audit
   - saml
-  - api-keys
+  - oauth2
+  - bearer-tokens
 category: reference
 order: 5
 nav_order: 5
@@ -17,10 +18,10 @@ This document summarizes the security-focused code review performed on the SSO G
 
 ## Authentication and authorization
 
-- **API keys** are hashed with SHA-256 and looked up by hash in `tenant_api_keys`. Each key has an optional expiration time; expired keys are rejected at lookup time.
-- **Scopes** are enforced per RPC by `require_scope`. Requests that only provide `X-Tenant-Id` (for example, the initial bootstrap flow) bypass scope checks.
+- **Bearer tokens** are required for all protected endpoints. Clients send `Authorization: Bearer <token>`. The shared `auth_middleware` introspects the token via Hydra, caches the result in Postgres (`token_introspection_cache`), and resolves the tenant from the token subject using `id_mappings`.
+- **Scopes** are enforced per RPC by `require_scope`. The tenant and scopes come from the `AuthContext` produced by introspection.
 - **Tenant isolation** is enforced at the HTTP middleware layer for Connect-RPC calls and at the handler layer for OAuth2, SAML, and SCIM protocol endpoints.
-- **Public paths** (`/.well-known/`, `/oauth2/`, `/saml/`, `/scim/`) skip API-key authentication because they validate the tenant from protocol-specific parameters.
+- **Public paths** (`/.well-known/`, `/oauth2/`, `/saml/`, `/scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`, `/scim/v2/Schemas`) skip shared bearer-token authentication because they perform protocol-native authentication (OAuth2 client credentials, SAML assertions, SCIM bearer tokens).
 
 ## Audit logging
 
@@ -51,9 +52,8 @@ The `audit_middleware` records method, path, resolved tenant, authenticated acto
 
 | Risk | Mitigation / recommendation |
 |---|---|
-| API key hashes are unsalted. | This is acceptable for the current threat model because keys are random and high-entropy. If the key table is ever exposed, consider migrating to per-key salted hashes. |
-| Database lookup of API key hashes may leak timing information. | Invalid and missing keys follow the same rejection path to minimize observable differences. |
-| Public protocol endpoints bypass API-key auth. | Each endpoint validates tenant from protocol-specific data (`client_id`, SAML issuer/SP client, SCIM bearer token). Keep Ory admin endpoints network-restricted. |
+| Introspection responses are cached in Postgres. | Cache entries are keyed by SHA-256 hash of the token and expire based on `cached_at` and the token `exp`. Revoked tokens remain usable until the cache entry expires; set `max_age` short enough for your revocation requirements. |
+| Public protocol endpoints bypass shared bearer-token auth. | Each endpoint validates tenants from protocol-specific data (`client_id`, SAML issuer/SP client, SCIM bearer token). Keep Ory admin endpoints network-restricted. |
 | Audit logs are best-effort. | Monitor `audit log insertion failed` warnings and alert if audit writes fail repeatedly. |
 
 ## Operational checklist

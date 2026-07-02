@@ -37,7 +37,7 @@ Pushing a tag matching `v*` triggers `.github/workflows/release.yml`, which buil
 
 ## Docker Compose
 
-Use the provided `docker-compose.yml` to run Postgres, Redis, Hydra, Kratos, Keto, and the gateway together:
+Use the provided `docker-compose.yml` to run Postgres, Hydra, Kratos, Keto, and the gateway together:
 
 ```bash
 export SYSTEM_TENANT_ULID="01JABCDEFGHIJKLMNOPQRSTUV"

@@ -21,7 +21,7 @@ This guide walks you through running the gateway locally, bootstrapping the syst
 
 ## Start the backing services
 
-A `docker-compose.yml` in the repo root starts Postgres, Redis, Hydra, Kratos, and Keto:
+A `docker-compose.yml` in the repo root starts Postgres, Hydra, Kratos, and Keto:
 
 ```bash
 docker compose up -d
@@ -37,24 +37,29 @@ Set the required environment variables and start the binary:
 export SYSTEM_TENANT_ULID="01JABCDEFGHIJKLMNOPQRSTUV"
 export DATABASE_URL="postgres://ory:ory@localhost:5432/ory?sslmode=disable"
 export PUBLIC_BASE_URL="http://localhost:8080"
+export SYSTEM_BOOTSTRAP_CLIENT_ID="system-bootstrap"
+export SYSTEM_BOOTSTRAP_CLIENT_SECRET="change-me"
 
 cargo run -p sso-gateway
 ```
 
-The server listens on `http://localhost:8080`.
+The server listens on `http://localhost:8080`. On startup the gateway creates a
+system bootstrap OAuth2 client in Hydra and maps it to the system tenant.
 
-## Create the first API key
+## Get an access token
 
-The system tenant must be bootstrapped before API keys work. On startup the gateway creates the system tenant if it does not exist. Create an API key via the Connect-RPC `RotateApiKey` method and use it for subsequent requests.
+Request a client-credentials token for the system bootstrap client:
 
 ```bash
-curl -X POST http://localhost:8080/iam.v1.TenantService/RotateApiKey \
-  -H "Content-Type: application/json" \
-  -H "X-Tenant-Id: $SYSTEM_TENANT_ULID" \
-  -d '{"scope": ["tenant:read", "tenant:write"]}'
+TOKEN=$(curl -s -X POST http://localhost:8080/oauth2/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -u "$SYSTEM_BOOTSTRAP_CLIENT_ID:$SYSTEM_BOOTSTRAP_CLIENT_SECRET" \
+  -d "grant_type=client_credentials" \
+  -d "scope=tenant:admin" | jq -r '.access_token')
 ```
 
-Use the returned key in the `X-Api-Key` header.
+Use the returned token in the `Authorization: Bearer` header for all protected
+Connect-RPC calls.
 
 ## Next steps
 

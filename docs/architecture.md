@@ -15,11 +15,12 @@ The gateway is a vendor-neutral facade. Callers never see Ory paths or global ID
 
 ## Request flow
 
-1. **Tenant resolution** — every request must include `X-Tenant-Id` with a valid ULID, except protocol endpoints that validate the tenant from the request itself.
-2. **Authentication** — API keys are hashed and looked up in `tenant_api_keys`; scopes are enforced per RPC.
-3. **Authorization** — service code can call Keto to check relation tuples scoped to the tenant.
-4. **Translation** — gateway ULIDs are mapped to Ory global IDs through `id_mappings`.
-5. **Audit** — the audit middleware records method, path, actor, tenant, and outcome asynchronously.
+1. **Authentication** — protected endpoints require `Authorization: Bearer <token>`. The shared `auth_middleware` introspects the token via Hydra, caches the result in Postgres (`token_introspection_cache`), and resolves the caller's tenant from the token subject through `id_mappings`.
+2. **Authorization** — service code calls `require_scope` and can call Keto to check relation tuples scoped to the tenant.
+3. **Translation** — gateway ULIDs are mapped to Ory global IDs through `id_mappings`.
+4. **Audit** — the audit middleware records method, path, actor, tenant, and outcome asynchronously.
+
+Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) skip the shared bearer-token middleware and authenticate using protocol-specific mechanisms.
 
 ## Multi-tenancy model
 
@@ -38,5 +39,4 @@ The gateway is a vendor-neutral facade. Callers never see Ory paths or global ID
 
 ## Data stores
 
-- **Postgres** — gateway metadata, audit log, identity schemas, SAML replay cache, and SAML key/cert rotation.
-- **Redis** — available through `sunbeam-g2v` for future caching and rate limiting.
+- **Postgres** — gateway metadata, audit log, identity schemas, SAML replay cache, SAML key/cert rotation, and token introspection cache.

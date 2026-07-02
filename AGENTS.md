@@ -11,7 +11,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - **HTTP stack**: `axum` (as re-exported / depended on by `sunbeam-g2v`). Do **not** introduce separate `tower` or `tonic` dependencies. Keto is accessed over HTTP, not gRPC.
 - **Error handling**: Custom errors use `thiserror`. `anyhow` is not used in gateway code. Convert everything into `sunbeam_g2v::error::ServiceError` at service boundaries.
 - **Identifiers**: All gateway-level identifiers are ULIDs (`ulid` crate). Do **not** use UUIDs for primary keys.
-- **Tenancy**: Every request must carry an `X-Tenant-Id` header containing a valid ULID. The system tenant ULID is configured via the `SYSTEM_TENANT_ULID` environment variable and is bootstrapped on startup with system-scoped permissions.
+- **Tenancy**: Protected endpoints require an `Authorization: Bearer <token>` header. The shared auth middleware introspects the token via Hydra and resolves the tenant from the token subject. The system tenant ULID is configured via `SYSTEM_TENANT_ULID`; a system bootstrap OAuth2 client is created on startup.
 - **Schemas**: Per-tenant identity schemas are managed through a registry API backed by `tenant_identity_schemas`.
 - **Audit**: Request audit records are written asynchronously to the `audit_log` table by `audit_middleware`.
 - **SAML**: The gateway is both a SAML Service Provider (`/saml/metadata`, `/saml/acs`) and a SAML Identity Provider (`/saml/sso`). IdP signing keys are stored in `saml_idp_keys`; SP client configuration is stored in `saml_sp_clients`.
@@ -32,7 +32,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - Target >90% unit and integration test coverage.
 - Integration tests use `testcontainers-rs` via the local `sunbeam-test` crate at `../test`.
 - Tests expect a Docker-compatible runtime at `DOCKER_HOST` (e.g., `lima-docker` / `socktainer` on macOS).
-- Containers are reached on the bridge network with `container_bridge_ip` from `sunbeam-test`, not via published ports.
+- Containers are reached via published ports because lima rootless Docker lacks bridge reachability; `container_bridge_ip` from `sunbeam-test` is not used.
 - Add tests alongside code (`#[cfg(test)]`) and in `crates/*/tests/` for integration scenarios.
 
 ### Useful commands

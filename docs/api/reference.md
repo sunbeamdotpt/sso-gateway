@@ -15,6 +15,8 @@ nav_order: 1
 ## Connect-RPC services
 
 All Connect-RPC methods accept JSON-encoded messages over HTTP/1.1 or HTTP/2.
+Protected methods require `Authorization: Bearer <token>`; the token is introspected
+via Hydra and the tenant is resolved from the token subject.
 
 ### `iam.v1.TenantService`
 
@@ -23,7 +25,6 @@ All Connect-RPC methods accept JSON-encoded messages over HTTP/1.1 or HTTP/2.
 | `CreateTenant` | Create a new tenant. |
 | `GetTenant` | Get a tenant by ID. |
 | `ListTenants` | List tenants. |
-| `RotateApiKey` | Create or rotate an API key for a tenant. |
 
 ### `iam.v1.IdentityService`
 
@@ -124,17 +125,20 @@ Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-serv
 
 ## Protocol endpoints
 
-| Path | Purpose |
-|---|---|
-| `GET /.well-known/openid-configuration` | OIDC discovery |
-| `GET /.well-known/jwks.json` | Public signing keys |
-| `GET /oauth2/auth` | Authorization endpoint |
-| `POST /oauth2/token` | Token endpoint |
-| `GET /oauth2/userinfo` | Userinfo endpoint |
-| `POST /oauth2/introspect` | Token introspection |
-| `POST /oauth2/revoke` | Token revocation |
-| `GET /saml/metadata` | SAML SP metadata |
-| `POST /saml/acs` | SAML Assertion Consumer Service |
-| `GET /saml/sso` | SAML IdP SSO endpoint |
-| `/scim/v2/Users` | SCIM user provisioning |
-| `/scim/v2/Groups` | SCIM group provisioning |
+| Path | Purpose | Authentication |
+|---|---|---|
+| `GET /.well-known/openid-configuration` | OIDC discovery | Public |
+| `GET /.well-known/jwks.json` | Public signing keys | Public |
+| `GET /oauth2/auth` | Authorization endpoint | Public (client_id must be registered) |
+| `POST /oauth2/token` | Token endpoint | Public (client credentials) |
+| `GET /oauth2/userinfo` | Userinfo endpoint | Bearer token |
+| `POST /oauth2/introspect` | Token introspection | Public (forwards to Hydra) |
+| `POST /oauth2/revoke` | Token revocation | Public (client credentials) |
+| `GET /saml/metadata` | SAML SP metadata | Public |
+| `POST /saml/acs` | SAML Assertion Consumer Service | Public (SAML assertion) |
+| `GET /saml/sso` | SAML IdP SSO endpoint | Public (Kratos session token) |
+| `/scim/v2/ServiceProviderConfig` | SCIM service provider config | Public |
+| `/scim/v2/ResourceTypes` | SCIM resource types | Public |
+| `/scim/v2/Schemas` | SCIM schemas | Public |
+| `/scim/v2/Users` | SCIM user provisioning | Bearer token |
+| `/scim/v2/Groups` | SCIM group provisioning | Bearer token |

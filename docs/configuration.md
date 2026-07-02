@@ -20,13 +20,15 @@ All configuration is read from environment variables.
 |---|---|
 | `SYSTEM_TENANT_ULID` | Fixed ULID of the system tenant. Bootstrapped on startup. |
 | `DATABASE_URL` | Postgres URL for gateway metadata and migrations. |
+| `SYSTEM_BOOTSTRAP_CLIENT_ID` | Client ID of the system bootstrap OAuth2 client created in Hydra. |
+| `SYSTEM_BOOTSTRAP_CLIENT_SECRET` | Client secret for the system bootstrap OAuth2 client. |
+| `STATE_COOKIE_SECRET` | Secret key used to sign browser session cookies established by the universal login callbacks. |
 
 ## Optional variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `BIND_ADDR` | `127.0.0.1:8080` | Address the HTTP server binds to. |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis URL for framework-level caching. |
 | `HYDRA_ADMIN_URL` | `http://127.0.0.1:4445` | Ory Hydra admin endpoint. |
 | `HYDRA_PUBLIC_URL` | `http://127.0.0.1:4444` | Ory Hydra public endpoint. |
 | `KRATOS_ADMIN_URL` | `http://127.0.0.1:4434` | Ory Kratos admin endpoint. |
@@ -40,6 +42,7 @@ All configuration is read from environment variables.
 | `SAML_REQUEST_TTL_SECONDS` | `900` | TTL for pending SAML authentication requests. |
 | `SAML_REQUIRE_SIGNED_ASSERTIONS` | `true` | Require signed SAML assertions from external IdPs. |
 | `SAML_REQUIRE_SIGNED_RESPONSES` | `false` | Require signed SAML responses from external IdPs. |
+| `ALLOWED_RETURN_TO_HOSTS` | — | Comma-separated list of trusted hosts for universal login `return_to` URLs (e.g. `example.com,app.example.com`). Subdomains of listed hosts are allowed. |
 
 ## Notes
 

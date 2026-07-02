@@ -36,8 +36,8 @@ The spec-mandated OAuth2/OIDC endpoints (`/.well-known/openid-configuration`,
 
 ## Tenant and authentication
 
-Self-service RPCs are called from the browser, so the gateway cannot require an
-`X-Tenant-Id` header or API key. Tenant is resolved instead from:
+Self-service RPCs are called from the browser, so the gateway does not require a
+bearer token for the browser flows themselves. Tenant is resolved instead from:
 
 - The session cookie (`ory_kratos_session`) for `ToSession` and flow submission.
 - The login/registration challenge for OAuth2 consent/logout flows.
