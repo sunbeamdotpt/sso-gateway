@@ -21,24 +21,6 @@ message Tenant {
   map<string, string> settings = 5;
 }
 
-// ApiKey is a tenant-scoped API credential.
-message ApiKey {
-  // Gateway identifier for the API key.
-  string id = 1;
-  // Tenant that owns the API key.
-  string tenant_id = 2;
-  // Human-readable name for the API key.
-  string name = 3;
-  // Scopes granted to the API key.
-  repeated string scopes = 4;
-  // Plaintext secret shown only immediately after creation or rotation.
-  string plaintext = 5;
-  // Timestamp when the API key expires.
-  google.protobuf.Timestamp expires_at = 6;
-  // Timestamp when the API key was created.
-  google.protobuf.Timestamp created_at = 7;
-}
-
 // CreateTenantRequest is the input for creating a new tenant.
 message CreateTenantRequest {
   // URL-safe identifier for the tenant.
@@ -69,19 +51,7 @@ message ListTenantsResponse {
   PageResponse page = 2;
 }
 
-// RotateApiKeyRequest is the input for rotating a tenant API key.
-message RotateApiKeyRequest {
-  // Tenant that owns the API key.
-  string tenant_id = 1;
-  // Human-readable name for the new API key.
-  string name = 2;
-  // Scopes granted to the new API key.
-  repeated string scopes = 3;
-  // Expiration timestamp for the new API key.
-  google.protobuf.Timestamp expires_at = 4;
-}
-
-// TenantService manages tenants and their API credentials.
+// TenantService manages tenants.
 service TenantService {
   // CreateTenant creates a new tenant.
   rpc CreateTenant(CreateTenantRequest) returns (Tenant);
@@ -89,6 +59,4 @@ service TenantService {
   rpc GetTenant(GetTenantRequest) returns (Tenant);
   // ListTenants returns a paginated list of tenants.
   rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
-  // RotateApiKey generates a new API key for the tenant.
-  rpc RotateApiKey(RotateApiKeyRequest) returns (ApiKey);
 }
