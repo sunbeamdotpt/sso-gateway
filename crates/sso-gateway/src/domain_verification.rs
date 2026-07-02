@@ -62,10 +62,7 @@ impl Default for HickoryDnsResolver {
 }
 
 impl DnsResolver for HickoryDnsResolver {
-    async fn txt_records(
-        &self,
-        domain: &str,
-    ) -> Result<Vec<String>, DomainVerificationError> {
+    async fn txt_records(&self, domain: &str) -> Result<Vec<String>, DomainVerificationError> {
         let resolver = hickory_resolver::TokioResolver::builder_tokio()
             .map_err(|e| DomainVerificationError::DnsLookup(e.to_string()))?
             .build()
@@ -82,7 +79,11 @@ impl DnsResolver for HickoryDnsResolver {
                 hickory_resolver::proto::rr::RData::TXT(txt) => Some(txt),
                 _ => None,
             })
-            .flat_map(|txt| txt.txt_data.iter().map(|b| String::from_utf8_lossy(b).to_string()))
+            .flat_map(|txt| {
+                txt.txt_data
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).to_string())
+            })
             .collect();
         Ok(records)
     }
@@ -99,10 +100,7 @@ mod tests {
     }
 
     impl DnsResolver for MockResolver {
-        async fn txt_records(
-            &self,
-            domain: &str,
-        ) -> Result<Vec<String>, DomainVerificationError> {
+        async fn txt_records(&self, domain: &str) -> Result<Vec<String>, DomainVerificationError> {
             Ok(self.records.get(domain).cloned().unwrap_or_default())
         }
     }
@@ -136,9 +134,11 @@ mod tests {
             records: HashMap::from([("example.com".to_string(), vec![expected.clone()])]),
         };
 
-        assert!(verify_domain(&resolver, "example.com", &token)
-            .await
-            .expect("verification should succeed"));
+        assert!(
+            verify_domain(&resolver, "example.com", &token)
+                .await
+                .expect("verification should succeed")
+        );
     }
 
     #[tokio::test]
@@ -151,9 +151,11 @@ mod tests {
             )]),
         };
 
-        assert!(!verify_domain(&resolver, "example.com", &token)
-            .await
-            .expect("verification should succeed"));
+        assert!(
+            !verify_domain(&resolver, "example.com", &token)
+                .await
+                .expect("verification should succeed")
+        );
     }
 
     #[tokio::test]
@@ -164,9 +166,11 @@ mod tests {
             records: HashMap::from([("example.com".to_string(), vec![expected])]),
         };
 
-        assert!(!verify_domain(&resolver, "other.com", &token)
-            .await
-            .expect("verification should succeed"));
+        assert!(
+            !verify_domain(&resolver, "other.com", &token)
+                .await
+                .expect("verification should succeed")
+        );
     }
 
     #[tokio::test]
@@ -174,15 +178,14 @@ mod tests {
         let token = generate_verification_token();
         let expected = build_txt_record_value(&token);
         let resolver = MockResolver {
-            records: HashMap::from([(
-                "example.com".to_string(),
-                vec![format!("  {expected}  ")],
-            )]),
+            records: HashMap::from([("example.com".to_string(), vec![format!("  {expected}  ")])]),
         };
 
-        assert!(verify_domain(&resolver, "example.com", &token)
-            .await
-            .expect("verification should succeed"));
+        assert!(
+            verify_domain(&resolver, "example.com", &token)
+                .await
+                .expect("verification should succeed")
+        );
     }
 
     #[tokio::test]
@@ -200,15 +203,17 @@ mod tests {
             )]),
         };
 
-        assert!(verify_domain(&resolver, "example.com", &token)
-            .await
-            .expect("verification should succeed"));
+        assert!(
+            verify_domain(&resolver, "example.com", &token)
+                .await
+                .expect("verification should succeed")
+        );
     }
 
     #[tokio::test]
     async fn hickory_resolver_new_default_and_lookup_error() {
         let _ = HickoryDnsResolver::new();
-        let resolver = HickoryDnsResolver::default();
+        let resolver = HickoryDnsResolver;
         let result = resolver.txt_records("does-not-exist.invalid").await;
         assert!(
             result.is_err(),
@@ -219,10 +224,7 @@ mod tests {
     struct FailingResolver;
 
     impl DnsResolver for FailingResolver {
-        async fn txt_records(
-            &self,
-            _domain: &str,
-        ) -> Result<Vec<String>, DomainVerificationError> {
+        async fn txt_records(&self, _domain: &str) -> Result<Vec<String>, DomainVerificationError> {
             Err(DomainVerificationError::DnsLookup("dns failure".into()))
         }
     }

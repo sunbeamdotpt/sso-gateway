@@ -86,9 +86,7 @@ impl From<HrdError> for sunbeam_g2v::error::ServiceError {
             HrdError::ConnectionDisabled => {
                 Self::PermissionDenied("connection disabled".to_string())
             }
-            HrdError::SamlProviderNotFound => {
-                Self::NotFound("SAML provider not found".to_string())
-            }
+            HrdError::SamlProviderNotFound => Self::NotFound("SAML provider not found".to_string()),
             HrdError::InvalidConnectionConfig(msg) => Self::InvalidArgument(msg),
             HrdError::Database(db_err) => db_err.into(),
         }
@@ -96,9 +94,9 @@ impl From<HrdError> for sunbeam_g2v::error::ServiceError {
 }
 
 /// Home Realm Discovery service.
+#[derive(Clone)]
 pub struct Hrd {
     connections: Arc<dyn TenantConnectionStore>,
-    #[allow(dead_code)]
     domains: Arc<dyn TenantDomainStore>,
     saml_providers: Arc<dyn SamlProviderStore>,
     public_base_url: String,
@@ -129,16 +127,22 @@ impl Hrd {
         validate_email(email)?;
         validate_return_to(return_to)?;
 
-        let domain = email
-            .rsplit_once('@')
-            .map(|(_, d)| d)
-            .unwrap_or_default();
+        let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+
+        // Only verified custom domains may be used for HRD.
+        if !self.is_verified_domain(domain).await? {
+            return Ok(DiscoveryResult::SelectTenant(TenantSelectionRedirect {
+                redirect_url: build_select_tenant_url(&self.public_base_url, email, return_to),
+            }));
+        }
 
         match self.connections.get_by_domain(domain).await {
             Ok(connection) => match connection.connection_type {
                 ConnectionType::Oidc => {
                     let url = build_oidc_url(&connection.config, return_to)?;
-                    Ok(DiscoveryResult::Oidc(OidcRedirect { authorization_url: url }))
+                    Ok(DiscoveryResult::Oidc(OidcRedirect {
+                        authorization_url: url,
+                    }))
                 }
                 ConnectionType::OAuth2 => {
                     let url = build_oauth2_url(&connection.config, return_to)?;
@@ -157,15 +161,19 @@ impl Hrd {
                     Ok(DiscoveryResult::Saml(redirect))
                 }
             },
-            Err(DbError::ConnectionNotFound) => Ok(DiscoveryResult::SelectTenant(
-                TenantSelectionRedirect {
-                    redirect_url: build_select_tenant_url(
-                        &self.public_base_url,
-                        email,
-                        return_to,
-                    ),
-                },
-            )),
+            Err(DbError::ConnectionNotFound) => {
+                Ok(DiscoveryResult::SelectTenant(TenantSelectionRedirect {
+                    redirect_url: build_select_tenant_url(&self.public_base_url, email, return_to),
+                }))
+            }
+            Err(e) => Err(HrdError::Database(e)),
+        }
+    }
+
+    async fn is_verified_domain(&self, domain: &str) -> Result<bool, HrdError> {
+        match self.domains.get_by_domain(domain).await {
+            Ok(domain_row) => Ok(domain_row.is_verified),
+            Err(DbError::DomainNotFound) => Ok(false),
             Err(e) => Err(HrdError::Database(e)),
         }
     }
@@ -178,10 +186,7 @@ fn validate_email(email: &str) -> Result<(), HrdError> {
     if email.chars().filter(|&c| c == '@').count() != 1 {
         return Err(HrdError::InvalidEmail);
     }
-    let domain = email
-        .rsplit_once('@')
-        .map(|(_, d)| d)
-        .unwrap_or_default();
+    let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
     if domain.is_empty() {
         return Err(HrdError::InvalidEmail);
     }
@@ -225,7 +230,9 @@ fn build_oidc_url(config: &Value, _return_to: &str) -> Result<String, HrdError> 
         .filter(|s| !s.is_empty())
         .collect();
     if scopes.is_empty() {
-        return Err(HrdError::InvalidConnectionConfig("empty scopes".to_string()));
+        return Err(HrdError::InvalidConnectionConfig(
+            "empty scopes".to_string(),
+        ));
     }
 
     let issuer_url = normalize_issuer_url(issuer);
@@ -258,7 +265,9 @@ fn build_oauth2_url(config: &Value, _return_to: &str) -> Result<String, HrdError
         .filter(|s| !s.is_empty())
         .collect();
     if scopes.is_empty() {
-        return Err(HrdError::InvalidConnectionConfig("empty scopes".to_string()));
+        return Err(HrdError::InvalidConnectionConfig(
+            "empty scopes".to_string(),
+        ));
     }
 
     let state = generate_state();
@@ -382,16 +391,23 @@ mod tests {
         }
     }
 
-    struct MockTenantDomainStore;
+    struct MockTenantDomainStore {
+        domains: Mutex<HashMap<String, TenantDomainRow>>,
+    }
 
     #[async_trait]
     impl TenantDomainStore for MockTenantDomainStore {
-        async fn create(&self, _tenant_id: &str, _domain: &str) -> Result<TenantDomainRow, DbError> {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _domain: &str,
+        ) -> Result<TenantDomainRow, DbError> {
             Err(DbError::ConnectionNotFound)
         }
 
-        async fn get_by_domain(&self, _domain: &str) -> Result<TenantDomainRow, DbError> {
-            Err(DbError::ConnectionNotFound)
+        async fn get_by_domain(&self, domain: &str) -> Result<TenantDomainRow, DbError> {
+            let domains = self.domains.lock().unwrap();
+            domains.get(domain).cloned().ok_or(DbError::DomainNotFound)
         }
 
         async fn mark_verified(
@@ -402,10 +418,7 @@ mod tests {
             Err(DbError::ConnectionNotFound)
         }
 
-        async fn list_by_tenant(
-            &self,
-            _tenant_id: &str,
-        ) -> Result<Vec<TenantDomainRow>, DbError> {
+        async fn list_by_tenant(&self, _tenant_id: &str) -> Result<Vec<TenantDomainRow>, DbError> {
             Ok(vec![])
         }
     }
@@ -464,6 +477,23 @@ mod tests {
         }
     }
 
+    fn domain_row(domain: &str, verified: bool) -> TenantDomainRow {
+        TenantDomainRow {
+            id: "DOMAIN01".to_string(),
+            tenant_id: "TENANT01".to_string(),
+            domain: domain.to_string(),
+            verification_token: "token".to_string(),
+            is_verified: verified,
+            verified_at: if verified {
+                Some(time::OffsetDateTime::now_utc())
+            } else {
+                None
+            },
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
     fn saml_provider_row(id: &str, sso_url: &str) -> SamlProviderRow {
         SamlProviderRow {
             id: id.to_string(),
@@ -482,17 +512,44 @@ mod tests {
         }
     }
 
-    fn hrd_with_connection(
+    fn hrd_with_connection_and_domain(
+        connection: TenantConnectionRow,
+        domain: TenantDomainRow,
+        providers: HashMap<String, SamlProviderRow>,
+    ) -> Hrd {
+        let mut connections = HashMap::new();
+        connections.insert(connection.domain.clone(), connection);
+        let mut domains = HashMap::new();
+        domains.insert(domain.domain.clone(), domain);
+        Hrd::new(
+            Arc::new(MockTenantConnectionStore {
+                connections: Mutex::new(connections),
+            }),
+            Arc::new(MockTenantDomainStore {
+                domains: Mutex::new(domains),
+            }),
+            Arc::new(MockSamlProviderStore {
+                providers: Mutex::new(providers),
+            }),
+            "https://gateway.example.com".to_string(),
+        )
+    }
+
+    fn hrd_with_connection_unverified_domain(
         connection: TenantConnectionRow,
         providers: HashMap<String, SamlProviderRow>,
     ) -> Hrd {
         let mut connections = HashMap::new();
         connections.insert(connection.domain.clone(), connection);
+        let mut domains = HashMap::new();
+        domains.insert("example.com".to_string(), domain_row("example.com", false));
         Hrd::new(
             Arc::new(MockTenantConnectionStore {
                 connections: Mutex::new(connections),
             }),
-            Arc::new(MockTenantDomainStore),
+            Arc::new(MockTenantDomainStore {
+                domains: Mutex::new(domains),
+            }),
             Arc::new(MockSamlProviderStore {
                 providers: Mutex::new(providers),
             }),
@@ -505,7 +562,9 @@ mod tests {
             Arc::new(MockTenantConnectionStore {
                 connections: Mutex::new(HashMap::new()),
             }),
-            Arc::new(MockTenantDomainStore),
+            Arc::new(MockTenantDomainStore {
+                domains: Mutex::new(HashMap::new()),
+            }),
             Arc::new(MockSamlProviderStore {
                 providers: Mutex::new(HashMap::new()),
             }),
@@ -522,8 +581,9 @@ mod tests {
             "scopes": ["openid", "email"],
             "redirect_uri": "https://gateway.example.com/auth/callback/oidc",
         });
-        let hrd = hrd_with_connection(
+        let hrd = hrd_with_connection_and_domain(
             connection_row("example.com", ConnectionType::Oidc, config, true),
+            domain_row("example.com", true),
             HashMap::new(),
         );
 
@@ -540,7 +600,9 @@ mod tests {
         assert!(url.contains("client_id=client123"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope=openid%20email"));
-        assert!(url.contains("redirect_uri=https%3A%2F%2Fgateway.example.com%2Fauth%2Fcallback%2Foidc"));
+        assert!(
+            url.contains("redirect_uri=https%3A%2F%2Fgateway.example.com%2Fauth%2Fcallback%2Foidc")
+        );
         assert!(url.contains("state="));
     }
 
@@ -556,8 +618,9 @@ mod tests {
             "scopes": ["user:email"],
             "redirect_uri": "https://gateway.example.com/auth/callback/oauth2",
         });
-        let hrd = hrd_with_connection(
+        let hrd = hrd_with_connection_and_domain(
             connection_row("example.com", ConnectionType::OAuth2, config, true),
+            domain_row("example.com", true),
             HashMap::new(),
         );
 
@@ -574,7 +637,11 @@ mod tests {
         assert!(url.contains("client_id=client456"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope=user%3Aemail"));
-        assert!(url.contains("redirect_uri=https%3A%2F%2Fgateway.example.com%2Fauth%2Fcallback%2Foauth2"));
+        assert!(
+            url.contains(
+                "redirect_uri=https%3A%2F%2Fgateway.example.com%2Fauth%2Fcallback%2Foauth2"
+            )
+        );
         assert!(url.contains("state="));
     }
 
@@ -586,8 +653,9 @@ mod tests {
             "PROVIDER01".to_string(),
             saml_provider_row("PROVIDER01", "https://idp.example.com/saml/sso"),
         );
-        let hrd = hrd_with_connection(
+        let hrd = hrd_with_connection_and_domain(
             connection_row("example.com", ConnectionType::Saml, config, true),
+            domain_row("example.com", true),
             providers,
         );
 
@@ -659,8 +727,9 @@ mod tests {
             "scopes": ["openid", "email"],
             "redirect_uri": "https://gateway.example.com/auth/callback/oidc",
         });
-        let hrd = hrd_with_connection(
+        let hrd = hrd_with_connection_and_domain(
             connection_row("example.com", ConnectionType::Oidc, config, false),
+            domain_row("example.com", true),
             HashMap::new(),
         );
 
@@ -672,6 +741,30 @@ mod tests {
         assert!(
             matches!(result, DiscoveryResult::SelectTenant(_)),
             "expected select tenant redirect for disabled connection, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_unverified_domain_returns_select_tenant() {
+        let config = serde_json::json!({
+            "issuer": "accounts.google.com",
+            "client_id": "client123",
+            "scopes": ["openid", "email"],
+            "redirect_uri": "https://gateway.example.com/auth/callback/oidc",
+        });
+        let hrd = hrd_with_connection_unverified_domain(
+            connection_row("example.com", ConnectionType::Oidc, config, true),
+            HashMap::new(),
+        );
+
+        let result = hrd
+            .discover("alice@example.com", "https://app.example.com")
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, DiscoveryResult::SelectTenant(_)),
+            "expected select tenant redirect for unverified domain, got {result:?}"
         );
     }
 
@@ -987,9 +1080,14 @@ mod tests {
             }
         }
         let config = json!({"provider_id": "P1"});
-        let err = build_saml_redirect("tenant-1", &config, "https://app.example.com", &FailingSamlProviderStore)
-            .await
-            .unwrap_err();
+        let err = build_saml_redirect(
+            "tenant-1",
+            &config,
+            "https://app.example.com",
+            &FailingSamlProviderStore,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, HrdError::Database(_)));
     }
 
@@ -1007,9 +1105,11 @@ mod tests {
             ) -> Result<TenantConnectionRow, DbError> {
                 unimplemented!()
             }
+
             async fn get_by_domain(&self, _domain: &str) -> Result<TenantConnectionRow, DbError> {
                 Err(DbError::Sqlx(sqlx::Error::PoolTimedOut))
             }
+
             async fn get_by_id(
                 &self,
                 _tenant_id: &str,
@@ -1017,12 +1117,14 @@ mod tests {
             ) -> Result<TenantConnectionRow, DbError> {
                 unimplemented!()
             }
+
             async fn list_by_tenant(
                 &self,
                 _tenant_id: &str,
             ) -> Result<Vec<TenantConnectionRow>, DbError> {
                 unimplemented!()
             }
+
             async fn update_config(
                 &self,
                 _tenant_id: &str,
@@ -1031,6 +1133,7 @@ mod tests {
             ) -> Result<TenantConnectionRow, DbError> {
                 unimplemented!()
             }
+
             async fn set_enabled(
                 &self,
                 _tenant_id: &str,
@@ -1040,44 +1143,51 @@ mod tests {
                 unimplemented!()
             }
         }
+
+        struct VerifiedDomainStore;
+        #[async_trait]
+        impl TenantDomainStore for VerifiedDomainStore {
+            async fn create(
+                &self,
+                _tenant_id: &str,
+                _domain: &str,
+            ) -> Result<TenantDomainRow, DbError> {
+                unimplemented!()
+            }
+
+            async fn get_by_domain(&self, _domain: &str) -> Result<TenantDomainRow, DbError> {
+                Ok(domain_row("example.com", true))
+            }
+
+            async fn mark_verified(
+                &self,
+                _tenant_id: &str,
+                _id: &str,
+            ) -> Result<TenantDomainRow, DbError> {
+                unimplemented!()
+            }
+
+            async fn list_by_tenant(
+                &self,
+                _tenant_id: &str,
+            ) -> Result<Vec<TenantDomainRow>, DbError> {
+                unimplemented!()
+            }
+        }
+
         let hrd = Hrd::new(
             Arc::new(FailingConnectionStore),
-            Arc::new(MockTenantDomainStore),
+            Arc::new(VerifiedDomainStore),
             Arc::new(MockSamlProviderStore {
                 providers: Mutex::new(HashMap::new()),
             }),
             "https://gateway.example.com".to_string(),
         );
+
         let err = hrd
             .discover("alice@example.com", "https://app.example.com")
             .await
             .unwrap_err();
         assert!(matches!(err, HrdError::Database(_)));
-    }
-
-    #[tokio::test]
-    async fn mock_store_methods_are_callable() {
-        let conn_store = MockTenantConnectionStore {
-            connections: Mutex::new(HashMap::new()),
-        };
-        let _ = conn_store.create("t", ConnectionType::Oidc, "example.com", json!({})).await;
-        let _ = conn_store.get_by_id("t", "id").await;
-        let _ = conn_store.list_by_tenant("t").await;
-        let _ = conn_store.update_config("t", "id", json!({})).await;
-        let _ = conn_store.set_enabled("t", "id", true).await;
-
-        let domain_store = MockTenantDomainStore;
-        let _ = domain_store.create("t", "example.com").await;
-        let _ = domain_store.get_by_domain("example.com").await;
-        let _ = domain_store.mark_verified("t", "id").await;
-        let _ = domain_store.list_by_tenant("t").await;
-
-        let provider_store = MockSamlProviderStore {
-            providers: Mutex::new(HashMap::new()),
-        };
-        let _ = provider_store
-            .create("t", "n", "e", "u", None, "sp", "acs", None, "s", false)
-            .await;
-        let _ = provider_store.get("t", "id").await;
     }
 }
