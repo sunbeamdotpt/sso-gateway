@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use serde_json::Value;
 use sqlx::Row;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::{DbError, DbPool};
@@ -60,10 +62,7 @@ pub trait TenantConnectionStore: Send + Sync + 'static {
 
     async fn get_by_id(&self, tenant_id: &str, id: &str) -> Result<TenantConnectionRow, DbError>;
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantConnectionRow>, DbError>;
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantConnectionRow>, DbError>;
 
     async fn update_config(
         &self,
@@ -83,11 +82,97 @@ pub trait TenantConnectionStore: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct PgTenantConnectionStore {
     pool: DbPool,
+    encryption_key: Option<Vec<u8>>,
 }
 
 impl PgTenantConnectionStore {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        let encryption_key = Self::encryption_key_from_env();
+        Self {
+            pool,
+            encryption_key,
+        }
+    }
+
+    pub fn with_encryption_key(pool: DbPool, key: Vec<u8>) -> Self {
+        Self {
+            pool,
+            encryption_key: Some(key),
+        }
+    }
+
+    fn encryption_key_from_env() -> Option<Vec<u8>> {
+        let value = std::env::var("TENANT_CONNECTION_ENCRYPTION_KEY").ok()?;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value.trim())
+            .or_else(|_| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, value.trim())
+            })
+            .ok()
+            .filter(|k| k.len() >= 32)
+    }
+
+    fn encrypt_secret(&self, secret: &str) -> Result<String, DbError> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or(DbError::EncryptionKeyMissing)?;
+        super::crypto::encrypt(secret, key)
+    }
+
+    fn decrypt_secret(&self, ciphertext: &str) -> Result<String, DbError> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or(DbError::EncryptionKeyMissing)?;
+        super::crypto::decrypt(ciphertext, key)
+    }
+
+    /// Encrypt any `client_secret` field inside `config`. Encrypted values are
+    /// prefixed with `enc:` so the store can detect them on read.
+    fn encrypt_config(&self, mut config: Value) -> Value {
+        if let Some(secret) = config.get("client_secret").and_then(|v| v.as_str()) {
+            match self.encrypt_secret(secret) {
+                Ok(encrypted) => {
+                    config["client_secret"] = Value::String(format!("enc:{encrypted}"));
+                }
+                Err(e) => {
+                    warn!("failed to encrypt tenant connection client_secret: {e}");
+                }
+            }
+        }
+        config
+    }
+
+    /// Reverse `encrypt_config`. Leaves plaintext secrets untouched.
+    fn decrypt_config(&self, mut config: Value) -> Value {
+        if let Some(value) = config.get("client_secret").and_then(|v| v.as_str())
+            && let Some(encrypted) = value.strip_prefix("enc:")
+        {
+            match self.decrypt_secret(encrypted) {
+                Ok(plain) => config["client_secret"] = Value::String(plain),
+                Err(e) => {
+                    warn!("failed to decrypt tenant connection client_secret: {e}");
+                }
+            }
+        }
+        config
+    }
+
+    async fn require_verified_domain(&self, tenant_id: &str, domain: &str) -> Result<(), DbError> {
+        let row = sqlx::query_as::<_, crate::db::TenantDomainRow>(
+            "SELECT id, tenant_id, domain, verification_token, is_verified, verified_at, created_at, updated_at \
+             FROM tenant_domains \
+             WHERE tenant_id = $1 AND domain = $2",
+        )
+        .bind(tenant_id)
+        .bind(domain)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(domain_row) if domain_row.is_verified => Ok(()),
+            _ => Err(DbError::DomainNotVerified),
+        }
     }
 
     pub async fn create(
@@ -97,7 +182,10 @@ impl PgTenantConnectionStore {
         domain: &str,
         config: serde_json::Value,
     ) -> Result<TenantConnectionRow, DbError> {
+        self.require_verified_domain(tenant_id, domain).await?;
+
         let id = Ulid::new().to_string();
+        let config = self.encrypt_config(config);
         let row = sqlx::query_as::<_, TenantConnectionRow>(
             "INSERT INTO tenant_connections \
              (id, tenant_id, connection_type, domain, config) \
@@ -111,7 +199,7 @@ impl PgTenantConnectionStore {
         .bind(sqlx::types::Json(config))
         .fetch_one(&self.pool)
         .await?;
-        Ok(row)
+        Ok(self.decrypt_row(row))
     }
 
     pub async fn get_by_domain(&self, domain: &str) -> Result<TenantConnectionRow, DbError> {
@@ -123,7 +211,8 @@ impl PgTenantConnectionStore {
         .bind(domain)
         .fetch_optional(&self.pool)
         .await?;
-        row.ok_or(DbError::ConnectionNotFound)
+        row.map(|r| self.decrypt_row(r))
+            .ok_or(DbError::ConnectionNotFound)
     }
 
     pub async fn get_by_id(
@@ -140,7 +229,8 @@ impl PgTenantConnectionStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.ok_or(DbError::ConnectionNotFound)
+        row.map(|r| self.decrypt_row(r))
+            .ok_or(DbError::ConnectionNotFound)
     }
 
     pub async fn list_by_tenant(
@@ -156,7 +246,7 @@ impl PgTenantConnectionStore {
         .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(rows.into_iter().map(|r| self.decrypt_row(r)).collect())
     }
 
     pub async fn update_config(
@@ -165,6 +255,7 @@ impl PgTenantConnectionStore {
         id: &str,
         config: serde_json::Value,
     ) -> Result<TenantConnectionRow, DbError> {
+        let config = self.encrypt_config(config);
         let row = sqlx::query_as::<_, TenantConnectionRow>(
             "UPDATE tenant_connections \
              SET config = $1, updated_at = NOW() \
@@ -176,7 +267,8 @@ impl PgTenantConnectionStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.ok_or(DbError::ConnectionNotFound)
+        row.map(|r| self.decrypt_row(r))
+            .ok_or(DbError::ConnectionNotFound)
     }
 
     pub async fn set_enabled(
@@ -196,7 +288,13 @@ impl PgTenantConnectionStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.ok_or(DbError::ConnectionNotFound)
+        row.map(|r| self.decrypt_row(r))
+            .ok_or(DbError::ConnectionNotFound)
+    }
+
+    fn decrypt_row(&self, mut row: TenantConnectionRow) -> TenantConnectionRow {
+        row.config = self.decrypt_config(row.config);
+        row
     }
 }
 
@@ -209,7 +307,8 @@ impl TenantConnectionStore for PgTenantConnectionStore {
         domain: &str,
         config: serde_json::Value,
     ) -> Result<TenantConnectionRow, DbError> {
-        self.create(tenant_id, connection_type, domain, config).await
+        self.create(tenant_id, connection_type, domain, config)
+            .await
     }
 
     async fn get_by_domain(&self, domain: &str) -> Result<TenantConnectionRow, DbError> {
@@ -220,10 +319,7 @@ impl TenantConnectionStore for PgTenantConnectionStore {
         self.get_by_id(tenant_id, id).await
     }
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantConnectionRow>, DbError> {
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantConnectionRow>, DbError> {
         self.list_by_tenant(tenant_id).await
     }
 
@@ -273,8 +369,27 @@ mod tests {
     use super::*;
     use crate::test_support::{create_test_tenant, postgres_pool};
 
+    fn encryption_key() -> Vec<u8> {
+        vec![0u8; 32]
+    }
+
+    async fn create_verified_domain(pool: &DbPool, tenant_id: &str, domain: &str) {
+        let domain_id = Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO tenant_domains (id, tenant_id, domain, verification_token, is_verified, verified_at) \
+             VALUES ($1, $2, $3, $4, TRUE, NOW())",
+        )
+        .bind(&domain_id)
+        .bind(tenant_id)
+        .bind(domain)
+        .bind("verification-token")
+        .execute(pool)
+        .await
+        .expect("insert domain");
+    }
+
     async fn store() -> PgTenantConnectionStore {
-        PgTenantConnectionStore::new(postgres_pool().await)
+        PgTenantConnectionStore::with_encryption_key(postgres_pool().await, encryption_key())
     }
 
     #[test]
@@ -286,9 +401,18 @@ mod tests {
 
     #[test]
     fn connection_type_from_str_valid() {
-        assert_eq!("oidc".parse::<ConnectionType>().unwrap(), ConnectionType::Oidc);
-        assert_eq!("oauth2".parse::<ConnectionType>().unwrap(), ConnectionType::OAuth2);
-        assert_eq!("saml".parse::<ConnectionType>().unwrap(), ConnectionType::Saml);
+        assert_eq!(
+            "oidc".parse::<ConnectionType>().unwrap(),
+            ConnectionType::Oidc
+        );
+        assert_eq!(
+            "oauth2".parse::<ConnectionType>().unwrap(),
+            ConnectionType::OAuth2
+        );
+        assert_eq!(
+            "saml".parse::<ConnectionType>().unwrap(),
+            ConnectionType::Saml
+        );
     }
 
     #[test]
@@ -321,18 +445,26 @@ mod tests {
         let pool = postgres_pool().await;
         let tenant = format!("tenant-{}", Ulid::new());
         create_test_tenant(&pool, &tenant).await;
-
         let domain = format!("conn-{}.example.com", Ulid::new());
+        create_verified_domain(&pool, &tenant, &domain).await;
+
         let created = store
-            .create(&tenant, ConnectionType::Oidc, &domain, serde_json::json!({"issuer": "https://idp"}))
+            .create(
+                &tenant,
+                ConnectionType::Oidc,
+                &domain,
+                serde_json::json!({"issuer": "https://idp", "client_secret": "secret123"}),
+            )
             .await
             .unwrap();
         assert_eq!(created.tenant_id, tenant);
         assert_eq!(created.connection_type, ConnectionType::Oidc);
         assert!(created.is_enabled);
+        assert_eq!(created.config["client_secret"], "secret123");
 
         let found_domain = store.get_by_domain(&domain).await.unwrap();
         assert_eq!(found_domain.id, created.id);
+        assert_eq!(found_domain.config["client_secret"], "secret123");
 
         let found_id = store.get_by_id(&tenant, &created.id).await.unwrap();
         assert_eq!(found_id.domain, domain);
@@ -342,12 +474,20 @@ mod tests {
         assert_eq!(list[0].id, created.id);
 
         let updated = store
-            .update_config(&tenant, &created.id, serde_json::json!({"issuer": "https://idp2"}))
+            .update_config(
+                &tenant,
+                &created.id,
+                serde_json::json!({"issuer": "https://idp2", "client_secret": "secret456"}),
+            )
             .await
             .unwrap();
-        assert_eq!(updated.config, serde_json::json!({"issuer": "https://idp2"}));
+        assert_eq!(updated.config["issuer"], "https://idp2");
+        assert_eq!(updated.config["client_secret"], "secret456");
 
-        let disabled = store.set_enabled(&tenant, &created.id, false).await.unwrap();
+        let disabled = store
+            .set_enabled(&tenant, &created.id, false)
+            .await
+            .unwrap();
         assert!(!disabled.is_enabled);
 
         let err = store.get_by_domain(&domain).await.unwrap_err();
@@ -369,15 +509,24 @@ mod tests {
             DbError::ConnectionNotFound
         ));
         assert!(matches!(
-            store.get_by_domain("missing.example.com").await.unwrap_err(),
+            store
+                .get_by_domain("missing.example.com")
+                .await
+                .unwrap_err(),
             DbError::ConnectionNotFound
         ));
         assert!(matches!(
-            store.update_config(&tenant, "missing", serde_json::json!({})).await.unwrap_err(),
+            store
+                .update_config(&tenant, "missing", serde_json::json!({}))
+                .await
+                .unwrap_err(),
             DbError::ConnectionNotFound
         ));
         assert!(matches!(
-            store.set_enabled(&tenant, "missing", false).await.unwrap_err(),
+            store
+                .set_enabled(&tenant, "missing", false)
+                .await
+                .unwrap_err(),
             DbError::ConnectionNotFound
         ));
         assert!(store.list_by_tenant(&tenant).await.unwrap().is_empty());
@@ -388,15 +537,74 @@ mod tests {
         let pool = postgres_pool().await;
         let tenant = format!("tenant-{}", Ulid::new());
         create_test_tenant(&pool, &tenant).await;
-        let store: Arc<dyn TenantConnectionStore> = Arc::new(PgTenantConnectionStore::new(pool));
-
         let domain = format!("trait-{}.example.com", Ulid::new());
+        create_verified_domain(&pool, &tenant, &domain).await;
+        let store: Arc<dyn TenantConnectionStore> = Arc::new(
+            PgTenantConnectionStore::with_encryption_key(pool, encryption_key()),
+        );
+
         let created = store
-            .create(&tenant, ConnectionType::Saml, &domain, serde_json::json!({}))
+            .create(
+                &tenant,
+                ConnectionType::Saml,
+                &domain,
+                serde_json::json!({"client_secret": "s"}),
+            )
             .await
             .unwrap();
         assert!(store.get_by_domain(&domain).await.is_ok());
         assert!(store.get_by_id(&tenant, &created.id).await.is_ok());
         assert_eq!(store.list_by_tenant(&tenant).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unverified_domain() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let domain_id = Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO tenant_domains (id, tenant_id, domain, verification_token, is_verified) \
+             VALUES ($1, $2, $3, $4, FALSE)",
+        )
+        .bind(&domain_id)
+        .bind(&tenant)
+        .bind("unverified.example.com")
+        .bind("token")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = store
+            .create(
+                &tenant,
+                ConnectionType::Oidc,
+                "unverified.example.com",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::DomainNotVerified));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_missing_domain_record() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let err = store
+            .create(
+                &tenant,
+                ConnectionType::Oidc,
+                "missing.example.com",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::DomainNotVerified));
     }
 }

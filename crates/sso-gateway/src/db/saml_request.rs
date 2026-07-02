@@ -24,7 +24,21 @@ pub trait SamlRequestStore: Send + Sync + 'static {
 
     async fn get(&self, tenant_id: &str, request_id: &str) -> Result<SamlRequestRow, DbError>;
 
+    /// Look up a pending SAML request by its id alone. Required by the public
+    /// HTTP ACS endpoint, which does not receive the tenant id in the POST body.
+    async fn get_by_request_id(&self, request_id: &str) -> Result<SamlRequestRow, DbError>;
+
     async fn delete(&self, tenant_id: &str, request_id: &str) -> Result<(), DbError>;
+
+    /// Store an inbound SAML AuthnRequest ID seen by the SAML IdP endpoint.
+    /// Duplicate IDs are rejected with `DbError::SamlRequestReplay`.
+    async fn create_inbound(
+        &self,
+        tenant_id: &str,
+        provider_id: &str,
+        request_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<(), DbError>;
 }
 
 #[derive(Clone)]
@@ -72,6 +86,18 @@ impl PgSamlRequestStore {
         row.ok_or(DbError::SamlRequestNotFound)
     }
 
+    pub async fn get_by_request_id(&self, request_id: &str) -> Result<SamlRequestRow, DbError> {
+        let row = sqlx::query_as::<_, SamlRequestRow>(
+            "SELECT id, tenant_id, provider_id, relay_state, created_at \
+             FROM saml_requests \
+             WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or(DbError::SamlRequestNotFound)
+    }
+
     pub async fn delete(&self, tenant_id: &str, request_id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM saml_requests WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -80,6 +106,32 @@ impl PgSamlRequestStore {
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::SamlRequestNotFound);
+        }
+        Ok(())
+    }
+
+    pub async fn create_inbound(
+        &self,
+        tenant_id: &str,
+        provider_id: &str,
+        request_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<(), DbError> {
+        let expires_at = time::OffsetDateTime::now_utc() + ttl;
+        let result = sqlx::query(
+            "INSERT INTO saml_inbound_requests \
+             (id, tenant_id, provider_id, expires_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(request_id)
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::SamlRequestReplay);
         }
         Ok(())
     }
@@ -94,15 +146,31 @@ impl SamlRequestStore for PgSamlRequestStore {
         provider_id: &str,
         relay_state: &str,
     ) -> Result<SamlRequestRow, DbError> {
-        self.create(tenant_id, request_id, provider_id, relay_state).await
+        self.create(tenant_id, request_id, provider_id, relay_state)
+            .await
     }
 
     async fn get(&self, tenant_id: &str, request_id: &str) -> Result<SamlRequestRow, DbError> {
         self.get(tenant_id, request_id).await
     }
 
+    async fn get_by_request_id(&self, request_id: &str) -> Result<SamlRequestRow, DbError> {
+        self.get_by_request_id(request_id).await
+    }
+
     async fn delete(&self, tenant_id: &str, request_id: &str) -> Result<(), DbError> {
         self.delete(tenant_id, request_id).await
+    }
+
+    async fn create_inbound(
+        &self,
+        tenant_id: &str,
+        provider_id: &str,
+        request_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<(), DbError> {
+        self.create_inbound(tenant_id, provider_id, request_id, ttl)
+            .await
     }
 }
 
@@ -225,5 +293,36 @@ mod tests {
             .unwrap();
         assert!(store.get(&tenant, &request_id).await.is_ok());
         assert!(store.delete(&tenant, &request_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn inbound_request_rejects_replays() {
+        let store = store().await;
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let provider_id = "sp-1";
+        let request_id = format!("inbound-req-{}", Ulid::new());
+
+        store
+            .create_inbound(
+                &tenant,
+                provider_id,
+                &request_id,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .create_inbound(
+                &tenant,
+                provider_id,
+                &request_id,
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::SamlRequestReplay));
     }
 }

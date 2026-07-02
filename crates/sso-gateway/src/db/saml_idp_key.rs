@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use sqlx::Row;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::{DbError, DbPool};
@@ -35,11 +36,87 @@ pub trait SamlIdpKeyStore: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct PgSamlIdpKeyStore {
     pool: DbPool,
+    encryption_key: Option<Vec<u8>>,
 }
 
 impl PgSamlIdpKeyStore {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        let encryption_key = Self::encryption_key_from_env();
+        Self {
+            pool,
+            encryption_key,
+        }
+    }
+
+    pub fn with_encryption_key(pool: DbPool, key: Vec<u8>) -> Self {
+        Self {
+            pool,
+            encryption_key: Some(key),
+        }
+    }
+
+    fn encryption_key_from_env() -> Option<Vec<u8>> {
+        let value = std::env::var("SAML_IDP_KEY_ENCRYPTION_KEY").ok()?;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value.trim())
+            .or_else(|_| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, value.trim())
+            })
+            .ok()
+            .filter(|k| k.len() >= 32)
+    }
+
+    fn encrypt(&self, plaintext: &str) -> Result<String, DbError> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or(DbError::EncryptionKeyMissing)?;
+        super::crypto::encrypt(plaintext, key)
+    }
+
+    fn decrypt(&self, ciphertext: &str) -> Result<String, DbError> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or(DbError::EncryptionKeyMissing)?;
+        super::crypto::decrypt(ciphertext, key)
+    }
+
+    async fn decrypt_row(&self, mut row: SamlIdpKeyRow) -> Result<SamlIdpKeyRow, DbError> {
+        let encrypted: Option<String> =
+            sqlx::query_scalar("SELECT encrypted_private_key FROM saml_idp_keys WHERE id = $1")
+                .bind(&row.id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        if let Some(ciphertext) = encrypted.filter(|s| !s.is_empty()) {
+            row.private_key_pem = self.decrypt(&ciphertext)?;
+            return Ok(row);
+        }
+
+        // Legacy plaintext row: migrate to encrypted storage when a key is available.
+        if !row.private_key_pem.is_empty() {
+            if let Some(key) = self.encryption_key.as_ref() {
+                let ciphertext = super::crypto::encrypt(&row.private_key_pem, key)?;
+                sqlx::query(
+                    "UPDATE saml_idp_keys \
+                     SET encrypted_private_key = $1, private_key_pem = '', updated_at = NOW() \
+                     WHERE id = $2",
+                )
+                .bind(&ciphertext)
+                .bind(&row.id)
+                .execute(&self.pool)
+                .await?;
+                return Ok(row);
+            }
+            warn!(
+                tenant_id = %row.tenant_id,
+                key_id = %row.key_id,
+                "encrypted SAML IdP key requested but no encryption key configured"
+            );
+            return Err(DbError::EncryptionKeyMissing);
+        }
+
+        Err(DbError::SamlIdpKeyNotFound)
     }
 
     pub async fn create(
@@ -51,21 +128,37 @@ impl PgSamlIdpKeyStore {
         is_active: bool,
     ) -> Result<SamlIdpKeyRow, DbError> {
         let id = Ulid::new().to_string();
+        let encrypted_private_key = self.encrypt(private_key_pem).ok();
+        let stored_private_key = if encrypted_private_key.is_some() {
+            ""
+        } else {
+            private_key_pem
+        };
+
         let row = sqlx::query_as::<_, SamlIdpKeyRow>(
             "INSERT INTO saml_idp_keys \
-             (id, tenant_id, key_id, private_key_pem, certificate_pem, is_active) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+             (id, tenant_id, key_id, private_key_pem, encrypted_private_key, certificate_pem, is_active) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              RETURNING id, tenant_id, key_id, private_key_pem, certificate_pem, is_active, created_at, updated_at",
         )
         .bind(&id)
         .bind(tenant_id)
         .bind(key_id)
-        .bind(private_key_pem)
+        .bind(stored_private_key)
+        .bind(encrypted_private_key.as_deref())
         .bind(certificate_pem)
         .bind(is_active)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row)
+
+        if encrypted_private_key.is_some() {
+            // Return a usable row to callers.
+            let mut row = row;
+            row.private_key_pem = private_key_pem.to_string();
+            Ok(row)
+        } else {
+            Ok(row)
+        }
     }
 
     pub async fn get_active(&self, tenant_id: &str) -> Result<SamlIdpKeyRow, DbError> {
@@ -79,7 +172,10 @@ impl PgSamlIdpKeyStore {
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.ok_or(DbError::SamlIdpKeyNotFound)
+        match row {
+            Some(row) => self.decrypt_row(row).await,
+            None => Err(DbError::SamlIdpKeyNotFound),
+        }
     }
 
     pub async fn list(&self, tenant_id: &str) -> Result<Vec<SamlIdpKeyRow>, DbError> {
@@ -92,7 +188,12 @@ impl PgSamlIdpKeyStore {
         .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+
+        let mut decrypted = Vec::with_capacity(rows.len());
+        for row in rows {
+            decrypted.push(self.decrypt_row(row).await?);
+        }
+        Ok(decrypted)
     }
 }
 
@@ -147,8 +248,12 @@ mod tests {
     use super::*;
     use crate::test_support::{create_test_tenant, postgres_pool};
 
+    fn encryption_key() -> Vec<u8> {
+        vec![0u8; 32]
+    }
+
     async fn store() -> PgSamlIdpKeyStore {
-        PgSamlIdpKeyStore::new(postgres_pool().await)
+        PgSamlIdpKeyStore::with_encryption_key(postgres_pool().await, encryption_key())
     }
 
     #[test]
@@ -183,9 +288,11 @@ mod tests {
             .unwrap();
         assert_eq!(created.key_id, key_id);
         assert!(created.is_active);
+        assert_eq!(created.private_key_pem, "private-pem");
 
         let active = store.get_active(&tenant).await.unwrap();
         assert_eq!(active.id, created.id);
+        assert_eq!(active.private_key_pem, "private-pem");
 
         let list = store.list(&tenant).await.unwrap();
         assert_eq!(list.len(), 1);
@@ -201,7 +308,10 @@ mod tests {
         let pool = postgres_pool().await;
         let tenant = format!("tenant-{}", Ulid::new());
         create_test_tenant(&pool, &tenant).await;
-        let store: Arc<dyn SamlIdpKeyStore> = Arc::new(PgSamlIdpKeyStore::new(pool));
+        let store: Arc<dyn SamlIdpKeyStore> = Arc::new(PgSamlIdpKeyStore::with_encryption_key(
+            pool,
+            encryption_key(),
+        ));
 
         let key_id = format!("trait-key-{}", Ulid::new());
         store
@@ -210,5 +320,32 @@ mod tests {
             .unwrap();
         assert!(store.get_active(&tenant).await.is_ok());
         assert_eq!(store.list(&tenant).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plaintext_row_without_key_returns_error() {
+        let pool = postgres_pool().await;
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+
+        let key_id = format!("plain-key-{}", Ulid::new());
+        sqlx::query(
+            "INSERT INTO saml_idp_keys \
+             (id, tenant_id, key_id, private_key_pem, certificate_pem, is_active) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(&tenant)
+        .bind(&key_id)
+        .bind("plaintext-private-key")
+        .bind("cert-pem")
+        .bind(true)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let store = PgSamlIdpKeyStore::new(pool);
+        let err = store.get_active(&tenant).await.unwrap_err();
+        assert!(matches!(err, DbError::EncryptionKeyMissing));
     }
 }

@@ -18,24 +18,13 @@ pub struct TenantDomainRow {
 
 #[async_trait]
 pub trait TenantDomainStore: Send + Sync + 'static {
-    async fn create(
-        &self,
-        tenant_id: &str,
-        domain: &str,
-    ) -> Result<TenantDomainRow, DbError>;
+    async fn create(&self, tenant_id: &str, domain: &str) -> Result<TenantDomainRow, DbError>;
 
     async fn get_by_domain(&self, domain: &str) -> Result<TenantDomainRow, DbError>;
 
-    async fn mark_verified(
-        &self,
-        tenant_id: &str,
-        id: &str,
-    ) -> Result<TenantDomainRow, DbError>;
+    async fn mark_verified(&self, tenant_id: &str, id: &str) -> Result<TenantDomainRow, DbError>;
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantDomainRow>, DbError>;
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantDomainRow>, DbError>;
 }
 
 #[derive(Clone)]
@@ -48,11 +37,7 @@ impl PgTenantDomainStore {
         Self { pool }
     }
 
-    pub async fn create(
-        &self,
-        tenant_id: &str,
-        domain: &str,
-    ) -> Result<TenantDomainRow, DbError> {
+    pub async fn create(&self, tenant_id: &str, domain: &str) -> Result<TenantDomainRow, DbError> {
         let id = Ulid::new().to_string();
         let verification_token = crate::domain_verification::generate_verification_token();
         let row = sqlx::query_as::<_, TenantDomainRow>(
@@ -100,10 +85,7 @@ impl PgTenantDomainStore {
         row.ok_or(DbError::DomainNotFound)
     }
 
-    pub async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantDomainRow>, DbError> {
+    pub async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantDomainRow>, DbError> {
         let rows = sqlx::query_as::<_, TenantDomainRow>(
             "SELECT id, tenant_id, domain, verification_token, is_verified, verified_at, created_at, updated_at \
              FROM tenant_domains \
@@ -119,11 +101,7 @@ impl PgTenantDomainStore {
 
 #[async_trait]
 impl TenantDomainStore for PgTenantDomainStore {
-    async fn create(
-        &self,
-        tenant_id: &str,
-        domain: &str,
-    ) -> Result<TenantDomainRow, DbError> {
+    async fn create(&self, tenant_id: &str, domain: &str) -> Result<TenantDomainRow, DbError> {
         self.create(tenant_id, domain).await
     }
 
@@ -131,18 +109,11 @@ impl TenantDomainStore for PgTenantDomainStore {
         self.get_by_domain(domain).await
     }
 
-    async fn mark_verified(
-        &self,
-        tenant_id: &str,
-        id: &str,
-    ) -> Result<TenantDomainRow, DbError> {
+    async fn mark_verified(&self, tenant_id: &str, id: &str) -> Result<TenantDomainRow, DbError> {
         self.mark_verified(tenant_id, id).await
     }
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantDomainRow>, DbError> {
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantDomainRow>, DbError> {
         self.list_by_tenant(tenant_id).await
     }
 }
@@ -224,7 +195,10 @@ mod tests {
         create_test_tenant(&pool, &tenant).await;
 
         assert!(matches!(
-            store.get_by_domain("missing.example.com").await.unwrap_err(),
+            store
+                .get_by_domain("missing.example.com")
+                .await
+                .unwrap_err(),
             DbError::DomainNotFound
         ));
         assert!(matches!(

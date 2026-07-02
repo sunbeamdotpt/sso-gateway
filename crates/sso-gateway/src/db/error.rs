@@ -27,8 +27,14 @@ pub enum DbError {
     #[error("saml request not found")]
     SamlRequestNotFound,
 
+    #[error("saml request replay detected")]
+    SamlRequestReplay,
+
     #[error("saml identity mapping not found")]
     SamlIdentityMappingNotFound,
+
+    #[error("encryption key missing or invalid")]
+    EncryptionKeyMissing,
 
     #[error("saml idp key not found")]
     SamlIdpKeyNotFound,
@@ -51,6 +57,9 @@ pub enum DbError {
     #[error("domain not verified")]
     DomainNotVerified,
 
+    #[error("login state not found or expired")]
+    LoginStateNotFound,
+
     #[error("invalid connection type: {0}")]
     InvalidConnectionType(String),
 
@@ -69,8 +78,14 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             DbError::TupleNotFound => Self::NotFound("permission tuple not found".to_string()),
             DbError::SamlProviderNotFound => Self::NotFound("saml provider not found".to_string()),
             DbError::SamlRequestNotFound => Self::NotFound("saml request not found".to_string()),
+            DbError::SamlRequestReplay => {
+                Self::InvalidArgument("saml request replay detected".to_string())
+            }
             DbError::SamlIdentityMappingNotFound => {
                 Self::NotFound("saml identity mapping not found".to_string())
+            }
+            DbError::EncryptionKeyMissing => {
+                Self::Configuration("encryption key missing or invalid".to_string())
             }
             DbError::SamlIdpKeyNotFound => Self::NotFound("saml idp key not found".to_string()),
             DbError::SamlSpClientNotFound => {
@@ -83,6 +98,9 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             DbError::LocalAuthNotFound => Self::NotFound("local auth method not found".to_string()),
             DbError::DomainNotFound => Self::NotFound("domain not found".to_string()),
             DbError::DomainNotVerified => Self::NotFound("domain not verified".to_string()),
+            DbError::LoginStateNotFound => {
+                Self::NotFound("login state not found or expired".to_string())
+            }
             DbError::InvalidConnectionType(s) => {
                 Self::InvalidArgument(format!("invalid connection type: {s}"))
             }
@@ -141,8 +159,16 @@ mod tests {
                 ServiceError::NotFound("saml request not found".into()),
             ),
             (
+                DbError::SamlRequestReplay,
+                ServiceError::InvalidArgument("saml request replay detected".into()),
+            ),
+            (
                 DbError::SamlIdentityMappingNotFound,
                 ServiceError::NotFound("saml identity mapping not found".into()),
+            ),
+            (
+                DbError::EncryptionKeyMissing,
+                ServiceError::Configuration("encryption key missing or invalid".into()),
             ),
             (
                 DbError::SamlIdpKeyNotFound,
@@ -171,6 +197,10 @@ mod tests {
             (
                 DbError::DomainNotVerified,
                 ServiceError::NotFound("domain not verified".into()),
+            ),
+            (
+                DbError::LoginStateNotFound,
+                ServiceError::NotFound("login state not found or expired".into()),
             ),
             (
                 DbError::InvalidConnectionType("foo".to_string()),
