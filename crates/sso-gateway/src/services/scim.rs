@@ -15,6 +15,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
+    auth::{AuthContext, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, require_scope},
     db::{
         IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaRow, IdentitySchemaStore,
         ScimGroupRepo, ScimGroupRow, ScimGroupStore,
@@ -174,6 +175,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimListUsersRequest>,
     ) -> ServiceResult<ScimListUsersResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
         let _req = request.to_owned_message();
 
         let public_ids = self
@@ -201,6 +203,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimGetUserRequest>,
     ) -> ServiceResult<ScimUser> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
         let req = request.to_owned_message();
         let user = self.load_user(&tenant_id, &req.id).await?;
         Ok(Response::new(user))
@@ -213,6 +216,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimCreateUserRequest>,
     ) -> ServiceResult<ScimUser> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
         let input = req
             .user
@@ -256,6 +260,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimUpdateUserRequest>,
     ) -> ServiceResult<ScimUser> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
         let input = req
             .user
@@ -296,6 +301,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimDeleteUserRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
         let ory_id = self
             .mappings
@@ -321,6 +327,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimListGroupsRequest>,
     ) -> ServiceResult<ScimListGroupsResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
         let _req = request.to_owned_message();
         let rows = self.groups.list(&tenant_id).await?;
         let mut groups = Vec::with_capacity(rows.len());
@@ -340,6 +347,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimGetGroupRequest>,
     ) -> ServiceResult<ScimGroup> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
         let req = request.to_owned_message();
         let row = self.groups.get(&tenant_id, &req.id).await?;
         let group = self.load_group(&tenant_id, &row).await?;
@@ -353,6 +361,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimCreateGroupRequest>,
     ) -> ServiceResult<ScimGroup> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
         let input = req
             .group
@@ -378,6 +387,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimUpdateGroupRequest>,
     ) -> ServiceResult<ScimGroup> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
         let input = req
             .group
@@ -419,6 +429,7 @@ impl ScimService for ScimServiceImpl {
         request: ServiceRequest<'_, ScimDeleteGroupRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
 
         let members = self.groups.list_members(&req.id).await?;
@@ -592,7 +603,21 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
+}
+
+fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: one of {}",
+            scopes.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 impl ScimServiceImpl {
@@ -726,7 +751,13 @@ impl ScimServiceImpl {
 
 fn request_context(tenant_id: String) -> RequestContext {
     let mut ctx = RequestContext::new(HeaderMap::new());
-    ctx.extensions_mut().insert(TenantId(tenant_id));
+    ctx.extensions_mut().insert(TenantId(tenant_id.clone()));
+    ctx.extensions_mut().insert(AuthContext {
+        tenant_id,
+        subject: "scim-subject".into(),
+        scopes: vec![SCOPE_SCIM_READ.into(), SCOPE_SCIM_ADMIN.into()],
+        token_hash: "hash".into(),
+    });
     ctx
 }
 
@@ -1856,9 +1887,108 @@ mod tests {
         assert_eq!(err.code, connectrpc::ErrorCode::Unauthenticated);
     }
 
+    fn scoped_request_context(tenant_id: &str, scopes: &[&str]) -> RequestContext {
+        let mut ctx = RequestContext::new(HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.into()));
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: tenant_id.into(),
+            subject: "scim-subject".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
+        ctx
+    }
+
+    #[tokio::test]
+    async fn create_user_requires_scim_admin_scope() {
+        let service = make_service();
+        let user = ScimUser {
+            user_name: "alice".into(),
+            emails: vec![email_field("alice@example.com")],
+            ..Default::default()
+        };
+        let req = ScimCreateUserRequest {
+            user: Some(user).into(),
+            ..Default::default()
+        };
+        let bytes = Bytes::from(req.encode_to_vec());
+        let view = decode_request::<ScimCreateUserRequest>(&bytes).expect("decode");
+        let svc_req = ServiceRequest::<ScimCreateUserRequest>::from_parts(&view, &bytes);
+        let err = ScimService::create_user(
+            &service,
+            scoped_request_context("tenant-1", &[SCOPE_SCIM_READ]),
+            svc_req,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_user_accepts_scim_read_scope() {
+        let service = make_service();
+        let user = ScimUser {
+            user_name: "alice".into(),
+            emails: vec![email_field("alice@example.com")],
+            ..Default::default()
+        };
+        let created = service
+            .create_user_http("tenant-1".into(), user)
+            .await
+            .unwrap()
+            .body;
+        let fetched = service
+            .get_user_http("tenant-1".into(), created.id)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(fetched.user_name, "alice");
+    }
+
+    #[tokio::test]
+    async fn get_user_requires_scim_read_or_admin_scope() {
+        let service = make_service();
+        let req = ScimGetUserRequest {
+            id: "u1".into(),
+            ..Default::default()
+        };
+        let bytes = Bytes::from(req.encode_to_vec());
+        let view = decode_request::<ScimGetUserRequest>(&bytes).expect("decode");
+        let svc_req = ServiceRequest::<ScimGetUserRequest>::from_parts(&view, &bytes);
+        let err = ScimService::get_user(
+            &service,
+            scoped_request_context("tenant-1", &["other:scope"]),
+            svc_req,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn delete_group_requires_scim_admin_scope() {
+        let service = make_service();
+        let req = ScimDeleteGroupRequest {
+            id: "g1".into(),
+            ..Default::default()
+        };
+        let bytes = Bytes::from(req.encode_to_vec());
+        let view = decode_request::<ScimDeleteGroupRequest>(&bytes).expect("decode");
+        let svc_req = ServiceRequest::<ScimDeleteGroupRequest>::from_parts(&view, &bytes);
+        let err = ScimService::delete_group(
+            &service,
+            scoped_request_context("tenant-1", &[SCOPE_SCIM_READ]),
+            svc_req,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
     #[tokio::test]
     async fn kratos_client_as_scim_kratos_delegates() {
-        let client = Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn ScimKratos>;
+        let client =
+            Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn ScimKratos>;
         assert!(client.create_identity(json!({})).await.is_err());
         assert!(client.get_identity("id").await.is_err());
         assert!(client.update_identity("id", json!({})).await.is_err());
@@ -1867,8 +1997,19 @@ mod tests {
 
     #[tokio::test]
     async fn keto_client_as_scim_keto_delegates() {
-        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ScimKeto>;
-        assert!(client.create_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
-        assert!(client.delete_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap())
+            as Arc<dyn ScimKeto>;
+        assert!(
+            client
+                .create_relation_tuple("ns", "obj", "rel", "subject")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .delete_relation_tuple("ns", "obj", "rel", "subject")
+                .await
+                .is_err()
+        );
     }
 }

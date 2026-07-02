@@ -15,11 +15,7 @@ pub struct ScimGroupRow {
 
 #[async_trait]
 pub trait ScimGroupStore: Send + Sync + 'static {
-    async fn create(
-        &self,
-        tenant_id: &str,
-        display_name: &str,
-    ) -> Result<ScimGroupRow, DbError>;
+    async fn create(&self, tenant_id: &str, display_name: &str) -> Result<ScimGroupRow, DbError>;
 
     async fn get(&self, tenant_id: &str, id: &str) -> Result<ScimGroupRow, DbError>;
 
@@ -206,11 +202,7 @@ impl PgScimGroupStore {
 
 #[async_trait]
 impl ScimGroupStore for PgScimGroupStore {
-    async fn create(
-        &self,
-        tenant_id: &str,
-        display_name: &str,
-    ) -> Result<ScimGroupRow, DbError> {
+    async fn create(&self, tenant_id: &str, display_name: &str) -> Result<ScimGroupRow, DbError> {
         self.create(tenant_id, display_name).await
     }
 
@@ -320,11 +312,20 @@ mod tests {
         let list = store.list(&tenant).await.unwrap();
         assert_eq!(list.len(), 1);
 
-        let updated = store.update(&tenant, &created.id, "Engineering Renamed").await.unwrap();
+        let updated = store
+            .update(&tenant, &created.id, "Engineering Renamed")
+            .await
+            .unwrap();
         assert_eq!(updated.display_name, "Engineering Renamed");
 
-        store.add_member(&tenant, &created.id, "user-1").await.unwrap();
-        store.add_member(&tenant, &created.id, "user-2").await.unwrap();
+        store
+            .add_member(&tenant, &created.id, "user-1")
+            .await
+            .unwrap();
+        store
+            .add_member(&tenant, &created.id, "user-2")
+            .await
+            .unwrap();
 
         let members = store.list_members(&created.id).await.unwrap();
         assert_eq!(members.len(), 2);
@@ -334,7 +335,10 @@ mod tests {
         let user_groups = store.list_user_groups("user-1").await.unwrap();
         assert_eq!(user_groups, vec![created.id.clone()]);
 
-        store.remove_member(&tenant, &created.id, "user-1").await.unwrap();
+        store
+            .remove_member(&tenant, &created.id, "user-1")
+            .await
+            .unwrap();
         let members_after = store.list_members(&created.id).await.unwrap();
         assert_eq!(members_after.len(), 1);
 
@@ -380,7 +384,10 @@ mod tests {
         create_test_tenant(&pool, &tenant).await;
 
         assert!(matches!(
-            store.add_member(&tenant, "missing-group", "user").await.unwrap_err(),
+            store
+                .add_member(&tenant, "missing-group", "user")
+                .await
+                .unwrap_err(),
             DbError::TenantNotFound
         ));
     }
@@ -396,7 +403,10 @@ mod tests {
         assert!(store.get(&tenant, &created.id).await.is_ok());
         assert_eq!(store.list(&tenant).await.unwrap().len(), 1);
         assert!(store.add_member(&tenant, &created.id, "u").await.is_ok());
-        assert_eq!(store.list_members(&created.id).await.unwrap(), vec!["u".to_string()]);
+        assert_eq!(
+            store.list_members(&created.id).await.unwrap(),
+            vec!["u".to_string()]
+        );
         assert!(store.update(&tenant, &created.id, "Renamed").await.is_ok());
         assert!(store.delete(&tenant, &created.id).await.is_ok());
     }

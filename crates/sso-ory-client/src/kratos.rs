@@ -72,6 +72,51 @@ impl KratosClient {
         self.send_empty(Method::DELETE, url).await
     }
 
+    /// List identities by a credential identifier (e.g. email address).
+    #[instrument(skip(self), fields(admin_url = %self.admin_url))]
+    pub async fn list_identities_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Value, OryClientError> {
+        let url = self.admin_url.join("admin/identities")?;
+        debug!(%url, %identifier, "listing kratos identities by identifier");
+        let response = self
+            .client
+            .get(url)
+            .query(&[("credentials_identifier", identifier)])
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
+    /// Create a browser session for an existing identity via the admin API.
+    ///
+    /// Returns the full response so callers can propagate `Set-Cookie` headers.
+    #[instrument(skip(self), fields(admin_url = %self.admin_url))]
+    pub async fn create_session_for_identity(
+        &self,
+        identity_id: &str,
+        amr: Option<&str>,
+    ) -> Result<KratosResponse, OryClientError> {
+        let url = self
+            .admin_url
+            .join(&format!("admin/identities/{identity_id}/sessions"))?;
+        debug!(%url, %identity_id, "creating kratos session for identity");
+        let mut body = serde_json::json!({ "session_token": true });
+        if let Some(amr) = amr {
+            body["authentication_methods"] = serde_json::json!([{ "method": amr }]);
+        }
+        let response = self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response_with_headers(response).await
+    }
+
     /// Get the active identity schema.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn get_identity_schema(&self, id: &str) -> Result<Value, OryClientError> {
@@ -597,13 +642,14 @@ mod tests {
 
     fn app() -> Router {
         let admin = Router::new()
-            .route("/admin/identities", post(create_identity))
+            .route("/admin/identities", get(list_identities).post(create_identity))
             .route(
                 "/admin/identities/{id}",
                 get(get_identity)
                     .put(update_identity)
                     .delete(delete_identity),
             )
+            .route("/admin/identities/{id}/sessions", post(create_session_for_identity))
             .route("/admin/sessions", get(list_sessions))
             .route(
                 "/admin/sessions/{id}",
@@ -630,6 +676,41 @@ mod tests {
             "id": "identity-1",
             "traits": body.get("traits").cloned().unwrap_or_default(),
         }))
+    }
+
+    async fn list_identities(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        let identifier = params.get("credentials_identifier").cloned().unwrap_or_default();
+        if identifier == "found@example.com" {
+            Json(json!([
+                { "id": "identity-found", "traits": { "email": identifier } }
+            ]))
+        } else {
+            Json(json!([]))
+        }
+    }
+
+    async fn create_session_for_identity(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        Json(body): Json<Value>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            format!("ory_kratos_session={id}; Path=/; HttpOnly")
+                .parse()
+                .unwrap(),
+        );
+        (
+            axum::http::StatusCode::CREATED,
+            headers,
+            Json(json!({
+                "id": "session-created",
+                "identity": { "id": id },
+                "token": body.get("session_token").and_then(|v| v.as_bool()).unwrap_or(false),
+            })),
+        )
     }
 
     async fn get_identity(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
@@ -1722,5 +1803,70 @@ mod tests {
     async fn new_with_invalid_url() {
         let err = KratosClient::new("not-a-url").unwrap_err();
         assert!(matches!(err, OryClientError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn list_identities_by_identifier_found() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .list_identities_by_identifier("found@example.com")
+            .await
+            .unwrap();
+        let identities = resp.as_array().unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0]["id"], "identity-found");
+    }
+
+    #[tokio::test]
+    async fn list_identities_by_identifier_not_found() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .list_identities_by_identifier("missing@example.com")
+            .await
+            .unwrap();
+        let identities = resp.as_array().unwrap();
+        assert!(identities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_for_identity_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .create_session_for_identity("identity-1", Some("oidc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["id"], "session-created");
+        assert_eq!(resp.body["identity"]["id"], "identity-1");
+        assert_eq!(resp.body["token"], true);
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=identity-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_for_identity_error() {
+        let app = Router::new().route(
+            "/admin/identities/{id}/sessions",
+            post(error_handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KratosClient::new(&format!("http://{addr}")).unwrap();
+        let err = client
+            .create_session_for_identity("identity-1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 }

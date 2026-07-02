@@ -7,6 +7,7 @@ use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
+use crate::auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN};
 use crate::proto::iam::v1::{
     DeviceAuthorizationRequest, DeviceAuthorizationResponse, DeviceTokenRequest,
     DeviceTokenResponse, OAuth2DeviceService,
@@ -46,14 +47,39 @@ impl OAuth2DeviceServiceImpl {
     }
 }
 
+fn require_device_admin(ctx: &RequestContext) -> Result<(), ServiceError> {
+    if require_scope(ctx, SCOPE_TENANT_ADMIN).is_ok()
+        || require_scope(ctx, SCOPE_APPLICATION_ADMIN).is_ok()
+    {
+        return Ok(());
+    }
+    Err(ServiceError::PermissionDenied(
+        "missing required scope: tenant:admin or application:admin".into(),
+    ))
+}
+
+fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| s == scope) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: {scope}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(refining_impl_trait)]
 impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
     #[instrument(skip(self, request))]
     async fn authorize_device(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, DeviceAuthorizationRequest>,
     ) -> ServiceResult<DeviceAuthorizationResponse> {
+        require_device_admin(&ctx)?;
         let req = request.to_owned_message();
         let mut form = vec![("client_id", req.client_id)];
         if !req.scope.is_empty() {
@@ -61,7 +87,10 @@ impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
         }
         let value = self
             .hydra
-            .device("auth".to_string(), form.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+            .device(
+                "auth".to_string(),
+                form.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            )
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_device_auth_to_proto(&value)))
@@ -70,12 +99,16 @@ impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
     #[instrument(skip(self, request))]
     async fn get_device_token(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, DeviceTokenRequest>,
     ) -> ServiceResult<DeviceTokenResponse> {
+        require_device_admin(&ctx)?;
         let req = request.to_owned_message();
         let form = vec![
-            ("grant_type".to_string(), "urn:ietf:params:oauth:grant-type:device_code".to_string()),
+            (
+                "grant_type".to_string(),
+                "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            ),
             ("client_id".to_string(), req.client_id),
             ("device_code".to_string(), req.device_code),
         ];
@@ -151,13 +184,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use buffa::{bytes::Bytes, HasMessageView, Message, MessageView};
+    use buffa::{HasMessageView, Message, MessageView, bytes::Bytes};
     use connectrpc::{ErrorCode, RequestContext, ServiceRequest};
     use http::HeaderMap;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
 
+    use crate::auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN};
     use crate::proto::iam::v1::{
         DeviceAuthorizationRequest, DeviceTokenRequest, OAuth2DeviceService,
     };
@@ -173,6 +207,17 @@ mod tests {
         let view = Req::View::decode_view(bytes).unwrap();
         let view: &'static Req::View<'static> = Box::leak(Box::new(view));
         ServiceRequest::from_parts(view, bytes)
+    }
+
+    fn auth_context(scopes: &[&str]) -> RequestContext {
+        let mut ctx = RequestContext::new(HeaderMap::new());
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "subject-1".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
+        ctx
     }
 
     #[derive(Default, Clone)]
@@ -229,14 +274,16 @@ mod tests {
             ..Default::default()
         };
         let svc = service(fake.clone());
-        let ctx = RequestContext::new(HeaderMap::new());
         let req = service_request(DeviceAuthorizationRequest {
             client_id: "client-1".to_string(),
             scope: vec!["openid".to_string(), "profile".to_string()],
             ..Default::default()
         });
 
-        let resp = svc.authorize_device(ctx, req).await.unwrap();
+        let resp = svc
+            .authorize_device(auth_context(&[SCOPE_TENANT_ADMIN]), req)
+            .await
+            .unwrap();
         assert_eq!(resp.body.device_code, "device-1");
         assert_eq!(resp.body.user_code, "user-1");
         assert_eq!(resp.body.expires_in, 600);
@@ -249,6 +296,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorize_device_rejects_missing_scope() {
+        let fake = FakeHydra::default();
+        let svc = service(fake);
+        let ctx = RequestContext::new(HeaderMap::new());
+        let req = service_request(DeviceAuthorizationRequest::default());
+
+        let err = svc.authorize_device(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
     async fn authorize_device_error_path() {
         let fake = FakeHydra {
             device_auth: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
@@ -258,10 +316,12 @@ mod tests {
             ..Default::default()
         };
         let svc = service(fake);
-        let ctx = RequestContext::new(HeaderMap::new());
         let req = service_request(DeviceAuthorizationRequest::default());
 
-        let err = svc.authorize_device(ctx, req).await.unwrap_err();
+        let err = svc
+            .authorize_device(auth_context(&[SCOPE_APPLICATION_ADMIN]), req)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
@@ -279,14 +339,16 @@ mod tests {
             ..Default::default()
         };
         let svc = service(fake.clone());
-        let ctx = RequestContext::new(HeaderMap::new());
         let req = service_request(DeviceTokenRequest {
             client_id: "client-1".to_string(),
             device_code: "device-1".to_string(),
             ..Default::default()
         });
 
-        let resp = svc.get_device_token(ctx, req).await.unwrap();
+        let resp = svc
+            .get_device_token(auth_context(&[SCOPE_APPLICATION_ADMIN]), req)
+            .await
+            .unwrap();
         assert_eq!(resp.body.access_token, "access-1");
         assert_eq!(resp.body.token_type, "Bearer");
         assert_eq!(resp.body.expires_in, 3600);
@@ -300,6 +362,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_device_token_rejects_missing_scope() {
+        let fake = FakeHydra::default();
+        let svc = service(fake);
+        let req = service_request(DeviceTokenRequest::default());
+
+        let err = svc
+            .get_device_token(RequestContext::new(HeaderMap::new()), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
     async fn get_device_token_error_path() {
         let fake = FakeHydra {
             device_token: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
@@ -309,10 +384,12 @@ mod tests {
             ..Default::default()
         };
         let svc = service(fake);
-        let ctx = RequestContext::new(HeaderMap::new());
         let req = service_request(DeviceTokenRequest::default());
 
-        let err = svc.get_device_token(ctx, req).await.unwrap_err();
+        let err = svc
+            .get_device_token(auth_context(&[SCOPE_TENANT_ADMIN]), req)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unauthenticated);
     }
 
@@ -361,7 +438,8 @@ mod tests {
 
     #[tokio::test]
     async fn hydra_client_as_device_hydra_delegates() {
-        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn DeviceHydra>;
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap())
+            as Arc<dyn DeviceHydra>;
         assert!(client.device("auth".to_string(), vec![]).await.is_err());
         assert!(client.device("token".to_string(), vec![]).await.is_err());
     }

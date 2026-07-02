@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,6 +8,7 @@ use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
+use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
 use crate::proto::iam::v1::{
     AcceptConsentRequest, AcceptLogoutRequest, ConsentRequest, ConsentResponse,
     GetChallengeRequest, LogoutRequest, LogoutResponse, OAuth2ConsentService, RejectConsentRequest,
@@ -102,14 +104,39 @@ impl OAuth2ConsentServiceImpl {
     }
 }
 
+fn require_consent_admin(ctx: &RequestContext) -> Result<(), ServiceError> {
+    if require_scope(ctx, SCOPE_TENANT_ADMIN).is_ok()
+        || require_scope(ctx, SCOPE_IDENTITY_ADMIN).is_ok()
+    {
+        return Ok(());
+    }
+    Err(ServiceError::PermissionDenied(
+        "missing required scope: tenant:admin or identity:admin".into(),
+    ))
+}
+
+fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| s == scope) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: {scope}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(refining_impl_trait)]
 impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn get_consent_request(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, GetChallengeRequest>,
     ) -> ServiceResult<ConsentRequest> {
+        require_consent_admin(&ctx)?;
         let req = request.to_owned_message();
         let value = self
             .hydra
@@ -122,11 +149,41 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn accept_consent(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, AcceptConsentRequest>,
     ) -> ServiceResult<ConsentResponse> {
+        require_consent_admin(&ctx)?;
         let req = request.to_owned_message();
         let challenge = req.challenge.clone();
+
+        // Fetch the consent request first to enforce that the challenge exists,
+        // has not been handled yet, and to obtain the requested scopes/subject.
+        let consent_value = self
+            .hydra
+            .get_consent_request(&challenge)
+            .await
+            .map_err(map_ory_error)?;
+        let consent = ory_consent_request_to_proto(&consent_value);
+
+        let requested: HashSet<_> = consent.requested_scope.iter().cloned().collect();
+        if !req.grant_scope.iter().all(|s| requested.contains(s)) {
+            return Err(ServiceError::InvalidArgument(
+                "grant_scope exceeds requested_scope".into(),
+            )
+            .into());
+        }
+
+        let auth = ctx.extensions().get::<AuthContext>().ok_or_else(|| {
+            ServiceError::Unauthenticated("missing authentication context".into())
+        })?;
+        let is_tenant_admin = auth.scopes.iter().any(|s| s == SCOPE_TENANT_ADMIN);
+        if auth.subject != consent.subject && !is_tenant_admin {
+            return Err(ServiceError::PermissionDenied(
+                "cannot accept consent for another subject".into(),
+            )
+            .into());
+        }
+
         let body = accept_consent_request_to_json(&req);
         let value = self
             .hydra
@@ -139,9 +196,10 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn reject_consent(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, RejectConsentRequest>,
     ) -> ServiceResult<ConsentResponse> {
+        require_consent_admin(&ctx)?;
         let req = request.to_owned_message();
         let challenge = req.challenge.clone();
         let body = reject_consent_request_to_json(&req);
@@ -227,23 +285,25 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use buffa::Message;
     use buffa::bytes::Bytes;
     use buffa::view::{HasMessageView, MessageView};
-    use connectrpc::{RequestContext, ServiceRequest};
+    use connectrpc::{ErrorCode, RequestContext, ServiceRequest};
     use http::HeaderMap;
     use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
 
+    use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
     use crate::proto::iam::v1::{
         AcceptConsentRequest, AcceptLogoutRequest, GetChallengeRequest, OAuth2ConsentService,
         RejectConsentRequest, RejectLogoutRequest,
     };
 
-    use super::{map_ory_error, ConsentHydra, OAuth2ConsentServiceImpl};
+    use super::{ConsentHydra, OAuth2ConsentServiceImpl, map_ory_error};
 
     #[derive(Debug, Clone)]
     enum Call {
@@ -257,20 +317,20 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MockConsentHydra {
-        next_result: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        results: Arc<Mutex<VecDeque<Result<Value, OryClientError>>>>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
 
     impl MockConsentHydra {
         fn queue(&self, result: Result<Value, OryClientError>) {
-            *self.next_result.lock().unwrap() = Some(result);
+            self.results.lock().unwrap().push_back(result);
         }
 
         fn take_result(&self) -> Result<Value, OryClientError> {
-            self.next_result
+            self.results
                 .lock()
                 .unwrap()
-                .take()
+                .pop_front()
                 .expect("mock result not queued")
         }
 
@@ -354,13 +414,25 @@ mod tests {
         RequestContext::new(HeaderMap::new())
     }
 
+    fn auth_context(scopes: &[&str]) -> RequestContext {
+        let mut ctx = RequestContext::new(HeaderMap::new());
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "subject-1".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
+        ctx
+    }
+
     fn decode_request<'a, Req: HasMessageView>(
         bytes: &'a Bytes,
     ) -> Result<Req::View<'a>, sunbeam_g2v::error::ServiceError> {
-        <Req::View<'a> as MessageView>::decode_view(bytes)
-            .map_err(|e| sunbeam_g2v::error::ServiceError::Internal(format!(
+        <Req::View<'a> as MessageView>::decode_view(bytes).map_err(|e| {
+            sunbeam_g2v::error::ServiceError::Internal(format!(
                 "failed to decode self-encoded request: {e}"
-            )))
+            ))
+        })
     }
 
     macro_rules! svc_req {
@@ -418,9 +490,7 @@ mod tests {
 
     #[test]
     fn oauth2_consent_service_impl_new_stores_hydra() {
-        let hydra = Arc::new(
-            HydraClient::new("http://localhost:1", "http://localhost:1").unwrap(),
-        );
+        let hydra = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap());
         let service = OAuth2ConsentServiceImpl::new(hydra);
         let _cloned = service.clone();
     }
@@ -444,7 +514,7 @@ mod tests {
             GetChallengeRequest
         );
         let resp = svc
-            .get_consent_request(request_context(), req)
+            .get_consent_request(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
             .await
             .unwrap()
             .body;
@@ -452,7 +522,28 @@ mod tests {
         assert_eq!(resp.client_id, "client-1");
         assert_eq!(resp.subject, "subject-1");
         assert!(!resp.skip);
-        assert!(matches!(mock.take_calls().as_slice(), [Call::GetConsent(c)] if c == "consent-challenge-1"));
+        assert!(
+            matches!(mock.take_calls().as_slice(), [Call::GetConsent(c)] if c == "consent-challenge-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_consent_request_rejects_missing_scope() {
+        let mock = Arc::new(MockConsentHydra::default());
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "consent-challenge-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let err = svc
+            .get_consent_request(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
@@ -472,15 +563,21 @@ mod tests {
             GetChallengeRequest
         );
         let err = svc
-            .get_consent_request(request_context(), req)
+            .get_consent_request(auth_context(&[SCOPE_TENANT_ADMIN]), req)
             .await
             .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 
     #[tokio::test]
     async fn accept_consent_happy_path() {
         let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "subject-1",
+            "requested_scope": ["openid"],
+        })));
         mock.queue(Ok(serde_json::json!({
             "redirect_to": "https://example.com/callback",
         })));
@@ -496,7 +593,7 @@ mod tests {
             AcceptConsentRequest
         );
         let resp = svc
-            .accept_consent(request_context(), req)
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
             .await
             .unwrap()
             .body;
@@ -504,7 +601,7 @@ mod tests {
         let calls = mock.take_calls();
         assert!(matches!(
             calls.as_slice(),
-            [Call::AcceptConsent(c)] if c == "consent-challenge-2"
+            [Call::GetConsent(_), Call::AcceptConsent(c)] if c == "consent-challenge-2"
         ));
     }
 
@@ -526,10 +623,116 @@ mod tests {
             AcceptConsentRequest
         );
         let err = svc
+            .accept_consent(auth_context(&[SCOPE_TENANT_ADMIN]), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn accept_consent_rejects_excessive_scope() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "subject-1",
+            "requested_scope": ["openid"],
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "consent-challenge-2".into(),
+                grant_scope: vec!["openid".into(), "admin".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn accept_consent_allows_tenant_admin_for_other_subject() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "other-subject",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "consent-challenge-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let ctx = {
+            let mut ctx = auth_context(&[SCOPE_TENANT_ADMIN]);
+            let existing = ctx.extensions().get::<AuthContext>().unwrap().clone();
+            ctx.extensions_mut().insert(AuthContext {
+                subject: "subject-1".into(),
+                ..existing
+            });
+            ctx
+        };
+        svc.accept_consent(ctx, req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_consent_rejects_subject_mismatch_without_admin() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "other-subject",
+            "requested_scope": ["openid"],
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "consent-challenge-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn accept_consent_rejects_missing_admin_scope() {
+        let mock = Arc::new(MockConsentHydra::default());
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "consent-challenge-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err = svc
             .accept_consent(request_context(), req)
             .await
             .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
@@ -549,7 +752,7 @@ mod tests {
             RejectConsentRequest
         );
         let resp = svc
-            .reject_consent(request_context(), req)
+            .reject_consent(auth_context(&[SCOPE_TENANT_ADMIN]), req)
             .await
             .unwrap()
             .body;
@@ -559,6 +762,26 @@ mod tests {
             calls.as_slice(),
             [Call::RejectConsent(c)] if c == "consent-challenge-3"
         ));
+    }
+
+    #[tokio::test]
+    async fn reject_consent_rejects_missing_admin_scope() {
+        let mock = Arc::new(MockConsentHydra::default());
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectConsentRequest {
+                challenge: "consent-challenge-3".into(),
+                error: "access_denied".into(),
+                ..Default::default()
+            },
+            RejectConsentRequest
+        );
+        let err = svc
+            .reject_consent(request_context(), req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
@@ -579,10 +802,10 @@ mod tests {
             RejectConsentRequest
         );
         let err = svc
-            .reject_consent(request_context(), req)
+            .reject_consent(auth_context(&[SCOPE_TENANT_ADMIN]), req)
             .await
             .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
@@ -613,8 +836,13 @@ mod tests {
         assert_eq!(resp.subject, "subject-1");
         assert_eq!(resp.client_id, "client-1");
         assert_eq!(resp.request_url, "https://example.com/logout");
-        assert_eq!(resp.post_logout_redirect_uri, "https://example.com/after-logout");
-        assert!(matches!(mock.take_calls().as_slice(), [Call::GetLogout(c)] if c == "logout-challenge-1"));
+        assert_eq!(
+            resp.post_logout_redirect_uri,
+            "https://example.com/after-logout"
+        );
+        assert!(
+            matches!(mock.take_calls().as_slice(), [Call::GetLogout(c)] if c == "logout-challenge-1")
+        );
     }
 
     #[tokio::test]
@@ -637,7 +865,7 @@ mod tests {
             .get_logout_request(request_context(), req)
             .await
             .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Unavailable);
     }
 
     #[tokio::test]
@@ -683,11 +911,8 @@ mod tests {
             },
             AcceptLogoutRequest
         );
-        let err = svc
-            .accept_logout(request_context(), req)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+        let err = svc.accept_logout(request_context(), req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
     }
 
     #[tokio::test]
@@ -735,21 +960,39 @@ mod tests {
             },
             RejectLogoutRequest
         );
-        let err = svc
-            .reject_logout(request_context(), req)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
+        let err = svc.reject_logout(request_context(), req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
     }
 
     #[tokio::test]
     async fn hydra_client_as_consent_hydra_delegates() {
-        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ConsentHydra>;
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap())
+            as Arc<dyn ConsentHydra>;
         assert!(client.get_consent_request("challenge").await.is_err());
-        assert!(client.accept_consent_request("challenge", json!({})).await.is_err());
-        assert!(client.reject_consent_request("challenge", json!({})).await.is_err());
+        assert!(
+            client
+                .accept_consent_request("challenge", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .reject_consent_request("challenge", json!({}))
+                .await
+                .is_err()
+        );
         assert!(client.get_logout_request("challenge").await.is_err());
-        assert!(client.accept_logout_request("challenge", json!({})).await.is_err());
-        assert!(client.reject_logout_request("challenge", json!({})).await.is_err());
+        assert!(
+            client
+                .accept_logout_request("challenge", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .reject_logout_request("challenge", json!({}))
+                .await
+                .is_err()
+        );
     }
 }

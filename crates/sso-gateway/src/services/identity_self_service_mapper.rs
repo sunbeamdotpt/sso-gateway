@@ -806,7 +806,8 @@ mod tests {
 
     #[test]
     fn ory_ui_node_text_attributes_to_proto_maps_object_and_string_text() {
-        let value = json!({ "node_type": "text", "text": { "id": "1", "text": "hello", "type": "info" } });
+        let value =
+            json!({ "node_type": "text", "text": { "id": "1", "text": "hello", "type": "info" } });
         let proto = ory_ui_node_text_attributes_to_proto(&value);
         assert_eq!(proto.node_type, "text");
         assert!(proto.text.is_set());
@@ -966,7 +967,10 @@ mod tests {
         let oauth2 = proto.oauth2_login_request.as_option().unwrap();
         assert_eq!(oauth2.client_name, "App Two");
         assert_eq!(oauth2.requested_scope, vec!["openid", "profile"]);
-        assert_eq!(oauth2.requested_access_token_audience, vec!["aud-1", "aud-2"]);
+        assert_eq!(
+            oauth2.requested_access_token_audience,
+            vec!["aud-1", "aud-2"]
+        );
         assert!(!oauth2.skip);
         let ui = proto.ui.as_option().unwrap();
         assert_eq!(ui.nodes.len(), 1);

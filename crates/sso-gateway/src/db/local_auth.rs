@@ -57,10 +57,7 @@ pub trait TenantLocalAuthStore: Send + Sync + 'static {
         method: LocalAuthMethod,
     ) -> Result<TenantLocalAuthRow, DbError>;
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantLocalAuthRow>, DbError>;
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantLocalAuthRow>, DbError>;
 
     async fn update_config(
         &self,
@@ -202,10 +199,7 @@ impl TenantLocalAuthStore for PgTenantLocalAuthStore {
         self.get_by_tenant_and_method(tenant_id, method).await
     }
 
-    async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantLocalAuthRow>, DbError> {
+    async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<TenantLocalAuthRow>, DbError> {
         self.list_by_tenant(tenant_id).await
     }
 
@@ -234,7 +228,9 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TenantLocalAuthRow {
         Ok(Self {
             id: row.try_get("id")?,
             tenant_id: row.try_get("tenant_id")?,
-            method: method.parse().map_err(|e: DbError| sqlx::Error::Decode(Box::new(e)))?,
+            method: method
+                .parse()
+                .map_err(|e: DbError| sqlx::Error::Decode(Box::new(e)))?,
             config: row
                 .try_get::<sqlx::types::Json<serde_json::Value>, _>("config")?
                 .0,
@@ -264,8 +260,14 @@ mod tests {
 
     #[test]
     fn local_auth_method_from_str_valid() {
-        assert_eq!("password".parse::<LocalAuthMethod>().unwrap(), LocalAuthMethod::Password);
-        assert_eq!("code".parse::<LocalAuthMethod>().unwrap(), LocalAuthMethod::Code);
+        assert_eq!(
+            "password".parse::<LocalAuthMethod>().unwrap(),
+            LocalAuthMethod::Password
+        );
+        assert_eq!(
+            "code".parse::<LocalAuthMethod>().unwrap(),
+            LocalAuthMethod::Code
+        );
     }
 
     #[test]
@@ -299,7 +301,11 @@ mod tests {
         create_test_tenant(&pool, &tenant).await;
 
         let created = store
-            .create(&tenant, LocalAuthMethod::Password, serde_json::json!({"min_length": 12}))
+            .create(
+                &tenant,
+                LocalAuthMethod::Password,
+                serde_json::json!({"min_length": 12}),
+            )
             .await
             .unwrap();
         assert_eq!(created.method, LocalAuthMethod::Password);
@@ -320,7 +326,10 @@ mod tests {
             .unwrap();
         assert_eq!(updated.config, serde_json::json!({"min_length": 16}));
 
-        let disabled = store.set_enabled(&tenant, &created.id, false).await.unwrap();
+        let disabled = store
+            .set_enabled(&tenant, &created.id, false)
+            .await
+            .unwrap();
         assert!(!disabled.is_enabled);
 
         let err = store
@@ -348,11 +357,17 @@ mod tests {
             DbError::LocalAuthNotFound
         ));
         assert!(matches!(
-            store.update_config(&tenant, "missing", serde_json::json!({})).await.unwrap_err(),
+            store
+                .update_config(&tenant, "missing", serde_json::json!({}))
+                .await
+                .unwrap_err(),
             DbError::LocalAuthNotFound
         ));
         assert!(matches!(
-            store.set_enabled(&tenant, "missing", false).await.unwrap_err(),
+            store
+                .set_enabled(&tenant, "missing", false)
+                .await
+                .unwrap_err(),
             DbError::LocalAuthNotFound
         ));
         assert!(store.list_by_tenant(&tenant).await.unwrap().is_empty());
@@ -369,11 +384,18 @@ mod tests {
             .create(&tenant, LocalAuthMethod::Code, serde_json::json!({}))
             .await
             .unwrap();
-        assert!(store.get_by_tenant_and_method(&tenant, LocalAuthMethod::Code).await.is_ok());
+        assert!(
+            store
+                .get_by_tenant_and_method(&tenant, LocalAuthMethod::Code)
+                .await
+                .is_ok()
+        );
         assert_eq!(store.list_by_tenant(&tenant).await.unwrap().len(), 1);
-        assert!(store
-            .update_config(&tenant, &created.id, serde_json::json!({"ttl": 300}))
-            .await
-            .is_ok());
+        assert!(
+            store
+                .update_config(&tenant, &created.id, serde_json::json!({"ttl": 300}))
+                .await
+                .is_ok()
+        );
     }
 }

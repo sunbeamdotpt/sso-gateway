@@ -1,38 +1,40 @@
 use std::sync::Arc;
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
-use rand::distributions::{Alphanumeric, DistString};
 use tracing::instrument;
 
-use crate::db::{TenantApiKeyStore, TenantRow, TenantStore};
-use crate::middleware::{TenantId, hash_api_key, require_scope};
+use crate::auth::{AuthContext, SCOPE_TENANT_ADMIN, SCOPE_TENANT_READ, require_scope};
+use crate::db::{TenantRow, TenantStore};
+use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
-    ApiKey, CreateTenantRequest, GetTenantRequest, ListTenantsRequest, ListTenantsResponse,
-    RotateApiKeyRequest, Tenant, TenantService,
+    CreateTenantRequest, GetTenantRequest, ListTenantsRequest, ListTenantsResponse, Tenant,
+    TenantService,
 };
 use sunbeam_g2v::error::ServiceError;
-
-const SCOPE_TENANT_ADMIN: &str = "tenant:admin";
 
 #[derive(Clone)]
 pub struct TenantServiceImpl {
     repo: Arc<dyn TenantStore>,
-    api_keys: Arc<dyn TenantApiKeyStore>,
     #[allow(dead_code)]
     system_tenant_ulid: String,
 }
 
 impl TenantServiceImpl {
-    pub fn new<R, A>(repo: R, api_keys: A, system_tenant_ulid: String) -> Self
+    pub fn new<R>(repo: R, system_tenant_ulid: String) -> Self
     where
         R: TenantStore + 'static,
-        A: TenantApiKeyStore + 'static,
     {
         Self {
             repo: Arc::new(repo) as Arc<dyn TenantStore>,
-            api_keys: Arc::new(api_keys) as Arc<dyn TenantApiKeyStore>,
             system_tenant_ulid,
         }
+    }
+
+    fn is_system_tenant(&self, ctx: &RequestContext) -> bool {
+        ctx.extensions()
+            .get::<AuthContext>()
+            .map(|a| a.tenant_id == self.system_tenant_ulid)
+            .unwrap_or(false)
     }
 }
 
@@ -44,7 +46,14 @@ impl TenantService for TenantServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, CreateTenantRequest>,
     ) -> ServiceResult<Tenant> {
-        let _tenant_id = require_tenant(&ctx)?;
+        let caller_tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_TENANT_ADMIN)?;
+        if caller_tenant_id != self.system_tenant_ulid {
+            return Err(ServiceError::PermissionDenied(
+                "only the system tenant can create tenants".into(),
+            )
+            .into());
+        }
         let req = request.to_owned_message();
         let settings = serde_json::Value::Object(
             req.settings
@@ -65,8 +74,12 @@ impl TenantService for TenantServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetTenantRequest>,
     ) -> ServiceResult<Tenant> {
-        let _tenant_id = require_tenant(&ctx)?;
+        let caller_tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_TENANT_READ, SCOPE_TENANT_ADMIN])?;
         let req = request.to_owned_message();
+        if req.id != caller_tenant_id && !self.is_system_tenant(&ctx) {
+            return Err(ServiceError::PermissionDenied("cannot access tenant".into()).into());
+        }
         let row = self.repo.get_by_id(&req.id).await?;
         Ok(Response::new(row.into_proto()))
     }
@@ -77,52 +90,21 @@ impl TenantService for TenantServiceImpl {
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListTenantsRequest>,
     ) -> ServiceResult<ListTenantsResponse> {
-        let _tenant_id = require_tenant(&ctx)?;
+        let caller_tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_TENANT_READ, SCOPE_TENANT_ADMIN])?;
         let rows = self.repo.list().await?;
-        let tenants: Vec<Tenant> = rows.into_iter().map(TenantRow::into_proto).collect();
+        let tenants: Vec<Tenant> = if self.is_system_tenant(&ctx) {
+            rows.into_iter().map(TenantRow::into_proto).collect()
+        } else {
+            rows.into_iter()
+                .filter(|r| r.id == caller_tenant_id)
+                .map(TenantRow::into_proto)
+                .collect()
+        };
         Ok(Response::new(ListTenantsResponse {
             tenants,
             page: None.into(),
             ..Default::default()
-        }))
-    }
-
-    #[instrument(skip(self, request))]
-    async fn rotate_api_key(
-        &self,
-        ctx: RequestContext,
-        request: ServiceRequest<'_, RotateApiKeyRequest>,
-    ) -> ServiceResult<ApiKey> {
-        let tenant_id = require_tenant(&ctx)?;
-        require_scope(&ctx, SCOPE_TENANT_ADMIN)?;
-        let req = request.to_owned_message();
-
-        if req.tenant_id != tenant_id {
-            return Err(ServiceError::PermissionDenied(
-                "cannot rotate api key for a different tenant".into(),
-            )
-            .into());
-        }
-
-        let plaintext = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
-        let key_hash = hash_api_key(&plaintext);
-        let scopes: Vec<String> = req.scopes;
-        let expires_at = req.expires_at.as_option().and_then(ts_to_offset);
-
-        let row = self
-            .api_keys
-            .create(&tenant_id, &req.name, &key_hash, &scopes, expires_at)
-            .await?;
-
-        Ok(Response::new(ApiKey {
-            id: row.id,
-            tenant_id: row.tenant_id,
-            name: row.name,
-            scopes: row.scopes,
-            plaintext,
-            expires_at: None.into(),
-            created_at: None.into(),
-            __buffa_unknown_fields: Default::default(),
         }))
     }
 }
@@ -157,13 +139,26 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .or_else(|| {
+            ctx.extensions()
+                .get::<AuthContext>()
+                .map(|a| a.tenant_id.clone())
+        })
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
 }
 
-fn ts_to_offset(ts: &buffa_types::google::protobuf::Timestamp) -> Option<time::OffsetDateTime> {
-    time::OffsetDateTime::from_unix_timestamp(ts.seconds)
-        .ok()
-        .map(|dt| dt + time::Duration::nanoseconds(ts.nanos.into()))
+fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: one of {}",
+            scopes.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -176,8 +171,7 @@ mod tests {
     use buffa::view::MessageView;
 
     use super::*;
-    use crate::db::{DbError, TenantApiKeyRow};
-    use crate::middleware::ApiKeyContext;
+    use crate::db::DbError;
     use serde_json::json;
 
     macro_rules! svc_req {
@@ -191,25 +185,35 @@ mod tests {
     fn tenant_ctx(tenant_id: &str) -> RequestContext {
         let mut ctx = RequestContext::new(http::HeaderMap::new());
         ctx.extensions_mut().insert(TenantId(tenant_id.into()));
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: tenant_id.into(),
+            subject: "sub-1".into(),
+            scopes: vec![SCOPE_TENANT_READ.into()],
+            token_hash: "hash".into(),
+        });
         ctx
     }
 
     fn admin_ctx(tenant_id: &str) -> RequestContext {
-        let mut ctx = tenant_ctx(tenant_id);
-        ctx.extensions_mut().insert(ApiKeyContext {
-            key_id: "key-1".into(),
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.into()));
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
+            subject: "sub-1".into(),
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
+            token_hash: "hash".into(),
         });
         ctx
     }
 
     fn ctx_without_scope(tenant_id: &str) -> RequestContext {
-        let mut ctx = tenant_ctx(tenant_id);
-        ctx.extensions_mut().insert(ApiKeyContext {
-            key_id: "key-1".into(),
+        let mut ctx = RequestContext::new(http::HeaderMap::new());
+        ctx.extensions_mut().insert(TenantId(tenant_id.into()));
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
+            subject: "sub-1".into(),
             scopes: vec!["other:scope".into()],
+            token_hash: "hash".into(),
         });
         ctx
     }
@@ -273,19 +277,15 @@ mod tests {
             display_name: &str,
             settings: serde_json::Value,
         ) -> Result<TenantRow, DbError> {
-            self.next_create
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| {
-                    Ok(TenantRow {
-                        id: "tid".into(),
-                        slug: slug.into(),
-                        display_name: display_name.into(),
-                        is_system: false,
-                        settings,
-                    })
+            self.next_create.lock().unwrap().take().unwrap_or_else(|| {
+                Ok(TenantRow {
+                    id: "tid".into(),
+                    slug: slug.into(),
+                    display_name: display_name.into(),
+                    is_system: false,
+                    settings,
                 })
+            })
         }
 
         async fn get_by_id(&self, id: &str) -> Result<TenantRow, DbError> {
@@ -301,60 +301,11 @@ mod tests {
         }
 
         async fn list(&self) -> Result<Vec<TenantRow>, DbError> {
-            self.next_list.lock().unwrap().take().unwrap_or_else(|| Ok(vec![]))
-        }
-    }
-
-    #[derive(Default)]
-    struct StubApiKeyStore {
-        next_create: Mutex<Option<Result<TenantApiKeyRow, DbError>>>,
-    }
-
-    impl StubApiKeyStore {
-        fn with_create(row: TenantApiKeyRow) -> Self {
-            Self {
-                next_create: Mutex::new(Some(Ok(row))),
-            }
-        }
-
-        fn with_create_err(err: DbError) -> Self {
-            Self {
-                next_create: Mutex::new(Some(Err(err))),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TenantApiKeyStore for StubApiKeyStore {
-        async fn create(
-            &self,
-            tenant_id: &str,
-            name: &str,
-            key_hash: &str,
-            scopes: &[String],
-            expires_at: Option<time::OffsetDateTime>,
-        ) -> Result<TenantApiKeyRow, DbError> {
-            self.next_create
+            self.next_list
                 .lock()
                 .unwrap()
                 .take()
-                .unwrap_or_else(|| {
-                    let now = time::OffsetDateTime::now_utc();
-                    Ok(TenantApiKeyRow {
-                        id: "key-1".into(),
-                        tenant_id: tenant_id.into(),
-                        key_hash: key_hash.into(),
-                        name: name.into(),
-                        scopes: scopes.to_vec(),
-                        expires_at,
-                        created_at: now,
-                        updated_at: now,
-                    })
-                })
-        }
-
-        async fn get_by_hash(&self, _key_hash: &str) -> Result<TenantApiKeyRow, DbError> {
-            Err(DbError::ApiKeyNotFound)
+                .unwrap_or_else(|| Ok(vec![]))
         }
     }
 
@@ -397,57 +348,6 @@ mod tests {
         };
         let proto = row.into_proto();
         assert!(proto.settings.is_empty());
-    }
-
-    #[test]
-    fn ts_to_offset_maps_timestamp() {
-        let ts = buffa_types::google::protobuf::Timestamp {
-            seconds: 1_782_648_000,
-            nanos: 500_000_000,
-            ..Default::default()
-        };
-        let dt = ts_to_offset(&ts).expect("valid");
-        assert_eq!(dt.unix_timestamp(), 1_782_648_000);
-    }
-
-    #[test]
-    fn ts_to_offset_rejects_invalid_seconds() {
-        let ts = buffa_types::google::protobuf::Timestamp {
-            seconds: i64::MAX,
-            nanos: 0,
-            ..Default::default()
-        };
-        assert!(ts_to_offset(&ts).is_none());
-    }
-
-    #[test]
-    fn ts_to_offset_zero_and_negative_seconds() {
-        let ts = buffa_types::google::protobuf::Timestamp {
-            seconds: 0,
-            nanos: 0,
-            ..Default::default()
-        };
-        let dt = ts_to_offset(&ts).expect("epoch");
-        assert_eq!(dt.unix_timestamp(), 0);
-
-        let ts = buffa_types::google::protobuf::Timestamp {
-            seconds: -1,
-            nanos: 0,
-            ..Default::default()
-        };
-        let dt = ts_to_offset(&ts).expect("negative");
-        assert_eq!(dt.unix_timestamp(), -1);
-    }
-
-    #[test]
-    fn ts_to_offset_adds_nanos() {
-        let ts = buffa_types::google::protobuf::Timestamp {
-            seconds: 1_000,
-            nanos: 1_000_000,
-            ..Default::default()
-        };
-        let dt = ts_to_offset(&ts).expect("valid");
-        assert_eq!(dt.unix_timestamp_nanos(), 1_000_001_000_000);
     }
 
     #[test]
@@ -519,10 +419,9 @@ mod tests {
                 is_system: false,
                 settings: json!({"domain": "acme.com"}),
             }),
-            StubApiKeyStore::default(),
             "system".into(),
         );
-        let ctx = tenant_ctx("tenant-1");
+        let ctx = admin_ctx("system");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
             display_name: "Acme Corp".into(),
@@ -538,16 +437,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_tenant_requires_admin_scope() {
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let ctx = ctx_without_scope("tenant-1");
+        let req_msg = CreateTenantRequest {
+            slug: "acme".into(),
+            display_name: "Acme".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req_msg, CreateTenantRequest);
+        let err: ServiceError = service
+            .create_tenant(ctx, request)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
     async fn create_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
-            "system".into(),
-        );
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = CreateTenantRequest::default();
         svc_req!(request, req_msg, CreateTenantRequest);
-        let err: ServiceError = service.create_tenant(ctx, request).await.unwrap_err().into();
+        let err: ServiceError = service
+            .create_tenant(ctx, request)
+            .await
+            .unwrap_err()
+            .into();
         assert!(matches!(err, ServiceError::Unauthenticated(_)));
     }
 
@@ -555,17 +472,20 @@ mod tests {
     async fn create_tenant_propagates_repo_error() {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_create_err(DbError::TenantNotFound),
-            StubApiKeyStore::default(),
             "system".into(),
         );
-        let ctx = tenant_ctx("tenant-1");
+        let ctx = admin_ctx("system");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
             display_name: "Acme".into(),
             ..Default::default()
         };
         svc_req!(request, req_msg, CreateTenantRequest);
-        let err: ServiceError = service.create_tenant(ctx, request).await.unwrap_err().into();
+        let err: ServiceError = service
+            .create_tenant(ctx, request)
+            .await
+            .unwrap_err()
+            .into();
         assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
@@ -579,7 +499,6 @@ mod tests {
                 is_system: false,
                 settings: json!({}),
             }),
-            StubApiKeyStore::default(),
             "system".into(),
         );
         let ctx = tenant_ctx("tenant-1");
@@ -594,11 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
-            "system".into(),
-        );
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = GetTenantRequest::default();
         svc_req!(request, req_msg, GetTenantRequest);
@@ -610,10 +525,9 @@ mod tests {
     async fn get_tenant_propagates_not_found() {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_get_err(DbError::TenantNotFound),
-            StubApiKeyStore::default(),
             "system".into(),
         );
-        let ctx = tenant_ctx("tenant-1");
+        let ctx = tenant_ctx("system");
         let req_msg = GetTenantRequest {
             id: "missing".into(),
             ..Default::default()
@@ -633,7 +547,6 @@ mod tests {
                 is_system: false,
                 settings: json!({}),
             }]),
-            StubApiKeyStore::default(),
             "system".into(),
         );
         let ctx = tenant_ctx("tenant-1");
@@ -646,11 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tenants_requires_tenant() {
-        let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
-            "system".into(),
-        );
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = ListTenantsRequest::default();
         svc_req!(request, req_msg, ListTenantsRequest);
@@ -662,7 +571,6 @@ mod tests {
     async fn list_tenants_propagates_repo_error() {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_list_err(DbError::Sqlx(sqlx::Error::PoolTimedOut)),
-            StubApiKeyStore::default(),
             "system".into(),
         );
         let ctx = tenant_ctx("tenant-1");
@@ -673,101 +581,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_api_key_happy_path() {
+    async fn create_tenant_rejects_non_system_tenant() {
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let ctx = admin_ctx("tenant-1");
+        let req_msg = CreateTenantRequest {
+            slug: "acme".into(),
+            display_name: "Acme".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req_msg, CreateTenantRequest);
+        let err: ServiceError = service
+            .create_tenant(ctx, request)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn get_tenant_rejects_other_tenant() {
         let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::with_create(TenantApiKeyRow {
-                id: "key-1".into(),
-                tenant_id: "tenant-1".into(),
-                key_hash: "hash".into(),
-                name: "admin-key".into(),
-                scopes: vec![SCOPE_TENANT_ADMIN.into()],
-                expires_at: None,
-                created_at: time::OffsetDateTime::now_utc(),
-                updated_at: time::OffsetDateTime::now_utc(),
+            StubTenantStore::with_get(TenantRow {
+                id: "tenant-2".into(),
+                slug: "other".into(),
+                display_name: "Other".into(),
+                is_system: false,
+                settings: json!({}),
             }),
             "system".into(),
         );
-        let ctx = admin_ctx("tenant-1");
-        let req_msg = RotateApiKeyRequest {
-            tenant_id: "tenant-1".into(),
-            name: "admin-key".into(),
-            scopes: vec![SCOPE_TENANT_ADMIN.into()],
+        let ctx = tenant_ctx("tenant-1");
+        let req_msg = GetTenantRequest {
+            id: "tenant-2".into(),
             ..Default::default()
         };
-        svc_req!(request, req_msg, RotateApiKeyRequest);
-        let response = service.rotate_api_key(ctx, request).await.unwrap();
-        assert_eq!(response.body.id, "key-1");
-        assert_eq!(response.body.tenant_id, "tenant-1");
-        assert_eq!(response.body.name, "admin-key");
-        assert!(!response.body.plaintext.is_empty());
+        svc_req!(request, req_msg, GetTenantRequest);
+        let err: ServiceError = service.get_tenant(ctx, request).await.unwrap_err().into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
     }
 
     #[tokio::test]
-    async fn rotate_api_key_requires_tenant() {
+    async fn get_tenant_system_can_access_any() {
         let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
+            StubTenantStore::with_get(TenantRow {
+                id: "tenant-2".into(),
+                slug: "other".into(),
+                display_name: "Other".into(),
+                is_system: false,
+                settings: json!({}),
+            }),
             "system".into(),
         );
-        let ctx = RequestContext::new(http::HeaderMap::new());
-        let req_msg = RotateApiKeyRequest::default();
-        svc_req!(request, req_msg, RotateApiKeyRequest);
-        let err: ServiceError = service.rotate_api_key(ctx, request).await.unwrap_err().into();
-        assert!(matches!(err, ServiceError::Unauthenticated(_)));
+        let ctx = tenant_ctx("system");
+        let req_msg = GetTenantRequest {
+            id: "tenant-2".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req_msg, GetTenantRequest);
+        let response = service.get_tenant(ctx, request).await.unwrap();
+        assert_eq!(response.body.id, "tenant-2");
     }
 
     #[tokio::test]
-    async fn rotate_api_key_requires_admin_scope() {
+    async fn list_tenants_filters_non_system() {
         let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
+            StubTenantStore::with_list(vec![
+                TenantRow {
+                    id: "tenant-1".into(),
+                    slug: "acme".into(),
+                    display_name: "Acme".into(),
+                    is_system: false,
+                    settings: json!({}),
+                },
+                TenantRow {
+                    id: "tenant-2".into(),
+                    slug: "other".into(),
+                    display_name: "Other".into(),
+                    is_system: false,
+                    settings: json!({}),
+                },
+            ]),
             "system".into(),
         );
+        let ctx = tenant_ctx("tenant-1");
+        let req_msg = ListTenantsRequest::default();
+        svc_req!(request, req_msg, ListTenantsRequest);
+        let response = service.list_tenants(ctx, request).await.unwrap();
+        assert_eq!(response.body.tenants.len(), 1);
+        assert_eq!(response.body.tenants[0].id, "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn list_tenants_system_sees_all() {
+        let service = TenantServiceImpl::new(
+            StubTenantStore::with_list(vec![
+                TenantRow {
+                    id: "tenant-1".into(),
+                    slug: "acme".into(),
+                    display_name: "Acme".into(),
+                    is_system: false,
+                    settings: json!({}),
+                },
+                TenantRow {
+                    id: "tenant-2".into(),
+                    slug: "other".into(),
+                    display_name: "Other".into(),
+                    is_system: false,
+                    settings: json!({}),
+                },
+            ]),
+            "system".into(),
+        );
+        let ctx = tenant_ctx("system");
+        let req_msg = ListTenantsRequest::default();
+        svc_req!(request, req_msg, ListTenantsRequest);
+        let response = service.list_tenants(ctx, request).await.unwrap();
+        assert_eq!(response.body.tenants.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_tenant_requires_read_scope() {
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
         let ctx = ctx_without_scope("tenant-1");
-        let req_msg = RotateApiKeyRequest {
-            tenant_id: "tenant-1".into(),
-            name: "key".into(),
+        let req_msg = GetTenantRequest {
+            id: "tenant-1".into(),
             ..Default::default()
         };
-        svc_req!(request, req_msg, RotateApiKeyRequest);
-        let err: ServiceError = service.rotate_api_key(ctx, request).await.unwrap_err().into();
+        svc_req!(request, req_msg, GetTenantRequest);
+        let err: ServiceError = service.get_tenant(ctx, request).await.unwrap_err().into();
         assert!(matches!(err, ServiceError::PermissionDenied(_)));
     }
 
     #[tokio::test]
-    async fn rotate_api_key_rejects_cross_tenant_rotation() {
-        let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::default(),
-            "system".into(),
-        );
-        let ctx = admin_ctx("tenant-1");
-        let req_msg = RotateApiKeyRequest {
-            tenant_id: "tenant-2".into(),
-            name: "key".into(),
-            ..Default::default()
-        };
-        svc_req!(request, req_msg, RotateApiKeyRequest);
-        let err: ServiceError = service.rotate_api_key(ctx, request).await.unwrap_err().into();
+    async fn list_tenants_requires_read_scope() {
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let ctx = ctx_without_scope("tenant-1");
+        let req_msg = ListTenantsRequest::default();
+        svc_req!(request, req_msg, ListTenantsRequest);
+        let err: ServiceError = service.list_tenants(ctx, request).await.unwrap_err().into();
         assert!(matches!(err, ServiceError::PermissionDenied(_)));
-    }
-
-    #[tokio::test]
-    async fn rotate_api_key_propagates_repo_error() {
-        let service = TenantServiceImpl::new(
-            StubTenantStore::default(),
-            StubApiKeyStore::with_create_err(DbError::TenantNotFound),
-            "system".into(),
-        );
-        let ctx = admin_ctx("tenant-1");
-        let req_msg = RotateApiKeyRequest {
-            tenant_id: "tenant-1".into(),
-            name: "key".into(),
-            ..Default::default()
-        };
-        svc_req!(request, req_msg, RotateApiKeyRequest);
-        let err: ServiceError = service.rotate_api_key(ctx, request).await.unwrap_err().into();
-        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 }

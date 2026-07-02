@@ -206,7 +206,8 @@ impl IdentitySchemaStore for PgIdentitySchemaStore {
         schema_json: serde_json::Value,
         is_default: bool,
     ) -> Result<IdentitySchemaRow, DbError> {
-        self.create(tenant_id, schema_id, schema_json, is_default).await
+        self.create(tenant_id, schema_id, schema_json, is_default)
+            .await
     }
 
     async fn get_by_schema_id(
@@ -232,7 +233,8 @@ impl IdentitySchemaStore for PgIdentitySchemaStore {
         schema_json: serde_json::Value,
         is_default: bool,
     ) -> Result<IdentitySchemaRow, DbError> {
-        self.update(tenant_id, schema_id, schema_json, is_default).await
+        self.update(tenant_id, schema_id, schema_json, is_default)
+            .await
     }
 
     async fn set_default(
@@ -346,7 +348,10 @@ mod tests {
 
         store.delete(&tenant, &schema_id).await.unwrap();
         assert!(matches!(
-            store.get_by_schema_id(&tenant, &schema_id).await.unwrap_err(),
+            store
+                .get_by_schema_id(&tenant, &schema_id)
+                .await
+                .unwrap_err(),
             DbError::SchemaNotFound
         ));
     }
@@ -359,7 +364,10 @@ mod tests {
         create_test_tenant(&pool, &tenant).await;
 
         assert!(matches!(
-            store.get_by_schema_id(&tenant, "missing").await.unwrap_err(),
+            store
+                .get_by_schema_id(&tenant, "missing")
+                .await
+                .unwrap_err(),
             DbError::SchemaNotFound
         ));
         assert!(matches!(
@@ -367,7 +375,10 @@ mod tests {
             DbError::SchemaNotFound
         ));
         assert!(matches!(
-            store.update(&tenant, "missing", schema_json(), false).await.unwrap_err(),
+            store
+                .update(&tenant, "missing", schema_json(), false)
+                .await
+                .unwrap_err(),
             DbError::SchemaNotFound
         ));
         assert!(matches!(
@@ -389,7 +400,10 @@ mod tests {
         let store: Arc<dyn IdentitySchemaStore> = Arc::new(PgIdentitySchemaStore::new(pool));
 
         let schema_id = format!("trait-{}", Ulid::new());
-        store.create(&tenant, &schema_id, schema_json(), true).await.unwrap();
+        store
+            .create(&tenant, &schema_id, schema_json(), true)
+            .await
+            .unwrap();
         assert!(store.get_by_schema_id(&tenant, &schema_id).await.is_ok());
         assert!(store.get_default(&tenant).await.is_ok());
         assert_eq!(store.list(&tenant).await.unwrap().len(), 1);

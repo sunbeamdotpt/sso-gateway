@@ -215,7 +215,14 @@ mod tests {
 
         let entity_id = format!("https://sp-{}/entity", Ulid::new());
         let created = store
-            .create(&tenant, &entity_id, "https://sp/acs", Some("cert-pem"), true, Some("email"))
+            .create(
+                &tenant,
+                &entity_id,
+                "https://sp/acs",
+                Some("cert-pem"),
+                true,
+                Some("email"),
+            )
             .await
             .unwrap();
         assert_eq!(created.entity_id, entity_id);
@@ -239,7 +246,10 @@ mod tests {
             DbError::SamlSpClientNotFound
         ));
         assert!(matches!(
-            store.get_by_entity_id(&tenant, "missing").await.unwrap_err(),
+            store
+                .get_by_entity_id(&tenant, "missing")
+                .await
+                .unwrap_err(),
             DbError::SamlSpClientNotFound
         ));
     }

@@ -10,6 +10,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
+    auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_APPLICATION_READ, require_scope},
     db::{IdMappingRepo, IdMappingStore},
     middleware::TenantId,
     proto::iam::v1::{
@@ -26,7 +27,8 @@ const BACKEND_HYDRA: &str = "hydra";
 pub trait ApplicationHydra: Send + Sync + 'static {
     async fn create_oauth2_client(&self, payload: Value) -> Result<Value, OryClientError>;
     async fn get_oauth2_client(&self, id: &str) -> Result<Value, OryClientError>;
-    async fn update_oauth2_client(&self, id: &str, payload: Value) -> Result<Value, OryClientError>;
+    async fn update_oauth2_client(&self, id: &str, payload: Value)
+    -> Result<Value, OryClientError>;
     async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError>;
     async fn rotate_client_secret(&self, id: &str) -> Result<Value, OryClientError>;
 }
@@ -41,7 +43,11 @@ impl ApplicationHydra for HydraClient {
         self.get_oauth2_client(id).await
     }
 
-    async fn update_oauth2_client(&self, id: &str, payload: Value) -> Result<Value, OryClientError> {
+    async fn update_oauth2_client(
+        &self,
+        id: &str,
+        payload: Value,
+    ) -> Result<Value, OryClientError> {
         self.update_oauth2_client(id, payload).await
     }
 
@@ -58,6 +64,7 @@ impl ApplicationHydra for HydraClient {
 pub struct ApplicationServiceImpl {
     hydra: Arc<dyn ApplicationHydra>,
     mappings: Arc<dyn IdMappingStore>,
+    allow_http_redirect_uris: bool,
 }
 
 impl ApplicationServiceImpl {
@@ -65,7 +72,16 @@ impl ApplicationServiceImpl {
         Self {
             hydra: hydra as Arc<dyn ApplicationHydra>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            allow_http_redirect_uris: false,
         }
+    }
+
+    /// Allow `http` redirect URIs in addition to `https`. Intended for tests;
+    /// production should keep the default https-only restriction.
+    #[must_use]
+    pub fn with_allow_http_redirect_uris(mut self, allow: bool) -> Self {
+        self.allow_http_redirect_uris = allow;
+        self
     }
 }
 
@@ -78,7 +94,11 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         request: ServiceRequest<'_, CreateApplicationRequest>,
     ) -> ServiceResult<Application> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_APPLICATION_ADMIN)?;
         let req = request.to_owned_message();
+
+        validate_redirect_uris(&req.redirect_uris, self.allow_http_redirect_uris)?;
+        validate_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
 
         let payload = build_hydra_payload(&req);
         let created = self
@@ -109,6 +129,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         request: ServiceRequest<'_, GetApplicationRequest>,
     ) -> ServiceResult<Application> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_APPLICATION_READ, SCOPE_APPLICATION_ADMIN])?;
         let req = request.to_owned_message();
         let ory_id = self
             .mappings
@@ -132,6 +153,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         _request: ServiceRequest<'_, ListApplicationsRequest>,
     ) -> ServiceResult<ListApplicationsResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_APPLICATION_READ, SCOPE_APPLICATION_ADMIN])?;
         let public_ids = self
             .mappings
             .list_public_ids(&tenant_id, BACKEND_HYDRA)
@@ -167,7 +189,11 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         request: ServiceRequest<'_, UpdateApplicationRequest>,
     ) -> ServiceResult<Application> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_APPLICATION_ADMIN)?;
         let req = request.to_owned_message();
+        validate_redirect_uris(&req.redirect_uris, self.allow_http_redirect_uris)?;
+        validate_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
+
         let ory_id = self
             .mappings
             .get_ory_id(&tenant_id, BACKEND_HYDRA, &req.id)
@@ -192,6 +218,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         request: ServiceRequest<'_, DeleteApplicationRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_APPLICATION_ADMIN)?;
         let req = request.to_owned_message();
         let ory_id = self
             .mappings
@@ -216,6 +243,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         request: ServiceRequest<'_, RotateSecretRequest>,
     ) -> ServiceResult<ApplicationSecret> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_APPLICATION_ADMIN)?;
         let req = request.to_owned_message();
         let ory_id = self
             .mappings
@@ -246,7 +274,64 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
+}
+
+fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: one of {}",
+            scopes.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), ServiceError> {
+    for uri in uris {
+        if uri.contains('*') {
+            return Err(ServiceError::InvalidArgument(format!(
+                "redirect_uri contains wildcard: {uri}"
+            )));
+        }
+        let parsed = reqwest::Url::parse(uri).map_err(|e| {
+            ServiceError::InvalidArgument(format!("invalid redirect_uri {uri}: {e}"))
+        })?;
+        let scheme = parsed.scheme();
+        match scheme {
+            "https" => {}
+            "http" if allow_http => {}
+            "javascript" | "data" => {
+                return Err(ServiceError::InvalidArgument(format!(
+                    "redirect_uri uses forbidden scheme: {scheme}"
+                )));
+            }
+            _ => {
+                return Err(ServiceError::InvalidArgument(format!(
+                    "redirect_uri must use https scheme: {uri}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_token_endpoint_auth_method(method: &str) -> Result<(), ServiceError> {
+    if method.is_empty() {
+        return Ok(());
+    }
+    const ALLOWED: &[&str] = &["client_secret_post", "client_secret_basic", "none"];
+    if !ALLOWED.contains(&method) {
+        return Err(ServiceError::InvalidArgument(format!(
+            "token_endpoint_auth_method must be one of {:?}",
+            ALLOWED
+        )));
+    }
+    Ok(())
 }
 
 fn map_ory_error(err: OryClientError) -> ServiceError {
@@ -355,17 +440,30 @@ mod tests {
     }
 
     fn tenant_context(tenant_id: &str) -> RequestContext {
+        scoped_context(tenant_id, &[SCOPE_APPLICATION_READ])
+    }
+
+    fn admin_context(tenant_id: &str) -> RequestContext {
+        scoped_context(tenant_id, &[SCOPE_APPLICATION_ADMIN])
+    }
+
+    fn no_scope_context(tenant_id: &str) -> RequestContext {
+        scoped_context(tenant_id, &["other:scope"])
+    }
+
+    fn scoped_context(tenant_id: &str, scopes: &[&str]) -> RequestContext {
         let mut ctx = RequestContext::new(http::HeaderMap::new());
         ctx.extensions_mut().insert(TenantId(tenant_id.to_string()));
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: tenant_id.to_string(),
+            subject: "sub-1".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
         ctx
     }
 
-    fn mapping_row(
-        tenant_id: &str,
-        backend: &str,
-        public_id: &str,
-        ory_id: &str,
-    ) -> IdMappingRow {
+    fn mapping_row(tenant_id: &str, backend: &str, public_id: &str, ory_id: &str) -> IdMappingRow {
         IdMappingRow {
             id: "id".to_string(),
             tenant_id: tenant_id.to_string(),
@@ -467,7 +565,10 @@ mod tests {
     }
 
     fn take_result<T>(slot: &Mutex<Option<Result<T, DbError>>>) -> Result<T, DbError> {
-        slot.lock().unwrap().take().unwrap_or(Err(DbError::MappingNotFound))
+        slot.lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Err(DbError::MappingNotFound))
     }
 
     #[async_trait]
@@ -530,13 +631,22 @@ mod tests {
         }
     }
 
-    fn build_service(
+    fn build_service(hydra: StubHydra, mappings: StubMappings) -> ApplicationServiceImpl {
+        ApplicationServiceImpl {
+            hydra: Arc::new(hydra),
+            mappings: Arc::new(mappings),
+            allow_http_redirect_uris: false,
+        }
+    }
+
+    fn build_service_allow_http(
         hydra: StubHydra,
         mappings: StubMappings,
     ) -> ApplicationServiceImpl {
         ApplicationServiceImpl {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
+            allow_http_redirect_uris: true,
         }
     }
 
@@ -552,7 +662,10 @@ mod tests {
         };
         let mappings = StubMappings {
             create_result: Mutex::new(Some(Ok(mapping_row(
-                "tenant-1", BACKEND_HYDRA, "pub-1", "ory-123",
+                "tenant-1",
+                BACKEND_HYDRA,
+                "pub-1",
+                "ory-123",
             )))),
             ..Default::default()
         };
@@ -570,7 +683,7 @@ mod tests {
         svc_req!(request, req, CreateApplicationRequest);
 
         let resp = service
-            .create_application(tenant_context("tenant-1"), request)
+            .create_application(admin_context("tenant-1"), request)
             .await
             .unwrap()
             .body;
@@ -607,7 +720,7 @@ mod tests {
         svc_req!(request, req, CreateApplicationRequest);
 
         let err = service
-            .create_application(tenant_context("tenant-1"), request)
+            .create_application(admin_context("tenant-1"), request)
             .await
             .unwrap_err();
 
@@ -625,7 +738,7 @@ mod tests {
         svc_req!(request, req, CreateApplicationRequest);
 
         let err = service
-            .create_application(tenant_context("tenant-1"), request)
+            .create_application(admin_context("tenant-1"), request)
             .await
             .unwrap_err();
 
@@ -728,7 +841,10 @@ mod tests {
         };
         let mappings = StubMappings {
             list_public_ids_result: Mutex::new(Some(Ok(vec!["pub-1".into(), "pub-2".into()]))),
-            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into()), Err(DbError::MappingNotFound)]),
+            get_ory_id_results: Mutex::new(vec![
+                Ok("ory-123".into()),
+                Err(DbError::MappingNotFound),
+            ]),
             ..Default::default()
         };
         let service = build_service(hydra, mappings);
@@ -749,10 +865,7 @@ mod tests {
     #[tokio::test]
     async fn list_applications_skips_hydra_failures() {
         let hydra = StubHydra {
-            get_results: Mutex::new(vec![
-                Err(ory_not_found()),
-                Ok(hydra_client_response()),
-            ]),
+            get_results: Mutex::new(vec![Err(ory_not_found()), Ok(hydra_client_response())]),
             ..Default::default()
         };
         let mappings = StubMappings {
@@ -804,7 +917,7 @@ mod tests {
         svc_req!(request, req, UpdateApplicationRequest);
 
         let resp = service
-            .update_application(tenant_context("tenant-1"), request)
+            .update_application(admin_context("tenant-1"), request)
             .await
             .unwrap()
             .body;
@@ -823,7 +936,7 @@ mod tests {
         svc_req!(request, req, UpdateApplicationRequest);
 
         let err = service
-            .update_application(tenant_context("tenant-1"), request)
+            .update_application(admin_context("tenant-1"), request)
             .await
             .unwrap_err();
 
@@ -854,7 +967,7 @@ mod tests {
         svc_req!(request, req, DeleteApplicationRequest);
 
         service
-            .delete_application(tenant_context("tenant-1"), request)
+            .delete_application(admin_context("tenant-1"), request)
             .await
             .unwrap();
     }
@@ -878,7 +991,7 @@ mod tests {
         svc_req!(request, req, DeleteApplicationRequest);
 
         let err = service
-            .delete_application(tenant_context("tenant-1"), request)
+            .delete_application(admin_context("tenant-1"), request)
             .await
             .unwrap_err();
 
@@ -911,7 +1024,7 @@ mod tests {
         svc_req!(request, req, RotateSecretRequest);
 
         let resp = service
-            .rotate_secret(tenant_context("tenant-1"), request)
+            .rotate_secret(admin_context("tenant-1"), request)
             .await
             .unwrap()
             .body;
@@ -939,7 +1052,7 @@ mod tests {
         svc_req!(request, req, RotateSecretRequest);
 
         let err = service
-            .rotate_secret(tenant_context("tenant-1"), request)
+            .rotate_secret(admin_context("tenant-1"), request)
             .await
             .unwrap_err();
 
@@ -1112,11 +1225,328 @@ mod tests {
 
     #[tokio::test]
     async fn hydra_client_as_application_hydra_delegates() {
-        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn ApplicationHydra>;
+        let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap())
+            as Arc<dyn ApplicationHydra>;
         assert!(client.create_oauth2_client(json!({})).await.is_err());
         assert!(client.get_oauth2_client("id").await.is_err());
         assert!(client.update_oauth2_client("id", json!({})).await.is_err());
         assert!(client.delete_oauth2_client("id").await.is_err());
         assert!(client.rotate_client_secret("id").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_application_does_not_return_client_secret() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = GetApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, GetApplicationRequest);
+
+        let resp = service
+            .get_application(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(resp.client_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_applications_does_not_return_client_secret() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            list_public_ids_result: Mutex::new(Some(Ok(vec!["pub-1".into()]))),
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = ListApplicationsRequest::default();
+        svc_req!(request, req, ListApplicationsRequest);
+
+        let resp = service
+            .list_applications(tenant_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.applications.len(), 1);
+        assert!(resp.applications[0].client_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_application_rejects_http_redirect_uri_by_default() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            redirect_uris: vec!["http://a/callback".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_allows_http_redirect_uri_when_configured() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            create_result: Mutex::new(Some(Ok(mapping_row(
+                "tenant-1",
+                BACKEND_HYDRA,
+                "pub-1",
+                "ory-123",
+            )))),
+            ..Default::default()
+        };
+        let service = build_service_allow_http(hydra, mappings);
+
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            redirect_uris: vec!["http://a/callback".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let resp = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.tenant_id, "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn create_application_rejects_javascript_redirect_uri() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            redirect_uris: vec!["javascript://alert(1)".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_rejects_wildcard_redirect_uri() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            redirect_uris: vec!["https://*.example.com/callback".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_rejects_invalid_token_endpoint_auth_method() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            token_endpoint_auth_method: "client_secret_jwt".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_application_requires_admin_scope() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = CreateApplicationRequest::default();
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(no_scope_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_application_requires_read_scope() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = GetApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, GetApplicationRequest);
+
+        let err = service
+            .get_application(no_scope_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_application_accepts_admin_scope() {
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = GetApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, GetApplicationRequest);
+
+        let resp = service
+            .get_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(resp.id, "pub-1");
+    }
+
+    #[tokio::test]
+    async fn update_application_requires_admin_scope() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let err = service
+            .update_application(no_scope_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_application_requires_admin_scope() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = DeleteApplicationRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, DeleteApplicationRequest);
+
+        let err = service
+            .delete_application(no_scope_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn rotate_secret_requires_admin_scope() {
+        let service = build_service(StubHydra::default(), StubMappings::default());
+        let req = RotateSecretRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, RotateSecretRequest);
+
+        let err = service
+            .rotate_secret(no_scope_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[test]
+    fn validate_redirect_uris_accepts_https() {
+        assert!(validate_redirect_uris(&["https://example.com/callback".into()], false,).is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_uris_rejects_http_when_not_allowed() {
+        assert!(validate_redirect_uris(&["http://example.com/callback".into()], false,).is_err());
+    }
+
+    #[test]
+    fn validate_redirect_uris_allows_http_when_allowed() {
+        assert!(validate_redirect_uris(&["http://example.com/callback".into()], true,).is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_uris_rejects_javascript_scheme() {
+        assert!(validate_redirect_uris(&["javascript://alert(1)".into()], false,).is_err());
+    }
+
+    #[test]
+    fn validate_redirect_uris_rejects_wildcard() {
+        assert!(
+            validate_redirect_uris(&["https://*.example.com/callback".into()], false,).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_token_endpoint_auth_method_accepts_allowed_values() {
+        for method in ["client_secret_post", "client_secret_basic", "none"] {
+            assert!(validate_token_endpoint_auth_method(method).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_token_endpoint_auth_method_rejects_invalid_value() {
+        assert!(validate_token_endpoint_auth_method("client_secret_jwt").is_err());
+    }
+
+    #[test]
+    fn validate_token_endpoint_auth_method_allows_empty() {
+        assert!(validate_token_endpoint_auth_method("").is_ok());
     }
 }

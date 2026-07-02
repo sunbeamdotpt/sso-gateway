@@ -9,6 +9,7 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
 use crate::{
+    auth::{AuthContext, SCOPE_PERMISSION_ADMIN, SCOPE_PERMISSION_READ, require_scope},
     db::{PermissionTupleRepo, PermissionTupleRow, PermissionTupleStore},
     middleware::TenantId,
     proto::iam::v1::{
@@ -122,6 +123,7 @@ impl PermissionService for PermissionServiceImpl {
         request: ServiceRequest<'_, CheckPermissionRequest>,
     ) -> ServiceResult<CheckPermissionResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_PERMISSION_READ, SCOPE_PERMISSION_ADMIN])?;
         let req = request.to_owned_message();
         let allowed = self
             .keto
@@ -146,6 +148,7 @@ impl PermissionService for PermissionServiceImpl {
         request: ServiceRequest<'_, CreateRelationTupleRequest>,
     ) -> ServiceResult<RelationTuple> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_PERMISSION_ADMIN)?;
         let req = request.to_owned_message();
         let object = tenant_object(&tenant_id, &req.object);
 
@@ -175,6 +178,7 @@ impl PermissionService for PermissionServiceImpl {
         request: ServiceRequest<'_, DeleteRelationTupleRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_PERMISSION_ADMIN)?;
         let req = request.to_owned_message();
         let row = self.tuples.get(&tenant_id, &req.id).await?;
         let object = tenant_object(&tenant_id, &row.object);
@@ -195,6 +199,7 @@ impl PermissionService for PermissionServiceImpl {
         request: ServiceRequest<'_, ExpandPermissionsRequest>,
     ) -> ServiceResult<ExpandPermissionsResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_PERMISSION_READ, SCOPE_PERMISSION_ADMIN])?;
         let req = request.to_owned_message();
         let object = tenant_object(&tenant_id, &req.object);
 
@@ -218,6 +223,7 @@ impl PermissionService for PermissionServiceImpl {
         request: ServiceRequest<'_, ListRelationTuplesRequest>,
     ) -> ServiceResult<ListRelationTuplesResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_PERMISSION_READ, SCOPE_PERMISSION_ADMIN])?;
         let req = request.to_owned_message();
         let rows = self
             .tuples
@@ -269,7 +275,21 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
+}
+
+fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: one of {}",
+            scopes.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn map_ory_error(err: OryClientError) -> ServiceError {
@@ -315,8 +335,26 @@ mod tests {
     use crate::db::DbError;
 
     fn tenant_ctx() -> RequestContext {
+        scoped_ctx(&[SCOPE_PERMISSION_READ])
+    }
+
+    fn admin_ctx() -> RequestContext {
+        scoped_ctx(&[SCOPE_PERMISSION_ADMIN])
+    }
+
+    fn no_scope_ctx() -> RequestContext {
+        scoped_ctx(&["other:scope"])
+    }
+
+    fn scoped_ctx(scopes: &[&str]) -> RequestContext {
         let mut ctx = RequestContext::new(http::HeaderMap::new());
         ctx.extensions_mut().insert(TenantId("tenant-1".into()));
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "sub-1".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
         ctx
     }
 
@@ -547,21 +585,15 @@ mod tests {
         }
 
         async fn get(&self, _tenant_id: &str, _id: &str) -> Result<PermissionTupleRow, DbError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(TupleCall::Get);
+            self.calls.lock().unwrap().push(TupleCall::Get);
             self.get_result.clone().map_err(Into::into)
         }
 
         async fn delete(&self, tenant_id: &str, id: &str) -> Result<(), DbError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(TupleCall::Delete {
-                    tenant_id: tenant_id.into(),
-                    id: id.into(),
-                });
+            self.calls.lock().unwrap().push(TupleCall::Delete {
+                tenant_id: tenant_id.into(),
+                id: id.into(),
+            });
             self.delete_result.clone().map_err(Into::into)
         }
 
@@ -582,10 +614,7 @@ mod tests {
         }
     }
 
-    fn service_with(
-        keto: FakeKeto,
-        tuples: FakeTupleStore,
-    ) -> PermissionServiceImpl {
+    fn service_with(keto: FakeKeto, tuples: FakeTupleStore) -> PermissionServiceImpl {
         PermissionServiceImpl {
             keto: Arc::new(keto) as Arc<dyn PermissionKeto>,
             tuples: Arc::new(tuples) as Arc<dyn PermissionTupleStore>,
@@ -654,8 +683,9 @@ mod tests {
         let tuples = FakeTupleStore::new();
         let service = service_with(keto.clone(), tuples);
 
-        let owned = crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
-            .unwrap();
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let resp = service.check_permission(tenant_ctx(), req).await.unwrap();
@@ -682,8 +712,9 @@ mod tests {
         let tuples = FakeTupleStore::new();
         let service = service_with(keto, tuples);
 
-        let owned = crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
-            .unwrap();
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let resp = service.check_permission(tenant_ctx(), req).await.unwrap();
@@ -695,12 +726,19 @@ mod tests {
         let service = service_with(FakeKeto::new(), FakeTupleStore::new());
         let ctx = RequestContext::new(http::HeaderMap::new());
 
-        let owned = crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
-            .unwrap();
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let err = service.check_permission(ctx, req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unauthenticated, .. }));
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -712,12 +750,22 @@ mod tests {
         let tuples = FakeTupleStore::new();
         let service = service_with(keto, tuples);
 
-        let owned = crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
-            .unwrap();
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.check_permission(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Internal, .. }));
+        let err = service
+            .check_permission(tenant_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Internal,
+                ..
+            }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -736,13 +784,15 @@ mod tests {
         };
         let service = service_with(keto.clone(), tuples.clone());
 
-        let owned = crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(
-            &create_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(&create_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let resp = service.create_relation_tuple(tenant_ctx(), req).await.unwrap();
+        let resp = service
+            .create_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap();
         assert_eq!(resp.body.id, "t1");
 
         let keto_calls = keto.calls.lock().unwrap();
@@ -765,14 +815,19 @@ mod tests {
         let service = service_with(FakeKeto::new(), FakeTupleStore::new());
         let ctx = RequestContext::new(http::HeaderMap::new());
 
-        let owned = crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(
-            &create_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(&create_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let err = service.create_relation_tuple(ctx, req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unauthenticated, .. }));
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -784,14 +839,22 @@ mod tests {
         };
         let service = service_with(keto.clone(), tuples);
 
-        let owned = crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(
-            &create_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(&create_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.create_relation_tuple(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::NotFound, .. }));
+        let err = service
+            .create_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::NotFound,
+                ..
+            }
+        ));
         assert!(keto.calls.lock().unwrap().is_empty());
     }
 
@@ -807,14 +870,22 @@ mod tests {
         };
         let service = service_with(keto, tuples);
 
-        let owned = crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(
-            &create_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(&create_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.create_relation_tuple(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::AlreadyExists, .. }));
+        let err = service
+            .create_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::AlreadyExists,
+                ..
+            }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -834,13 +905,15 @@ mod tests {
         };
         let service = service_with(keto.clone(), tuples.clone());
 
-        let owned = crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(
-            &delete_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(&delete_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let resp = service.delete_relation_tuple(tenant_ctx(), req).await.unwrap();
+        let resp = service
+            .delete_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap();
         assert_eq!(resp.body, Empty::default());
 
         let keto_calls = keto.calls.lock().unwrap();
@@ -861,14 +934,19 @@ mod tests {
         let service = service_with(FakeKeto::new(), FakeTupleStore::new());
         let ctx = RequestContext::new(http::HeaderMap::new());
 
-        let owned = crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(
-            &delete_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(&delete_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let err = service.delete_relation_tuple(ctx, req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unauthenticated, .. }));
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -880,14 +958,22 @@ mod tests {
         let keto = FakeKeto::new();
         let service = service_with(keto.clone(), tuples);
 
-        let owned = crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(
-            &delete_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(&delete_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.delete_relation_tuple(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::NotFound, .. }));
+        let err = service
+            .delete_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::NotFound,
+                ..
+            }
+        ));
         assert!(keto.calls.lock().unwrap().is_empty());
     }
 
@@ -903,14 +989,22 @@ mod tests {
         };
         let service = service_with(keto, tuples.clone());
 
-        let owned = crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(
-            &delete_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(&delete_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.delete_relation_tuple(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::NotFound, .. }));
+        let err = service
+            .delete_relation_tuple(admin_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::NotFound,
+                ..
+            }
+        ));
 
         let tuple_calls = tuples.calls.lock().unwrap();
         assert_eq!(tuple_calls.len(), 1); // only get, no delete
@@ -929,10 +1023,9 @@ mod tests {
         let tuples = FakeTupleStore::new();
         let service = service_with(keto.clone(), tuples);
 
-        let owned = crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(
-            &expand_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(&expand_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let resp = service.expand_permissions(tenant_ctx(), req).await.unwrap();
@@ -951,14 +1044,19 @@ mod tests {
         let service = service_with(FakeKeto::new(), FakeTupleStore::new());
         let ctx = RequestContext::new(http::HeaderMap::new());
 
-        let owned = crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(
-            &expand_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(&expand_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let err = service.expand_permissions(ctx, req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unauthenticated, .. }));
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -970,14 +1068,22 @@ mod tests {
         let tuples = FakeTupleStore::new();
         let service = service_with(keto, tuples);
 
-        let owned = crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(
-            &expand_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ExpandPermissionsRequestOwnedView::from_owned(&expand_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.expand_permissions(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unavailable, .. }));
+        let err = service
+            .expand_permissions(tenant_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unavailable,
+                ..
+            }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -992,13 +1098,15 @@ mod tests {
         };
         let service = service_with(FakeKeto::new(), tuples.clone());
 
-        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(
-            &list_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&list_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let resp = service.list_relation_tuples(tenant_ctx(), req).await.unwrap();
+        let resp = service
+            .list_relation_tuples(tenant_ctx(), req)
+            .await
+            .unwrap();
         assert_eq!(resp.body.tuples.len(), 1);
         assert_eq!(resp.body.tuples[0].id, "t1");
 
@@ -1018,14 +1126,19 @@ mod tests {
         let service = service_with(FakeKeto::new(), FakeTupleStore::new());
         let ctx = RequestContext::new(http::HeaderMap::new());
 
-        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(
-            &list_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&list_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let err = service.list_relation_tuples(ctx, req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Unauthenticated, .. }));
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1036,14 +1149,22 @@ mod tests {
         };
         let service = service_with(FakeKeto::new(), tuples);
 
-        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(
-            &list_req(),
-        )
-        .unwrap();
+        let owned =
+            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&list_req())
+                .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
-        let err = service.list_relation_tuples(tenant_ctx(), req).await.unwrap_err();
-        assert!(matches!(err, connectrpc::ConnectError { code: connectrpc::ErrorCode::Internal, .. }));
+        let err = service
+            .list_relation_tuples(tenant_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Internal,
+                ..
+            }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -1157,10 +1278,103 @@ mod tests {
 
     #[tokio::test]
     async fn keto_client_as_permission_keto_delegates() {
-        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn PermissionKeto>;
-        assert!(client.check_permission("ns", "obj", "rel", "subject").await.is_err());
-        assert!(client.create_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
-        assert!(client.delete_relation_tuple("ns", "obj", "rel", "subject").await.is_err());
+        let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap())
+            as Arc<dyn PermissionKeto>;
+        assert!(
+            client
+                .check_permission("ns", "obj", "rel", "subject")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .create_relation_tuple("ns", "obj", "rel", "subject")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .delete_relation_tuple("ns", "obj", "rel", "subject")
+                .await
+                .is_err()
+        );
         assert!(client.expand("ns", "obj", "rel").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_permission_requires_read_scope() {
+        let service = service_with(FakeKeto::new(), FakeTupleStore::new());
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+        let err = service
+            .check_permission(no_scope_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::PermissionDenied,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_permission_accepts_admin_scope() {
+        let service = service_with(
+            FakeKeto {
+                check_result: Ok(true),
+                ..FakeKeto::new()
+            },
+            FakeTupleStore::new(),
+        );
+        let owned =
+            crate::proto::iam::v1::CheckPermissionRequestOwnedView::from_owned(&check_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+        let resp = service.check_permission(admin_ctx(), req).await.unwrap();
+        assert!(resp.body.allowed);
+    }
+
+    #[tokio::test]
+    async fn create_relation_tuple_requires_admin_scope() {
+        let service = service_with(FakeKeto::new(), FakeTupleStore::new());
+        let owned =
+            crate::proto::iam::v1::CreateRelationTupleRequestOwnedView::from_owned(&create_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+        let err = service
+            .create_relation_tuple(tenant_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::PermissionDenied,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_relation_tuple_requires_admin_scope() {
+        let service = service_with(FakeKeto::new(), FakeTupleStore::new());
+        let owned =
+            crate::proto::iam::v1::DeleteRelationTupleRequestOwnedView::from_owned(&delete_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+        let err = service
+            .delete_relation_tuple(tenant_ctx(), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::PermissionDenied,
+                ..
+            }
+        ));
     }
 }

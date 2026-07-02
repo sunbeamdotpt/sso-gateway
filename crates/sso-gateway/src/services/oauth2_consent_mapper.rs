@@ -52,11 +52,15 @@ impl From<&Value> for OAuth2Client {
             client_name: json_str(value, "client_name"),
             client_uri: json_str(value, "client_uri"),
             logo_uri: json_str(value, "logo_uri"),
-            redirect_uris: json_array_to_strings(value.get("redirect_uris").unwrap_or(&Value::Null)),
+            redirect_uris: json_array_to_strings(
+                value.get("redirect_uris").unwrap_or(&Value::Null),
+            ),
             skip_consent: json_bool(value, "skip_consent"),
             skip_logout_consent: json_bool(value, "skip_logout_consent"),
             grant_types: json_array_to_strings(value.get("grant_types").unwrap_or(&Value::Null)),
-            response_types: json_array_to_strings(value.get("response_types").unwrap_or(&Value::Null)),
+            response_types: json_array_to_strings(
+                value.get("response_types").unwrap_or(&Value::Null),
+            ),
             scope: json_str(value, "scope"),
             policy_uri: json_str(value, "policy_uri"),
             tos_uri: json_str(value, "tos_uri"),

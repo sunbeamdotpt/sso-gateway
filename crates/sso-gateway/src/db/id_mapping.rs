@@ -38,18 +38,10 @@ pub trait IdMappingStore: Send + Sync + 'static {
         ory_global_id: &str,
     ) -> Result<String, DbError>;
 
-    async fn delete(
-        &self,
-        tenant_id: &str,
-        backend: &str,
-        public_id: &str,
-    ) -> Result<(), DbError>;
+    async fn delete(&self, tenant_id: &str, backend: &str, public_id: &str) -> Result<(), DbError>;
 
-    async fn list_public_ids(
-        &self,
-        tenant_id: &str,
-        backend: &str,
-    ) -> Result<Vec<String>, DbError>;
+    async fn list_public_ids(&self, tenant_id: &str, backend: &str)
+    -> Result<Vec<String>, DbError>;
 
     /// Find the tenant that owns a given Ory global id for a backend.
     async fn get_tenant_id_by_ory_id(
@@ -190,7 +182,8 @@ impl IdMappingStore for PgIdMappingStore {
         public_id: &str,
         ory_global_id: &str,
     ) -> Result<IdMappingRow, DbError> {
-        self.create(tenant_id, backend, public_id, ory_global_id).await
+        self.create(tenant_id, backend, public_id, ory_global_id)
+            .await
     }
 
     async fn get_ory_id(
@@ -211,12 +204,7 @@ impl IdMappingStore for PgIdMappingStore {
         self.get_public_id(tenant_id, backend, ory_global_id).await
     }
 
-    async fn delete(
-        &self,
-        tenant_id: &str,
-        backend: &str,
-        public_id: &str,
-    ) -> Result<(), DbError> {
+    async fn delete(&self, tenant_id: &str, backend: &str, public_id: &str) -> Result<(), DbError> {
         self.delete(tenant_id, backend, public_id).await
     }
 
@@ -294,10 +282,16 @@ mod tests {
         assert_eq!(row.public_id, public_id);
         assert_eq!(row.ory_global_id, ory_id);
 
-        let found_ory = store.get_ory_id(&tenant, "kratos", &public_id).await.unwrap();
+        let found_ory = store
+            .get_ory_id(&tenant, "kratos", &public_id)
+            .await
+            .unwrap();
         assert_eq!(found_ory, ory_id);
 
-        let found_public = store.get_public_id(&tenant, "kratos", &ory_id).await.unwrap();
+        let found_public = store
+            .get_public_id(&tenant, "kratos", &ory_id)
+            .await
+            .unwrap();
         assert_eq!(found_public, public_id);
 
         let tenant_id = store
@@ -310,7 +304,12 @@ mod tests {
         assert_eq!(ids, vec![public_id.clone()]);
 
         store.delete(&tenant, "kratos", &public_id).await.unwrap();
-        assert!(store.get_ory_id(&tenant, "kratos", &public_id).await.is_err());
+        assert!(
+            store
+                .get_ory_id(&tenant, "kratos", &public_id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -339,7 +338,10 @@ mod tests {
     async fn delete_missing_returns_not_found() {
         let store = store().await;
         let tenant = format!("tenant-{}", Ulid::new());
-        let err = store.delete(&tenant, "kratos", "missing").await.unwrap_err();
+        let err = store
+            .delete(&tenant, "kratos", "missing")
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::MappingNotFound));
     }
 

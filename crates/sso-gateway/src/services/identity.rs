@@ -9,6 +9,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
+    auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_IDENTITY_READ, require_scope},
     db::{IdMappingStore, IdentitySchemaRow, IdentitySchemaStore},
     middleware::TenantId,
     proto::iam::v1::{
@@ -149,6 +150,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, CreateIdentityRequest>,
     ) -> ServiceResult<Identity> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
 
         let schema = self.resolve_schema(&tenant_id, &req.schema_id).await?;
@@ -189,6 +191,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, GetIdentityRequest>,
     ) -> ServiceResult<Identity> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
         let (ory_id, schema_id) = self.resolve_identity(&tenant_id, &req.id).await?;
 
@@ -210,6 +213,7 @@ impl IdentityService for IdentityServiceImpl {
         _request: ServiceRequest<'_, ListIdentitiesRequest>,
     ) -> ServiceResult<ListIdentitiesResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let public_ids = self
             .mappings
             .list_public_ids(&tenant_id, BACKEND_KRATOS)
@@ -241,6 +245,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, UpdateIdentityRequest>,
     ) -> ServiceResult<Identity> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         let (ory_id, current_schema_id) = self.resolve_identity(&tenant_id, &req.id).await?;
 
@@ -280,6 +285,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, DeleteIdentityRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         let ory_id = self
             .mappings
@@ -304,6 +310,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, CreateIdentitySchemaRequest>,
     ) -> ServiceResult<IdentitySchema> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         let schema_json = req
             .schema_json
@@ -324,6 +331,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, GetIdentitySchemaRequest>,
     ) -> ServiceResult<IdentitySchema> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
         let row = self
             .schemas
@@ -339,6 +347,7 @@ impl IdentityService for IdentityServiceImpl {
         _request: ServiceRequest<'_, ListIdentitySchemasRequest>,
     ) -> ServiceResult<ListIdentitySchemasResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let rows = self.schemas.list(&tenant_id).await?;
         let schemas = rows.into_iter().map(schema_row_to_proto).collect();
         Ok(Response::new(ListIdentitySchemasResponse {
@@ -354,6 +363,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, UpdateIdentitySchemaRequest>,
     ) -> ServiceResult<IdentitySchema> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         let schema_json = req
             .schema_json
@@ -374,6 +384,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, DeleteIdentitySchemaRequest>,
     ) -> ServiceResult<Empty> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         self.schemas.delete(&tenant_id, &req.schema_id).await?;
         Ok(Response::new(Empty::default()))
@@ -386,6 +397,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, SetDefaultIdentitySchemaRequest>,
     ) -> ServiceResult<IdentitySchema> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
         let row = self.schemas.set_default(&tenant_id, &req.schema_id).await?;
         Ok(Response::new(schema_row_to_proto(row)))
@@ -398,6 +410,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, CreateLoginFlowRequest>,
     ) -> ServiceResult<Flow> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
         let mut query = Vec::<(&str, &str)>::new();
         if !req.return_to.is_empty() {
@@ -436,6 +449,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, CreateRegistrationFlowRequest>,
     ) -> ServiceResult<Flow> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
         let mut query = Vec::<(&str, &str)>::new();
         if !req.return_to.is_empty() {
@@ -462,6 +476,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, GetSessionRequest>,
     ) -> ServiceResult<Session> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
         let session = self
             .kratos
@@ -469,15 +484,11 @@ impl IdentityService for IdentityServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
+        let identity_id = session["identity_id"].as_str().unwrap_or("");
         let public_identity_id = self
             .mappings
-            .get_public_id(
-                &tenant_id,
-                BACKEND_KRATOS,
-                session["identity_id"].as_str().unwrap_or(""),
-            )
-            .await
-            .unwrap_or_default();
+            .get_public_id(&tenant_id, BACKEND_KRATOS, identity_id)
+            .await?;
 
         Ok(Response::new(Session {
             id: req.id,
@@ -495,6 +506,7 @@ impl IdentityService for IdentityServiceImpl {
         request: ServiceRequest<'_, ListSessionsRequest>,
     ) -> ServiceResult<ListSessionsResponse> {
         let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
 
         if req.identity_id.is_empty() {
@@ -530,11 +542,27 @@ impl IdentityService for IdentityServiceImpl {
     #[instrument(skip(self, request))]
     async fn delete_session(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, DeleteSessionRequest>,
     ) -> ServiceResult<Empty> {
+        let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
+        let req = request.to_owned_message();
+
+        let session = self
+            .kratos
+            .admin_get_session(&req.id)
+            .await
+            .map_err(map_ory_error)?;
+        let identity_id = session["identity_id"].as_str().unwrap_or("");
+        // Verify the session belongs to an identity in the caller's tenant.
+        let _ = self
+            .mappings
+            .get_public_id(&tenant_id, BACKEND_KRATOS, identity_id)
+            .await?;
+
         self.kratos
-            .delete_session(&request.to_owned_message().id)
+            .delete_session(&req.id)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(Empty::default()))
@@ -580,6 +608,9 @@ impl IdentityServiceImpl {
     }
 }
 
+const MAX_SCHEMA_SIZE_BYTES: usize = 64 * 1024;
+const MAX_SCHEMA_DEPTH: usize = 10;
+
 pub(crate) fn validate_traits(
     schema_json: &serde_json::Value,
     traits: &serde_json::Value,
@@ -592,6 +623,11 @@ pub(crate) fn validate_traits(
         .and_then(|p| p.get("traits"))
         .unwrap_or(schema_json);
 
+    validate_schema_size(traits_schema)?;
+    validate_schema_depth(traits_schema, 0)?;
+    reject_remote_refs(traits_schema)?;
+    validate_schema_depth(traits, 0)?;
+
     let validator = jsonschema::validator_for(traits_schema)
         .map_err(|e| ServiceError::InvalidArgument(format!("invalid identity schema: {e}")))?;
     if let Err(error) = validator.validate(traits) {
@@ -602,11 +638,83 @@ pub(crate) fn validate_traits(
     Ok(())
 }
 
+fn validate_schema_size(schema: &serde_json::Value) -> Result<(), ServiceError> {
+    let size = serde_json::to_string(schema)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_SCHEMA_SIZE_BYTES {
+        return Err(ServiceError::InvalidArgument(
+            "identity schema exceeds maximum size of 64KiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_depth(value: &serde_json::Value, depth: usize) -> Result<(), ServiceError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(ServiceError::InvalidArgument(
+            "identity schema exceeds maximum depth of 10".into(),
+        ));
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for child in map.values() {
+                validate_schema_depth(child, depth + 1)?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                validate_schema_depth(child, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reject_remote_refs(value: &serde_json::Value) -> Result<(), ServiceError> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(r)) = map.get("$ref")
+                && !r.starts_with('#')
+            {
+                return Err(ServiceError::InvalidArgument(
+                    "identity schema contains remote $ref".into(),
+                ));
+            }
+            for child in map.values() {
+                reject_remote_refs(child)?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                reject_remote_refs(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
+}
+
+fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.scopes.iter().any(|s| scopes.contains(&s.as_str())) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required scope: one of {}",
+            scopes.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn map_ory_error(err: OryClientError) -> ServiceError {
@@ -746,6 +854,7 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Mutex;
 
+    use crate::auth::AuthContext;
     use crate::db::{DbError, IdMappingRepo, IdMappingRow, IdentitySchemaRepo};
 
     macro_rules! svc_req {
@@ -763,10 +872,28 @@ mod tests {
             .map_err(|e| ServiceError::Internal(format!("failed to decode request: {e}")))
     }
 
-    fn request_context(tenant_id: &str) -> RequestContext {
+    fn request_context(tenant_id: &str, scopes: &[&str]) -> RequestContext {
         let mut ctx = RequestContext::new(HeaderMap::new());
         ctx.extensions_mut().insert(TenantId(tenant_id.to_string()));
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: tenant_id.to_string(),
+            subject: "sub-1".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_hash: "hash".into(),
+        });
         ctx
+    }
+
+    fn admin_ctx(tenant_id: &str) -> RequestContext {
+        request_context(tenant_id, &[SCOPE_IDENTITY_ADMIN])
+    }
+
+    fn read_ctx(tenant_id: &str) -> RequestContext {
+        request_context(tenant_id, &[SCOPE_IDENTITY_READ])
+    }
+
+    fn no_scope_ctx(tenant_id: &str) -> RequestContext {
+        request_context(tenant_id, &["other:scope"])
     }
 
     fn schema_row(
@@ -839,7 +966,10 @@ mod tests {
             let id = Ulid::new().to_string();
             let mut identity = payload.clone();
             identity["id"] = json!(id);
-            self.identities.lock().await.insert(id.clone(), identity.clone());
+            self.identities
+                .lock()
+                .await
+                .insert(id.clone(), identity.clone());
             Ok(identity)
         }
 
@@ -868,7 +998,10 @@ mod tests {
             }
             let mut identity = payload;
             identity["id"] = json!(id);
-            self.identities.lock().await.insert(id.to_string(), identity.clone());
+            self.identities
+                .lock()
+                .await
+                .insert(id.to_string(), identity.clone());
             Ok(identity)
         }
 
@@ -1397,12 +1530,7 @@ mod tests {
         let svc = make_service(
             StubKratos::default(),
             StubMappingStore::default(),
-            StubSchemaStore::with_row(schema_row(
-                "tenant-1",
-                "default",
-                email_schema(),
-                true,
-            )),
+            StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1411,7 +1539,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, CreateIdentityRequest);
-        let resp = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::create_identity(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap();
         assert_eq!(resp.body.tenant_id, "tenant-1");
@@ -1424,12 +1552,7 @@ mod tests {
         let svc = make_service(
             StubKratos::default(),
             StubMappingStore::default(),
-            StubSchemaStore::with_row(schema_row(
-                "tenant-1",
-                "default",
-                email_schema(),
-                true,
-            )),
+            StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1437,7 +1560,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, CreateIdentityRequest);
-        let err = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+        let err = IdentityService::create_identity(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap_err();
         assert!(matches!(err, connectrpc::ConnectError { .. }));
@@ -1451,12 +1574,7 @@ mod tests {
                 message: "down".into(),
             }),
             StubMappingStore::default(),
-            StubSchemaStore::with_row(schema_row(
-                "tenant-1",
-                "default",
-                email_schema(),
-                true,
-            )),
+            StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1464,7 +1582,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, CreateIdentityRequest);
-        let err = IdentityService::create_identity(&svc, request_context("tenant-1"), svc_req)
+        let err = IdentityService::create_identity(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
@@ -1480,9 +1598,12 @@ mod tests {
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
         );
-        let req = GetIdentityRequest { id: "pub-1".into(), ..Default::default() };
+        let req = GetIdentityRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
         svc_req!(svc_req, req, GetIdentityRequest);
-        let resp = IdentityService::get_identity(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::get_identity(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1497,9 +1618,12 @@ mod tests {
             StubMappingStore::default(),
             StubSchemaStore::default(),
         );
-        let req = GetIdentityRequest { id: "missing".into(), ..Default::default() };
+        let req = GetIdentityRequest {
+            id: "missing".into(),
+            ..Default::default()
+        };
         svc_req!(svc_req, req, GetIdentityRequest);
-        let err = IdentityService::get_identity(&svc, request_context("tenant-1"), svc_req)
+        let err = IdentityService::get_identity(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
@@ -1515,7 +1639,7 @@ mod tests {
         let svc = make_service(kratos, mappings, StubSchemaStore::default());
         let req = ListIdentitiesRequest::default();
         svc_req!(svc_req, req, ListIdentitiesRequest);
-        let resp = IdentityService::list_identities(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::list_identities(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1532,12 +1656,7 @@ mod tests {
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
-            StubSchemaStore::with_row(schema_row(
-                "tenant-1",
-                "default",
-                email_schema(),
-                true,
-            )),
+            StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
         );
         let req = UpdateIdentityRequest {
             id: "pub-1".into(),
@@ -1546,7 +1665,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, UpdateIdentityRequest);
-        let resp = IdentityService::update_identity(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::update_identity(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1559,9 +1678,12 @@ mod tests {
         let kratos = StubKratos::with_identity("ory-1", json!({"id": "ory-1"}));
         let mappings = StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1");
         let svc = make_service(kratos, mappings, StubSchemaStore::default());
-        let req = DeleteIdentityRequest { id: "pub-1".into(), ..Default::default() };
+        let req = DeleteIdentityRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
         svc_req!(svc_req, req, DeleteIdentityRequest);
-        IdentityService::delete_identity(&svc, request_context("tenant-1"), svc_req)
+        IdentityService::delete_identity(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap();
     }
@@ -1583,14 +1705,10 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, create_req, CreateIdentitySchemaRequest);
-        let created = IdentityService::create_identity_schema(
-            &svc,
-            request_context(tenant_id),
-            svc_req,
-        )
-        .await
-        .unwrap()
-        .body;
+        let created = IdentityService::create_identity_schema(&svc, admin_ctx(tenant_id), svc_req)
+            .await
+            .unwrap()
+            .body;
         assert_eq!(created.schema_id, "custom");
 
         // get
@@ -1599,7 +1717,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, get_req, GetIdentitySchemaRequest);
-        let got = IdentityService::get_identity_schema(&svc, request_context(tenant_id), svc_req)
+        let got = IdentityService::get_identity_schema(&svc, read_ctx(tenant_id), svc_req)
             .await
             .unwrap()
             .body;
@@ -1608,11 +1726,10 @@ mod tests {
         // list
         let list_req = ListIdentitySchemasRequest::default();
         svc_req!(svc_req, list_req, ListIdentitySchemasRequest);
-        let listed =
-            IdentityService::list_identity_schemas(&svc, request_context(tenant_id), svc_req)
-                .await
-                .unwrap()
-                .body;
+        let listed = IdentityService::list_identity_schemas(&svc, read_ctx(tenant_id), svc_req)
+            .await
+            .unwrap()
+            .body;
         assert_eq!(listed.schemas.len(), 1);
 
         // update
@@ -1623,14 +1740,10 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, update_req, UpdateIdentitySchemaRequest);
-        let updated = IdentityService::update_identity_schema(
-            &svc,
-            request_context(tenant_id),
-            svc_req,
-        )
-        .await
-        .unwrap()
-        .body;
+        let updated = IdentityService::update_identity_schema(&svc, admin_ctx(tenant_id), svc_req)
+            .await
+            .unwrap()
+            .body;
         assert!(updated.is_default);
 
         // set default
@@ -1640,7 +1753,7 @@ mod tests {
         };
         svc_req!(svc_req, set_req, SetDefaultIdentitySchemaRequest);
         let defaulted =
-            IdentityService::set_default_identity_schema(&svc, request_context(tenant_id), svc_req)
+            IdentityService::set_default_identity_schema(&svc, admin_ctx(tenant_id), svc_req)
                 .await
                 .unwrap()
                 .body;
@@ -1652,7 +1765,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, del_req, DeleteIdentitySchemaRequest);
-        IdentityService::delete_identity_schema(&svc, request_context(tenant_id), svc_req)
+        IdentityService::delete_identity_schema(&svc, admin_ctx(tenant_id), svc_req)
             .await
             .unwrap();
     }
@@ -1669,7 +1782,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, CreateLoginFlowRequest);
-        let resp = IdentityService::create_login_flow(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::create_login_flow(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1689,30 +1802,31 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, CreateRegistrationFlowRequest);
-        let resp =
-            IdentityService::create_registration_flow(&svc, request_context("tenant-1"), svc_req)
-                .await
-                .unwrap()
-                .body;
+        let resp = IdentityService::create_registration_flow(&svc, read_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.r#type, "registration");
     }
 
     #[tokio::test]
     async fn get_session_resolves_identity_id() {
         let kratos = StubKratos::default();
-        kratos
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), json!({"id": "sess-1", "identity_id": "ory-1", "active": true}));
+        kratos.sessions.lock().await.insert(
+            "sess-1".into(),
+            json!({"id": "sess-1", "identity_id": "ory-1", "active": true}),
+        );
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
         );
-        let req = GetSessionRequest { id: "sess-1".into(), ..Default::default() };
+        let req = GetSessionRequest {
+            id: "sess-1".into(),
+            ..Default::default()
+        };
         svc_req!(svc_req, req, GetSessionRequest);
-        let resp = IdentityService::get_session(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::get_session(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1730,7 +1844,7 @@ mod tests {
         );
         let req = ListSessionsRequest::default();
         svc_req!(svc_req, req, ListSessionsRequest);
-        let err = IdentityService::list_sessions(&svc, request_context("tenant-1"), svc_req)
+        let err = IdentityService::list_sessions(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
@@ -1754,7 +1868,7 @@ mod tests {
             ..Default::default()
         };
         svc_req!(svc_req, req, ListSessionsRequest);
-        let resp = IdentityService::list_sessions(&svc, request_context("tenant-1"), svc_req)
+        let resp = IdentityService::list_sessions(&svc, read_ctx("tenant-1"), svc_req)
             .await
             .unwrap()
             .body;
@@ -1764,14 +1878,23 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_happy_path() {
+        let kratos = StubKratos::default();
+        kratos
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), json!({"id": "sess-1", "identity_id": "ory-1", "active": true}));
         let svc = make_service(
-            StubKratos::default(),
-            StubMappingStore::default(),
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
         );
-        let req = DeleteSessionRequest { id: "sess-1".into(), ..Default::default() };
+        let req = DeleteSessionRequest {
+            id: "sess-1".into(),
+            ..Default::default()
+        };
         svc_req!(svc_req, req, DeleteSessionRequest);
-        IdentityService::delete_session(&svc, request_context("tenant-1"), svc_req)
+        IdentityService::delete_session(&svc, admin_ctx("tenant-1"), svc_req)
             .await
             .unwrap();
     }
@@ -1816,7 +1939,9 @@ mod tests {
 
     #[tokio::test]
     async fn kratos_client_as_identity_kratos_delegates() {
-        let client = Arc::new(KratosClient::new_with_public("http://localhost:1", "http://localhost:1").unwrap()) as Arc<dyn IdentityKratos>;
+        let client = Arc::new(
+            KratosClient::new_with_public("http://localhost:1", "http://localhost:1").unwrap(),
+        ) as Arc<dyn IdentityKratos>;
         assert!(client.create_identity(json!({})).await.is_err());
         assert!(client.get_identity("id").await.is_err());
         assert!(client.update_identity("id", json!({})).await.is_err());
@@ -1826,5 +1951,194 @@ mod tests {
         assert!(client.admin_get_session("id").await.is_err());
         assert!(client.list_sessions_by_identity("id").await.is_err());
         assert!(client.delete_session("id").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_identity_requires_admin_scope() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+        );
+        let req = CreateIdentityRequest {
+            schema_id: "default".into(),
+            traits: Some(proto_struct(json!({"email": "alice@example.com"}))).into(),
+            password: "secret".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateIdentityRequest);
+        let err = IdentityService::create_identity(&svc, no_scope_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_identity_rejects_read_scope_missing() {
+        let svc = make_service(
+            StubKratos::with_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@b.com"}}),
+            ),
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetIdentityRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, GetIdentityRequest);
+        let err = IdentityService::get_identity(&svc, no_scope_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_identity_accepts_admin_scope() {
+        let svc = make_service(
+            StubKratos::with_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@b.com"}}),
+            ),
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetIdentityRequest {
+            id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, GetIdentityRequest);
+        let resp = IdentityService::get_identity(&svc, admin_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.id, "pub-1");
+    }
+
+    #[tokio::test]
+    async fn delete_session_requires_admin_scope() {
+        let svc = make_service(
+            StubKratos::default(),
+            StubMappingStore::default(),
+            StubSchemaStore::default(),
+        );
+        let req = DeleteSessionRequest {
+            id: "sess-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, DeleteSessionRequest);
+        let err = IdentityService::delete_session(&svc, read_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_foreign_tenant_session() {
+        let kratos = StubKratos::default();
+        kratos.sessions.lock().await.insert(
+            "sess-1".into(),
+            json!({"id": "sess-1", "identity_id": "ory-1", "active": true}),
+        );
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-2", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = DeleteSessionRequest {
+            id: "sess-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, DeleteSessionRequest);
+        let err = IdentityService::delete_session(&svc, admin_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_session_rejects_foreign_tenant_session() {
+        let kratos = StubKratos::default();
+        kratos.sessions.lock().await.insert(
+            "sess-1".into(),
+            json!({"id": "sess-1", "identity_id": "ory-1", "active": true}),
+        );
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-2", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetSessionRequest {
+            id: "sess-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, GetSessionRequest);
+        let err = IdentityService::get_session(&svc, read_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn validate_traits_rejects_oversized_schema() {
+        let mut props = serde_json::Map::new();
+        let filler = "x".repeat(1024);
+        for i in 0..70 {
+            props.insert(
+                format!("field{i}"),
+                json!({ "type": "string", "description": &filler }),
+            );
+        }
+        let schema = json!({"type": "object", "properties": props});
+        let traits = json!({});
+        assert!(validate_traits(&schema, &traits).is_err());
+    }
+
+    #[test]
+    fn validate_traits_rejects_deep_schema() {
+        let mut schema = json!({"type": "object"});
+        for _ in 0..15 {
+            schema = json!({"type": "object", "properties": {"nested": schema}});
+        }
+        let traits = json!({});
+        assert!(validate_traits(&schema, &traits).is_err());
+    }
+
+    #[test]
+    fn validate_traits_rejects_remote_ref() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "email": { "$ref": "https://example.com/schema.json" }
+            }
+        });
+        let traits = json!({"email": "alice@example.com"});
+        assert!(validate_traits(&schema, &traits).is_err());
+    }
+
+    #[test]
+    fn validate_traits_rejects_deep_traits() {
+        let schema = json!({"type": "object"});
+        let mut traits = json!({"value": "x"});
+        for _ in 0..15 {
+            traits = json!({"nested": traits});
+        }
+        assert!(validate_traits(&schema, &traits).is_err());
+    }
+
+    #[test]
+    fn validate_traits_accepts_local_ref() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "email": { "type": "string", "format": "email" }
+            },
+            "properties": {
+                "email": { "$ref": "#/definitions/email" }
+            }
+        });
+        let traits = json!({"email": "alice@example.com"});
+        assert!(validate_traits(&schema, &traits).is_ok());
     }
 }

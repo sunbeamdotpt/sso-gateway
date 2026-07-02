@@ -1,30 +1,42 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
+    auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        AuditLogRepo, DbPool, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo,
-        SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo, SamlReplayCache,
-        SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantApiKeyRepo, TenantRepo,
-        bootstrap_system_tenant, create_pool,
+        AuditLogRepo, DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo,
+        PermissionTupleRepo, PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo,
+        SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo,
+        TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
     },
+    identity_provisioner::KratosIdentityProvisioner,
     middleware::{audit_middleware, auth_middleware},
-    oauth2::{Oauth2State, router as oauth2_router},
     proto::iam::v1::{
         ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
         OAuth2ConsentServiceExt, OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt,
         TenantServiceExt,
     },
-    saml::{SamlState, router as saml_router},
-    saml_idp::{SamlIdpState, router as saml_idp_router},
-    scim::{ScimState, router as scim_router},
     services::{
-        application::ApplicationServiceImpl, federation::FederationServiceImpl,
-        identity::IdentityServiceImpl, identity_self_service::IdentitySelfServiceImpl,
-        oauth2_consent::OAuth2ConsentServiceImpl, oauth2_device::OAuth2DeviceServiceImpl,
-        permission::PermissionServiceImpl, scim::ScimServiceImpl, tenant::TenantServiceImpl,
+        application::ApplicationServiceImpl,
+        federation::FederationServiceImpl,
+        handlers::{
+            callback::{CallbackState, router as callback_router},
+            oauth2::{Oauth2State, router as oauth2_router},
+            saml::{SamlState, router as saml_router},
+            saml_idp::{SamlIdpState, router as saml_idp_router},
+            scim::{ScimState, router as scim_router},
+        },
+        identity::IdentityServiceImpl,
+        identity_self_service::IdentitySelfServiceImpl,
+        oauth2_consent::OAuth2ConsentServiceImpl,
+        oauth2_device::OAuth2DeviceServiceImpl,
+        permission::PermissionServiceImpl,
+        scim::ScimServiceImpl,
+        tenant::TenantServiceImpl,
     },
+    session_token::SessionTokenSigner,
 };
 use axum::{Extension, Router as AxumRouter, middleware::from_fn, routing::get};
 use connectrpc::Router as ConnectRouter;
@@ -60,6 +72,18 @@ fn build_server_config(addr: SocketAddr, name: &str) -> ServerConfig {
 /// This is split out of `run` so unit tests can exercise the wiring without
 /// actually binding a TCP socket or serving requests.
 pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Router> {
+    build_app_with_upstream(config, pool, None).await
+}
+
+/// Build the gateway Axum application with an optional upstream OAuth client.
+///
+/// The optional `upstream_oauth` override is intended for integration tests that
+/// need to exercise callback flows without relying on a real upstream IdP.
+pub async fn build_app_with_upstream(
+    config: &Config,
+    pool: DbPool,
+    upstream_oauth: Option<Arc<dyn crate::upstream_oauth::UpstreamOAuthClient>>,
+) -> ServiceResult<axum::Router> {
     bootstrap_system_tenant(&pool, &config.system_tenant_ulid)
         .await
         .map_err(|e| sunbeam_g2v::error::ServiceError::Database(e.to_string()))?;
@@ -68,6 +92,22 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
         HydraClient::new(&config.hydra_admin_url, &config.hydra_public_url)
             .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
     );
+
+    let mappings = IdMappingRepo::new(pool.clone());
+
+    if let (Some(client_id), Some(client_secret)) = (
+        config.system_bootstrap_client_id.as_deref(),
+        config.system_bootstrap_client_secret.as_deref(),
+    ) {
+        bootstrap_system_client(
+            hydra.as_ref(),
+            &mappings,
+            &config.system_tenant_ulid,
+            client_id,
+            client_secret,
+        )
+        .await?;
+    }
     let kratos = Arc::new(
         KratosClient::new_with_public(&config.kratos_admin_url, &config.kratos_public_url)
             .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
@@ -83,15 +123,63 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
     let providers = SamlProviderRepo::new(pool.clone());
     let requests = SamlRequestRepo::new(pool.clone());
     let federation_mappings = SamlIdentityMappingRepo::new(pool.clone());
-    let idp_keys = SamlIdpKeyRepo::new(pool.clone());
+    let idp_keys = match config.saml_idp_key_encryption_key.as_ref() {
+        Some(key) => SamlIdpKeyRepo::with_encryption_key(pool.clone(), key.clone()),
+        None => SamlIdpKeyRepo::new(pool.clone()),
+    };
     let sp_clients = SamlSpClientRepo::new(pool.clone());
     let scim_groups = ScimGroupRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let api_keys = TenantApiKeyRepo::new(pool.clone());
+    let connections = TenantConnectionRepo::new(pool.clone());
+    let domains = TenantDomainRepo::new(pool.clone());
+    let login_state = LoginStateRepo::new(pool.clone());
     let audit_log = AuditLogRepo::new(pool.clone());
-    let replay_cache = Arc::new(SamlReplayCache::new(pool));
 
-    let idp_entity_id = resolve_idp_entity_id(config.saml_idp_entity_id.clone(), config.public_base_url.clone());
+    // Keep trait-object handles for the public callback handlers; the concrete
+    // repos are moved into FederationServiceImpl below.
+    let callback_connections: Arc<dyn crate::db::TenantConnectionStore> =
+        Arc::new(connections.clone());
+    let callback_login_state: Arc<dyn crate::db::LoginStateStore> = Arc::new(login_state.clone());
+    let callback_mappings: Arc<dyn crate::db::IdMappingStore> = Arc::new(mappings.clone());
+    let callback_schemas: Arc<dyn crate::db::IdentitySchemaStore> = Arc::new(schemas.clone());
+    let callback_identity_provisioner: Arc<dyn crate::identity_provisioner::IdentityProvisioner> =
+        Arc::new(KratosIdentityProvisioner::new(
+            kratos.clone(),
+            callback_mappings,
+            callback_schemas,
+        ));
+    let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> =
+        upstream_oauth.unwrap_or_else(|| {
+            Arc::new(ReqwestUpstreamOAuthClient::new(
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
+            ))
+        });
+    let session_signer = SessionTokenSigner::new(
+        &config.state_cookie_secret,
+        86400,
+        config.public_base_url.clone(),
+    );
+    let session_store: Arc<dyn crate::db::SessionStore> =
+        Arc::new(crate::db::PgSessionStore::new(pool.clone()));
+    let replay_cache = Arc::new(SamlReplayCache::new(pool.clone()));
+
+    let token_cache = Arc::new(PgTokenIntrospectionCache::new(pool));
+    let hydra_introspector: Arc<dyn crate::auth::TokenIntrospector> =
+        Arc::new(HydraTokenIntrospector::new(hydra.clone()));
+    let introspector: Arc<dyn crate::auth::TokenIntrospector> =
+        Arc::new(CachedTokenIntrospector::new(
+            hydra_introspector,
+            token_cache,
+            time::Duration::seconds(config.token_introspection_cache_ttl_seconds as i64),
+        ));
+
+    let idp_entity_id = resolve_idp_entity_id(
+        config.saml_idp_entity_id.clone(),
+        config.public_base_url.clone(),
+    );
 
     let (saml_signer, sp_certificate_pem) =
         if let Some(key_path) = &config.saml_sp_private_key_pem_path {
@@ -117,7 +205,6 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
-        api_keys.clone(),
         config.system_tenant_ulid.clone(),
     ));
     let application_service =
@@ -136,7 +223,6 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
         scim_groups,
     ));
     let oauth_mappings = mappings.clone();
-    let scim_mappings = mappings.clone();
     let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
     let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(hydra.clone()));
@@ -149,6 +235,9 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
         federation_mappings,
         schemas,
         idp_keys.clone(),
+        connections,
+        domains,
+        login_state,
         config.hydra_public_url.clone(),
         config.public_base_url.clone(),
         saml_signer,
@@ -164,18 +253,35 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
         oauth_mappings,
         config.public_base_url.clone(),
     ));
-    let scim_state = Arc::new(ScimState::new(
-        scim_service.clone(),
-        hydra.clone(),
-        scim_mappings,
-    ));
+    let scim_state = Arc::new(ScimState::new(scim_service.clone()));
     let saml_state = Arc::new(SamlState::new(federation_service.clone()));
-    let saml_idp_state = Arc::new(SamlIdpState::new(
-        kratos.clone(),
-        idp_keys,
-        sp_clients,
-        idp_entity_id,
-    ));
+    let saml_idp_state = Arc::new(
+        SamlIdpState::new(
+            kratos.clone(),
+            idp_keys,
+            sp_clients,
+            idp_entity_id,
+        )
+        .with_sso_endpoint_url(format!(
+            "{}/saml/sso",
+            config.public_base_url.trim_end_matches('/')
+        )),
+    );
+    let callback_state = Arc::new(
+        CallbackState::new(
+            callback_login_state,
+            callback_connections,
+            upstream_oauth,
+            callback_identity_provisioner,
+            session_signer.clone(),
+            session_store.clone(),
+            config.allowed_return_to_hosts.clone(),
+            config.public_base_url.clone(),
+            config.cookie_secure,
+            config.cookie_samesite.clone(),
+        )
+        .with_saml(federation_service.clone()),
+    );
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
@@ -193,7 +299,8 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
         .merge(oauth2_router(oauth_state))
         .merge(scim_router(scim_state))
         .merge(saml_router(saml_state))
-        .merge(saml_idp_router(saml_idp_state));
+        .merge(saml_idp_router(saml_idp_state))
+        .merge(callback_router(callback_state));
 
     let health = HealthRouter::new();
 
@@ -208,19 +315,67 @@ pub async fn build_app(config: &Config, pool: DbPool) -> ServiceResult<axum::Rou
 
     let app = server
         .app()
+        // Audit must be outermost so that authentication failures are captured.
         .layer(from_fn(audit_middleware))
-        .layer(from_fn(auth_middleware))
-        .layer(Extension(api_keys))
         .layer(Extension(audit_log))
-        .layer(Extension(kratos))
-        .layer(Extension(mappings));
+        .layer(from_fn(auth_middleware))
+        .layer(Extension(introspector))
+        .layer(Extension(session_signer))
+        .layer(Extension(session_store))
+        .layer(Extension(
+            Arc::new(mappings) as Arc<dyn crate::db::IdMappingStore>
+        ));
 
     Ok(app)
 }
 
+async fn bootstrap_system_client(
+    hydra: &HydraClient,
+    mappings: &IdMappingRepo,
+    system_tenant_ulid: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> ServiceResult<()> {
+    match mappings.get_tenant_id_by_ory_id("hydra", client_id).await {
+        Ok(Some(_)) => {
+            info!("system bootstrap OAuth2 client already mapped; skipping creation");
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(sunbeam_g2v::error::ServiceError::Database(e.to_string()));
+        }
+    }
+
+    let payload = serde_json::json!({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_types": ["client_credentials"],
+        "token_endpoint_auth_method": "client_secret_post",
+        "scope": "tenant:admin application:admin"
+    });
+
+    hydra.create_oauth2_client(payload).await.map_err(|e| {
+        sunbeam_g2v::error::ServiceError::Configuration(format!("bootstrap client: {e}"))
+    })?;
+
+    mappings
+        .create(system_tenant_ulid, "hydra", client_id, client_id)
+        .await
+        .map_err(|e| sunbeam_g2v::error::ServiceError::Database(e.to_string()))?;
+
+    info!(
+        system_tenant = %system_tenant_ulid,
+        client_id = %client_id,
+        "installed system bootstrap OAuth2 client"
+    );
+
+    Ok(())
+}
+
 /// Build and run the gateway server from a loaded configuration.
 pub async fn run(config: Config) -> ServiceResult<()> {
-    let pool = create_pool(&config.database_url)
+    let pool = create_pool(&config.database_url, config.database_ssl_required)
         .await
         .map_err(|e| sunbeam_g2v::error::ServiceError::Database(e.to_string()))?;
 
@@ -247,6 +402,9 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
     use ulid::Ulid;
 
     use super::*;
@@ -273,7 +431,6 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             system_tenant_ulid,
             database_url,
-            redis_url: "redis://127.0.0.1:6379".to_string(),
             hydra_admin_url: "http://127.0.0.1:4445".to_string(),
             hydra_public_url: "http://127.0.0.1:4444".to_string(),
             kratos_admin_url: "http://127.0.0.1:4434".to_string(),
@@ -288,7 +445,21 @@ mod tests {
             saml_require_signed_assertions: true,
             saml_require_signed_responses: false,
             registration_enabled: false,
-            allowed_return_to_hosts: vec![],
+            allowed_return_to_hosts: vec!["example.com".to_string()],
+            system_bootstrap_client_id: None,
+            system_bootstrap_client_secret: None,
+            state_cookie_secret: "test-secret-key-for-cookies-at-least-32-bytes-long".into(),
+            cookie_secure: false,
+            cookie_samesite: "Lax".to_string(),
+            saml_idp_key_encryption_key: None,
+            tenant_connection_encryption_key: None,
+            database_ssl_required: false,
+            database_max_connections: 5,
+            database_acquire_timeout_seconds: 5,
+            database_idle_timeout_seconds: 60,
+            database_max_lifetime_seconds: 300,
+            database_statement_timeout_seconds: 5,
+            token_introspection_cache_ttl_seconds: 30,
         }
     }
 
@@ -300,7 +471,10 @@ mod tests {
     #[test]
     fn resolve_idp_entity_id_uses_configured_value() {
         assert_eq!(
-            resolve_idp_entity_id(Some("https://idp.example.com".into()), "https://gateway.example.com".into()),
+            resolve_idp_entity_id(
+                Some("https://idp.example.com".into()),
+                "https://gateway.example.com".into()
+            ),
             "https://idp.example.com"
         );
     }
@@ -324,8 +498,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_wires_routes_and_layers() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let system_tenant_ulid = Ulid::new().to_string();
         let config = test_config(url, system_tenant_ulid.clone());
         let app = build_app(&config, pool.clone()).await.unwrap();
@@ -342,10 +519,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_routes_are_public_and_wired() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(
+            base,
+            &format!("app_callbacks_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
+        let config = test_config(url, Ulid::new().to_string());
+        let app = build_app(&config, pool).await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/callbacks/oidc?code=c&state=s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Missing/expired state returns a 400; the important part is that the
+        // bearer-token middleware did not block the public callback route.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::post("/saml/acs")
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn build_app_with_custom_idp_entity_id() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_idp_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_idp_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.saml_idp_entity_id = Some("https://idp.example.com".to_string());
         let app = build_app(&config, pool).await.unwrap();
@@ -355,8 +574,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_loads_saml_signer_when_key_and_cert_configured() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_key_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_key_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.saml_sp_private_key_pem_path = Some("tests/fixtures/saml-test-key.pem".into());
         config.saml_sp_certificate_pem_path = Some("tests/fixtures/saml-test-cert.pem".into());
@@ -367,8 +589,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_loads_saml_signer_when_only_key_path_configured() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_key_only_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_key_only_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.saml_sp_private_key_pem_path = Some("tests/fixtures/saml-test-key.pem".into());
         let app = build_app(&config, pool).await.unwrap();
@@ -378,8 +603,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_returns_error_when_saml_key_file_missing() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_missing_key_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_missing_key_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.saml_sp_private_key_pem_path = Some("tests/fixtures/does-not-exist.pem".into());
         assert!(build_app(&config, pool).await.is_err());
@@ -388,7 +616,10 @@ mod tests {
     #[tokio::test]
     async fn run_returns_error_for_unbindable_address() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_run_{}", Ulid::new().to_string().to_lowercase()));
+        let url = db_url_with_name(
+            base,
+            &format!("app_run_{}", Ulid::new().to_string().to_lowercase()),
+        );
         let mut config = test_config(url, Ulid::new().to_string());
         config.bind_addr = "192.0.2.1:80".parse().unwrap();
         let result = run(config).await;
@@ -398,8 +629,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_returns_error_for_invalid_hydra_url() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_hydra_url_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_hydra_url_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.hydra_admin_url = "not a valid url".to_string();
         assert!(build_app(&config, pool).await.is_err());
@@ -408,8 +642,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_returns_error_for_invalid_kratos_url() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_kratos_url_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_kratos_url_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.kratos_admin_url = "not a valid url".to_string();
         assert!(build_app(&config, pool).await.is_err());
@@ -418,8 +655,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_returns_error_for_invalid_keto_url() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_keto_url_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_keto_url_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.keto_read_url = "not a valid url".to_string();
         assert!(build_app(&config, pool).await.is_err());
@@ -428,8 +668,11 @@ mod tests {
     #[tokio::test]
     async fn build_app_returns_error_for_invalid_saml_certificate_file() {
         let base = postgres_url().await;
-        let url = db_url_with_name(base, &format!("app_cert_{}", Ulid::new().to_string().to_lowercase()));
-        let pool = create_pool(&url).await.unwrap();
+        let url = db_url_with_name(
+            base,
+            &format!("app_cert_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
         config.saml_sp_private_key_pem_path = Some("tests/fixtures/saml-test-key.pem".into());
         config.saml_sp_certificate_pem_path = Some("tests/fixtures/does-not-exist.pem".into());

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use super::{DbError, DbPool};
@@ -36,10 +37,34 @@ impl PgAuditLogStore {
         metadata: serde_json::Value,
     ) -> Result<(), DbError> {
         let id = Ulid::new().to_string();
+        let created_at = time::OffsetDateTime::now_utc();
+
+        let prev_hash: Option<String> = sqlx::query_scalar(
+            "SELECT integrity_hash FROM audit_log ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let prev_hash = prev_hash.unwrap_or_default();
+
+        let metadata_str = serde_json::to_string(&metadata).unwrap_or_default();
+        let canonical = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            id,
+            tenant_id.unwrap_or(""),
+            actor.unwrap_or(""),
+            action,
+            resource,
+            outcome,
+            metadata_str,
+            prev_hash,
+            created_at
+        );
+        let integrity_hash = hex::encode(Sha256::digest(canonical));
+
         sqlx::query(
             "INSERT INTO audit_log \
-             (id, tenant_id, actor, action, resource, outcome, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (id, tenant_id, actor, action, resource, outcome, metadata, prev_hash, integrity_hash, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&id)
         .bind(tenant_id)
@@ -48,9 +73,22 @@ impl PgAuditLogStore {
         .bind(resource)
         .bind(outcome)
         .bind(sqlx::types::Json(metadata))
+        .bind(&prev_hash)
+        .bind(&integrity_hash)
+        .bind(created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn latest_hash(&self) -> Result<Option<String>, DbError> {
+        let hash: Option<String> = sqlx::query_scalar(
+            "SELECT integrity_hash FROM audit_log ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(hash)
     }
 }
 
@@ -75,7 +113,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_support::{create_test_tenant, postgres_pool};
+    use crate::db::create_pool;
+    use crate::test_support::{create_test_tenant, postgres_pool, postgres_url};
 
     #[tokio::test]
     async fn insert_audit_log_with_tenant() {
@@ -101,7 +140,14 @@ mod tests {
     async fn insert_audit_log_without_tenant_or_actor() {
         let store = PgAuditLogStore::new(postgres_pool().await);
         store
-            .insert(None, None, "login", "session", "success", serde_json::json!({}))
+            .insert(
+                None,
+                None,
+                "login",
+                "session",
+                "success",
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
     }
@@ -120,5 +166,109 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_chain_links_entries() {
+        let base = postgres_url().await;
+        let db_name = format!("audit_log_{}", Ulid::new().to_string().to_lowercase());
+        let url = db_url_with_name(base, &db_name);
+        let pool = create_pool(&url, false).await.unwrap();
+        let store = PgAuditLogStore::new(pool);
+
+        store
+            .insert(
+                None,
+                Some("actor-1"),
+                "a1",
+                "r1",
+                "success",
+                serde_json::json!({"k": 1}),
+            )
+            .await
+            .unwrap();
+        let first_hash = store.latest_hash().await.unwrap().unwrap();
+
+        store
+            .insert(
+                None,
+                Some("actor-2"),
+                "a2",
+                "r2",
+                "failure",
+                serde_json::json!({"k": 2}),
+            )
+            .await
+            .unwrap();
+        let second_hash = store.latest_hash().await.unwrap().unwrap();
+
+        assert_ne!(first_hash, second_hash);
+
+        let prev: String = sqlx::query_scalar("SELECT prev_hash FROM audit_log WHERE action = $1")
+            .bind("a2")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(prev, first_hash);
+    }
+
+    fn db_url_with_name(base: &str, db_name: &str) -> String {
+        if let Some(query_start) = base.rfind('?') {
+            let before_query = &base[..query_start];
+            let query = &base[query_start..];
+            if let Some(db_sep) = before_query.rfind('/') {
+                format!("{}{}{}", &before_query[..db_sep + 1], db_name, query)
+            } else {
+                format!("{}/{}", before_query, db_name)
+            }
+        } else if let Some(db_sep) = base.rfind('/') {
+            format!("{}{}", &base[..db_sep + 1], db_name)
+        } else {
+            format!("{}/{}", base, db_name)
+        }
+    }
+
+    #[tokio::test]
+    async fn append_only_trigger_blocks_update() {
+        let pool = postgres_pool().await;
+        let store = PgAuditLogStore::new(pool);
+        store
+            .insert(
+                None,
+                None,
+                "action",
+                "resource",
+                "success",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let result = sqlx::query("UPDATE audit_log SET outcome = 'failure'")
+            .execute(&store.pool)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn append_only_trigger_blocks_delete() {
+        let pool = postgres_pool().await;
+        let store = PgAuditLogStore::new(pool);
+        store
+            .insert(
+                None,
+                None,
+                "action",
+                "resource",
+                "success",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let result = sqlx::query("DELETE FROM audit_log")
+            .execute(&store.pool)
+            .await;
+        assert!(result.is_err());
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use chrono::Utc;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use gamlastan::bindings::relay_state::RelayState;
@@ -21,26 +22,40 @@ use gamlastan::profiles::sso::sp::{
 use gamlastan::profiles::sso::web_browser::{AuthnRequestOptions, bindings as saml_bindings};
 use gamlastan::security::SecurityConfig;
 use gamlastan::xml::{SamlSerialize, parse_saml, parse_secure};
+use rand::RngCore;
+use sha2::Digest;
 use sso_ory_client::kratos::KratosClient;
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::db::{
-    IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
-    SamlIdentityMappingRepo, SamlIdentityMappingStore, SamlIdpKeyRepo, SamlIdpKeyStore,
-    SamlProviderRepo, SamlProviderRow, SamlProviderStore, SamlRequestRepo, SamlRequestStore,
+    GamlastanReplayAdapter, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
+    LoginStateRepo, LoginStateStore, SamlIdentityMappingRepo, SamlIdentityMappingStore,
+    SamlIdpKeyRepo, SamlIdpKeyStore, SamlProviderRepo, SamlProviderRow, SamlProviderStore,
+    SamlReplayCacheTrait, SamlRequestRepo, SamlRequestStore, TenantConnectionRepo,
+    TenantConnectionStore, TenantDomainRepo, TenantDomainStore,
+};
+use crate::hrd::Hrd;
+use crate::identity_provisioner::{
+    IdentityProvisioner, KratosIdentityProvisioner, ProvisionedIdentity,
 };
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
-    AcceptSamlAssertionRequest, FederationService, GetJSONWebKeysRequest,
-    GetOpenIDConfigurationRequest, InitiateSamlLoginRequest, JSONWebKey, JSONWebKeySet,
-    OpenIDConfiguration, SamlLoginResponse, Session,
+    AcceptSamlAssertionRequest, DiscoverLoginMethodRequest, DiscoverLoginMethodResponse,
+    FederationService, GetJSONWebKeysRequest, GetOpenIDConfigurationRequest,
+    InitiateOAuth2LoginRequest, InitiateOAuth2LoginResponse, InitiateOidcLoginRequest,
+    InitiateOidcLoginResponse, InitiateSamlLoginRequest, JSONWebKey, JSONWebKeySet, OAuth2Redirect,
+    OidcRedirect, OpenIDConfiguration, SamlLoginResponse, SamlRedirect, Session,
 };
+use crate::services::handlers::callback::SamlAcsService;
+use crate::upstream_oauth::validate_upstream_url;
 
+#[allow(dead_code)]
 const BACKEND_KRATOS: &str = "kratos";
 
 #[async_trait::async_trait]
+#[allow(dead_code)]
 trait FederationKratos: Send + Sync + 'static {
     async fn create_identity(
         &self,
@@ -88,6 +103,7 @@ impl FederationHydra for reqwest::Client {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct FederationServiceImpl {
     kratos: Arc<dyn FederationKratos>,
     pub(crate) providers: Arc<dyn SamlProviderStore>,
@@ -97,6 +113,13 @@ pub struct FederationServiceImpl {
     schemas: Arc<dyn IdentitySchemaStore>,
     #[allow(dead_code)]
     idp_keys: Arc<dyn SamlIdpKeyStore>,
+    #[allow(dead_code)]
+    connections: Arc<dyn TenantConnectionStore>,
+    #[allow(dead_code)]
+    domains: Arc<dyn TenantDomainStore>,
+    login_state: Arc<dyn LoginStateStore>,
+    identity_provisioner: Arc<dyn IdentityProvisioner>,
+    hrd: Hrd,
     hydra_public_url: String,
     public_base_url: String,
     http: Arc<dyn FederationHydra>,
@@ -105,7 +128,7 @@ pub struct FederationServiceImpl {
     request_ttl: Duration,
     require_signed_assertions: bool,
     require_signed_responses: bool,
-    replay_cache: Arc<dyn gamlastan::security::ReplayCache>,
+    replay_cache: Arc<dyn SamlReplayCacheTrait>,
 }
 
 impl FederationServiceImpl {
@@ -118,6 +141,9 @@ impl FederationServiceImpl {
         federation_mappings: SamlIdentityMappingRepo,
         schemas: IdentitySchemaRepo,
         idp_keys: SamlIdpKeyRepo,
+        connections: TenantConnectionRepo,
+        domains: TenantDomainRepo,
+        login_state: LoginStateRepo,
         hydra_public_url: String,
         public_base_url: String,
         saml_signer: Option<Arc<SamlSigner>>,
@@ -125,17 +151,36 @@ impl FederationServiceImpl {
         request_ttl: Duration,
         require_signed_assertions: bool,
         require_signed_responses: bool,
-        replay_cache: Arc<dyn gamlastan::security::ReplayCache>,
+        replay_cache: Arc<dyn SamlReplayCacheTrait>,
     ) -> Self {
+        let providers: Arc<dyn SamlProviderStore> = Arc::new(providers);
+        let connections: Arc<dyn TenantConnectionStore> = Arc::new(connections);
+        let domains: Arc<dyn TenantDomainStore> = Arc::new(domains);
+        let mappings: Arc<dyn IdMappingStore> = Arc::new(mappings);
+        let schemas: Arc<dyn IdentitySchemaStore> = Arc::new(schemas);
+        let identity_provisioner: Arc<dyn IdentityProvisioner> = Arc::new(
+            KratosIdentityProvisioner::new(kratos.clone(), mappings.clone(), schemas.clone())
+                .with_saml_mappings(Arc::new(federation_mappings.clone()) as Arc<dyn SamlIdentityMappingStore>),
+        );
+        let hrd = Hrd::new(
+            connections.clone(),
+            domains.clone(),
+            providers.clone(),
+            public_base_url.clone(),
+        );
         Self {
             kratos: kratos as Arc<dyn FederationKratos>,
-            providers: Arc::new(providers) as Arc<dyn SamlProviderStore>,
+            providers,
             requests: Arc::new(requests) as Arc<dyn SamlRequestStore>,
-            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
-            federation_mappings: Arc::new(federation_mappings)
-                as Arc<dyn SamlIdentityMappingStore>,
-            schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            mappings,
+            federation_mappings: Arc::new(federation_mappings) as Arc<dyn SamlIdentityMappingStore>,
+            schemas,
             idp_keys: Arc::new(idp_keys) as Arc<dyn SamlIdpKeyStore>,
+            connections,
+            domains,
+            login_state: Arc::new(login_state) as Arc<dyn LoginStateStore>,
+            identity_provisioner,
+            hrd,
             hydra_public_url,
             public_base_url,
             http: Arc::new(
@@ -156,6 +201,181 @@ impl FederationServiceImpl {
 
 #[allow(refining_impl_trait)]
 impl FederationService for FederationServiceImpl {
+    #[instrument(skip(self, request))]
+    async fn discover_login_method(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, DiscoverLoginMethodRequest>,
+    ) -> ServiceResult<DiscoverLoginMethodResponse> {
+        let req = request.to_owned_message();
+        let result = self
+            .hrd
+            .discover(&req.email, &req.return_to)
+            .await
+            .map_err(ServiceError::from)?;
+        let response = match result {
+            crate::hrd::DiscoveryResult::Oidc(crate::hrd::OidcRedirect { authorization_url }) => {
+                DiscoverLoginMethodResponse {
+                    method: Some(
+                        crate::proto::iam::v1::discover_login_method_response::Method::Oidc(
+                            Box::new(OidcRedirect {
+                                authorization_url,
+                                state: String::new(),
+                                __buffa_unknown_fields: Default::default(),
+                            }),
+                        ),
+                    ),
+                    __buffa_unknown_fields: Default::default(),
+                }
+            }
+            crate::hrd::DiscoveryResult::OAuth2(crate::hrd::OAuth2Redirect {
+                authorization_url,
+            }) => DiscoverLoginMethodResponse {
+                method: Some(
+                    crate::proto::iam::v1::discover_login_method_response::Method::Oauth2(
+                        Box::new(OAuth2Redirect {
+                            authorization_url,
+                            state: String::new(),
+                            __buffa_unknown_fields: Default::default(),
+                        }),
+                    ),
+                ),
+                __buffa_unknown_fields: Default::default(),
+            },
+            crate::hrd::DiscoveryResult::Saml(crate::hrd::SamlRedirect {
+                sso_url,
+                saml_request,
+                relay_state,
+            }) => DiscoverLoginMethodResponse {
+                method: Some(
+                    crate::proto::iam::v1::discover_login_method_response::Method::Saml(Box::new(
+                        SamlRedirect {
+                            sso_url,
+                            saml_request,
+                            relay_state,
+                            __buffa_unknown_fields: Default::default(),
+                        },
+                    )),
+                ),
+                __buffa_unknown_fields: Default::default(),
+            },
+            crate::hrd::DiscoveryResult::SelectTenant(crate::hrd::TenantSelectionRedirect {
+                redirect_url,
+            }) => DiscoverLoginMethodResponse {
+                method: Some(
+                    crate::proto::iam::v1::discover_login_method_response::Method::SelectTenant(
+                        Box::new(crate::proto::iam::v1::SelectTenantRedirect {
+                            redirect_url,
+                            __buffa_unknown_fields: Default::default(),
+                        }),
+                    ),
+                ),
+                __buffa_unknown_fields: Default::default(),
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn initiate_oidc_login(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, InitiateOidcLoginRequest>,
+    ) -> ServiceResult<InitiateOidcLoginResponse> {
+        let tenant_id = require_tenant(&ctx)?;
+        let req = request.to_owned_message();
+        let connection = self
+            .connections
+            .get_by_id(&tenant_id, &req.connection_id)
+            .await
+            .map_err(ServiceError::from)?;
+        if connection.connection_type != crate::db::ConnectionType::Oidc {
+            return Err(ServiceError::InvalidArgument(
+                "connection is not an OIDC connection".into(),
+            )
+            .into());
+        }
+        let code_verifier = generate_code_verifier();
+        let nonce = generate_nonce();
+        let state = self
+            .login_state
+            .create(
+                &tenant_id,
+                &req.connection_id,
+                "oidc",
+                &req.return_to,
+                Some(code_verifier.clone()),
+                Some(nonce.clone()),
+                self.request_ttl,
+            )
+            .await
+            .map_err(ServiceError::from)?;
+        let authorization_url = build_oidc_authorization_url(
+            &connection.config,
+            &format!(
+                "{}/callbacks/oidc",
+                self.public_base_url.trim_end_matches('/')
+            ),
+            &state.state_token,
+            &code_verifier,
+            &nonce,
+        )?;
+        Ok(Response::new(InitiateOidcLoginResponse {
+            authorization_url,
+            state: state.state_token,
+            __buffa_unknown_fields: Default::default(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn initiate_o_auth2_login(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, InitiateOAuth2LoginRequest>,
+    ) -> ServiceResult<InitiateOAuth2LoginResponse> {
+        let tenant_id = require_tenant(&ctx)?;
+        let req = request.to_owned_message();
+        let connection = self
+            .connections
+            .get_by_id(&tenant_id, &req.connection_id)
+            .await
+            .map_err(ServiceError::from)?;
+        if connection.connection_type != crate::db::ConnectionType::OAuth2 {
+            return Err(ServiceError::InvalidArgument(
+                "connection is not an OAuth2 connection".into(),
+            )
+            .into());
+        }
+        let code_verifier = generate_code_verifier();
+        let state = self
+            .login_state
+            .create(
+                &tenant_id,
+                &req.connection_id,
+                "oauth2",
+                &req.return_to,
+                Some(code_verifier.clone()),
+                None,
+                self.request_ttl,
+            )
+            .await
+            .map_err(ServiceError::from)?;
+        let authorization_url = build_oauth2_authorization_url(
+            &connection.config,
+            &format!(
+                "{}/callbacks/oauth2",
+                self.public_base_url.trim_end_matches('/')
+            ),
+            &state.state_token,
+            &code_verifier,
+        )?;
+        Ok(Response::new(InitiateOAuth2LoginResponse {
+            authorization_url,
+            state: state.state_token,
+            __buffa_unknown_fields: Default::default(),
+        }))
+    }
+
     #[instrument(skip(self))]
     async fn get_open_id_configuration(
         &self,
@@ -281,27 +501,9 @@ impl FederationService for FederationServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
 
-        let saml_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &req.encoded_assertion,
-        )
-        .map_err(|e| ServiceError::InvalidArgument(format!("base64: {e}")))?;
-        let saml_xml = String::from_utf8(saml_bytes)
-            .map_err(|e| ServiceError::InvalidArgument(format!("utf8: {e}")))?;
+        let request_id = parse_saml_request_id(&req.encoded_assertion)?;
 
-        let doc = parse_secure(&saml_xml)
-            .map_err(|e| ServiceError::InvalidArgument(format!("saml parse: {e}")))?;
-        let response: SamlResponse = parse_saml::<SamlResponseRef>(&doc)
-            .map_err(|e| ServiceError::InvalidArgument(format!("saml response: {e}")))?
-            .to_owned();
-
-        let request_id = response
-            .base
-            .in_response_to
-            .as_deref()
-            .ok_or_else(|| ServiceError::InvalidArgument("unsolicited saml response".into()))?;
-
-        let pending = self.requests.get(&tenant_id, request_id).await?;
+        let pending = self.requests.get(&tenant_id, &request_id).await?;
         let provider = self.providers.get(&tenant_id, &pending.provider_id).await?;
 
         if req.relay_state != pending.relay_state {
@@ -313,36 +515,133 @@ impl FederationService for FederationServiceImpl {
             return Err(ServiceError::InvalidArgument("saml request expired".into()).into());
         }
 
+        let identity = self
+            .process_saml_assertion(&tenant_id, &provider, &req.encoded_assertion, &request_id)
+            .await?;
+
+        let session_id = Ulid::new().to_string();
+        Ok(Response::new(Session {
+            id: session_id,
+            identity_id: identity.public_id,
+            tenant_id,
+            active: true,
+            ..Default::default()
+        }))
+    }
+}
+
+impl FederationServiceImpl {
+    /// Provision (or link) a Kratos identity from a validated SAML assertion.
+    async fn provision_saml_identity(
+        &self,
+        tenant_id: &str,
+        provider: &SamlProviderRow,
+        name_id: &str,
+        email: &str,
+    ) -> Result<ProvisionedIdentity, ServiceError> {
+        // SAML identity providers are treated as trusted for the purposes of
+        // email linking, but per-provider saml_identity_mappings are still
+        // preferred when present.
+        self.identity_provisioner
+            .provision_saml(
+                tenant_id,
+                &provider.id,
+                &provider.schema_id,
+                name_id,
+                email,
+                false,
+                true,
+            )
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// Validate a SAML assertion and provision (or link) the corresponding
+    /// identity. Used by both the Connect-RPC `AcceptSamlAssertion` method and
+    /// the public HTTP ACS callback.
+    pub async fn process_saml_assertion(
+        &self,
+        tenant_id: &str,
+        provider: &SamlProviderRow,
+        encoded_assertion: &str,
+        request_id: &str,
+    ) -> Result<ProvisionedIdentity, ServiceError> {
+        // Fail closed: if the gateway is configured to require signed assertions
+        // or responses, the provider must have a certificate before we parse
+        // anything.
+        if provider.idp_certificate_pem.is_none() {
+            if self.require_signed_assertions {
+                return Err(ServiceError::Configuration(
+                    "provider requires signed assertions but no IdP certificate is configured"
+                        .into(),
+                ));
+            }
+            if self.require_signed_responses {
+                return Err(ServiceError::Configuration(
+                    "provider requires signed responses but no IdP certificate is configured"
+                        .into(),
+                ));
+            }
+        }
+
+        let saml_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded_assertion,
+        )
+        .map_err(|e| ServiceError::InvalidArgument(format!("base64: {e}")))?;
+        let saml_xml = String::from_utf8(saml_bytes)
+            .map_err(|e| ServiceError::InvalidArgument(format!("utf8: {e}")))?;
+
+        let doc = parse_secure(&saml_xml)
+            .map_err(|e| ServiceError::InvalidArgument(format!("saml parse: {e}")))?;
+        let response: SamlResponse = parse_saml::<SamlResponseRef>(&doc)
+            .map_err(|e| ServiceError::InvalidArgument(format!("saml response: {e}")))?
+            .to_owned();
+
         let verified_signed_ids =
             verify_saml_signature(&saml_xml, provider.idp_certificate_pem.as_deref())
                 .map_err(|e| ServiceError::InvalidArgument(format!("saml signature: {e}")))?;
 
-        let mut config = SecurityConfig::new();
+        let mut security_config = SecurityConfig::new();
         let has_idp_cert = provider.idp_certificate_pem.is_some();
-        config.require_signed_assertions = has_idp_cert && self.require_signed_assertions;
-        config.require_signed_responses = has_idp_cert && self.require_signed_responses;
-        config.require_encrypted_assertions = false;
+        security_config.require_signed_assertions = has_idp_cert && self.require_signed_assertions;
+        security_config.require_signed_responses = has_idp_cert && self.require_signed_responses;
+        security_config.require_encrypted_assertions = false;
 
-        let signed_ids: Vec<&str> = verified_signed_ids.iter().map(|s| s.as_str()).collect();
-        let result = process_response_with_verified_signatures(
-            &response,
-            &config,
-            Some(self.replay_cache.as_ref()),
-            &provider.sp_entity_id,
-            &provider.acs_url,
-            Some(request_id),
-            &provider.idp_entity_id,
-            &signed_ids,
-            Utc::now(),
-        )
+        let signed_ids_owned: Vec<String> = verified_signed_ids.to_vec();
+        let replay_adapter = GamlastanReplayAdapter::new(self.replay_cache.clone());
+        let response = response.clone();
+        let security_config = security_config.clone();
+        let sp_entity_id = provider.sp_entity_id.clone();
+        let acs_url = provider.acs_url.clone();
+        let request_id_owned = request_id.to_string();
+        let idp_entity_id = provider.idp_entity_id.clone();
+        let now = Utc::now();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let signed_ids: Vec<&str> = signed_ids_owned.iter().map(|s| s.as_str()).collect();
+            process_response_with_verified_signatures(
+                &response,
+                &security_config,
+                Some(&replay_adapter),
+                &sp_entity_id,
+                &acs_url,
+                Some(&request_id_owned),
+                &idp_entity_id,
+                &signed_ids,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| ServiceError::Internal(format!("saml processing task failed: {e}")))?
         .map_err(|e| ServiceError::InvalidArgument(format!("saml validation: {e}")))?;
 
-        self.requests.delete(&tenant_id, request_id).await.ok();
+        self.requests.delete(tenant_id, request_id).await.ok();
 
         // Validate the identity schema registered for this tenant.
         let _schema = self
             .schemas
-            .get_by_schema_id(&tenant_id, &provider.schema_id)
+            .get_by_schema_id(tenant_id, &provider.schema_id)
             .await?;
 
         let name_id = result.name_id.clone();
@@ -355,48 +654,10 @@ impl FederationService for FederationServiceImpl {
             .map(|s| s.to_string())
             .unwrap_or_else(|| name_id.clone());
 
-        let (public_id, _ory_id) = match self
-            .federation_mappings
-            .get_by_name_id(&tenant_id, &provider.id, &name_id)
+        self.provision_saml_identity(tenant_id, provider, &name_id, &email)
             .await
-        {
-            Ok(mapping) => (mapping.identity_public_id, mapping.ory_global_id),
-            Err(_) => {
-                let payload = serde_json::json!({
-                    "schema_id": provider.schema_id,
-                    "traits": { "email": email },
-                });
-                let created = self
-                    .kratos
-                    .create_identity(payload)
-                    .await
-                    .map_err(map_ory_error)?;
-                let ory_id = created["id"]
-                    .as_str()
-                    .ok_or_else(|| ServiceError::Internal("kratos response missing id".into()))?;
-                let public_id = Ulid::new().to_string();
-                self.mappings
-                    .create(&tenant_id, BACKEND_KRATOS, &public_id, ory_id)
-                    .await?;
-                self.federation_mappings
-                    .create(&tenant_id, &provider.id, &name_id, &public_id, ory_id)
-                    .await?;
-                (public_id, ory_id.to_string())
-            }
-        };
-
-        let session_id = Ulid::new().to_string();
-        Ok(Response::new(Session {
-            id: session_id,
-            identity_id: public_id,
-            tenant_id,
-            active: true,
-            ..Default::default()
-        }))
     }
-}
 
-impl FederationServiceImpl {
     /// Generate SAML 2.0 SP metadata XML for a configured provider.
     pub fn generate_sp_metadata(&self, provider: &SamlProviderRow) -> Result<String, ServiceError> {
         let mut base =
@@ -455,6 +716,44 @@ impl FederationServiceImpl {
         entity
             .to_xml_string()
             .map_err(|e| ServiceError::Internal(format!("saml metadata serialize: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl SamlAcsService for FederationServiceImpl {
+    async fn process_saml_assertion_http(
+        &self,
+        encoded_assertion: &str,
+        relay_state: &str,
+    ) -> Result<ProvisionedIdentity, ServiceError> {
+        let request_id = parse_saml_request_id(encoded_assertion)?;
+
+        let pending = self
+            .requests
+            .get_by_request_id(&request_id)
+            .await
+            .map_err(ServiceError::from)?;
+        let provider = self
+            .providers
+            .get(&pending.tenant_id, &pending.provider_id)
+            .await?;
+
+        if relay_state != pending.relay_state {
+            return Err(ServiceError::InvalidArgument("relay state mismatch".into()));
+        }
+
+        let request_age = time::OffsetDateTime::now_utc() - pending.created_at;
+        if request_age.whole_seconds() > self.request_ttl.as_secs() as i64 {
+            return Err(ServiceError::InvalidArgument("saml request expired".into()));
+        }
+
+        self.process_saml_assertion(
+            &pending.tenant_id,
+            &provider,
+            encoded_assertion,
+            &request_id,
+        )
+        .await
     }
 }
 
@@ -542,13 +841,161 @@ fn split_certificate_pem_blocks(pem: &str) -> Vec<&str> {
     blocks
 }
 
+fn build_oidc_authorization_url(
+    config: &serde_json::Value,
+    redirect_uri: &str,
+    state: &str,
+    code_verifier: &str,
+    nonce: &str,
+) -> Result<String, ServiceError> {
+    let authorization_endpoint = config["authorization_endpoint"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            config["issuer"]
+                .as_str()
+                .map(|issuer| format!("{}/oauth2/authorize", issuer.trim_end_matches('/')))
+        })
+        .ok_or_else(|| {
+            ServiceError::InvalidArgument("missing authorization_endpoint or issuer".into())
+        })?;
+    let client_id = config["client_id"]
+        .as_str()
+        .ok_or_else(|| ServiceError::InvalidArgument("missing client_id".into()))?;
+    let scope = config["scopes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ServiceError::InvalidArgument("missing scopes".into()))?;
+
+    validate_oauth_url("authorization_endpoint", &authorization_endpoint)?;
+    if let Some(issuer) = config["issuer"].as_str() {
+        validate_oauth_url("issuer", issuer)?;
+    }
+    if let Some(token_url) = config["token_url"].as_str() {
+        validate_oauth_url("token_url", token_url)?;
+    }
+    if let Some(userinfo_url) = config["userinfo_url"].as_str() {
+        validate_oauth_url("userinfo_url", userinfo_url)?;
+    }
+
+    let code_challenge = compute_code_challenge(code_verifier);
+
+    Ok(format!(
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&nonce={}",
+        authorization_endpoint.trim_end_matches('/'),
+        urlencoding::encode(client_id),
+        urlencoding::encode(&scope),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(state),
+        urlencoding::encode(&code_challenge),
+        urlencoding::encode(nonce),
+    ))
+}
+
+fn build_oauth2_authorization_url(
+    config: &serde_json::Value,
+    redirect_uri: &str,
+    state: &str,
+    code_verifier: &str,
+) -> Result<String, ServiceError> {
+    let authorization_url = config["authorization_url"]
+        .as_str()
+        .ok_or_else(|| ServiceError::InvalidArgument("missing authorization_url".into()))?;
+    let client_id = config["client_id"]
+        .as_str()
+        .ok_or_else(|| ServiceError::InvalidArgument("missing client_id".into()))?;
+    let scope = config["scopes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ServiceError::InvalidArgument("missing scopes".into()))?;
+
+    validate_oauth_url("authorization_url", authorization_url)?;
+    if let Some(token_url) = config["token_url"].as_str() {
+        validate_oauth_url("token_url", token_url)?;
+    }
+    if let Some(userinfo_url) = config["userinfo_url"].as_str() {
+        validate_oauth_url("userinfo_url", userinfo_url)?;
+    }
+
+    let code_challenge = compute_code_challenge(code_verifier);
+
+    Ok(format!(
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        authorization_url,
+        urlencoding::encode(client_id),
+        urlencoding::encode(&scope),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(state),
+        urlencoding::encode(&code_challenge),
+    ))
+}
+
+fn parse_saml_request_id(encoded_assertion: &str) -> Result<String, ServiceError> {
+    let saml_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded_assertion,
+    )
+    .map_err(|e| ServiceError::InvalidArgument(format!("base64: {e}")))?;
+    let saml_xml = String::from_utf8(saml_bytes)
+        .map_err(|e| ServiceError::InvalidArgument(format!("utf8: {e}")))?;
+
+    let doc = parse_secure(&saml_xml)
+        .map_err(|e| ServiceError::InvalidArgument(format!("saml parse: {e}")))?;
+    let response: SamlResponse = parse_saml::<SamlResponseRef>(&doc)
+        .map_err(|e| ServiceError::InvalidArgument(format!("saml response: {e}")))?
+        .to_owned();
+
+    response
+        .base
+        .in_response_to
+        .ok_or_else(|| ServiceError::InvalidArgument("unsolicited saml response".into()))
+}
+
 fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
     ctx.extensions()
         .get::<TenantId>()
         .map(|t| t.0.clone())
-        .ok_or_else(|| ServiceError::Unauthenticated("missing x-tenant-id".into()))
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
 }
 
+fn generate_code_verifier() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn compute_code_challenge(verifier: &str) -> String {
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn validate_oauth_url(name: &str, url: &str) -> Result<(), ServiceError> {
+    validate_upstream_url(url).map_err(|e| {
+        ServiceError::InvalidArgument(format!("{name} is not a valid upstream URL: {e}"))
+    })
+}
+
+#[allow(dead_code)]
 fn map_ory_error(err: sso_ory_client::error::OryClientError) -> ServiceError {
     use sso_ory_client::error::OryClientError;
     match err {
@@ -616,6 +1063,7 @@ fn json_web_key_to_proto(value: serde_json::Value) -> JSONWebKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::get};
     use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
     use gamlastan::core::assertion::name_id::NameId;
     use gamlastan::core::constants;
@@ -623,14 +1071,13 @@ mod tests {
     use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
     use gamlastan::security::InMemoryReplayCache;
     use gamlastan::xml::SamlSerialize;
-    use axum::{Json, Router, routing::get};
     use serde_json::json;
     use sso_ory_client::error::OryClientError;
     use sso_ory_client::kratos::KratosClient;
     use std::sync::Mutex;
 
     use crate::db::{
-        DbError, IdMappingRow, IdentitySchemaRow, SamlIdpKeyRow, SamlIdentityMappingRow,
+        DbError, IdMappingRow, IdentitySchemaRow, SamlIdentityMappingRow, SamlIdpKeyRow,
         SamlRequestRow,
     };
     use base64::Engine;
@@ -801,7 +1248,19 @@ mod tests {
                 .expect("request create stub not configured")
         }
 
-        async fn get(&self, _tenant_id: &str, _request_id: &str) -> Result<SamlRequestRow, DbError> {
+        async fn get(
+            &self,
+            _tenant_id: &str,
+            _request_id: &str,
+        ) -> Result<SamlRequestRow, DbError> {
+            self.get_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request get stub not configured")
+        }
+
+        async fn get_by_request_id(&self, _request_id: &str) -> Result<SamlRequestRow, DbError> {
             self.get_result
                 .lock()
                 .unwrap()
@@ -815,6 +1274,16 @@ mod tests {
             } else {
                 Err(DbError::SamlRequestNotFound)
             }
+        }
+
+        async fn create_inbound(
+            &self,
+            _tenant_id: &str,
+            _provider_id: &str,
+            _request_id: &str,
+            _ttl: std::time::Duration,
+        ) -> Result<(), DbError> {
+            Ok(())
         }
     }
 
@@ -1005,26 +1474,258 @@ mod tests {
         }
     }
 
-    fn service_with_stubs(
-        kratos: Arc<dyn FederationKratos>,
-        providers: Arc<dyn SamlProviderStore>,
-        requests: Arc<dyn SamlRequestStore>,
-        mappings: Arc<dyn IdMappingStore>,
-        federation_mappings: Arc<dyn SamlIdentityMappingStore>,
-        schemas: Arc<dyn IdentitySchemaStore>,
-        http: Arc<dyn FederationHydra>,
+    #[derive(Clone, Default)]
+    struct StubConnectionStore {
+        result: Arc<Mutex<Option<Result<crate::db::TenantConnectionRow, DbError>>>>,
+    }
+
+    impl StubConnectionStore {
+        fn queue(&self, result: Result<crate::db::TenantConnectionRow, DbError>) {
+            *self.result.lock().unwrap() = Some(result);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TenantConnectionStore for StubConnectionStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _connection_type: crate::db::ConnectionType,
+            _domain: &str,
+            _config: serde_json::Value,
+        ) -> Result<crate::db::TenantConnectionRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_by_domain(
+            &self,
+            _domain: &str,
+        ) -> Result<crate::db::TenantConnectionRow, DbError> {
+            Err(DbError::ConnectionNotFound)
+        }
+
+        async fn get_by_id(
+            &self,
+            _tenant_id: &str,
+            _id: &str,
+        ) -> Result<crate::db::TenantConnectionRow, DbError> {
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(DbError::ConnectionNotFound))
+        }
+
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<Vec<crate::db::TenantConnectionRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn update_config(
+            &self,
+            _tenant_id: &str,
+            _id: &str,
+            _config: serde_json::Value,
+        ) -> Result<crate::db::TenantConnectionRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn set_enabled(
+            &self,
+            _tenant_id: &str,
+            _id: &str,
+            _is_enabled: bool,
+        ) -> Result<crate::db::TenantConnectionRow, DbError> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubDomainStore;
+
+    #[derive(Clone, Default)]
+    struct StubLoginStateStore {
+        rows: Arc<Mutex<Vec<crate::db::LoginStateRow>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LoginStateStore for StubLoginStateStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _connection_id: &str,
+            connection_type: &str,
+            return_to: &str,
+            code_verifier: Option<String>,
+            nonce: Option<String>,
+            _ttl: std::time::Duration,
+        ) -> Result<crate::db::LoginStateRow, DbError> {
+            let row = crate::db::LoginStateRow {
+                state_token: "state-1".into(),
+                tenant_id: "tenant-1".into(),
+                connection_id: "conn-1".into(),
+                connection_type: connection_type.into(),
+                return_to: return_to.into(),
+                code_verifier,
+                nonce,
+                created_at: time::OffsetDateTime::now_utc(),
+                expires_at: time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(900),
+            };
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(row)
+        }
+
+        async fn get(&self, _state_token: &str) -> Result<crate::db::LoginStateRow, DbError> {
+            Err(DbError::LoginStateNotFound)
+        }
+
+        async fn delete(&self, _state_token: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TenantDomainStore for StubDomainStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _domain: &str,
+        ) -> Result<crate::db::TenantDomainRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_by_domain(
+            &self,
+            _domain: &str,
+        ) -> Result<crate::db::TenantDomainRow, DbError> {
+            Err(DbError::DomainNotFound)
+        }
+
+        async fn mark_verified(
+            &self,
+            _tenant_id: &str,
+            _id: &str,
+        ) -> Result<crate::db::TenantDomainRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<Vec<crate::db::TenantDomainRow>, DbError> {
+            Ok(vec![])
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StubIdentityProvisioner;
+
+    #[async_trait::async_trait]
+    impl IdentityProvisioner for StubIdentityProvisioner {
+        async fn provision(
+            &self,
+            tenant_id: &str,
+            _schema_id: &str,
+            claims: &serde_json::Value,
+        ) -> Result<ProvisionedIdentity, crate::identity_provisioner::ProvisionError> {
+            Ok(ProvisionedIdentity {
+                tenant_id: tenant_id.to_string(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: claims["email"]
+                    .as_str()
+                    .unwrap_or("alice@example.com")
+                    .to_string(),
+            })
+        }
+
+        async fn provision_saml(
+            &self,
+            tenant_id: &str,
+            _provider_id: &str,
+            _schema_id: &str,
+            _name_id: &str,
+            email: &str,
+            _email_verified: bool,
+            _trusted_provider: bool,
+        ) -> Result<ProvisionedIdentity, crate::identity_provisioner::ProvisionError> {
+            Ok(ProvisionedIdentity {
+                tenant_id: tenant_id.to_string(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: email.to_string(),
+            })
+        }
+    }
+
+    impl Default for FederationServiceImpl {
+        fn default() -> Self {
+            let connections: Arc<dyn TenantConnectionStore> =
+                Arc::new(StubConnectionStore::default());
+            let domains: Arc<dyn TenantDomainStore> = Arc::new(StubDomainStore);
+            let providers: Arc<dyn SamlProviderStore> = Arc::new(StubProviderStore::default());
+            let hrd = crate::hrd::Hrd::new(
+                connections.clone(),
+                domains.clone(),
+                providers.clone(),
+                "http://gateway".into(),
+            );
+            Self {
+                kratos: Arc::new(StubKratos::default()),
+                providers,
+                requests: Arc::new(StubRequestStore::default()),
+                mappings: Arc::new(StubMappingStore::default()),
+                federation_mappings: Arc::new(StubFederationMappingStore::default()),
+                schemas: Arc::new(StubSchemaStore::default()),
+                idp_keys: Arc::new(StubIdpKeys),
+                connections,
+                domains,
+                login_state: Arc::new(StubLoginStateStore::default()),
+                identity_provisioner: Arc::new(StubIdentityProvisioner),
+                hrd,
+                hydra_public_url: "http://hydra".into(),
+                public_base_url: "http://gateway".into(),
+                http: Arc::new(StubHydra::default()),
+                saml_signer: None,
+                sp_certificate_pem: None,
+                request_ttl: Duration::from_secs(900),
+                require_signed_assertions: false,
+                require_signed_responses: false,
+                replay_cache: Arc::new(InMemoryReplayCache::new()),
+            }
+        }
+    }
+
+    fn service_with_connection_and_login_state(
+        connections: Arc<dyn TenantConnectionStore>,
+        login_state: Arc<dyn LoginStateStore>,
     ) -> FederationServiceImpl {
+        let providers: Arc<dyn SamlProviderStore> = Arc::new(StubProviderStore::default());
+        let domains: Arc<dyn TenantDomainStore> = Arc::new(StubDomainStore);
+        let hrd = crate::hrd::Hrd::new(
+            connections.clone(),
+            domains.clone(),
+            providers.clone(),
+            "http://gateway".into(),
+        );
         FederationServiceImpl {
-            kratos,
+            kratos: Arc::new(StubKratos::default()),
             providers,
-            requests,
-            mappings,
-            federation_mappings,
-            schemas,
+            requests: Arc::new(StubRequestStore::default()),
+            mappings: Arc::new(StubMappingStore::default()),
+            federation_mappings: Arc::new(StubFederationMappingStore::default()),
+            schemas: Arc::new(StubSchemaStore::default()),
             idp_keys: Arc::new(StubIdpKeys),
+            connections,
+            domains,
+            login_state,
+            identity_provisioner: Arc::new(StubIdentityProvisioner),
+            hrd,
             hydra_public_url: "http://hydra".into(),
-            public_base_url: "http://gateway".into(),
-            http,
+            public_base_url: "https://gateway.example.com".into(),
+            http: Arc::new(StubHydra::default()),
             saml_signer: None,
             sp_certificate_pem: None,
             request_ttl: Duration::from_secs(900),
@@ -1249,7 +1950,7 @@ mod tests {
         // We do not need a real Postgres pool for generate_sp_metadata; any pool
         // value would do, so we create one pointing at localhost and accept that
         // it may fail to connect (the constructor only stores the pool).
-        let pool = crate::db::create_pool("postgres://localhost:5432/unused")
+        let pool = crate::db::create_pool("postgres://localhost:5432/unused", false)
             .await
             .unwrap_or_else(|_| {
                 use sqlx::PgPool;
@@ -1262,7 +1963,10 @@ mod tests {
             IdMappingRepo::new(pool.clone()),
             SamlIdentityMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool.clone()),
-            SamlIdpKeyRepo::new(pool),
+            SamlIdpKeyRepo::new(pool.clone()),
+            TenantConnectionRepo::new(pool.clone()),
+            TenantDomainRepo::new(pool.clone()),
+            LoginStateRepo::new(pool),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -1310,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_sp_metadata_with_certificate() {
         let cert_pem = include_str!("../../tests/fixtures/saml-test-cert.pem");
-        let pool = crate::db::create_pool("postgres://localhost:5432/unused")
+        let pool = crate::db::create_pool("postgres://localhost:5432/unused", false)
             .await
             .unwrap_or_else(|_| {
                 use sqlx::PgPool;
@@ -1323,7 +2027,10 @@ mod tests {
             IdMappingRepo::new(pool.clone()),
             SamlIdentityMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool.clone()),
-            SamlIdpKeyRepo::new(pool),
+            SamlIdpKeyRepo::new(pool.clone()),
+            TenantConnectionRepo::new(pool.clone()),
+            TenantDomainRepo::new(pool.clone()),
+            LoginStateRepo::new(pool),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -1363,7 +2070,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_federation_service_impl_new() {
-        let pool = crate::db::create_pool("postgres://localhost:5432/unused")
+        let pool = crate::db::create_pool("postgres://localhost:5432/unused", false)
             .await
             .unwrap_or_else(|_| {
                 use sqlx::PgPool;
@@ -1376,7 +2083,10 @@ mod tests {
             IdMappingRepo::new(pool.clone()),
             SamlIdentityMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool.clone()),
-            SamlIdpKeyRepo::new(pool),
+            SamlIdpKeyRepo::new(pool.clone()),
+            TenantConnectionRepo::new(pool.clone()),
+            TenantDomainRepo::new(pool.clone()),
+            LoginStateRepo::new(pool),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -1421,8 +2131,8 @@ mod tests {
         xml.insert_str(status_pos, &template);
 
         let key_pem = include_bytes!("../../tests/fixtures/saml-test-key.pem");
-        let key_manager = gamlastan::crypto::keys::build_idp_keys_manager(key_pem)
-            .expect("load saml test key");
+        let key_manager =
+            gamlastan::crypto::keys::build_idp_keys_manager(key_pem).expect("load saml test key");
         let signer = gamlastan::crypto::SamlSigner::new(key_manager);
         let signed_xml = signer.sign_enveloped(&xml).expect("sign saml response");
 
@@ -1454,15 +2164,10 @@ mod tests {
             }))))),
             ..Default::default()
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
-            Arc::new(StubProviderStore::default()),
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            hydra,
-        );
+        let service = FederationServiceImpl {
+            http: hydra,
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = GetOpenIDConfigurationRequest::default();
         svc_req!(request, proto_req, GetOpenIDConfigurationRequest);
@@ -1486,15 +2191,10 @@ mod tests {
             ))))),
             ..Default::default()
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
-            Arc::new(StubProviderStore::default()),
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            hydra,
-        );
+        let service = FederationServiceImpl {
+            http: hydra,
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = GetOpenIDConfigurationRequest::default();
         svc_req!(request, proto_req, GetOpenIDConfigurationRequest);
@@ -1523,15 +2223,10 @@ mod tests {
             }))))),
             ..Default::default()
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
-            Arc::new(StubProviderStore::default()),
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            hydra,
-        );
+        let service = FederationServiceImpl {
+            http: hydra,
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = GetJSONWebKeysRequest::default();
         svc_req!(request, proto_req, GetJSONWebKeysRequest);
@@ -1559,15 +2254,11 @@ mod tests {
             })))),
             ..Default::default()
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
             requests,
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = InitiateSamlLoginRequest {
             provider_id: provider.id.clone(),
@@ -1581,7 +2272,11 @@ mod tests {
             .await
             .expect("initiate login");
 
-        assert!(resp.body.redirect_url.contains("https://idp.example.com/sso"));
+        assert!(
+            resp.body
+                .redirect_url
+                .contains("https://idp.example.com/sso")
+        );
         assert!(!resp.body.request_id.is_empty());
     }
 
@@ -1590,15 +2285,10 @@ mod tests {
         let providers = Arc::new(StubProviderStore {
             provider: Arc::new(Mutex::new(Some(Err(DbError::SamlProviderNotFound)))),
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = InitiateSamlLoginRequest {
             provider_id: "missing".into(),
@@ -1621,15 +2311,10 @@ mod tests {
         let providers = Arc::new(StubProviderStore {
             provider: Arc::new(Mutex::new(Some(Ok(provider)))),
         });
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = InitiateSamlLoginRequest {
             provider_id: "provider-1".into(),
@@ -1645,7 +2330,7 @@ mod tests {
         assert_eq!(err.code, connectrpc::ErrorCode::Internal);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_accept_saml_assertion_existing_mapping() {
         let provider = test_provider();
         let request_id = "_request_123";
@@ -1683,15 +2368,13 @@ mod tests {
             get_by_schema_id_result: Arc::new(Mutex::new(Some(Ok(test_schema())))),
         });
 
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
             requests,
-            Arc::new(StubMappingStore::default()),
             federation_mappings,
             schemas,
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: encoded,
@@ -1710,7 +2393,7 @@ mod tests {
         assert!(resp.body.active);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_accept_saml_assertion_creates_new_identity() {
         let provider = test_provider();
         let request_id = "_request_123";
@@ -1763,15 +2446,15 @@ mod tests {
             create_identity_result: Arc::new(Mutex::new(Some(Ok(json!({"id": "ory-1"}))))),
         });
 
-        let service = service_with_stubs(
+        let service = FederationServiceImpl {
             kratos,
             providers,
             requests,
             mappings,
             federation_mappings,
             schemas,
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: encoded,
@@ -1790,15 +2473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_accept_saml_assertion_invalid_base64() {
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
-            Arc::new(StubProviderStore::default()),
-            Arc::new(StubRequestStore::default()),
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+        let service = FederationServiceImpl::default();
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: "not-valid-base64!!!".into(),
@@ -1835,15 +2510,11 @@ mod tests {
             ..Default::default()
         });
 
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
             requests,
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: encoded,
@@ -1880,15 +2551,11 @@ mod tests {
             ..Default::default()
         });
 
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
+        let service = FederationServiceImpl {
             providers,
             requests,
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: encoded,
@@ -1916,15 +2583,10 @@ mod tests {
             ..Default::default()
         });
 
-        let service = service_with_stubs(
-            Arc::new(StubKratos::default()),
-            Arc::new(StubProviderStore::default()),
+        let service = FederationServiceImpl {
             requests,
-            Arc::new(StubMappingStore::default()),
-            Arc::new(StubFederationMappingStore::default()),
-            Arc::new(StubSchemaStore::default()),
-            Arc::new(StubHydra::default()),
-        );
+            ..Default::default()
+        };
         let ctx = tenant_context("tenant-1");
         let proto_req = AcceptSamlAssertionRequest {
             encoded_assertion: encoded,
@@ -1938,6 +2600,214 @@ mod tests {
             .await
             .expect_err("should fail");
         assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    fn oidc_connection_row() -> crate::db::TenantConnectionRow {
+        crate::db::TenantConnectionRow {
+            id: "conn-oidc".into(),
+            tenant_id: "tenant-1".into(),
+            connection_type: crate::db::ConnectionType::Oidc,
+            domain: "idp.example.com".into(),
+            config: json!({
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "issuer": "https://idp.example.com",
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_url": "https://idp.example.com/token",
+                "userinfo_url": "https://idp.example.com/userinfo",
+                "scopes": ["openid", "profile"],
+            }),
+            is_enabled: true,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn oauth2_connection_row() -> crate::db::TenantConnectionRow {
+        crate::db::TenantConnectionRow {
+            id: "conn-oauth2".into(),
+            tenant_id: "tenant-1".into(),
+            connection_type: crate::db::ConnectionType::OAuth2,
+            domain: "idp.example.com".into(),
+            config: json!({
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "authorization_url": "https://idp.example.com/authorize",
+                "token_url": "https://idp.example.com/token",
+                "userinfo_url": "https://idp.example.com/userinfo",
+                "scopes": ["profile"],
+            }),
+            is_enabled: true,
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initiate_oidc_login_includes_pkce_and_nonce() {
+        let connections = Arc::new(StubConnectionStore::default());
+        connections.queue(Ok(oidc_connection_row()));
+        let login_state = Arc::new(StubLoginStateStore::default());
+        let service = service_with_connection_and_login_state(connections, login_state.clone());
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateOidcLoginRequest {
+            connection_id: "conn-oidc".into(),
+            return_to: "https://app.example.com".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateOidcLoginRequest);
+
+        let resp = service
+            .initiate_oidc_login(ctx, request)
+            .await
+            .expect("initiate oidc login");
+
+        let url = resp.body.authorization_url;
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("nonce="));
+        let rows = login_state.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].code_verifier.is_some());
+        assert!(rows[0].nonce.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_initiate_oauth2_login_includes_pkce() {
+        let connections = Arc::new(StubConnectionStore::default());
+        connections.queue(Ok(oauth2_connection_row()));
+        let login_state = Arc::new(StubLoginStateStore::default());
+        let service = service_with_connection_and_login_state(connections, login_state.clone());
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateOAuth2LoginRequest {
+            connection_id: "conn-oauth2".into(),
+            return_to: "https://app.example.com".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateOAuth2LoginRequest);
+
+        let resp = service
+            .initiate_o_auth2_login(ctx, request)
+            .await
+            .expect("initiate oauth2 login");
+
+        let url = resp.body.authorization_url;
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(!url.contains("nonce="));
+        let rows = login_state.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].code_verifier.is_some());
+        assert!(rows[0].nonce.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initiate_oidc_login_rejects_http_url() {
+        let mut row = oidc_connection_row();
+        row.config["issuer"] = "http://idp.example.com".into();
+        row.config["authorization_endpoint"] = "http://idp.example.com/authorize".into();
+        let connections = Arc::new(StubConnectionStore::default());
+        connections.queue(Ok(row));
+        let service = service_with_connection_and_login_state(
+            connections,
+            Arc::new(StubLoginStateStore::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateOidcLoginRequest {
+            connection_id: "conn-oidc".into(),
+            return_to: "https://app.example.com".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateOidcLoginRequest);
+
+        let err = service
+            .initiate_oidc_login(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_oauth2_login_rejects_loopback_url() {
+        let mut row = oauth2_connection_row();
+        row.config["authorization_url"] = "https://127.0.0.1/authorize".into();
+        let connections = Arc::new(StubConnectionStore::default());
+        connections.queue(Ok(row));
+        let service = service_with_connection_and_login_state(
+            connections,
+            Arc::new(StubLoginStateStore::default()),
+        );
+        let ctx = tenant_context("tenant-1");
+        let proto_req = InitiateOAuth2LoginRequest {
+            connection_id: "conn-oauth2".into(),
+            return_to: "https://app.example.com".into(),
+            ..Default::default()
+        };
+        svc_req!(request, proto_req, InitiateOAuth2LoginRequest);
+
+        let err = service
+            .initiate_o_auth2_login(ctx, request)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_compute_code_challenge_is_s256() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = compute_code_challenge(verifier);
+        // Known S256 test vector from RFC 7636 appendix B.
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn test_generate_code_verifier_and_nonce_are_random() {
+        let v1 = generate_code_verifier();
+        let v2 = generate_code_verifier();
+        assert_ne!(v1, v2);
+        assert!(!v1.is_empty());
+
+        let n1 = generate_nonce();
+        let n2 = generate_nonce();
+        assert_ne!(n1, n2);
+        assert!(!n1.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_process_saml_assertion_fail_closed_without_certificate() {
+        let mut provider = test_provider();
+        provider.idp_certificate_pem = None;
+        let request_id = "_request_123";
+        let response = build_test_response(request_id, &provider.sp_entity_id, &provider.acs_url);
+        let encoded = encode_saml_response(&response);
+
+        let providers = Arc::new(StubProviderStore {
+            provider: Arc::new(Mutex::new(Some(Ok(provider.clone())))),
+        });
+        let requests = Arc::new(StubRequestStore {
+            get_result: Arc::new(Mutex::new(Some(Ok(SamlRequestRow {
+                id: request_id.into(),
+                tenant_id: "tenant-1".into(),
+                provider_id: provider.id.clone(),
+                relay_state: "relay-1".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+            delete_ok: Arc::new(Mutex::new(true)),
+            ..Default::default()
+        });
+
+        let service = FederationServiceImpl {
+            providers,
+            requests,
+            require_signed_assertions: true,
+            ..Default::default()
+        };
+
+        let err = service
+            .process_saml_assertion("tenant-1", &provider, &encoded, request_id)
+            .await
+            .expect_err("should fail");
+        assert!(matches!(err, ServiceError::Configuration(_)));
     }
 
     async fn start_hydra_server() -> (tokio::task::JoinHandle<()>, String) {
@@ -1981,17 +2851,27 @@ mod tests {
     async fn test_reqwest_client_as_federation_hydra_hits_server() {
         let (_handle, url) = start_hydra_server().await;
         let client = reqwest::Client::new();
-        let discovery = client.fetch_discovery(&format!("{url}/.well-known/openid-configuration")).await.unwrap();
+        let discovery = client
+            .fetch_discovery(&format!("{url}/.well-known/openid-configuration"))
+            .await
+            .unwrap();
         assert_eq!(discovery["issuer"], "https://issuer.example.com");
 
-        let jwks = client.fetch_jwks(&format!("{url}/oauth2/jwks.json")).await.unwrap();
+        let jwks = client
+            .fetch_jwks(&format!("{url}/oauth2/jwks.json"))
+            .await
+            .unwrap();
         assert_eq!(jwks["keys"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn test_kratos_client_as_federation_kratos_delegates() {
-        let client = Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn FederationKratos>;
-        let err = client.create_identity(json!({"traits": {}})).await.unwrap_err();
+        let client =
+            Arc::new(KratosClient::new("http://localhost:1").unwrap()) as Arc<dyn FederationKratos>;
+        let err = client
+            .create_identity(json!({"traits": {}}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, OryClientError::Http(_)));
     }
 }

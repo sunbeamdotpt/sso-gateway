@@ -151,7 +151,8 @@ impl PermissionTupleStore for PgPermissionTupleStore {
         relation: &str,
         subject_id: &str,
     ) -> Result<PermissionTupleRow, DbError> {
-        self.create(tenant_id, namespace, object, relation, subject_id).await
+        self.create(tenant_id, namespace, object, relation, subject_id)
+            .await
     }
 
     async fn get(&self, tenant_id: &str, id: &str) -> Result<PermissionTupleRow, DbError> {
@@ -240,16 +241,28 @@ mod tests {
         let by_ns = store.list(&tenant, Some("app"), None, None).await.unwrap();
         assert_eq!(by_ns.len(), 1);
 
-        let by_obj = store.list(&tenant, None, Some("doc-1"), None).await.unwrap();
+        let by_obj = store
+            .list(&tenant, None, Some("doc-1"), None)
+            .await
+            .unwrap();
         assert_eq!(by_obj.len(), 1);
 
-        let by_rel = store.list(&tenant, None, None, Some("owner")).await.unwrap();
+        let by_rel = store
+            .list(&tenant, None, None, Some("owner"))
+            .await
+            .unwrap();
         assert_eq!(by_rel.len(), 1);
 
-        let combined = store.list(&tenant, Some("app"), Some("doc-1"), Some("owner")).await.unwrap();
+        let combined = store
+            .list(&tenant, Some("app"), Some("doc-1"), Some("owner"))
+            .await
+            .unwrap();
         assert_eq!(combined.len(), 1);
 
-        let no_match = store.list(&tenant, Some("other"), None, None).await.unwrap();
+        let no_match = store
+            .list(&tenant, Some("other"), None, None)
+            .await
+            .unwrap();
         assert!(no_match.is_empty());
 
         store.delete(&tenant, &created.id).await.unwrap();
@@ -274,7 +287,13 @@ mod tests {
             store.delete(&tenant, "missing").await.unwrap_err(),
             DbError::TupleNotFound
         ));
-        assert!(store.list(&tenant, None, None, None).await.unwrap().is_empty());
+        assert!(
+            store
+                .list(&tenant, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -284,9 +303,15 @@ mod tests {
         create_test_tenant(&pool, &tenant).await;
         let store: Arc<dyn PermissionTupleStore> = Arc::new(PgPermissionTupleStore::new(pool));
 
-        let created = store.create(&tenant, "ns", "obj", "rel", "sub").await.unwrap();
+        let created = store
+            .create(&tenant, "ns", "obj", "rel", "sub")
+            .await
+            .unwrap();
         assert!(store.get(&tenant, &created.id).await.is_ok());
-        assert_eq!(store.list(&tenant, None, None, None).await.unwrap().len(), 1);
+        assert_eq!(
+            store.list(&tenant, None, None, None).await.unwrap().len(),
+            1
+        );
         assert!(store.delete(&tenant, &created.id).await.is_ok());
     }
 }

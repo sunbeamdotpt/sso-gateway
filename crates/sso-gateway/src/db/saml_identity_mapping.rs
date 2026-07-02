@@ -230,7 +230,12 @@ mod tests {
             .create(&tenant, &provider, "nameid-2", "public-2", "ory-2")
             .await
             .unwrap();
-        assert!(store.get_by_name_id(&tenant, &provider, "nameid-2").await.is_ok());
+        assert!(
+            store
+                .get_by_name_id(&tenant, &provider, "nameid-2")
+                .await
+                .is_ok()
+        );
         assert_eq!(created.identity_public_id, "public-2");
     }
 }
