@@ -1,0 +1,11 @@
+[advisories]
+# RUSTSEC-2023-0071: Marvin Attack: potential key recovery through timing sidechannels.
+#
+# The `rsa` crate is pulled in transitively via bergshamra/gamlastan. The gateway
+# does not use RSA decryption: SAML encrypted assertions are explicitly disabled
+# (`require_encrypted_assertions = false`) and only RSA signature verification is
+# performed. Marvin is a decryption timing attack, so this path is not reachable.
+#
+# Revisit once a fixed `rsa` version is published or gamlastan/bergshamra move to
+# a different RSA backend.
+ignore = ["RUSTSEC-2023-0071"]
