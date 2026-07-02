@@ -1,217 +1,178 @@
-use async_trait::async_trait;
 use axum::{
     Extension,
     body::Body,
     extract::Request,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use connectrpc::RequestContext;
-use serde_json::Value;
-
-use crate::db::{AuditLogRepo, DbError, IdMappingRepo, IdMappingStore, TenantApiKeyRepo, TenantApiKeyStore};
-use sso_ory_client::{KratosClient, error::OryClientError};
 use std::sync::Arc;
-use sunbeam_g2v::error::ServiceError;
+
+use crate::auth::{
+    AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_tenant_from_subject,
+};
+use crate::db::{AuditLogRepo, IdMappingStore, SessionStore};
+use crate::session_token::SessionTokenSigner;
 
 pub const TENANT_ID_HEADER: &str = "x-tenant-id";
-pub const API_KEY_HEADER: &str = "x-api-key";
 
 #[derive(Clone, Debug)]
 pub struct TenantId(pub String);
 
-#[derive(Clone, Debug)]
-pub struct ApiKeyContext {
-    pub key_id: String,
-    pub tenant_id: String,
-    pub scopes: Vec<String>,
-}
-
-#[async_trait]
-trait SessionClient: Send + Sync {
-    async fn to_session(
-        &self,
-        cookie: Option<&str>,
-        token: Option<&str>,
-    ) -> Result<Value, OryClientError>;
-}
-
-#[async_trait]
-impl SessionClient for KratosClient {
-    async fn to_session(
-        &self,
-        cookie: Option<&str>,
-        token: Option<&str>,
-    ) -> Result<Value, OryClientError> {
-        self.to_session(cookie, token).await
+/// Public paths that skip the shared bearer-token middleware.
+///
+/// These endpoints perform their own protocol-level authentication (OAuth2
+/// client credentials, SAML assertions, OIDC discovery) or are discovery
+/// documents.
+fn is_public_path(path: &str) -> bool {
+    match path {
+        "/.well-known/openid-configuration" | "/.well-known/jwks.json" => true,
+        "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" => true,
+        "/saml/metadata" | "/saml/acs" | "/saml/sso" => true,
+        "/callbacks/oidc" | "/callbacks/oauth2" => true,
+        "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
+        "/health" | "/health/ready" | "/health/live" => true,
+        _ => path.starts_with("/oauth2/device/"),
     }
 }
 
-fn is_public_path(path: &str) -> bool {
-    path.starts_with("/.well-known/")
-        || path.starts_with("/oauth2/")
-        || path.starts_with("/scim/")
-        || path.starts_with("/saml/")
-}
+const SESSION_COOKIE_NAME: &str = "__Host-sso_session";
 
 pub async fn auth_middleware(
-    Extension(api_keys): Extension<TenantApiKeyRepo>,
-    Extension(kratos): Extension<Arc<KratosClient>>,
-    Extension(mappings): Extension<IdMappingRepo>,
+    Extension(introspector): Extension<Arc<dyn TokenIntrospector>>,
+    Extension(mappings): Extension<Arc<dyn IdMappingStore>>,
+    Extension(session_signer): Extension<SessionTokenSigner>,
+    Extension(session_store): Extension<Arc<dyn SessionStore>>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    // Public OAuth2/OIDC discovery and browser flows perform their own tenant
-    // validation (via client_id or explicit x-tenant-id in handlers).
     if is_public_path(path) {
         return next.run(request).await;
     }
 
-    let api_key_value = request
-        .headers()
-        .get(API_KEY_HEADER)
-        .and_then(|v| v.to_str().ok());
+    let auth_result = if let Some(token) = bearer_token(request.headers()) {
+        authenticate_bearer_token(introspector.as_ref(), mappings.as_ref(), &token).await
+    } else if let Some(cookie) = session_cookie(request.headers()) {
+        authenticate_session_cookie(&session_signer, session_store.as_ref(), cookie).await
+    } else {
+        return auth_error(StatusCode::UNAUTHORIZED);
+    };
 
-    if let Some(key) = api_key_value {
-        match authenticate_api_key(&api_keys, key).await {
-            Ok(ctx) => {
-                request
-                    .extensions_mut()
-                    .insert(TenantId(ctx.tenant_id.clone()));
-                request.extensions_mut().insert(ctx);
-            }
-            Err(resp) => return *resp,
+    match auth_result {
+        Ok(ctx) => {
+            request
+                .extensions_mut()
+                .insert(TenantId(ctx.tenant_id.clone()));
+            request.extensions_mut().insert(AuthOutcome::Success);
+            request.extensions_mut().insert(ctx);
         }
-        return next.run(request).await;
-    }
-
-    let cookie_value = request
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok());
-
-    if let Some(cookie) = cookie_value {
-        match authenticate_session_cookie(kratos.as_ref(), &mappings, cookie).await {
-            Ok(tenant_id) => {
-                request.extensions_mut().insert(TenantId(tenant_id));
-                return next.run(request).await;
-            }
-            Err(resp) => return *resp,
-        }
-    }
-
-    let tenant_value = request
-        .headers()
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok());
-
-    match tenant_value {
-        Some(value) => match parse_tenant_id(value) {
-            Ok(tenant_id) => {
-                request.extensions_mut().insert(TenantId(tenant_id));
-            }
-            Err(resp) => return *resp,
-        },
-        None => {
-            return auth_error(
-                StatusCode::UNAUTHORIZED,
-                "missing x-tenant-id or x-api-key header",
-            );
+        Err(resp) => {
+            request.extensions_mut().insert(AuthOutcome::Failure);
+            return *resp;
         }
     }
 
     next.run(request).await
 }
 
+/// Outcome of authentication, recorded by the audit middleware.
+#[derive(Clone, Debug)]
+pub enum AuthOutcome {
+    Success,
+    Failure,
+}
+
+/// Extract the gateway session cookie value, if present.
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                if name == SESSION_COOKIE_NAME {
+                    Some(value.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
 async fn authenticate_session_cookie(
-    client: &dyn SessionClient,
-    mappings: &dyn IdMappingStore,
-    cookie: &str,
-) -> Result<String, Box<Response>> {
-    let session = client.to_session(Some(cookie), None).await.map_err(|_| {
-        Box::new(auth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired session cookie",
-        ))
+    signer: &SessionTokenSigner,
+    session_store: &dyn SessionStore,
+    cookie: String,
+) -> Result<AuthContext, Box<Response>> {
+    let claims = signer.verify(&cookie).map_err(|err| {
+        tracing::debug!(%err, "session cookie verification failed");
+        Box::new(auth_error(StatusCode::UNAUTHORIZED))
     })?;
 
-    let ory_identity_id = session["identity"]["id"].as_str().unwrap_or("");
+    let active = session_store.is_active(&claims.sid).await.map_err(|err| {
+        tracing::warn!(%err, "session store lookup failed");
+        Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR))
+    })?;
 
-    if ory_identity_id.is_empty() {
-        return Err(Box::new(auth_error(
-            StatusCode::UNAUTHORIZED,
-            "session missing identity",
-        )));
+    if !active {
+        return Err(Box::new(auth_error(StatusCode::UNAUTHORIZED)));
     }
 
-    let tenant_id = mappings
-        .get_tenant_id_by_ory_id("kratos", ory_identity_id)
+    Ok(build_auth_context(
+        claims.tenant_id,
+        claims.sub,
+        vec![],
+        &cookie,
+    ))
+}
+
+async fn authenticate_bearer_token(
+    introspector: &dyn TokenIntrospector,
+    mappings: &dyn IdMappingStore,
+    token: &str,
+) -> Result<AuthContext, Box<Response>> {
+    let introspection = introspector.introspect(token).await.map_err(|err| {
+        tracing::debug!(%err, "token introspection failed");
+        Box::new(auth_error(StatusCode::UNAUTHORIZED))
+    })?;
+
+    if !introspection.active {
+        return Err(Box::new(auth_error(StatusCode::UNAUTHORIZED)));
+    }
+
+    let subject = introspection.sub.ok_or_else(|| {
+        tracing::debug!("introspection response missing subject");
+        Box::new(auth_error(StatusCode::UNAUTHORIZED))
+    })?;
+
+    let tenant_id = resolve_tenant_from_subject(mappings, &subject)
         .await
-        .map_err(|_| {
-            Box::new(auth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to resolve tenant",
-            ))
-        })?
-        .ok_or_else(|| {
-            Box::new(auth_error(
-                StatusCode::UNAUTHORIZED,
-                "identity not registered",
-            ))
+        .map_err(|err| {
+            tracing::debug!(%err, "failed to resolve tenant for subject");
+            match err {
+                crate::auth::AuthError::UnknownSubject => {
+                    Box::new(auth_error(StatusCode::UNAUTHORIZED))
+                }
+                _ => Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR)),
+            }
         })?;
 
-    Ok(tenant_id)
+    Ok(build_auth_context(
+        tenant_id,
+        subject,
+        introspection.scope,
+        token,
+    ))
 }
 
-async fn authenticate_api_key(
-    repo: &dyn TenantApiKeyStore,
-    key: &str,
-) -> Result<ApiKeyContext, Box<Response>> {
-    let hash = hash_api_key(key);
-    match repo.get_by_hash(&hash).await {
-        Ok(row) => Ok(ApiKeyContext {
-            key_id: row.id,
-            tenant_id: row.tenant_id,
-            scopes: row.scopes,
-        }),
-        Err(DbError::ApiKeyNotFound) => Err(Box::new(auth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired api key",
-        ))),
-        Err(_) => Err(Box::new(auth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to authenticate api key",
-        ))),
-    }
-}
-
-pub fn hash_api_key(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn parse_tenant_id(value: &str) -> Result<String, Box<Response>> {
-    if value.is_empty() {
-        return Err(Box::new(auth_error(
-            StatusCode::BAD_REQUEST,
-            "missing tenant id",
-        )));
-    }
-    if ulid::Ulid::from_string(value).is_err() {
-        return Err(Box::new(auth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid tenant id",
-        )));
-    }
-    Ok(value.to_string())
-}
-
-fn auth_error(status: StatusCode, message: &'static str) -> Response {
-    let body = Body::from(format!("{{\"error\":\"{message}\"}}"));
+pub fn auth_error(status: StatusCode) -> Response {
+    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        "internal server error"
+    } else {
+        "unauthorized"
+    };
+    let body = Body::from(format!("{{\"error\":\"{}\"}}", message));
     (
         status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -238,8 +199,9 @@ pub async fn audit_middleware(
 ) -> Response {
     let tenant_id = request
         .extensions()
-        .get::<TenantId>()
-        .map(|t| t.0.clone())
+        .get::<AuthContext>()
+        .map(|c| c.tenant_id.clone())
+        .or_else(|| request.extensions().get::<TenantId>().map(|t| t.0.clone()))
         .or_else(|| {
             request
                 .headers()
@@ -249,8 +211,8 @@ pub async fn audit_middleware(
         });
     let actor = request
         .extensions()
-        .get::<ApiKeyContext>()
-        .map(|c| c.key_id.clone());
+        .get::<AuthContext>()
+        .map(|c| c.subject.clone());
     let method = request.method().to_string();
     let resource = request.uri().path().to_string();
 
@@ -283,98 +245,163 @@ pub async fn audit_middleware(
     response
 }
 
-/// Require a scope when the request was authenticated with an API key.
-/// Requests that only supplied `X-Tenant-Id` (e.g. bootstrap) bypass scope checks.
-pub fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceError> {
-    if let Some(api_key) = ctx.extensions().get::<ApiKeyContext>()
-        && !api_key.scopes.iter().any(|s| s == scope)
-    {
-        return Err(ServiceError::PermissionDenied(format!(
-            "missing required scope: {scope}"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{IdMappingRow, TenantApiKeyRow};
+    use crate::auth::IntrospectionResult;
+    use crate::session_token::SessionTokenSigner;
+    use axum::{Extension, Router, body::Body, http::Request, middleware::from_fn, routing::get};
     use std::sync::Mutex;
+    use tower::ServiceExt;
 
-    #[test]
-    fn hash_api_key_is_deterministic_and_hex() {
-        let h1 = hash_api_key("my-secret-key");
-        let h2 = hash_api_key("my-secret-key");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64);
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+    struct StubIntrospector(Mutex<Option<Result<IntrospectionResult, crate::auth::AuthError>>>);
+
+    #[async_trait::async_trait]
+    impl TokenIntrospector for StubIntrospector {
+        async fn introspect(
+            &self,
+            _token: &str,
+        ) -> Result<IntrospectionResult, crate::auth::AuthError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(crate::auth::AuthError::InactiveToken))
+        }
+    }
+
+    struct StubSessionStore(Mutex<Option<Result<bool, crate::db::DbError>>>);
+
+    #[async_trait::async_trait]
+    impl SessionStore for StubSessionStore {
+        async fn create(
+            &self,
+            _session_id: &str,
+            _sub: &str,
+            _tenant_id: &str,
+            _amr: &str,
+            _expires_at: time::OffsetDateTime,
+        ) -> Result<(), crate::db::DbError> {
+            Ok(())
+        }
+
+        async fn is_active(&self, _session_id: &str) -> Result<bool, crate::db::DbError> {
+            self.0.lock().unwrap().take().unwrap_or(Ok(true))
+        }
+
+        async fn revoke(&self, _session_id: &str) -> Result<(), crate::db::DbError> {
+            Ok(())
+        }
+
+        async fn revoke_all_for_subject(&self, _sub: &str) -> Result<(), crate::db::DbError> {
+            Ok(())
+        }
+    }
+
+    struct StubMappingStore(Mutex<Option<Result<Option<String>, crate::db::DbError>>>);
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            self.0.lock().unwrap().take().unwrap_or(Ok(None))
+        }
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn test_router(
+        introspector: Arc<dyn TokenIntrospector>,
+        mappings: Arc<dyn IdMappingStore>,
+    ) -> Router {
+        Router::new()
+            .route("/protected", get(ok_handler))
+            .route("/.well-known/openid-configuration", get(ok_handler))
+            .route("/oauth2/auth", get(ok_handler))
+            .layer(from_fn(auth_middleware))
+            .layer(Extension(introspector))
+            .layer(Extension(SessionTokenSigner::new(
+                "test-secret-that-is-at-least-32-bytes-long",
+                3600,
+                "https://gateway.example.com",
+            )))
+            .layer(Extension(
+                Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
+            ))
+            .layer(Extension(mappings))
     }
 
     #[test]
-    fn hash_api_key_differs_for_different_keys() {
-        let h1 = hash_api_key("key-one");
-        let h2 = hash_api_key("key-two");
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn parse_tenant_id_accepts_valid_ulid() {
-        let valid = ulid::Ulid::new().to_string();
-        assert_eq!(parse_tenant_id(&valid).unwrap(), valid);
-    }
-
-    #[test]
-    fn parse_tenant_id_rejects_empty() {
-        let err = parse_tenant_id("").unwrap_err();
-        let resp = *err;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn parse_tenant_id_rejects_invalid_ulid() {
-        let err = parse_tenant_id("not-a-ulid").unwrap_err();
-        let resp = *err;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn require_scope_allows_when_no_api_key_context() {
-        let ctx = RequestContext::default();
-        assert!(require_scope(&ctx, "tenant:write").is_ok());
-    }
-
-    #[test]
-    fn require_scope_enforces_scope_for_api_key() {
-        let mut ctx = RequestContext::default();
-        ctx.extensions_mut().insert(ApiKeyContext {
-            key_id: "key-1".to_string(),
-            tenant_id: "tenant-1".to_string(),
-            scopes: vec!["tenant:read".to_string()],
-        });
-        assert!(require_scope(&ctx, "tenant:read").is_ok());
-        let err = require_scope(&ctx, "tenant:write").unwrap_err();
-        assert!(matches!(err, ServiceError::PermissionDenied(_)));
-    }
-
-    #[test]
-    fn auth_error_builds_json_response() {
-        let resp = auth_error(StatusCode::FORBIDDEN, "no");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .unwrap(),
-            "application/json"
-        );
-    }
-
-    #[test]
-    fn is_public_path_matches_public_prefixes() {
+    fn is_public_path_matches_public_routes() {
         assert!(is_public_path("/.well-known/openid-configuration"));
+        assert!(is_public_path("/.well-known/jwks.json"));
         assert!(is_public_path("/oauth2/auth"));
-        assert!(is_public_path("/scim/v2/Users"));
+        assert!(is_public_path("/oauth2/token"));
+        assert!(is_public_path("/oauth2/device/auth"));
+        assert!(is_public_path("/oauth2/revoke"));
+        assert!(!is_public_path("/oauth2/introspect"));
+        assert!(is_public_path("/oauth2/userinfo"));
         assert!(is_public_path("/saml/metadata"));
+        assert!(is_public_path("/saml/acs"));
+        assert!(is_public_path("/saml/sso"));
+        assert!(is_public_path("/callbacks/oidc"));
+        assert!(is_public_path("/callbacks/oauth2"));
+        assert!(is_public_path("/scim/v2/ServiceProviderConfig"));
+        assert!(is_public_path("/scim/v2/ResourceTypes"));
+        assert!(is_public_path("/scim/v2/Schemas"));
+        assert!(is_public_path("/health"));
+        assert!(is_public_path("/health/ready"));
+        assert!(is_public_path("/health/live"));
         assert!(!is_public_path("/iam/v1/tenants"));
     }
 
@@ -384,374 +411,189 @@ mod tests {
         assert_eq!(metadata["status"], 201);
     }
 
-    struct StubApiKeyStore(Mutex<Option<Result<TenantApiKeyRow, DbError>>>);
-
-    #[async_trait]
-    impl TenantApiKeyStore for StubApiKeyStore {
-        async fn create(
-            &self,
-            _tenant_id: &str,
-            _name: &str,
-            _key_hash: &str,
-            _scopes: &[String],
-            _expires_at: Option<time::OffsetDateTime>,
-        ) -> Result<TenantApiKeyRow, DbError> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Err(DbError::ApiKeyNotFound))
-        }
-
-        async fn get_by_hash(&self, _key_hash: &str) -> Result<TenantApiKeyRow, DbError> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Err(DbError::ApiKeyNotFound))
-        }
-    }
-
-    fn dummy_api_key_row() -> TenantApiKeyRow {
-        TenantApiKeyRow {
-            id: "key-1".into(),
-            tenant_id: "tenant-1".into(),
-            key_hash: hash_api_key("secret"),
-            name: "test".into(),
-            scopes: vec!["tenant:read".into()],
-            expires_at: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            updated_at: time::OffsetDateTime::now_utc(),
-        }
-    }
-
     #[tokio::test]
-    async fn authenticate_api_key_returns_context_for_valid_key() {
-        let repo = StubApiKeyStore(Mutex::new(Some(Ok(dummy_api_key_row()))));
-        let ctx = authenticate_api_key(&repo, "secret").await.unwrap();
-        assert_eq!(ctx.key_id, "key-1");
-        assert_eq!(ctx.tenant_id, "tenant-1");
-        assert_eq!(ctx.scopes, vec!["tenant:read".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn authenticate_api_key_returns_unauthorized_for_unknown_key() {
-        let repo = StubApiKeyStore(Mutex::new(Some(Err(DbError::ApiKeyNotFound))));
-        let err = authenticate_api_key(&repo, "secret").await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn authenticate_api_key_returns_internal_for_db_error() {
-        let repo =
-            StubApiKeyStore(Mutex::new(Some(Err(DbError::Sqlx(sqlx::Error::PoolTimedOut)))));
-        let err = authenticate_api_key(&repo, "secret").await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    struct StubSessionClient(Mutex<Option<Result<Value, OryClientError>>>);
-
-    #[async_trait]
-    impl SessionClient for StubSessionClient {
-        async fn to_session(
-            &self,
-            _cookie: Option<&str>,
-            _token: Option<&str>,
-        ) -> Result<Value, OryClientError> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Err(OryClientError::MissingTenant))
-        }
-    }
-
-    struct StubIdMappingStore(Mutex<Option<Result<Option<String>, DbError>>>);
-
-    #[async_trait]
-    impl IdMappingStore for StubIdMappingStore {
-        async fn create(
-            &self,
-            _tenant_id: &str,
-            _backend: &str,
-            _public_id: &str,
-            _ory_global_id: &str,
-        ) -> Result<IdMappingRow, DbError> {
-            Ok(IdMappingRow {
-                id: "m1".into(),
-                tenant_id: "tenant-1".into(),
-                backend: "kratos".into(),
-                public_id: "pub".into(),
-                ory_global_id: "ory".into(),
-                created_at: time::OffsetDateTime::now_utc(),
-            })
-        }
-
-        async fn get_ory_id(
-            &self,
-            _tenant_id: &str,
-            _backend: &str,
-            _public_id: &str,
-        ) -> Result<String, DbError> {
-            Ok("ory".into())
-        }
-
-        async fn get_public_id(
-            &self,
-            _tenant_id: &str,
-            _backend: &str,
-            _ory_global_id: &str,
-        ) -> Result<String, DbError> {
-            Ok("pub".into())
-        }
-
-        async fn delete(
-            &self,
-            _tenant_id: &str,
-            _backend: &str,
-            _public_id: &str,
-        ) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn list_public_ids(
-            &self,
-            _tenant_id: &str,
-            _backend: &str,
-        ) -> Result<Vec<String>, DbError> {
-            Ok(vec![])
-        }
-
-        async fn get_tenant_id_by_ory_id(
-            &self,
-            _backend: &str,
-            _ory_global_id: &str,
-        ) -> Result<Option<String>, DbError> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Ok(None))
-        }
-    }
-
-    fn session_with_identity(id: &str) -> Value {
-        serde_json::json!({
-            "id": "session-1",
-            "identity": { "id": id }
-        })
-    }
-
-    #[tokio::test]
-    async fn authenticate_session_cookie_resolves_registered_identity() {
-        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
-        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(Some("tenant-1".into())))));
-        let tenant = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+    async fn public_path_bypasses_auth() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(tenant, "tenant-1");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn authenticate_session_cookie_rejects_invalid_session() {
-        let client = StubSessionClient(Mutex::new(Some(Err(OryClientError::Ory {
-            status: 401,
-            message: "no session".into(),
-        }))));
-        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
-        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+    async fn missing_token_or_cookie_returns_unauthorized() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
             .await
-            .unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn authenticate_session_cookie_rejects_missing_identity() {
-        let client = StubSessionClient(Mutex::new(Some(Ok(serde_json::json!({ "identity": {} })))));
-        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
-        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+    async fn valid_session_cookie_authenticates() {
+        let signer = SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        );
+        let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Cookie", format!("__Host-sso_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn authenticate_session_cookie_rejects_unregistered_identity() {
-        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
-        let mappings = StubIdMappingStore(Mutex::new(Some(Ok(None))));
-        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+    async fn invalid_session_cookie_returns_unauthorized() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Cookie", "__Host-sso_session=not-a-valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn authenticate_session_cookie_returns_internal_for_mapping_db_error() {
-        let client = StubSessionClient(Mutex::new(Some(Ok(session_with_identity("identity-1")))));
-        let mappings = StubIdMappingStore(Mutex::new(Some(Err(DbError::Sqlx(
-            sqlx::Error::PoolTimedOut,
-        )))));
-        let err = authenticate_session_cookie(&client, &mappings, "ory_session=abc")
+    async fn revoked_session_cookie_returns_unauthorized() {
+        let signer = SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        );
+        let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
+        let router = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(from_fn(auth_middleware))
+            .layer(Extension(
+                Arc::new(StubIntrospector(Mutex::new(None))) as Arc<dyn TokenIntrospector>
+            ))
+            .layer(Extension(SessionTokenSigner::new(
+                "test-secret-that-is-at-least-32-bytes-long",
+                3600,
+                "https://gateway.example.com",
+            )))
+            .layer(Extension(
+                Arc::new(StubSessionStore(Mutex::new(Some(Ok(false))))) as Arc<dyn SessionStore>,
+            ))
+            .layer(Extension(
+                Arc::new(StubMappingStore(Mutex::new(None))) as Arc<dyn IdMappingStore>
+            ));
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Cookie", format!("__Host-sso_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap_err();
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    mod middleware_integration {
-        use axum::{Router, body::Body, http::Request, middleware::from_fn, routing::get};
-        use tower::ServiceExt;
+    #[tokio::test]
+    async fn valid_token_authenticates() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+                IntrospectionResult {
+                    active: true,
+                    sub: Some("sub-1".into()),
+                    scope: vec!["tenant:read".into()],
+                    exp: None,
+                },
+            ))))),
+            Arc::new(StubMappingStore(Mutex::new(Some(Ok(Some(
+                "tenant-1".into(),
+            )))))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
-        use super::*;
-        use crate::{
-            db::{IdMappingRepo, TenantApiKeyRepo},
-            test_support::{create_test_tenant, postgres_pool},
-        };
+    #[tokio::test]
+    async fn inactive_token_returns_unauthorized() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+                IntrospectionResult {
+                    active: false,
+                    sub: Some("sub-1".into()),
+                    scope: vec![],
+                    exp: None,
+                },
+            ))))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Authorization", "Bearer invalid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 
-        async fn ok_handler() -> &'static str {
-            "ok"
-        }
-
-        fn api_key_router(
-            api_keys: TenantApiKeyRepo,
-            kratos: Arc<KratosClient>,
-            mappings: IdMappingRepo,
-        ) -> Router {
-            Router::new()
-                .route("/", get(ok_handler))
-                .route("/protected", get(ok_handler))
-                .route("/.well-known/openid-configuration", get(ok_handler))
-                .layer(from_fn(auth_middleware))
-                .layer(Extension(api_keys))
-                .layer(Extension(kratos))
-                .layer(Extension(mappings))
-        }
-
-        #[tokio::test]
-        async fn public_path_bypasses_auth() {
-            let router = api_key_router(
-                TenantApiKeyRepo::new(postgres_pool().await),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(Request::get("/.well-known/openid-configuration").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn missing_auth_returns_unauthorized() {
-            let router = api_key_router(
-                TenantApiKeyRepo::new(postgres_pool().await),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        #[tokio::test]
-        async fn valid_api_key_authenticates() {
-            let pool = postgres_pool().await;
-            let tenant = format!("tenant-{}", ulid::Ulid::new());
-            create_test_tenant(&pool, &tenant).await;
-            let api_keys = TenantApiKeyRepo::new(pool);
-            api_keys
-                .create(&tenant, "test-key", &hash_api_key("secret"), &["tenant:read".to_string()], None)
-                .await
-                .unwrap();
-
-            let router = api_key_router(
-                api_keys.clone(),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(
-                    Request::get("/protected")
-                        .header(API_KEY_HEADER, "secret")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn invalid_api_key_returns_unauthorized() {
-            let router = api_key_router(
-                TenantApiKeyRepo::new(postgres_pool().await),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(
-                    Request::get("/protected")
-                        .header(API_KEY_HEADER, "bad-secret")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        #[tokio::test]
-        async fn valid_tenant_header_authenticates() {
-            let tenant = ulid::Ulid::new().to_string();
-            let router = api_key_router(
-                TenantApiKeyRepo::new(postgres_pool().await),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(
-                    Request::get("/protected")
-                        .header(TENANT_ID_HEADER, &tenant)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn invalid_tenant_header_returns_bad_request() {
-            let router = api_key_router(
-                TenantApiKeyRepo::new(postgres_pool().await),
-                Arc::new(KratosClient::new("http://127.0.0.1:4434").unwrap()),
-                IdMappingRepo::new(postgres_pool().await),
-            );
-            let response = router
-                .oneshot(
-                    Request::get("/protected")
-                        .header(TENANT_ID_HEADER, "not-a-ulid")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn audit_middleware_records_and_returns_ok() {
-            let audit = AuditLogRepo::new(postgres_pool().await);
-            let router = Router::new()
-                .route("/", get(ok_handler))
-                .layer(from_fn(audit_middleware))
-                .layer(Extension(audit));
-            let response = router
-                .oneshot(Request::get("/").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
+    #[tokio::test]
+    async fn unknown_subject_returns_unauthorized() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+                IntrospectionResult {
+                    active: true,
+                    sub: Some("sub-1".into()),
+                    scope: vec!["tenant:read".into()],
+                    exp: None,
+                },
+            ))))),
+            Arc::new(StubMappingStore(Mutex::new(Some(Ok(None))))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

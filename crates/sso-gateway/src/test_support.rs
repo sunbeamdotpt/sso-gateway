@@ -24,6 +24,17 @@ fn ensure_lima_docker() {
             );
         }
     }
+    // Tests use testcontainers with sslmode=disable and need forgiving pool
+    // defaults to avoid timeouts on the shared Postgres container.
+    if std::env::var("DATABASE_SSL_REQUIRED").is_err() {
+        unsafe { std::env::set_var("DATABASE_SSL_REQUIRED", "false") };
+    }
+    if std::env::var("DATABASE_MAX_CONNECTIONS").is_err() {
+        unsafe { std::env::set_var("DATABASE_MAX_CONNECTIONS", "5") };
+    }
+    if std::env::var("DATABASE_ACQUIRE_TIMEOUT_SECONDS").is_err() {
+        unsafe { std::env::set_var("DATABASE_ACQUIRE_TIMEOUT_SECONDS", "30") };
+    }
 }
 
 async fn container_url() -> &'static str {
