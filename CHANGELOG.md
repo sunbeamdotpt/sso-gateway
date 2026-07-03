@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] - 2026-07-03
+
+### Added
+
+- Federation callback support for upstream OAuth2/OIDC identity providers.
+  - New `FederationCallback` and tenant connection domain messages in the
+    Connect-RPC API.
+  - HRD domain verification to route users to the correct upstream provider.
+  - Identity provisioning from upstream OIDC claims into tenant-local
+    identities.
+- Encrypted key storage, replay cache, and login-state tables in the metadata
+  store.
+- Cached token introspection backed by the metadata store to reduce Hydra
+  round-trips.
+- Session cookie authentication in the gateway middleware for browser-facing
+  flows.
+- `cargo audit` CI workflow.
+
+### Changed
+
+- Hardened OIDC, SAML, session, network, and API boundaries across the service
+  layer and HTTP handlers.
+- Moved HTTP handlers into `services/handlers` and hardened SAML/OAuth2
+  endpoints.
+- Refreshed migration timestamps and consolidated session/login-state/replay-cache
+  schemas.
+- Updated workspace dependencies and container configuration for the security
+  review.
+- Removed obsolete `TenantApiKey` module.
+
+### Fixed
+
+- Fixed TOCTOU and SSRF vulnerabilities in outbound request handling.
+
+### Security
+
+- Continued ignoring `RUSTSEC-2023-0071` (rsa Marvin Attack) pending an upstream
+  fix.
+
 ## [1.0.0-rc.6] - 2026-07-01
 
 ### Added
@@ -118,6 +157,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[1.0.0-rc.7]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc7
+[1.0.0-rc.6]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc6
+[1.0.0-rc.5]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc5
+[1.0.0-rc.4]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc4
+[1.0.0-rc.3]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc3
 [1.0.0-rc.2]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc2
 [1.0.0-rc.1]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc1
 [1.0.0-rc.0]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc0
