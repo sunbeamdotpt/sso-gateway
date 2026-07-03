@@ -182,7 +182,7 @@ identity:
   default_schema_id: default
   schemas:
     - id: default
-      url: base64://eyIkaWQiOiAiaHR0cHM6Ly9zY2hlbWFzLm9yeS5zaC9wcmVzZXRzL2tyYXRvcy9xdWlja3N0YXJ0L2VtYWlsLXBhc3N3b3JkL2lkZW50aXR5LnNjaGVtYS5qc29uIiwgIiRzY2hlbWEiOiAiaHR0cDovL2pzb24tc2NoZW1hLm9yZy9kcmFmdC0wNy9zY2hlbWEjIiwgInRpdGxlIjogIlBlcnNvbiIsICJ0eXBlIjogIm9iamVjdCIsICJwcm9wZXJ0aWVzIjogeyJ0cmFpdHMiOiB7InR5cGUiOiAib2JqZWN0IiwgInByb3BlcnRpZXMiOiB7ImVtYWlsIjogeyJ0eXBlIjogInN0cmluZyIsICJmb3JtYXQiOiAiZW1haWwiLCAidGl0bGUiOiAiRS1NYWlsIiwgIm9yeS5zaC9rcmF0b3MiOiB7ImNyZWRlbnRpYWxzIjogeyJwYXNzd29yZCI6IHsiaWRlbnRpZmllciI6IHRydWV9fSwgInJlY292ZXJ5IjogeyJ2aWEiOiAiZW1haWwifSwgInZlcmlmaWNhdGlvbiI6IHsidmlhIjogImVtYWlsIn19fSwgInVzZXJOYW1lIjogeyJ0eXBlIjogInN0cmluZyJ9LCAibmFtZSI6IHsidHlwZSI6ICJvYmplY3QifSwgImFjdGl2ZSI6IHsidHlwZSI6ICJib29sZWFuIn19LCAicmVxdWlyZWQiOiBbImVtYWlsIl0sICJhZGRpdGlvbmFsUHJvcGVydGllcyI6IGZhbHNlfX19Cg==
+      url: base64://eyIkaWQiOiJodHRwczovL3NjaGVtYXMub3J5LnNoL3ByZXNldHMva3JhdG9zL3F1aWNrc3RhcnQvZW1haWwtcGFzc3dvcmQvaWRlbnRpdHkuc2NoZW1hLmpzb24iLCIkc2NoZW1hIjoiaHR0cDovL2pzb24tc2NoZW1hLm9yZy9kcmFmdC0wNy9zY2hlbWEjIiwidGl0bGUiOiJQZXJzb24iLCJ0eXBlIjoib2JqZWN0IiwicHJvcGVydGllcyI6eyJ0cmFpdHMiOnsidHlwZSI6Im9iamVjdCIsInByb3BlcnRpZXMiOnsiZW1haWwiOnsidHlwZSI6InN0cmluZyIsImZvcm1hdCI6ImVtYWlsIiwidGl0bGUiOiJFLU1haWwiLCJvcnkuc2gva3JhdG9zIjp7ImNyZWRlbnRpYWxzIjp7InBhc3N3b3JkIjp7ImlkZW50aWZpZXIiOnRydWV9fSwicmVjb3ZlcnkiOnsidmlhIjoiZW1haWwifSwidmVyaWZpY2F0aW9uIjp7InZpYSI6ImVtYWlsIn19fSwidXNlck5hbWUiOnsidHlwZSI6InN0cmluZyJ9LCJuYW1lIjp7InR5cGUiOiJvYmplY3QifSwiYWN0aXZlIjp7InR5cGUiOiJib29sZWFuIn0sInRlbmFudF9pZCI6eyJ0eXBlIjoic3RyaW5nIn19LCJyZXF1aXJlZCI6WyJlbWFpbCJdLCJhZGRpdGlvbmFsUHJvcGVydGllcyI6ZmFsc2V9fX0=
 serve:
   public:
     base_url: http://localhost:4433/
@@ -364,6 +364,7 @@ impl TokenIntrospector for TestIntrospector {
                 sub: None,
                 scope: vec![],
                 exp: None,
+                authentication_methods: vec![],
             });
         }
         Ok(IntrospectionResult {
@@ -383,6 +384,7 @@ impl TokenIntrospector for TestIntrospector {
                 "application:read".to_string(),
             ],
             exp: None,
+            authentication_methods: vec![],
         })
     }
 }
@@ -417,10 +419,7 @@ impl SessionStore for TestSessionStore {
         Ok(())
     }
 
-    async fn revoke_all_for_subject(
-        &self,
-        _sub: &str,
-    ) -> Result<(), sso_gateway::db::DbError> {
+    async fn revoke_all_for_subject(&self, _sub: &str) -> Result<(), sso_gateway::db::DbError> {
         Ok(())
     }
 }

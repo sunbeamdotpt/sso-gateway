@@ -12,8 +12,8 @@ use base64::Engine;
 use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::constants;
-use gamlastan::crypto::keys::build_idp_keys_manager;
 use gamlastan::crypto::SamlSigner;
+use gamlastan::crypto::keys::build_idp_keys_manager;
 use gamlastan::profiles::sso::idp::create_response;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::SamlSerialize;
@@ -95,9 +95,7 @@ impl CallbackHarness {
         Self::start_with_upstream(None).await
     }
 
-    async fn start_with_upstream(
-        upstream_oauth: Option<Arc<dyn UpstreamOAuthClient>>,
-    ) -> Self {
+    async fn start_with_upstream(upstream_oauth: Option<Arc<dyn UpstreamOAuthClient>>) -> Self {
         let (_pg, database_url) = support::start_postgres()
             .await
             .expect("postgres should start");
@@ -146,7 +144,7 @@ impl CallbackHarness {
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
             system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
             state_cookie_secret: "callback-test-secret-key-at-least-32-bytes-long".into(),
-            cookie_secure: false,
+            cookie_secure: true,
             cookie_samesite: "Lax".to_string(),
             saml_idp_key_encryption_key: None,
             tenant_connection_encryption_key: None,
@@ -157,6 +155,9 @@ impl CallbackHarness {
             database_max_lifetime_seconds: 1800,
             database_statement_timeout_seconds: 30,
             token_introspection_cache_ttl_seconds: 30,
+            session_ttl_seconds: 86400,
+            public_rate_limit_requests: 100,
+            public_rate_limit_window_seconds: 60,
         };
 
         let app = build_app_with_upstream(&config, pool.clone(), upstream_oauth)
@@ -249,7 +250,8 @@ impl CallbackHarness {
                                         "verification": { "via": "email" }
                                     }
                                 },
-                                "name": { "type": "object" }
+                                "name": { "type": "object" },
+                                "tenant_id": { "type": "string" }
                             },
                             "required": ["email"],
                             "additionalProperties": false
@@ -290,10 +292,9 @@ async fn fetch_bootstrap_token(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let resp = client
         .post(format!("{base_url}/oauth2/token"))
+        .basic_auth(client_id, Some(client_secret))
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
             ("scope", "tenant:admin"),
         ])
         .send()
@@ -579,7 +580,10 @@ async fn oauth2_callback_redirects_with_session_cookie() {
         .get("set-cookie")
         .expect("session cookie should be set");
     assert!(
-        set_cookie.to_str().unwrap().starts_with("__Host-sso_session="),
+        set_cookie
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-sso_session="),
         "cookie should be the sso_session"
     );
 
@@ -703,7 +707,10 @@ async fn saml_acs_callback_redirects_with_session_cookie() {
         .get("set-cookie")
         .expect("session cookie should be set");
     assert!(
-        set_cookie.to_str().unwrap().starts_with("__Host-sso_session="),
+        set_cookie
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-sso_session="),
         "cookie should be the sso_session"
     );
 

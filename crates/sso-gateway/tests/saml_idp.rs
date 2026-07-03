@@ -196,12 +196,7 @@ async fn start_idp_server(
 
     let idp_entity_id = "https://gateway.example.com/saml/idp".to_string();
 
-    let state = SamlIdpState::new(
-        kratos,
-        idp_keys,
-        sp_clients,
-        idp_entity_id.clone(),
-    );
+    let state = SamlIdpState::new(kratos, idp_keys, sp_clients, idp_entity_id.clone());
 
     (system_tenant_ulid, state, idp_entity_id, cert_pem)
 }

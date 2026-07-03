@@ -87,7 +87,7 @@ impl Gateway {
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
             system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
             state_cookie_secret: "conformance-test-secret-key-at-least-32-bytes-long".into(),
-            cookie_secure: false,
+            cookie_secure: true,
             cookie_samesite: "Lax".to_string(),
             saml_idp_key_encryption_key: Some(vec![0u8; 32]),
             tenant_connection_encryption_key: None,
@@ -98,6 +98,9 @@ impl Gateway {
             database_max_lifetime_seconds: 1800,
             database_statement_timeout_seconds: 30,
             token_introspection_cache_ttl_seconds: 30,
+            session_ttl_seconds: 86400,
+            public_rate_limit_requests: 100,
+            public_rate_limit_window_seconds: 60,
         };
 
         let app = build_app(&config, pool.clone())
@@ -386,8 +389,7 @@ impl Gateway {
         let certificate_pem = cert.pem();
         let key_id = ulid::Ulid::new().to_string();
 
-        let store =
-            PgSamlIdpKeyStore::with_encryption_key(self.pool.clone(), vec![0u8; 32]);
+        let store = PgSamlIdpKeyStore::with_encryption_key(self.pool.clone(), vec![0u8; 32]);
         store
             .create(
                 &self.system_tenant_ulid,
@@ -411,10 +413,9 @@ async fn fetch_bootstrap_token(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let resp = client
         .post(format!("{base_url}/oauth2/token"))
+        .basic_auth(client_id, Some(client_secret))
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
             ("scope", "tenant:admin application:admin"),
         ])
         .send()

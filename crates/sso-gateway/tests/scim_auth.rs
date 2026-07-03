@@ -150,12 +150,15 @@ async fn scim_auth_error_branches() {
         .expect("mapping should be created");
 
     let token_resp = hydra
-        .token(vec![
-            ("grant_type".to_string(), "client_credentials".to_string()),
-            ("client_id".to_string(), client_id.to_string()),
-            ("client_secret".to_string(), client_secret.to_string()),
-            ("scope".to_string(), "openid".to_string()),
-        ])
+        .token(
+            vec![
+                ("grant_type".to_string(), "client_credentials".to_string()),
+                ("client_id".to_string(), client_id.to_string()),
+                ("client_secret".to_string(), client_secret.to_string()),
+                ("scope".to_string(), "openid".to_string()),
+            ],
+            None,
+        )
         .await
         .expect("token request should succeed");
     let access_token = token_resp["access_token"]
@@ -203,12 +206,15 @@ async fn scim_auth_error_branches() {
 
     // Issue a fresh token and delete the id mapping so the subject is unknown.
     let token_resp = hydra
-        .token(vec![
-            ("grant_type".to_string(), "client_credentials".to_string()),
-            ("client_id".to_string(), client_id.to_string()),
-            ("client_secret".to_string(), client_secret.to_string()),
-            ("scope".to_string(), "openid".to_string()),
-        ])
+        .token(
+            vec![
+                ("grant_type".to_string(), "client_credentials".to_string()),
+                ("client_id".to_string(), client_id.to_string()),
+                ("client_secret".to_string(), client_secret.to_string()),
+                ("scope".to_string(), "openid".to_string()),
+            ],
+            None,
+        )
         .await
         .expect("second token request should succeed");
     let fresh_token = token_resp["access_token"]

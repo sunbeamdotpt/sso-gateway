@@ -143,7 +143,8 @@ async fn federation_saml_login_round_trip() {
                                     "recovery": { "via": "email" },
                                     "verification": { "via": "email" }
                                 }
-                            }
+                            },
+                            "tenant_id": { "type": "string" }
                         },
                         "required": ["email"],
                         "additionalProperties": false
@@ -393,7 +394,8 @@ async fn federation_saml_signed_login_is_idempotent() {
                                     "recovery": { "via": "email" },
                                     "verification": { "via": "email" }
                                 }
-                            }
+                            },
+                            "tenant_id": { "type": "string" }
                         },
                         "required": ["email"],
                         "additionalProperties": false
@@ -800,16 +802,22 @@ async fn federation_saml_db_replay_cache_rejects_duplicates() {
     let cache = SamlReplayCache::new(pool);
     let expiry = chrono::Utc::now() + chrono::Duration::seconds(300);
 
-    assert!(cache
-        .check_and_insert("_assertion_1", expiry)
-        .await
-        .unwrap());
-    assert!(!cache
-        .check_and_insert("_assertion_1", expiry)
-        .await
-        .unwrap());
-    assert!(cache
-        .check_and_insert("_assertion_2", expiry)
-        .await
-        .unwrap());
+    assert!(
+        cache
+            .check_and_insert("_assertion_1", expiry)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .check_and_insert("_assertion_1", expiry)
+            .await
+            .unwrap()
+    );
+    assert!(
+        cache
+            .check_and_insert("_assertion_2", expiry)
+            .await
+            .unwrap()
+    );
 }

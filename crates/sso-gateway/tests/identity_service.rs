@@ -64,7 +64,8 @@ async fn identity_service_round_trip() {
                                     "recovery": { "via": "email" },
                                     "verification": { "via": "email" }
                                 }
-                            }
+                            },
+                            "tenant_id": { "type": "string" }
                         },
                         "required": ["email"],
                         "additionalProperties": false
