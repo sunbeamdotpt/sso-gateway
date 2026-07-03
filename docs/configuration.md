@@ -42,9 +42,17 @@ All configuration is read from environment variables.
 | `SAML_REQUEST_TTL_SECONDS` | `900` | TTL for pending SAML authentication requests. |
 | `SAML_REQUIRE_SIGNED_ASSERTIONS` | `true` | Require signed SAML assertions from external IdPs. |
 | `SAML_REQUIRE_SIGNED_RESPONSES` | `false` | Require signed SAML responses from external IdPs. |
-| `ALLOWED_RETURN_TO_HOSTS` | — | Comma-separated list of trusted hosts for universal login `return_to` URLs (e.g. `example.com,app.example.com`). Subdomains of listed hosts are allowed. |
+| `ALLOWED_RETURN_TO_HOSTS` | — | Comma-separated list of trusted hosts for universal login `return_to` URLs (e.g. `example.com,app.example.com`). Only exact hosts are allowed; subdomains must be listed explicitly. |
+| `COOKIE_SECURE` | `true` if `PUBLIC_BASE_URL` is HTTPS, else `false` | Sets the `Secure` attribute on the session cookie. Must be `true` in production because the session cookie uses the `__Host-` prefix. |
+| `COOKIE_SAMESITE` | `Lax` | `SameSite` policy for the session cookie (`Strict`, `Lax`, or `None`). |
+| `SESSION_TTL_SECONDS` | `86400` | Lifetime of browser session cookies established by the universal login callbacks. |
+| `PUBLIC_RATE_LIMIT_REQUESTS` | `100` | Maximum number of requests allowed per public IP in the rate-limit window. |
+| `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Duration of the rate-limit window in seconds. |
 
 ## Notes
 
 - The gateway runs `sqlx migrate` against `DATABASE_URL` on startup.
+- The gateway session cookie is named `__Host-sso_session`. The `__Host-` prefix requires `Secure=true` and a same-site policy that is not `None` without Secure; startup fails if `COOKIE_SECURE=false` while the cookie uses the `__Host-` prefix.
+- Public routes (discovery, authorization, token, device, SAML metadata/ACS, and universal login callbacks) are rate-limited per source IP using a token-bucket algorithm.
+- The maximum request body size for all routes is 1 MiB.
 - For production, use mTLS or network policies to protect the Ory admin endpoints.

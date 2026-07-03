@@ -50,9 +50,13 @@ message SamlRedirect {
 message DiscoverLoginMethodResponse {
   // One of the supported authentication methods.
   oneof method {
+    // Redirect to an OIDC identity provider.
     OidcRedirect oidc = 1;
+    // Redirect to an OAuth2 identity provider.
     OAuth2Redirect oauth2 = 2;
+    // Redirect to a SAML identity provider.
     SamlRedirect saml = 3;
+    // Redirect to the tenant selection page.
     SelectTenantRedirect select_tenant = 4;
   }
 }
