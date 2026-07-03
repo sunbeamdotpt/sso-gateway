@@ -16,7 +16,10 @@ impl KetoClient {
     /// Create a new Keto client.
     pub fn new(read_url: &str, write_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()?,
             read_url: parse_base_url(read_url)?,
             write_url: parse_base_url(write_url)?,
         })

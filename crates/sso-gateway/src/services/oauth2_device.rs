@@ -30,7 +30,7 @@ impl DeviceHydra for HydraClient {
         path: String,
         form: Vec<(String, String)>,
     ) -> Result<Value, OryClientError> {
-        self.device(&path, form).await
+        self.device(&path, form, None).await
     }
 }
 
@@ -216,6 +216,7 @@ mod tests {
             subject: "subject-1".into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }

@@ -192,9 +192,11 @@ mod tests {
         });
         let adapter = GamlastanReplayAdapter::new(stub);
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-        assert!(tokio::task::spawn_blocking(move || adapter.check_and_insert("id-1", expiry))
-            .await
-            .unwrap());
+        assert!(
+            tokio::task::spawn_blocking(move || adapter.check_and_insert("id-1", expiry))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -204,9 +206,11 @@ mod tests {
         });
         let adapter = GamlastanReplayAdapter::new(stub);
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-        assert!(!tokio::task::spawn_blocking(move || adapter.check_and_insert("id-1", expiry))
-            .await
-            .unwrap());
+        assert!(
+            !tokio::task::spawn_blocking(move || adapter.check_and_insert("id-1", expiry))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

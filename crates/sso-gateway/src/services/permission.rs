@@ -354,6 +354,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }

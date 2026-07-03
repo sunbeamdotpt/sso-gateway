@@ -880,6 +880,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }
@@ -1879,11 +1880,10 @@ mod tests {
     #[tokio::test]
     async fn delete_session_happy_path() {
         let kratos = StubKratos::default();
-        kratos
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), json!({"id": "sess-1", "identity_id": "ory-1", "active": true}));
+        kratos.sessions.lock().await.insert(
+            "sess-1".into(),
+            json!({"id": "sess-1", "identity_id": "ory-1", "active": true}),
+        );
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),

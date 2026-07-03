@@ -46,7 +46,7 @@ log:
 
 secrets:
   cookie:
-    - youReallyNeedToChangeThis
+    - ${KRATOS_COOKIE_SECRET:?required}
 
 identity:
   default_schema_id: default

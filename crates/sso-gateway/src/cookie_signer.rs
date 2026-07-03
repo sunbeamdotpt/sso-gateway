@@ -25,10 +25,13 @@ pub enum CookieError {
 
     #[error("invalid signature")]
     InvalidSignature,
+
+    #[error("cookie signing key must be at least 32 bytes")]
+    WeakKey,
 }
 
 /// Signs and verifies session cookie values.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CookieSigner {
     key: Vec<u8>,
 }
@@ -36,23 +39,20 @@ pub struct CookieSigner {
 impl CookieSigner {
     /// Create a signer from a secret key.
     ///
-    /// # Panics
-    ///
-    /// Panics if `key` is shorter than 32 bytes. The caller is expected to
-    /// validate this at config load time.
-    pub fn new(key: impl AsRef<[u8]>) -> Self {
+    /// Returns an error if `key` is shorter than 32 bytes. The caller is
+    /// expected to validate this at config load time.
+    pub fn new(key: impl AsRef<[u8]>) -> Result<Self, CookieError> {
         let key_material = key.as_ref();
-        assert!(
-            key_material.len() >= 32,
-            "cookie signing key must be at least 32 bytes"
-        );
+        if key_material.len() < 32 {
+            return Err(CookieError::WeakKey);
+        }
         let hk = hkdf::Hkdf::<Sha256>::new(None, key_material);
         let mut derived = [0u8; 32];
         hk.expand(HKDF_INFO, &mut derived)
             .expect("32-byte expansion fits within HKDF-SHA256 limit");
-        Self {
+        Ok(Self {
             key: derived.to_vec(),
-        }
+        })
     }
 
     /// Sign a payload and return a cookie-safe string.
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify_round_trip() {
-        let signer = CookieSigner::new(test_key());
+        let signer = CookieSigner::new(test_key()).unwrap();
         let cookie = signer.sign("session-token-123");
         let verified = signer.verify(&cookie).unwrap();
         assert_eq!(verified, "session-token-123");
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered_payload() {
-        let signer = CookieSigner::new(test_key());
+        let signer = CookieSigner::new(test_key()).unwrap();
         let cookie = signer.sign("session-token-123");
         let mut parts: Vec<&str> = cookie.split('.').collect();
         let tampered =
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_malformed_cookie() {
-        let signer = CookieSigner::new(test_key());
+        let signer = CookieSigner::new(test_key()).unwrap();
         assert!(matches!(
             signer.verify("no-dot-here").unwrap_err(),
             CookieError::InvalidFormat
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_invalid_base64() {
-        let signer = CookieSigner::new(test_key());
+        let signer = CookieSigner::new(test_key()).unwrap();
         assert!(matches!(
             signer.verify("!!!.!!!").unwrap_err(),
             CookieError::InvalidBase64
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_short_signature() {
-        let signer = CookieSigner::new(test_key());
+        let signer = CookieSigner::new(test_key()).unwrap();
         let cookie = signer.sign("session-token-123");
         let mut parts: Vec<&str> = cookie.split('.').collect();
         let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"short");
@@ -166,8 +166,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cookie signing key must be at least 32 bytes")]
-    fn new_panics_with_short_key() {
-        CookieSigner::new("short-key");
+    fn new_rejects_short_key() {
+        let err = CookieSigner::new("short-key").unwrap_err();
+        assert!(matches!(err, CookieError::WeakKey));
     }
 }

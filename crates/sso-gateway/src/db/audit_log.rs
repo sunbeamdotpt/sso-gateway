@@ -4,6 +4,8 @@ use ulid::Ulid;
 
 use super::{DbError, DbPool};
 
+const GENESIS_HASH: &str = "be6ece231f28401aa8b1615c287eb9e31aa41f4d4d0d24e9eded24238ce6d635";
+
 #[async_trait]
 pub trait AuditLogStore: Send + Sync + 'static {
     async fn insert(
@@ -39,12 +41,18 @@ impl PgAuditLogStore {
         let id = Ulid::new().to_string();
         let created_at = time::OffsetDateTime::now_utc();
 
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("SELECT audit_log_advisory_lock()")
+            .execute(&mut *tx)
+            .await?;
+
         let prev_hash: Option<String> = sqlx::query_scalar(
             "SELECT integrity_hash FROM audit_log ORDER BY created_at DESC LIMIT 1",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        let prev_hash = prev_hash.unwrap_or_default();
+        let prev_hash = prev_hash.unwrap_or_else(|| GENESIS_HASH.to_string());
 
         let metadata_str = serde_json::to_string(&metadata).unwrap_or_default();
         let canonical = format!(
@@ -76,8 +84,10 @@ impl PgAuditLogStore {
         .bind(&prev_hash)
         .bind(&integrity_hash)
         .bind(created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -269,6 +279,53 @@ mod tests {
         let result = sqlx::query("DELETE FROM audit_log")
             .execute(&store.pool)
             .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn hash_chain_uses_genesis_for_first_row() {
+        let base = postgres_url().await;
+        let db_name = format!("audit_log_{}", Ulid::new().to_string().to_lowercase());
+        let url = db_url_with_name(base, &db_name);
+        let pool = create_pool(&url, false).await.unwrap();
+        let store = PgAuditLogStore::new(pool);
+
+        store
+            .insert(
+                None,
+                Some("actor-1"),
+                "a1",
+                "r1",
+                "success",
+                serde_json::json!({"k": 1}),
+            )
+            .await
+            .unwrap();
+
+        let prev: String = sqlx::query_scalar("SELECT prev_hash FROM audit_log LIMIT 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(prev, GENESIS_HASH);
+    }
+
+    #[tokio::test]
+    async fn truncate_audit_log_is_rejected() {
+        let pool = postgres_pool().await;
+        let store = PgAuditLogStore::new(pool);
+        store
+            .insert(
+                None,
+                None,
+                "action",
+                "resource",
+                "success",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let result = sqlx::query("TRUNCATE audit_log").execute(&store.pool).await;
         assert!(result.is_err());
     }
 }

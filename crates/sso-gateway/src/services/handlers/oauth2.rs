@@ -26,12 +26,16 @@ pub trait HydraOperations: Send + Sync + 'static {
         &self,
         query: Vec<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError>;
-    async fn token(&self, form: Vec<(String, String)>)
-    -> Result<serde_json::Value, OryClientError>;
+    async fn token(
+        &self,
+        form: Vec<(String, String)>,
+        client_credentials: Option<(String, String)>,
+    ) -> Result<serde_json::Value, OryClientError>;
     async fn device(
         &self,
         path: &str,
         form: Vec<(String, String)>,
+        client_credentials: Option<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError>;
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
@@ -52,16 +56,24 @@ impl HydraOperations for HydraClient {
     async fn token(
         &self,
         form: Vec<(String, String)>,
+        client_credentials: Option<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError> {
-        self.token(form).await
+        let creds = client_credentials
+            .as_ref()
+            .map(|(id, secret)| (id.as_str(), secret.as_str()));
+        self.token(form, creds).await
     }
 
     async fn device(
         &self,
         path: &str,
         form: Vec<(String, String)>,
+        client_credentials: Option<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError> {
-        self.device(path, form).await
+        let creds = client_credentials
+            .as_ref()
+            .map(|(id, secret)| (id.as_str(), secret.as_str()));
+        self.device(path, form, creds).await
     }
 
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError> {
@@ -130,6 +142,23 @@ fn base_url(public_base_url: &str) -> String {
     public_base_url.trim_end_matches('/').to_string()
 }
 
+/// Decode an HTTP Basic Authorization header into `(client_id, client_secret)`.
+fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let header = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, payload) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        payload.trim(),
+    )
+    .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (id, secret) = decoded.split_once(':')?;
+    Some((id.to_string(), secret.to_string()))
+}
+
 async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl IntoResponse {
     let base = base_url(&state.public_base_url);
     let body = json!({
@@ -185,14 +214,32 @@ async fn authorize(
 
 async fn token(
     State(state): State<Arc<Oauth2State>>,
-    Form(form): Form<HashMap<String, String>>,
+    headers: HeaderMap,
+    Form(mut form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let client_id = form.get("client_id").cloned().unwrap_or_default();
+    let client_credentials = if let Some((id, secret)) = basic_auth_credentials(&headers) {
+        // Avoid sending credentials twice: use the Basic header and drop any
+        // duplicate values from the form body.
+        form.remove("client_id");
+        form.remove("client_secret");
+        Some((id, secret))
+    } else {
+        None
+    };
+
+    let client_id = client_credentials
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .or_else(|| form.get("client_id").cloned())
+        .unwrap_or_default();
+    if client_id.is_empty() {
+        return bad_request("missing client_id");
+    }
     if let Err(err) = validate_public_client(&state, &client_id).await {
         return *err;
     }
 
-    match state.hydra.token(form.into_iter().collect()).await {
+    match state.hydra.token(form.into_iter().collect(), client_credentials).await {
         Ok(value) => json_response(value),
         Err(err) => map_ory_error(err),
     }
@@ -200,15 +247,35 @@ async fn token(
 
 async fn device(
     State(state): State<Arc<Oauth2State>>,
+    headers: HeaderMap,
     Path(path): Path<String>,
-    Form(form): Form<HashMap<String, String>>,
+    Form(mut form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let client_id = form.get("client_id").cloned().unwrap_or_default();
+    let client_credentials = if let Some((id, secret)) = basic_auth_credentials(&headers) {
+        form.remove("client_id");
+        form.remove("client_secret");
+        Some((id, secret))
+    } else {
+        None
+    };
+
+    let client_id = client_credentials
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .or_else(|| form.get("client_id").cloned())
+        .unwrap_or_default();
+    if client_id.is_empty() {
+        return bad_request("missing client_id");
+    }
     if let Err(err) = validate_public_client(&state, &client_id).await {
         return *err;
     }
 
-    match state.hydra.device(&path, form.into_iter().collect()).await {
+    match state
+        .hydra
+        .device(&path, form.into_iter().collect(), client_credentials)
+        .await
+    {
         Ok(value) => json_response(value),
         Err(err) => map_ory_error(err),
     }
@@ -235,7 +302,9 @@ async fn revoke(
 
     match state.hydra.revoke(form_vec).await {
         Ok(()) => {
-            if let Some(token) = token && let Some(cache) = &state.token_cache {
+            if let Some(token) = token
+                && let Some(cache) = &state.token_cache
+            {
                 let token_hash = hash_token(&token);
                 if let Err(e) = cache.remove(&token_hash).await {
                     warn!("failed to clear token introspection cache after revocation: {e}");
@@ -382,6 +451,7 @@ mod tests {
         async fn token(
             &self,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub token not configured")
         }
@@ -390,6 +460,7 @@ mod tests {
             &self,
             _path: &str,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub device not configured")
         }
@@ -764,6 +835,7 @@ mod tests {
         async fn token(
             &self,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
         }
@@ -772,6 +844,7 @@ mod tests {
             &self,
             _path: &str,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
         }
@@ -832,16 +905,24 @@ mod tests {
     #[tokio::test]
     async fn token_succeeds_for_valid_client() {
         let state = Arc::new(ok_state(Some("tenant-1".to_string())));
-        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = token(State(state), Form(form)).await.into_response();
+        let form = HashMap::from([
+            ("client_id".to_string(), "client-1".to_string()),
+            ("client_secret".to_string(), "secret".to_string()),
+        ]);
+        let resp = token(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn device_succeeds_for_valid_client() {
         let state = Arc::new(ok_state(Some("tenant-1".to_string())));
-        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = device(State(state), Path("auth".to_string()), Form(form))
+        let form = HashMap::from([
+            ("client_id".to_string(), "client-1".to_string()),
+            ("client_secret".to_string(), "secret".to_string()),
+        ]);
+        let resp = device(State(state), HeaderMap::new(), Path("auth".to_string()), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -951,6 +1032,7 @@ mod tests {
         async fn token(
             &self,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
@@ -959,6 +1041,7 @@ mod tests {
             &self,
             _path: &str,
             _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
@@ -1017,16 +1100,24 @@ mod tests {
     #[tokio::test]
     async fn token_returns_bad_gateway_on_hydra_error() {
         let state = Arc::new(err_state(Some("tenant-1".to_string())));
-        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = token(State(state), Form(form)).await.into_response();
+        let form = HashMap::from([
+            ("client_id".to_string(), "client-1".to_string()),
+            ("client_secret".to_string(), "secret".to_string()),
+        ]);
+        let resp = token(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn device_returns_bad_gateway_on_hydra_error() {
         let state = Arc::new(err_state(Some("tenant-1".to_string())));
-        let form = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = device(State(state), Path("auth".to_string()), Form(form))
+        let form = HashMap::from([
+            ("client_id".to_string(), "client-1".to_string()),
+            ("client_secret".to_string(), "secret".to_string()),
+        ]);
+        let resp = device(State(state), HeaderMap::new(), Path("auth".to_string()), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1054,8 +1145,8 @@ mod tests {
         let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap())
             as Arc<dyn HydraOperations>;
         assert!(client.authorize(vec![]).await.is_err());
-        assert!(client.token(vec![]).await.is_err());
-        assert!(client.device("auth", vec![]).await.is_err());
+        assert!(client.token(vec![], None).await.is_err());
+        assert!(client.device("auth", vec![], None).await.is_err());
         assert!(client.userinfo("token").await.is_err());
         assert!(client.revoke(vec![]).await.is_err());
         assert!(
@@ -1093,6 +1184,7 @@ mod tests {
             async fn token(
                 &self,
                 _form: Vec<(String, String)>,
+                _client_credentials: Option<(String, String)>,
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }
@@ -1100,6 +1192,7 @@ mod tests {
                 &self,
                 _path: &str,
                 _form: Vec<(String, String)>,
+                _client_credentials: Option<(String, String)>,
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }

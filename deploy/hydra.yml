@@ -15,10 +15,10 @@ urls:
   logout: http://localhost:8080/oauth2/logout
 secrets:
   system:
-    - youReallyNeedToChangeThis
+    - ${HYDRA_SYSTEM_SECRET:?required}
 oidc:
   subject_identifiers:
     supported_types:
       - public
     pairwise:
-      salt: youReallyNeedToChangeThisToo
+      salt: ${HYDRA_PAIRWISE_SALT:?required}

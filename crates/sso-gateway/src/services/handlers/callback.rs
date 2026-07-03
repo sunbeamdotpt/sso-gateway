@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::db::{DbError, LoginStateStore, SessionStore, TenantConnectionStore};
 use crate::identity_provisioner::{IdentityProvisioner, ProvisionedIdentity};
+use crate::jwks::JwksService;
 use crate::session_token::SessionTokenSigner;
 use crate::upstream_oauth::UpstreamOAuthClient;
 
@@ -58,6 +59,9 @@ pub enum CallbackError {
     #[error("invalid id_token nonce")]
     InvalidNonce,
 
+    #[error("invalid ID token")]
+    InvalidIdToken,
+
     #[error("database error: {0}")]
     Database(#[from] DbError),
 
@@ -93,13 +97,17 @@ pub struct CallbackState {
     pub(crate) connections: Arc<dyn TenantConnectionStore>,
     pub(crate) upstream_oauth: Arc<dyn UpstreamOAuthClient>,
     pub(crate) identity_provisioner: Arc<dyn IdentityProvisioner>,
+    pub(crate) jwks_service: Arc<dyn JwksService>,
     pub(crate) saml: Option<Arc<dyn SamlAcsService>>,
     pub(crate) session_signer: SessionTokenSigner,
     pub(crate) session_store: Arc<dyn SessionStore>,
     pub(crate) allowed_return_to_hosts: Vec<String>,
+    pub(crate) tenant_allowed_return_to_hosts: Option<Vec<String>>,
     pub(crate) public_base_url: String,
     pub(crate) cookie_secure: bool,
     pub(crate) cookie_samesite: String,
+    pub(crate) session_ttl_seconds: u64,
+    pub(crate) local_dev_mode: bool,
 }
 
 impl CallbackState {
@@ -109,25 +117,31 @@ impl CallbackState {
         connections: Arc<dyn TenantConnectionStore>,
         upstream_oauth: Arc<dyn UpstreamOAuthClient>,
         identity_provisioner: Arc<dyn IdentityProvisioner>,
+        jwks_service: Arc<dyn JwksService>,
         session_signer: SessionTokenSigner,
         session_store: Arc<dyn SessionStore>,
         allowed_return_to_hosts: Vec<String>,
         public_base_url: String,
         cookie_secure: bool,
         cookie_samesite: String,
+        session_ttl_seconds: u64,
     ) -> Self {
         Self {
             login_state,
             connections,
             upstream_oauth,
             identity_provisioner,
+            jwks_service,
             saml: None,
             session_signer,
             session_store,
             allowed_return_to_hosts,
+            tenant_allowed_return_to_hosts: None,
             public_base_url,
             cookie_secure,
             cookie_samesite,
+            session_ttl_seconds,
+            local_dev_mode: false,
         }
     }
 
@@ -178,7 +192,12 @@ async fn handle_oauth_callback(
 
     state.login_state.delete(&params.state).await?;
 
-    validate_return_to(&state.allowed_return_to_hosts, &login_state.return_to)?;
+    validate_return_to(
+        &state.allowed_return_to_hosts,
+        state.tenant_allowed_return_to_hosts.as_deref(),
+        state.local_dev_mode,
+        &login_state.return_to,
+    )?;
 
     let connection = state
         .connections
@@ -206,20 +225,20 @@ async fn handle_oauth_callback(
             CallbackError::TokenExchange
         })?;
 
-    // For OIDC flows, validate the nonce returned in the ID token against the
-    // value stored when the login was initiated.
-    if let Some(expected_nonce) = &login_state.nonce {
-        let id_token = token_response
-            .id_token
-            .as_deref()
-            .ok_or(CallbackError::InvalidNonce)?;
-        let claims = decode_id_token_claims(id_token)?;
-        let returned_nonce = claims
-            .get("nonce")
-            .and_then(|v| v.as_str())
-            .ok_or(CallbackError::InvalidNonce)?;
-        if returned_nonce != expected_nonce {
-            return Err(CallbackError::InvalidNonce);
+    // For OIDC flows, validate the ID token signature, issuer, audience, and
+    // expiry. If a nonce was stored when the login was initiated, validate it
+    // against the nonce claim as well.
+    if connection_type == "oidc" {
+        if let Some(id_token) = token_response.id_token.as_deref() {
+            validate_id_token(
+                id_token,
+                &connection.config,
+                login_state.nonce.as_deref(),
+                &state.jwks_service,
+            )
+            .await?;
+        } else if login_state.nonce.is_some() {
+            return Err(CallbackError::InvalidIdToken);
         }
     }
 
@@ -236,20 +255,61 @@ async fn handle_oauth_callback(
     build_session_redirect(&state, &identity, connection_type, &login_state.return_to).await
 }
 
-fn decode_id_token_claims(id_token: &str) -> Result<serde_json::Value, CallbackError> {
-    let parts: Vec<&str> = id_token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(CallbackError::InvalidNonce);
+async fn validate_id_token(
+    id_token: &str,
+    config: &serde_json::Value,
+    expected_nonce: Option<&str>,
+    jwks_service: &Arc<dyn JwksService>,
+) -> Result<(), CallbackError> {
+    let jwks_url = config["jwks_url"]
+        .as_str()
+        .ok_or_else(|| CallbackError::Configuration("missing jwks_url".into()))?;
+    let issuer = config["issuer"]
+        .as_str()
+        .ok_or_else(|| CallbackError::Configuration("missing issuer".into()))?;
+    let client_id = config["client_id"]
+        .as_str()
+        .ok_or_else(|| CallbackError::Configuration("missing client_id".into()))?;
+
+    let header =
+        jsonwebtoken::decode_header(id_token).map_err(|_| CallbackError::InvalidIdToken)?;
+
+    let decoding_key = jwks_service
+        .decoding_key_for_token(id_token, jwks_url)
+        .await?;
+
+    let mut validation = jsonwebtoken::Validation::new(header.alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[client_id]);
+
+    #[derive(serde::Deserialize)]
+    struct IdTokenClaims {
+        nonce: Option<String>,
+        iat: Option<u64>,
     }
 
-    let payload =
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1])
-            .or_else(|_| {
-                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, parts[1])
-            })
-            .map_err(|_| CallbackError::InvalidNonce)?;
+    let token_data = jsonwebtoken::decode::<IdTokenClaims>(id_token, &decoding_key, &validation)
+        .map_err(|_| CallbackError::InvalidIdToken)?;
 
-    serde_json::from_slice(&payload).map_err(|_| CallbackError::InvalidNonce)
+    if let Some(iat) = token_data.claims.iat {
+        let now = jsonwebtoken::get_current_timestamp();
+        if iat > now + validation.leeway {
+            return Err(CallbackError::InvalidIdToken);
+        }
+    }
+
+    if let Some(expected) = expected_nonce {
+        let actual = token_data
+            .claims
+            .nonce
+            .as_deref()
+            .ok_or(CallbackError::InvalidIdToken)?;
+        if actual != expected {
+            return Err(CallbackError::InvalidIdToken);
+        }
+    }
+
+    Ok(())
 }
 
 async fn saml_acs_callback(
@@ -318,7 +378,12 @@ async fn build_session_redirect(
         .create(&claims.sid, &claims.sub, &claims.tenant_id, amr, expires_at)
         .await?;
 
-    let cookie = build_session_cookie(&session_token, state.cookie_secure, &state.cookie_samesite);
+    let cookie = build_session_cookie(
+        &session_token,
+        state.cookie_secure,
+        &state.cookie_samesite,
+        state.session_ttl_seconds,
+    );
 
     Response::builder()
         .status(StatusCode::FOUND)
@@ -328,16 +393,21 @@ async fn build_session_redirect(
         .map_err(|e| CallbackError::Configuration(e.to_string()))
 }
 
-fn build_session_cookie(value: &str, secure: bool, same_site: &str) -> String {
+fn build_session_cookie(value: &str, secure: bool, same_site: &str, max_age_seconds: u64) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     format!(
         "{}={}; Path=/; HttpOnly; SameSite={}; Max-Age={}{}",
-        SESSION_COOKIE_NAME, value, same_site, COOKIE_MAX_AGE_SECONDS, secure_flag
+        SESSION_COOKIE_NAME, value, same_site, max_age_seconds, secure_flag
     )
 }
 
-fn validate_return_to(hosts: &[String], return_to: &str) -> Result<(), CallbackError> {
-    if hosts.is_empty() {
+fn validate_return_to(
+    allowed_hosts: &[String],
+    tenant_allowed_hosts: Option<&[String]>,
+    local_dev_mode: bool,
+    return_to: &str,
+) -> Result<(), CallbackError> {
+    if allowed_hosts.is_empty() && tenant_allowed_hosts.map(|h| h.is_empty()).unwrap_or(true) {
         return Err(CallbackError::InvalidReturnTo);
     }
 
@@ -346,14 +416,40 @@ fn validate_return_to(hosts: &[String], return_to: &str) -> Result<(), CallbackE
         .map_err(|_| CallbackError::InvalidReturnTo)?;
     let host = url.host_str().ok_or(CallbackError::InvalidReturnTo)?;
 
-    if hosts
-        .iter()
-        .any(|h| h == host || host.ends_with(&format!(".{h}")))
+    if url.scheme() != "https" && !local_dev_mode {
+        return Err(CallbackError::InvalidReturnTo);
+    }
+
+    if allowed_hosts.iter().any(|h| is_public_suffix(h))
+        || tenant_allowed_hosts
+            .iter()
+            .flat_map(|h| h.iter())
+            .any(|h| is_public_suffix(h))
     {
+        return Err(CallbackError::InvalidReturnTo);
+    }
+
+    let matches = allowed_hosts
+        .iter()
+        .chain(tenant_allowed_hosts.iter().flat_map(|h| h.iter()))
+        .any(|h| h == host);
+
+    if matches {
         Ok(())
     } else {
         Err(CallbackError::InvalidReturnTo)
     }
+}
+
+fn is_public_suffix(host: &str) -> bool {
+    const PUBLIC_SUFFIXES: &[&str] = &[
+        "com", "org", "net", "edu", "gov", "mil", "int", "co", "ai", "io", "dev", "cloud", "app",
+        "info", "biz", "name", "pro", "co.uk", "org.uk", "net.uk", "ac.uk", "gov.uk", "co.jp",
+        "or.jp", "ne.jp", "go.jp", "de", "fr", "uk", "eu", "us",
+    ];
+    PUBLIC_SUFFIXES
+        .iter()
+        .any(|suffix| host.eq_ignore_ascii_case(suffix))
 }
 
 fn derive_saml_return_to(
@@ -363,7 +459,13 @@ fn derive_saml_return_to(
     // The portal encodes the final return URL in the SAML RelayState. If it is
     // not a valid URL, fall back to the gateway public base URL.
     if let Ok(url) = relay_state.parse::<reqwest::Url>()
-        && validate_return_to(&state.allowed_return_to_hosts, url.as_str()).is_ok()
+        && validate_return_to(
+            &state.allowed_return_to_hosts,
+            state.tenant_allowed_return_to_hosts.as_deref(),
+            state.local_dev_mode,
+            url.as_str(),
+        )
+        .is_ok()
     {
         return Ok(relay_state.into());
     }
@@ -383,6 +485,7 @@ mod tests {
     use super::*;
     use crate::db::{LoginStateRow, TenantConnectionRow};
     use crate::identity_provisioner::ProvisionError;
+    use crate::jwks::JwksService;
     use crate::upstream_oauth::UpstreamTokenResponse;
 
     #[derive(Clone, Default)]
@@ -594,12 +697,65 @@ mod tests {
         }
     }
 
+    fn test_rsa_key_pair() -> &'static (String, String) {
+        static KEY_PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEY_PAIR.get_or_init(|| {
+            use rand::rngs::OsRng;
+            use rsa::pkcs1::EncodeRsaPublicKey;
+            use rsa::pkcs8::EncodePrivateKey;
+            use rsa::{RsaPrivateKey, RsaPublicKey};
+
+            let private_key =
+                RsaPrivateKey::new(&mut OsRng, 2048).expect("failed to generate RSA test key");
+            let public_key = RsaPublicKey::from(&private_key);
+            let private_pem = private_key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::default())
+                .expect("failed to encode private key")
+                .to_string();
+            let public_pem = public_key
+                .to_pkcs1_pem(rsa::pkcs1::LineEnding::default())
+                .expect("failed to encode public key")
+                .to_string();
+            (private_pem, public_pem)
+        })
+    }
+
+    fn sign_id_token(claims: serde_json::Value, kid: Option<&str>) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = kid.map(String::from);
+        let encoding_key =
+            EncodingKey::from_rsa_pem(test_rsa_key_pair().0.as_bytes()).expect("valid RSA key");
+        jsonwebtoken::encode(&header, &claims, &encoding_key).expect("token signing failed")
+    }
+
+    #[derive(Clone)]
+    struct StubJwksService {
+        public_pem: String,
+    }
+
+    #[async_trait]
+    impl JwksService for StubJwksService {
+        async fn decoding_key_for_token(
+            &self,
+            _id_token: &str,
+            _jwks_url: &str,
+        ) -> Result<jsonwebtoken::DecodingKey, CallbackError> {
+            jsonwebtoken::DecodingKey::from_rsa_pem(self.public_pem.as_bytes())
+                .map_err(|_| CallbackError::InvalidIdToken)
+        }
+    }
+
     fn test_state() -> Arc<CallbackState> {
         Arc::new(CallbackState {
             login_state: Arc::new(StubLoginStateStore::default()),
             connections: Arc::new(StubConnectionStore::default()),
             upstream_oauth: Arc::new(StubUpstreamOAuthClient::default()),
             identity_provisioner: Arc::new(StubIdentityProvisioner::default()),
+            jwks_service: Arc::new(StubJwksService {
+                public_pem: test_rsa_key_pair().1.clone(),
+            }),
             saml: None,
             session_signer: SessionTokenSigner::new(
                 "test-secret-that-is-at-least-32-bytes-long",
@@ -608,9 +764,12 @@ mod tests {
             ),
             session_store: Arc::new(StubSessionStore),
             allowed_return_to_hosts: vec!["app.example.com".into()],
+            tenant_allowed_return_to_hosts: None,
             public_base_url: "https://gateway.example.com".into(),
             cookie_secure: true,
             cookie_samesite: "Lax".into(),
+            session_ttl_seconds: 86400,
+            local_dev_mode: true,
         })
     }
 
@@ -681,6 +840,8 @@ mod tests {
                 "client_secret": "secret-1",
                 "token_url": "https://idp.example.com/token",
                 "userinfo_url": "https://idp.example.com/userinfo",
+                "jwks_url": "https://idp.example.com/.well-known/jwks.json",
+                "issuer": "https://idp.example.com",
             }),
             is_enabled: true,
             created_at: time::OffsetDateTime::now_utc(),
@@ -828,13 +989,14 @@ mod tests {
         }));
         test_state_with_connection(&mut state, connection_row());
 
-        let id_token = format!(
-            "eyJhbGciOiJub25lIn0.{}.signature",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-                serde_json::json!({"nonce": "nonce-1"})
-                    .to_string()
-                    .as_bytes()
-            )
+        let id_token = sign_id_token(
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() + 300,
+                "nonce": "nonce-1",
+            }),
+            None,
         );
         test_state_with_upstream(
             &mut state,
@@ -877,13 +1039,14 @@ mod tests {
         }));
         test_state_with_connection(&mut state, connection_row());
 
-        let id_token = format!(
-            "eyJhbGciOiJub25lIn0.{}.signature",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-                serde_json::json!({"nonce": "nonce-evil"})
-                    .to_string()
-                    .as_bytes()
-            )
+        let id_token = sign_id_token(
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() + 300,
+                "nonce": "nonce-evil",
+            }),
+            None,
         );
         test_state_with_upstream(
             &mut state,
@@ -920,23 +1083,85 @@ mod tests {
     #[test]
     fn validate_return_to_allows_exact_host() {
         assert!(
-            validate_return_to(&["app.example.com".into()], "https://app.example.com/x").is_ok()
+            validate_return_to(
+                &["app.example.com".into()],
+                None,
+                true,
+                "https://app.example.com/x"
+            )
+            .is_ok()
         );
     }
 
     #[test]
-    fn validate_return_to_allows_subdomain() {
-        assert!(validate_return_to(&["example.com".into()], "https://app.example.com/x").is_ok());
+    fn validate_return_to_rejects_unlisted_subdomain() {
+        assert!(
+            validate_return_to(
+                &["example.com".into()],
+                None,
+                true,
+                "https://app.example.com/x"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn validate_return_to_rejects_untrusted_host() {
-        assert!(validate_return_to(&["example.com".into()], "https://evil.com/x").is_err());
+        assert!(
+            validate_return_to(&["example.com".into()], None, true, "https://evil.com/x").is_err()
+        );
     }
 
     #[test]
     fn validate_return_to_rejects_empty_allowlist() {
-        assert!(validate_return_to(&[], "https://app.example.com/x").is_err());
+        assert!(validate_return_to(&[], None, true, "https://app.example.com/x").is_err());
+    }
+
+    #[test]
+    fn validate_return_to_rejects_http_in_production() {
+        assert!(
+            validate_return_to(
+                &["app.example.com".into()],
+                None,
+                false,
+                "http://app.example.com/x"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_return_to_rejects_public_suffix_allowlist() {
+        assert!(
+            validate_return_to(&["com".into()], None, true, "https://app.example.com/x").is_err()
+        );
+        assert!(validate_return_to(&["co.uk".into()], None, true, "https://app.co.uk/x").is_err());
+    }
+
+    #[test]
+    fn validate_return_to_accepts_tenant_host() {
+        let tenant_hosts = vec!["tenant.example.com".into()];
+        assert!(
+            validate_return_to(
+                &["example.com".into()],
+                Some(&tenant_hosts),
+                true,
+                "https://tenant.example.com/x"
+            )
+            .is_ok()
+        );
+
+        // Tenant host should be rejected when tenant list is not provided.
+        assert!(
+            validate_return_to(
+                &["example.com".into()],
+                None,
+                true,
+                "https://tenant.example.com/x"
+            )
+            .is_err()
+        );
     }
 
     #[derive(Clone, Default)]
@@ -1057,30 +1282,220 @@ mod tests {
 
     #[test]
     fn build_session_cookie_has_expected_attributes() {
-        let cookie = build_session_cookie("value-1", true, "Lax");
+        let cookie = build_session_cookie("value-1", true, "Lax", 3600);
         assert!(cookie.contains("__Host-sso_session=value-1"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Max-Age=86400"));
+        assert!(cookie.contains("Max-Age=3600"));
     }
 
-    #[test]
-    fn decode_id_token_claims_extracts_nonce() {
+    #[tokio::test]
+    async fn oidc_callback_rejects_unsigned_id_token() {
+        let mut state = test_state_with_login(Ok(login_row("oidc")));
+        test_state_with_connection(&mut state, connection_row());
+
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"nonce": "n-1", "sub": "u-1"})
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() + 300,
+            })
+            .to_string()
+            .as_bytes(),
         );
-        let id_token = format!("header.{payload}.signature");
-        let claims = decode_id_token_claims(&id_token).unwrap();
-        assert_eq!(claims["nonce"], "n-1");
-        assert_eq!(claims["sub"], "u-1");
+        let id_token = format!("eyJhbGciOiJub25lIn0.{payload}.signature");
+        test_state_with_upstream(
+            &mut state,
+            UpstreamTokenResponse {
+                access_token: "token-1".into(),
+                token_type: "Bearer".into(),
+                id_token: Some(id_token.clone()),
+                raw: json!({"access_token": "token-1", "id_token": id_token}),
+            },
+            json!({"email": "alice@example.com"}),
+        );
+        test_state_with_provisioner(
+            &mut state,
+            ProvisionedIdentity {
+                tenant_id: "tenant-1".into(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: "alice@example.com".into(),
+            },
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/callbacks/oidc?code=code-1&state=state-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn decode_id_token_claims_rejects_malformed_token() {
-        assert!(decode_id_token_claims("not-a-jwt").is_err());
-        assert!(decode_id_token_claims("one.two").is_err());
+    #[tokio::test]
+    async fn oidc_callback_rejects_wrong_issuer() {
+        let mut state = test_state_with_login(Ok(login_row("oidc")));
+        test_state_with_connection(&mut state, connection_row());
+
+        let id_token = sign_id_token(
+            json!({
+                "iss": "https://evil.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() + 300,
+            }),
+            None,
+        );
+        test_state_with_upstream(
+            &mut state,
+            UpstreamTokenResponse {
+                access_token: "token-1".into(),
+                token_type: "Bearer".into(),
+                id_token: Some(id_token),
+                raw: json!({"access_token": "token-1"}),
+            },
+            json!({"email": "alice@example.com"}),
+        );
+        test_state_with_provisioner(
+            &mut state,
+            ProvisionedIdentity {
+                tenant_id: "tenant-1".into(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: "alice@example.com".into(),
+            },
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/callbacks/oidc?code=code-1&state=state-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_rejects_expired_id_token() {
+        let mut state = test_state_with_login(Ok(login_row("oidc")));
+        test_state_with_connection(&mut state, connection_row());
+
+        let id_token = sign_id_token(
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() - 300,
+            }),
+            None,
+        );
+        test_state_with_upstream(
+            &mut state,
+            UpstreamTokenResponse {
+                access_token: "token-1".into(),
+                token_type: "Bearer".into(),
+                id_token: Some(id_token),
+                raw: json!({"access_token": "token-1"}),
+            },
+            json!({"email": "alice@example.com"}),
+        );
+        test_state_with_provisioner(
+            &mut state,
+            ProvisionedIdentity {
+                tenant_id: "tenant-1".into(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: "alice@example.com".into(),
+            },
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/callbacks/oidc?code=code-1&state=state-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_rejects_wrong_signature() {
+        let mut state = test_state_with_login(Ok(login_row("oidc")));
+        test_state_with_connection(&mut state, connection_row());
+
+        // Replace the JWKS service with one that uses a different public key.
+        let wrong_key_pair = {
+            use rand::rngs::OsRng;
+            use rsa::pkcs1::EncodeRsaPublicKey;
+            use rsa::pkcs8::EncodePrivateKey;
+            use rsa::{RsaPrivateKey, RsaPublicKey};
+
+            let private_key =
+                RsaPrivateKey::new(&mut OsRng, 2048).expect("failed to generate RSA test key");
+            let public_key = RsaPublicKey::from(&private_key);
+            let private_pem = private_key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::default())
+                .expect("failed to encode private key")
+                .to_string();
+            let public_pem = public_key
+                .to_pkcs1_pem(rsa::pkcs1::LineEnding::default())
+                .expect("failed to encode public key")
+                .to_string();
+            (private_pem, public_pem)
+        };
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            state_mut.jwks_service = Arc::new(StubJwksService {
+                public_pem: wrong_key_pair.1,
+            });
+        }
+
+        let id_token = sign_id_token(
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-1",
+                "exp": jsonwebtoken::get_current_timestamp() + 300,
+            }),
+            None,
+        );
+        test_state_with_upstream(
+            &mut state,
+            UpstreamTokenResponse {
+                access_token: "token-1".into(),
+                token_type: "Bearer".into(),
+                id_token: Some(id_token),
+                raw: json!({"access_token": "token-1"}),
+            },
+            json!({"email": "alice@example.com"}),
+        );
+        test_state_with_provisioner(
+            &mut state,
+            ProvisionedIdentity {
+                tenant_id: "tenant-1".into(),
+                public_id: "public-1".into(),
+                ory_id: "ory-1".into(),
+                email: "alice@example.com".into(),
+            },
+        );
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/callbacks/oidc?code=code-1&state=state-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

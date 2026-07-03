@@ -32,6 +32,8 @@ pub struct AuthContext {
     pub subject: String,
     pub scopes: Vec<String>,
     pub token_hash: String,
+    /// Authentication Method Reference values asserted for this session.
+    pub authentication_methods: Vec<String>,
 }
 
 /// Result of a token introspection call.
@@ -41,6 +43,9 @@ pub struct IntrospectionResult {
     pub sub: Option<String>,
     pub scope: Vec<String>,
     pub exp: Option<time::OffsetDateTime>,
+    /// Authentication methods reported by the authorization server (e.g. Kratos
+    /// session metadata passed through Hydra's `ext` claim).
+    pub authentication_methods: Vec<String>,
 }
 
 impl IntrospectionResult {
@@ -54,13 +59,42 @@ impl IntrospectionResult {
         let exp = value["exp"]
             .as_i64()
             .and_then(|ts| time::OffsetDateTime::from_unix_timestamp(ts).ok());
+        let authentication_methods = parse_authentication_methods(value);
         Self {
             active,
             sub,
             scope,
             exp,
+            authentication_methods,
         }
     }
+}
+
+/// Parse AMR values from a Hydra introspection response.
+///
+/// Hydra may return the methods under `ext.authentication_methods` or a
+/// top-level `authentication_methods` key. Each entry may be an object with a
+/// `method` field or a plain string.
+fn parse_authentication_methods(value: &Value) -> Vec<String> {
+    let amr = value
+        .get("ext")
+        .and_then(|ext| ext.get("authentication_methods"))
+        .or_else(|| value.get("authentication_methods"));
+
+    let Some(array) = amr.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    array
+        .iter()
+        .filter_map(|entry| {
+            if let Some(method) = entry.get("method").and_then(|m| m.as_str()) {
+                Some(method.to_string())
+            } else {
+                entry.as_str().map(String::from)
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -144,6 +178,9 @@ impl TokenIntrospector for CachedTokenIntrospector {
                     .map(|s| s.split(' ').map(String::from).collect())
                     .unwrap_or_default(),
                 exp: row.exp,
+                // The cache schema does not store AMR; callers that need
+                // stepped-up assurance should bypass the cache or accept empty.
+                authentication_methods: Vec::new(),
             });
         }
 
@@ -218,6 +255,7 @@ pub fn build_auth_context(
     tenant_id: String,
     subject: String,
     scopes: Vec<String>,
+    authentication_methods: Vec<String>,
     token: &str,
 ) -> AuthContext {
     AuthContext {
@@ -225,6 +263,7 @@ pub fn build_auth_context(
         subject,
         scopes,
         token_hash: hash_token(token),
+        authentication_methods,
     }
 }
 
@@ -237,6 +276,23 @@ pub fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceErr
     if !auth.scopes.iter().any(|s| s == scope) {
         return Err(ServiceError::PermissionDenied(format!(
             "missing required scope: {scope}"
+        )));
+    }
+    Ok(())
+}
+
+/// Require an Authentication Method Reference from the request's `AuthContext`.
+///
+/// This helper is intended for RPC handlers that need stepped-up assurance
+/// (e.g. admin operations requiring a second factor).
+pub fn require_amr(ctx: &RequestContext, method: &str) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if !auth.authentication_methods.iter().any(|m| m == method) {
+        return Err(ServiceError::PermissionDenied(format!(
+            "missing required authentication method: {method}"
         )));
     }
     Ok(())
@@ -313,6 +369,49 @@ mod tests {
         assert_eq!(result.sub, Some("client-1".to_string()));
         assert_eq!(result.scope, vec!["openid", "tenant:read"]);
         assert!(result.exp.is_some());
+        assert!(result.authentication_methods.is_empty());
+    }
+
+    #[test]
+    fn introspection_result_parses_ext_authentication_methods_objects() {
+        let value = serde_json::json!({
+            "active": true,
+            "sub": "client-1",
+            "scope": "openid",
+            "ext": {
+                "authentication_methods": [
+                    {"method": "password"},
+                    {"method": "totp"}
+                ]
+            }
+        });
+        let result = IntrospectionResult::from_hydra(&value);
+        assert_eq!(result.authentication_methods, vec!["password", "totp"]);
+    }
+
+    #[test]
+    fn introspection_result_parses_top_level_authentication_methods_strings() {
+        let value = serde_json::json!({
+            "active": true,
+            "sub": "client-1",
+            "scope": "openid",
+            "authentication_methods": ["password", "webauthn"]
+        });
+        let result = IntrospectionResult::from_hydra(&value);
+        assert_eq!(result.authentication_methods, vec!["password", "webauthn"]);
+    }
+
+    #[test]
+    fn build_auth_context_includes_authentication_methods() {
+        let ctx = build_auth_context(
+            "tenant-1".into(),
+            "sub-1".into(),
+            vec!["tenant:read".into()],
+            vec!["password".into(), "totp".into()],
+            "secret-token",
+        );
+        assert_eq!(ctx.tenant_id, "tenant-1");
+        assert_eq!(ctx.authentication_methods, vec!["password", "totp"]);
     }
 
     #[test]
@@ -323,6 +422,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: vec!["tenant:read".into()],
             token_hash: "hash".into(),
+            authentication_methods: vec![],
         });
         assert!(require_scope(&ctx, "tenant:read").is_ok());
         let err = require_scope(&ctx, "tenant:write").unwrap_err();
@@ -333,6 +433,41 @@ mod tests {
     fn require_scope_requires_auth_context() {
         let ctx = RequestContext::default();
         let err = require_scope(&ctx, "tenant:read").unwrap_err();
+        assert!(matches!(err, ServiceError::Unauthenticated(_)));
+    }
+
+    #[test]
+    fn require_amr_accepts_matching_method() {
+        let mut ctx = RequestContext::default();
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "sub-1".into(),
+            scopes: vec![],
+            token_hash: "hash".into(),
+            authentication_methods: vec!["password".into(), "totp".into()],
+        });
+        assert!(require_amr(&ctx, "password").is_ok());
+        assert!(require_amr(&ctx, "totp").is_ok());
+    }
+
+    #[test]
+    fn require_amr_rejects_missing_method() {
+        let mut ctx = RequestContext::default();
+        ctx.extensions_mut().insert(AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "sub-1".into(),
+            scopes: vec![],
+            token_hash: "hash".into(),
+            authentication_methods: vec!["password".into()],
+        });
+        let err = require_amr(&ctx, "totp").unwrap_err();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn require_amr_requires_auth_context() {
+        let ctx = RequestContext::default();
+        let err = require_amr(&ctx, "password").unwrap_err();
         assert!(matches!(err, ServiceError::Unauthenticated(_)));
     }
 }

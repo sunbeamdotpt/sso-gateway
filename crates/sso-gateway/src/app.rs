@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::jwks::ReqwestJwksService;
 use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
@@ -12,7 +13,7 @@ use crate::{
         TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
-    middleware::{audit_middleware, auth_middleware},
+    middleware::{audit_middleware, auth_middleware, rate_limit_middleware, RateLimiter},
     proto::iam::v1::{
         ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
         OAuth2ConsentServiceExt, OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt,
@@ -38,7 +39,10 @@ use crate::{
     },
     session_token::SessionTokenSigner,
 };
-use axum::{Extension, Router as AxumRouter, middleware::from_fn, routing::get};
+use axum::{
+    Extension, Router as AxumRouter, extract::DefaultBodyLimit,
+    middleware::{from_fn, from_fn_with_state}, routing::get,
+};
 use connectrpc::Router as ConnectRouter;
 use gamlastan::crypto::SamlSigner;
 use gamlastan::crypto::keys::build_idp_keys_manager;
@@ -148,8 +152,8 @@ pub async fn build_app_with_upstream(
             callback_mappings,
             callback_schemas,
         ));
-    let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> =
-        upstream_oauth.unwrap_or_else(|| {
+    let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> = upstream_oauth
+        .unwrap_or_else(|| {
             Arc::new(ReqwestUpstreamOAuthClient::new(
                 reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
@@ -157,9 +161,15 @@ pub async fn build_app_with_upstream(
                     .unwrap_or_else(|_| reqwest::Client::new()),
             ))
         });
+    let jwks_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let jwks_service: Arc<dyn crate::jwks::JwksService> =
+        Arc::new(ReqwestJwksService::new(jwks_client));
     let session_signer = SessionTokenSigner::new(
         &config.state_cookie_secret,
-        86400,
+        config.session_ttl_seconds as i64,
         config.public_base_url.clone(),
     );
     let session_store: Arc<dyn crate::db::SessionStore> =
@@ -256,16 +266,11 @@ pub async fn build_app_with_upstream(
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
     let saml_state = Arc::new(SamlState::new(federation_service.clone()));
     let saml_idp_state = Arc::new(
-        SamlIdpState::new(
-            kratos.clone(),
-            idp_keys,
-            sp_clients,
-            idp_entity_id,
-        )
-        .with_sso_endpoint_url(format!(
-            "{}/saml/sso",
-            config.public_base_url.trim_end_matches('/')
-        )),
+        SamlIdpState::new(kratos.clone(), idp_keys, sp_clients, idp_entity_id)
+            .with_sso_endpoint_url(format!(
+                "{}/saml/sso",
+                config.public_base_url.trim_end_matches('/')
+            )),
     );
     let callback_state = Arc::new(
         CallbackState::new(
@@ -273,12 +278,14 @@ pub async fn build_app_with_upstream(
             callback_connections,
             upstream_oauth,
             callback_identity_provisioner,
+            jwks_service,
             session_signer.clone(),
             session_store.clone(),
             config.allowed_return_to_hosts.clone(),
             config.public_base_url.clone(),
             config.cookie_secure,
             config.cookie_samesite.clone(),
+            config.session_ttl_seconds,
         )
         .with_saml(federation_service.clone()),
     );
@@ -294,13 +301,20 @@ pub async fn build_app_with_upstream(
     let connect_router: ConnectRouter = oauth2_device_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
 
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.public_rate_limit_requests,
+        std::time::Duration::from_secs(config.public_rate_limit_window_seconds),
+    ));
+
     let public_routes = AxumRouter::new()
         .route("/", get(root_handler))
         .merge(oauth2_router(oauth_state))
         .merge(scim_router(scim_state))
         .merge(saml_router(saml_state))
         .merge(saml_idp_router(saml_idp_state))
-        .merge(callback_router(callback_state));
+        .merge(callback_router(callback_state))
+        .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(from_fn_with_state(rate_limiter, rate_limit_middleware));
 
     let health = HealthRouter::new();
 
@@ -351,7 +365,7 @@ async fn bootstrap_system_client(
         "client_id": client_id,
         "client_secret": client_secret,
         "grant_types": ["client_credentials"],
-        "token_endpoint_auth_method": "client_secret_post",
+        "token_endpoint_auth_method": "client_secret_basic",
         "scope": "tenant:admin application:admin"
     });
 
@@ -403,12 +417,27 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
+    use axum::extract::DefaultBodyLimit;
     use axum::http::{Request, StatusCode};
+    use axum::middleware::from_fn_with_state;
+    use axum::routing::post;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::Service;
     use tower::ServiceExt;
     use ulid::Ulid;
 
     use super::*;
+    use crate::middleware::RateLimiter;
     use crate::{config::Config, db::create_pool, test_support::postgres_url};
+
+    async fn ok_handler() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn echo_handler(body: axum::body::Bytes) -> axum::body::Bytes {
+        body
+    }
 
     fn db_url_with_name(base: &str, db_name: &str) -> String {
         if let Some(query_start) = base.rfind('?') {
@@ -449,7 +478,7 @@ mod tests {
             system_bootstrap_client_id: None,
             system_bootstrap_client_secret: None,
             state_cookie_secret: "test-secret-key-for-cookies-at-least-32-bytes-long".into(),
-            cookie_secure: false,
+            cookie_secure: true,
             cookie_samesite: "Lax".to_string(),
             saml_idp_key_encryption_key: None,
             tenant_connection_encryption_key: None,
@@ -460,6 +489,9 @@ mod tests {
             database_max_lifetime_seconds: 300,
             database_statement_timeout_seconds: 5,
             token_introspection_cache_ttl_seconds: 30,
+            session_ttl_seconds: 86400,
+            public_rate_limit_requests: 100,
+            public_rate_limit_window_seconds: 60,
         }
     }
 
@@ -677,5 +709,47 @@ mod tests {
         config.saml_sp_private_key_pem_path = Some("tests/fixtures/saml-test-key.pem".into());
         config.saml_sp_certificate_pem_path = Some("tests/fixtures/does-not-exist.pem".into());
         assert!(build_app(&config, pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_routes_apply_body_size_limit() {
+        let app = AxumRouter::new()
+            .route("/", post(echo_handler))
+            .layer(DefaultBodyLimit::max(1_048_576));
+
+        let oversized = vec![b'x'; 1_048_577];
+        let response = app
+            .oneshot(Request::post("/").body(Body::from(oversized)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn public_routes_apply_rate_limit() {
+        let limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
+        let mut app = AxumRouter::new()
+            .route("/", get(ok_handler))
+            .layer(from_fn_with_state(limiter, rate_limit_middleware));
+
+        for i in 0..2 {
+            let response = app
+                .call(Request::get("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "request {} should be allowed",
+                i
+            );
+        }
+
+        let response = app
+            .call(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

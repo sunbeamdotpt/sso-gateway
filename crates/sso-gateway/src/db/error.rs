@@ -33,6 +33,9 @@ pub enum DbError {
     #[error("saml identity mapping not found")]
     SamlIdentityMappingNotFound,
 
+    #[error("saml nameid mapping not found")]
+    SamlNameIdMappingNotFound,
+
     #[error("encryption key missing or invalid")]
     EncryptionKeyMissing,
 
@@ -83,6 +86,9 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             }
             DbError::SamlIdentityMappingNotFound => {
                 Self::NotFound("saml identity mapping not found".to_string())
+            }
+            DbError::SamlNameIdMappingNotFound => {
+                Self::NotFound("saml nameid mapping not found".to_string())
             }
             DbError::EncryptionKeyMissing => {
                 Self::Configuration("encryption key missing or invalid".to_string())
@@ -165,6 +171,10 @@ mod tests {
             (
                 DbError::SamlIdentityMappingNotFound,
                 ServiceError::NotFound("saml identity mapping not found".into()),
+            ),
+            (
+                DbError::SamlNameIdMappingNotFound,
+                ServiceError::NotFound("saml nameid mapping not found".into()),
             ),
             (
                 DbError::EncryptionKeyMissing,

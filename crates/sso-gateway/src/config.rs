@@ -36,6 +36,9 @@ pub struct Config {
     pub database_max_lifetime_seconds: u64,
     pub database_statement_timeout_seconds: u64,
     pub token_introspection_cache_ttl_seconds: u64,
+    pub session_ttl_seconds: u64,
+    pub public_rate_limit_requests: u32,
+    pub public_rate_limit_window_seconds: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -115,6 +118,12 @@ impl std::fmt::Debug for Config {
                 "token_introspection_cache_ttl_seconds",
                 &self.token_introspection_cache_ttl_seconds,
             )
+            .field("session_ttl_seconds", &self.session_ttl_seconds)
+            .field("public_rate_limit_requests", &self.public_rate_limit_requests)
+            .field(
+                "public_rate_limit_window_seconds",
+                &self.public_rate_limit_window_seconds,
+            )
             .finish()
     }
 }
@@ -180,10 +189,27 @@ impl Config {
             ));
         }
 
+        let system_bootstrap_client_secret = std::env::var("SYSTEM_BOOTSTRAP_CLIENT_SECRET").ok();
+
+        Self::validate_no_dev_secrets(
+            &state_cookie_secret,
+            system_bootstrap_client_secret.as_deref(),
+        )?;
+
         let cookie_secure = std::env::var("COOKIE_SECURE")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|| public_base_url.starts_with("https://"));
+
+        // The gateway session cookie uses the __Host- prefix, which requires the
+        // Secure attribute.
+        const SESSION_COOKIE_NAME: &str = "__Host-sso_session";
+        if SESSION_COOKIE_NAME.starts_with("__Host-") && !cookie_secure {
+            return Err(ConfigError::InvalidConfig(
+                "COOKIE_SECURE must be true because the session cookie uses the __Host- prefix"
+                    .to_string(),
+            ));
+        }
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| ConfigError::MissingVar("DATABASE_URL".to_string()))?;
@@ -238,7 +264,7 @@ impl Config {
                 .unwrap_or(false),
             allowed_return_to_hosts,
             system_bootstrap_client_id: std::env::var("SYSTEM_BOOTSTRAP_CLIENT_ID").ok(),
-            system_bootstrap_client_secret: std::env::var("SYSTEM_BOOTSTRAP_CLIENT_SECRET").ok(),
+            system_bootstrap_client_secret,
             state_cookie_secret,
             cookie_secure,
             cookie_samesite: std::env::var("COOKIE_SAMESITE").unwrap_or_else(|_| "Lax".to_string()),
@@ -271,6 +297,18 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30),
+            session_ttl_seconds: std::env::var("SESSION_TTL_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(86400),
+            public_rate_limit_requests: std::env::var("PUBLIC_RATE_LIMIT_REQUESTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
+            public_rate_limit_window_seconds: std::env::var("PUBLIC_RATE_LIMIT_WINDOW_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
         })
     }
 
@@ -306,6 +344,33 @@ impl Config {
             )));
         }
         Ok(Some(decoded))
+    }
+
+    fn validate_no_dev_secrets(
+        state_cookie_secret: &[u8],
+        system_bootstrap_client_secret: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        const DENYLIST: &[&str] = &[
+            "youReallyNeedToChangeThis",
+            "change-me-in-production-cookie-secret",
+            "ory",
+            "system-bootstrap-secret",
+        ];
+
+        for denied in DENYLIST {
+            if state_cookie_secret == denied.as_bytes() {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "STATE_COOKIE_SECRET must not be the development value '{denied}'"
+                )));
+            }
+            if system_bootstrap_client_secret == Some(*denied) {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "SYSTEM_BOOTSTRAP_CLIENT_SECRET must not be the development value '{denied}'"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -363,6 +428,9 @@ mod tests {
         clear_env("DATABASE_MAX_LIFETIME_SECONDS");
         clear_env("DATABASE_STATEMENT_TIMEOUT_SECONDS");
         clear_env("TOKEN_INTROSPECTION_CACHE_TTL_SECONDS");
+        clear_env("SESSION_TTL_SECONDS");
+        clear_env("PUBLIC_RATE_LIMIT_REQUESTS");
+        clear_env("PUBLIC_RATE_LIMIT_WINDOW_SECONDS");
     }
 
     #[test]
@@ -377,6 +445,7 @@ mod tests {
             "test-secret-key-that-is-at-least-32-bytes-long",
         );
         set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
 
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
@@ -392,10 +461,16 @@ mod tests {
         assert_eq!(config.public_base_url, "http://127.0.0.1:8080");
         assert_eq!(config.saml_idp_entity_id, None);
         assert_eq!(config.saml_request_ttl_seconds, 900);
+        assert_eq!(config.session_ttl_seconds, 86400);
+        assert_eq!(config.public_rate_limit_requests, 100);
+        assert_eq!(config.public_rate_limit_window_seconds, 60);
         assert!(config.saml_require_signed_assertions);
         assert!(!config.saml_require_signed_responses);
         assert!(!config.registration_enabled);
-        assert_eq!(config.allowed_return_to_hosts, vec!["example.com".to_string()]);
+        assert_eq!(
+            config.allowed_return_to_hosts,
+            vec!["example.com".to_string()]
+        );
     }
 
     #[test]
@@ -495,6 +570,7 @@ mod tests {
             "STATE_COOKIE_SECRET",
             "test-secret-key-that-is-at-least-32-bytes-long",
         );
+        set_env("COOKIE_SECURE", "true");
 
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
@@ -518,6 +594,7 @@ mod tests {
             "test-secret-key-that-is-at-least-32-bytes-long",
         );
         set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
         let err = Config::from_env().unwrap_err();
         drop(_guard);
         assert!(matches!(err, ConfigError::InvalidBindAddr(_)));
@@ -554,6 +631,7 @@ mod tests {
             "test-secret-key-that-is-at-least-32-bytes-long",
         );
         set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
         let err = Config::from_env().unwrap_err();
         drop(_guard);
         assert!(matches!(err, ConfigError::InvalidConfig(ref s) if s.contains("sslmode=disable")));
@@ -572,6 +650,7 @@ mod tests {
         );
         set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
         set_env("SYSTEM_BOOTSTRAP_CLIENT_SECRET", "bootstrap-secret");
+        set_env("COOKIE_SECURE", "true");
         let config = Config::from_env().expect("config should parse");
         let debug = format!("{:?}", config);
         drop(_guard);
@@ -598,6 +677,27 @@ mod tests {
         assert_eq!(
             config.allowed_return_to_hosts,
             vec!["gateway.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_rejects_dev_secrets() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "change-me-in-production-cookie-secret",
+        );
+
+        let err = Config::from_env().unwrap_err();
+        drop(_guard);
+        assert!(
+            matches!(err, ConfigError::InvalidConfig(ref s) if s.contains("change-me-in-production-cookie-secret")),
         );
     }
 }

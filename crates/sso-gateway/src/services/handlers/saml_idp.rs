@@ -29,7 +29,8 @@ use sso_ory_client::{error::OryClientError, kratos::KratosClient};
 use tracing::warn;
 
 use crate::db::{
-    SamlIdpKeyRepo, SamlIdpKeyStore, SamlRequestStore, SamlSpClientRepo, SamlSpClientStore,
+    SamlIdpKeyRepo, SamlIdpKeyStore, SamlNameIdMappingStore, SamlRequestStore, SamlSpClientRepo,
+    SamlSpClientStore, compute_pairwise_name_id,
 };
 
 const HTML_CONTENT_TYPE: &str = "text/html";
@@ -105,6 +106,7 @@ pub struct SamlIdpState {
     pub(crate) idp_keys: Arc<dyn SamlIdpKeyStore>,
     pub(crate) sp_clients: Arc<dyn SamlSpClientStore>,
     pub(crate) requests: Option<Arc<dyn SamlRequestStore>>,
+    pub(crate) nameid_mappings: Option<Arc<dyn SamlNameIdMappingStore>>,
     pub(crate) idp_entity_id: String,
     pub(crate) sso_endpoint_url: String,
     pub(crate) request_ttl: Duration,
@@ -123,6 +125,7 @@ impl SamlIdpState {
             idp_keys: Arc::new(idp_keys) as Arc<dyn SamlIdpKeyStore>,
             sp_clients: Arc::new(sp_clients) as Arc<dyn SamlSpClientStore>,
             requests: None,
+            nameid_mappings: None,
             idp_entity_id,
             sso_endpoint_url,
             request_ttl: DEFAULT_REQUEST_TTL,
@@ -131,6 +134,14 @@ impl SamlIdpState {
 
     pub fn with_request_store(mut self, requests: crate::db::SamlRequestRepo) -> Self {
         self.requests = Some(Arc::new(requests) as Arc<dyn SamlRequestStore>);
+        self
+    }
+
+    pub fn with_nameid_mappings(
+        mut self,
+        nameid_mappings: crate::db::SamlNameIdMappingRepo,
+    ) -> Self {
+        self.nameid_mappings = Some(Arc::new(nameid_mappings) as Arc<dyn SamlNameIdMappingStore>);
         self
     }
 
@@ -343,6 +354,13 @@ async fn sso(
             .await?;
     }
 
+    if authn_request.force_authn == Some(true) {
+        return Err(SamlIdpError::Response(Box::new(idp_error(
+            StatusCode::UNAUTHORIZED,
+            "fresh authentication required",
+        ))));
+    }
+
     let session_token = extract_session_token(&req)?;
 
     let session = state.kratos.whoami(session_token).await?;
@@ -376,6 +394,15 @@ async fn sso(
     key_manager.add_trusted_cert(idp_key.certificate_pem.into_bytes());
     let signer = SamlSigner::new(key_manager);
 
+    let name_id_value = resolve_pairwise_name_id(
+        state.nameid_mappings.as_ref(),
+        &sp_client.tenant_id,
+        &sp_client.entity_id,
+        identity_id,
+    )
+    .await;
+    let authn_context_class_ref = authn_context_class_from_session(&session);
+
     let options = ResponseOptions {
         idp_entity_id: state.idp_entity_id.clone(),
         in_response_to: Some(authn_request.base.id.clone()),
@@ -384,7 +411,7 @@ async fn sso(
         assertion_lifetime_seconds: 300,
         session_index: Some(identity_id.to_string()),
         session_not_on_or_after: None,
-        authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+        authn_context_class_ref: Some(authn_context_class_ref),
         client_address: None,
         attributes: vec![Attribute {
             name: "email".to_string(),
@@ -394,8 +421,8 @@ async fn sso(
         }],
     };
     let name_id = NameId {
-        value: email.to_string(),
-        format: sp_client.name_id_format.clone(),
+        value: name_id_value,
+        format: Some(constants::NAMEID_PERSISTENT.to_string()),
         name_qualifier: None,
         sp_name_qualifier: None,
         sp_provided_id: None,
@@ -500,6 +527,62 @@ fn split_certificate_pem_blocks(pem: &str) -> Vec<&str> {
     blocks
 }
 
+/// Derive a SAML authentication context class reference from the Kratos
+/// session's `authentication_methods` array. Falls back to the password
+/// context when no methods are present.
+fn authn_context_class_from_session(session: &Value) -> String {
+    let methods = session
+        .get("authentication_methods")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut has_webauthn = false;
+    let mut has_totp = false;
+    let mut has_password = false;
+    for method in &methods {
+        if let Some(name) = method.get("method").and_then(|v| v.as_str()) {
+            match name {
+                "webauthn" => has_webauthn = true,
+                "totp" => has_totp = true,
+                "password" => has_password = true,
+                _ => {}
+            }
+        }
+    }
+
+    if has_webauthn {
+        // SAML 2.0 has no dedicated WebAuthn context class; the strongest
+        // standard class for an authenticated TLS session is used.
+        constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT.to_string()
+    } else if has_totp {
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:TimeSyncToken".to_string()
+    } else if has_password {
+        constants::AUTHN_CONTEXT_PASSWORD.to_string()
+    } else {
+        constants::AUTHN_CONTEXT_UNSPECIFIED.to_string()
+    }
+}
+
+async fn resolve_pairwise_name_id(
+    nameid_mappings: Option<&Arc<dyn SamlNameIdMappingStore>>,
+    tenant_id: &str,
+    sp_entity_id: &str,
+    identity_id: &str,
+) -> String {
+    if let Some(store) = nameid_mappings {
+        store
+            .get_or_create(tenant_id, sp_entity_id, identity_id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("saml nameid mapping lookup failed: {e}; falling back to computed nameid");
+                compute_pairwise_name_id(tenant_id, sp_entity_id, identity_id)
+            })
+    } else {
+        compute_pairwise_name_id(tenant_id, sp_entity_id, identity_id)
+    }
+}
+
 fn idp_error(status: StatusCode, detail: &str) -> Response<Body> {
     let body = Body::from(format!("{{\"error\":\"{detail}\"}}"));
     (
@@ -517,7 +600,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Mutex;
 
-    use crate::db::{SamlIdpKeyRow, SamlSpClientRow};
+    use crate::db::{DbError, SamlIdpKeyRow, SamlSpClientRow};
     use gamlastan::bindings::redirect::{RedirectEncodeParams, redirect_encode};
     use gamlastan::bindings::relay_state::RelayState;
     use gamlastan::core::assertion::issuer::Issuer;
@@ -634,10 +717,39 @@ mod tests {
                 client: Arc::new(Mutex::new(client)),
             }),
             requests: None,
+            nameid_mappings: None,
             idp_entity_id: "https://idp.example.com".to_string(),
             sso_endpoint_url: "https://idp.example.com/saml/sso".to_string(),
             request_ttl: DEFAULT_REQUEST_TTL,
         })
+    }
+
+    #[derive(Clone, Default)]
+    struct StubNameIdMappingStore;
+
+    #[async_trait]
+    impl SamlNameIdMappingStore for StubNameIdMappingStore {
+        async fn get_or_create(
+            &self,
+            tenant_id: &str,
+            sp_entity_id: &str,
+            identity_id: &str,
+        ) -> Result<String, DbError> {
+            Ok(compute_pairwise_name_id(
+                tenant_id,
+                sp_entity_id,
+                identity_id,
+            ))
+        }
+
+        async fn find_by_name_id(
+            &self,
+            _tenant_id: &str,
+            _sp_entity_id: &str,
+            name_id: &str,
+        ) -> Result<String, DbError> {
+            Ok(name_id.to_string())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -703,6 +815,7 @@ mod tests {
                 client: Arc::new(Mutex::new(client)),
             }),
             requests: None,
+            nameid_mappings: Some(Arc::new(StubNameIdMappingStore)),
             idp_entity_id: "https://idp.example.com".to_string(),
             sso_endpoint_url: "https://idp.example.com/saml/sso".to_string(),
             request_ttl: DEFAULT_REQUEST_TTL,
@@ -767,8 +880,8 @@ mod tests {
         let saml_xml = authn_request
             .to_xml_string()
             .expect("serialize authn request");
-        let signer_key_pem = signer_key_pem
-            .unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
+        let signer_key_pem =
+            signer_key_pem.unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
         let key_manager = build_idp_keys_manager(signer_key_pem).expect("load signer key");
         let signer = SamlSigner::new(key_manager);
         let signer_ref = Some((&signer, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
@@ -856,8 +969,8 @@ mod tests {
         let saml_xml = authn_request
             .to_xml_string()
             .expect("serialize authn request");
-        let signer_key_pem = signer_key_pem
-            .unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
+        let signer_key_pem =
+            signer_key_pem.unwrap_or(include_bytes!("../../../tests/fixtures/saml-test-key.pem"));
         let key_manager = build_idp_keys_manager(signer_key_pem).expect("load signer key");
         let signer = SamlSigner::new(key_manager);
         let signer_ref = Some((&signer, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
@@ -1528,5 +1641,108 @@ mod tests {
             .unwrap_err()
             .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn authn_request_url_with_force_authn(
+        entity_id: &str,
+        provider_id: &str,
+        force_authn: bool,
+    ) -> String {
+        let destination = format!("/saml/sso?provider_id={provider_id}");
+        let authn_request = AuthnRequest {
+            base: RequestBase {
+                id: "_req_force_1".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: Some("https://idp.example.com/saml/sso".to_string()),
+                consent: None,
+                issuer: Some(Issuer::entity(entity_id)),
+                has_signature: false,
+            },
+            subject: None,
+            name_id_policy: None,
+            conditions: None,
+            requested_authn_context: None,
+            scoping: None,
+            force_authn: Some(force_authn),
+            is_passive: None,
+            assertion_consumer_service_index: None,
+            assertion_consumer_service_url: Some("https://sp.example.com/acs".to_string()),
+            protocol_binding: None,
+            attribute_consuming_service_index: None,
+            provider_name: None,
+            extensions: None,
+        };
+        let saml_xml = authn_request
+            .to_xml_string()
+            .expect("serialize authn request");
+        let params = RedirectEncodeParams {
+            saml_xml: saml_xml.as_bytes(),
+            is_request: true,
+            destination: &destination,
+            relay_state: None,
+            signer: None,
+        };
+        redirect_encode(&params).expect("encode authn request")
+    }
+
+    #[tokio::test]
+    async fn sso_rejects_force_authn_request() {
+        let url = authn_request_url_with_force_authn("https://sp.example.com", "sp-1", true);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("fresh authentication required"));
+    }
+
+    #[tokio::test]
+    async fn sso_allows_non_force_authn_request() {
+        let url = authn_request_url_with_force_authn("https://sp.example.com", "sp-1", false);
+        let state = test_state_full(
+            Some(Ok(test_sp_client("https://sp.example.com"))),
+            Some(Ok(session_with_email("alice@example.com"))),
+            Some(Ok(active_idp_key())),
+        );
+        let req = sso_request(&url, vec![("X-Session-Token", "session-1")]);
+        let resp = sso(State(state), Query(provider_query()), req)
+            .await
+            .expect("sso should succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn authn_context_class_prefers_strongest_method() {
+        let password = json!({"authentication_methods": [{"method": "password"}]});
+        assert_eq!(
+            authn_context_class_from_session(&password),
+            constants::AUTHN_CONTEXT_PASSWORD
+        );
+
+        let totp = json!({"authentication_methods": [{"method": "password"}, {"method": "totp"}]});
+        assert_eq!(
+            authn_context_class_from_session(&totp),
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:TimeSyncToken"
+        );
+
+        let webauthn = json!({"authentication_methods": [{"method": "webauthn"}]});
+        assert_eq!(
+            authn_context_class_from_session(&webauthn),
+            constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT
+        );
+
+        let empty = json!({});
+        assert_eq!(
+            authn_context_class_from_session(&empty),
+            constants::AUTHN_CONTEXT_UNSPECIFIED
+        );
     }
 }

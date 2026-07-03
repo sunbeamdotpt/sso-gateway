@@ -31,9 +31,11 @@ pub fn encrypt(plaintext: &str, key: &[u8]) -> Result<String, DbError> {
     let cipher = cipher(key)?;
     let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
     let mut buffer = nonce.to_vec();
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|e| DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!("encrypt: {e}")))))?;
+    let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
+        DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!(
+            "encrypt: {e}"
+        ))))
+    })?;
     buffer.extend_from_slice(&ciphertext);
     Ok(base64::engine::general_purpose::STANDARD.encode(&buffer))
 }
@@ -43,7 +45,11 @@ pub fn decrypt(ciphertext_b64: &str, key: &[u8]) -> Result<String, DbError> {
     let cipher = cipher(key)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(ciphertext_b64)
-        .map_err(|e| DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!("base64: {e}")))))?;
+        .map_err(|e| {
+            DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!(
+                "base64: {e}"
+            ))))
+        })?;
     if bytes.len() < NONCE_LEN {
         return Err(DbError::Sqlx(sqlx::Error::Configuration(Box::from(
             "ciphertext too short",
@@ -51,11 +57,16 @@ pub fn decrypt(ciphertext_b64: &str, key: &[u8]) -> Result<String, DbError> {
     }
     let (nonce, ciphertext) = bytes.split_at(NONCE_LEN);
     let nonce = aes_gcm::Nonce::from_slice(nonce);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!("decrypt: {e}")))))?;
-    String::from_utf8(plaintext)
-        .map_err(|e| DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!("decrypt utf8: {e}")))))
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!(
+            "decrypt: {e}"
+        ))))
+    })?;
+    String::from_utf8(plaintext).map_err(|e| {
+        DbError::Sqlx(sqlx::Error::Configuration(Box::from(format!(
+            "decrypt utf8: {e}"
+        ))))
+    })
 }
 
 #[cfg(test)]

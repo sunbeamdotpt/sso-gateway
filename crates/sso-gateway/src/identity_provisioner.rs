@@ -114,6 +114,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 pub trait ProvisionerKratos: Send + Sync + 'static {
     async fn list_identities_by_identifier(
         &self,
+        tenant_id: &str,
         identifier: &str,
     ) -> Result<serde_json::Value, OryClientError>;
 
@@ -127,9 +128,11 @@ pub trait ProvisionerKratos: Send + Sync + 'static {
 impl ProvisionerKratos for KratosClient {
     async fn list_identities_by_identifier(
         &self,
+        tenant_id: &str,
         identifier: &str,
     ) -> Result<serde_json::Value, OryClientError> {
-        self.list_identities_by_identifier(identifier).await
+        self.list_identities_by_identifier(tenant_id, identifier)
+            .await
     }
 
     async fn create_identity(
@@ -217,9 +220,10 @@ impl KratosIdentityProvisioner {
         email: &str,
         name: Option<&serde_json::Value>,
     ) -> Result<ProvisionedIdentity, ProvisionError> {
+        let scoped_identifier = format!("{tenant_id}:{email}");
         let existing = self
             .kratos
-            .list_identities_by_identifier(email)
+            .list_identities_by_identifier(tenant_id, &scoped_identifier)
             .await
             .map_err(ProvisionError::Kratos)?;
 
@@ -252,6 +256,7 @@ impl KratosIdentityProvisioner {
                     "schema_id": schema_id,
                     "traits": {
                         "email": email,
+                        "tenant_id": tenant_id,
                         "name": normalize_name_claim(name),
                     },
                 });
@@ -396,6 +401,7 @@ mod tests {
     impl ProvisionerKratos for StubKratos {
         async fn list_identities_by_identifier(
             &self,
+            _tenant_id: &str,
             _identifier: &str,
         ) -> Result<serde_json::Value, OryClientError> {
             self.list_result
@@ -685,6 +691,143 @@ mod tests {
             .unwrap();
         assert_eq!(result.ory_id, "ory-2");
         assert_eq!(result.public_id, "public-2");
+    }
+
+    #[tokio::test]
+    async fn provision_isolates_identities_by_tenant() {
+        #[derive(Clone)]
+        struct TenantAwareStubKratos {
+            expected_tenant_id: String,
+            expected_identifier: String,
+            existing_identity_id: String,
+        }
+
+        #[async_trait]
+        impl ProvisionerKratos for TenantAwareStubKratos {
+            async fn list_identities_by_identifier(
+                &self,
+                tenant_id: &str,
+                identifier: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                if tenant_id == self.expected_tenant_id && identifier == self.expected_identifier {
+                    Ok(json!([{ "id": self.existing_identity_id }]))
+                } else {
+                    Ok(json!([]))
+                }
+            }
+
+            async fn create_identity(
+                &self,
+                payload: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                let tenant_id = payload["traits"]["tenant_id"].as_str().unwrap_or("unknown");
+                Ok(json!({ "id": format!("ory-created-{tenant_id}") }))
+            }
+        }
+
+        let kratos = Arc::new(TenantAwareStubKratos {
+            expected_tenant_id: "tenant-a".into(),
+            expected_identifier: "tenant-a:alice@example.com".into(),
+            existing_identity_id: "ory-a".into(),
+        });
+        let mappings = Arc::new(StubMappingStore {
+            get_public_id_result: Arc::new(Mutex::new(Some(Ok("public-a".into())))),
+            create_result: Arc::new(Mutex::new(Some(Ok(IdMappingRow {
+                id: "id-b".into(),
+                tenant_id: "tenant-b".into(),
+                backend: BACKEND_KRATOS.into(),
+                public_id: "public-b".into(),
+                ory_global_id: "ory-created-tenant-b".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+        });
+        #[derive(Clone)]
+        struct AlwaysSchemaStore;
+
+        #[async_trait]
+        impl IdentitySchemaStore for AlwaysSchemaStore {
+            async fn create(
+                &self,
+                _tenant_id: &str,
+                _schema_id: &str,
+                _schema_json: serde_json::Value,
+                _is_default: bool,
+            ) -> Result<IdentitySchemaRow, DbError> {
+                unimplemented!()
+            }
+
+            async fn get_by_schema_id(
+                &self,
+                _tenant_id: &str,
+                _schema_id: &str,
+            ) -> Result<IdentitySchemaRow, DbError> {
+                Ok(IdentitySchemaRow {
+                    id: "schema-1".into(),
+                    tenant_id: "tenant-a".into(),
+                    schema_id: "default".into(),
+                    schema_json: json!({}),
+                    is_default: true,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    updated_at: time::OffsetDateTime::now_utc(),
+                })
+            }
+
+            async fn list(&self, _tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
+                unimplemented!()
+            }
+
+            async fn delete(&self, _tenant_id: &str, _schema_id: &str) -> Result<(), DbError> {
+                unimplemented!()
+            }
+
+            async fn update(
+                &self,
+                _tenant_id: &str,
+                _schema_id: &str,
+                _schema_json: serde_json::Value,
+                _is_default: bool,
+            ) -> Result<IdentitySchemaRow, DbError> {
+                unimplemented!()
+            }
+
+            async fn set_default(
+                &self,
+                _tenant_id: &str,
+                _schema_id: &str,
+            ) -> Result<IdentitySchemaRow, DbError> {
+                unimplemented!()
+            }
+
+            async fn get_default(&self, _tenant_id: &str) -> Result<IdentitySchemaRow, DbError> {
+                unimplemented!()
+            }
+        }
+
+        let schemas = Arc::new(AlwaysSchemaStore);
+        let p = provisioner(kratos, mappings, schemas);
+
+        let a = p
+            .provision(
+                "tenant-a",
+                "default",
+                &json!({"email": "alice@example.com", "email_verified": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(a.ory_id, "ory-a");
+        assert_eq!(a.public_id, "public-a");
+
+        let b = p
+            .provision(
+                "tenant-b",
+                "default",
+                &json!({"email": "alice@example.com", "email_verified": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b.ory_id, "ory-created-tenant-b");
+        assert_eq!(b.public_id, "public-b");
+        assert_ne!(a.public_id, b.public_id);
     }
 
     #[tokio::test]

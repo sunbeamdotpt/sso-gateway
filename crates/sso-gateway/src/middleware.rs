@@ -1,12 +1,13 @@
 use axum::{
     Extension,
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::auth::{
     AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_tenant_from_subject,
@@ -14,7 +15,67 @@ use crate::auth::{
 use crate::db::{AuditLogRepo, IdMappingStore, SessionStore};
 use crate::session_token::SessionTokenSigner;
 
+/// Re-exported helper for RPC handlers that need stepped-up authentication.
+pub use crate::auth::require_amr;
+
 pub const TENANT_ID_HEADER: &str = "x-tenant-id";
+
+/// Simple token-bucket rate limiter.
+#[derive(Clone, Debug)]
+pub struct RateLimiter {
+    max: u32,
+    per: Duration,
+    state: Arc<Mutex<RateLimiterState>>,
+}
+
+#[derive(Clone, Debug)]
+struct RateLimiterState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    /// Create a limiter that allows `max` requests per `per` duration.
+    pub fn new(max: u32, per: Duration) -> Self {
+        Self {
+            max,
+            per,
+            state: Arc::new(Mutex::new(RateLimiterState {
+                tokens: max as f64,
+                last: Instant::now(),
+            })),
+        }
+    }
+
+    /// Attempt to consume one token. Returns `true` if the request is allowed.
+    pub fn check(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last).as_secs_f64();
+        let refill = elapsed * (self.max as f64 / self.per.as_secs_f64());
+        state.tokens = (state.tokens + refill).min(self.max as f64);
+        state.last = now;
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Reject requests with `429 Too Many Requests` when the rate limiter is empty.
+pub async fn rate_limit_middleware(
+    State(limiter): State<Arc<RateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if limiter.check() {
+        next.run(request).await
+    } else {
+        StatusCode::TOO_MANY_REQUESTS.into_response()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TenantId(pub String);
@@ -123,6 +184,7 @@ async fn authenticate_session_cookie(
         claims.tenant_id,
         claims.sub,
         vec![],
+        vec![],
         &cookie,
     ))
 }
@@ -162,6 +224,7 @@ async fn authenticate_bearer_token(
         tenant_id,
         subject,
         introspection.scope,
+        introspection.authentication_methods,
         token,
     ))
 }
@@ -529,6 +592,7 @@ mod tests {
                     sub: Some("sub-1".into()),
                     scope: vec!["tenant:read".into()],
                     exp: None,
+                    authentication_methods: vec![],
                 },
             ))))),
             Arc::new(StubMappingStore(Mutex::new(Some(Ok(Some(
@@ -556,6 +620,7 @@ mod tests {
                     sub: Some("sub-1".into()),
                     scope: vec![],
                     exp: None,
+                    authentication_methods: vec![],
                 },
             ))))),
             Arc::new(StubMappingStore(Mutex::new(None))),
@@ -581,6 +646,7 @@ mod tests {
                     sub: Some("sub-1".into()),
                     scope: vec!["tenant:read".into()],
                     exp: None,
+                    authentication_methods: vec![],
                 },
             ))))),
             Arc::new(StubMappingStore(Mutex::new(Some(Ok(None))))),

@@ -62,7 +62,7 @@ pub enum SessionTokenError {
 impl From<CookieError> for SessionTokenError {
     fn from(err: CookieError) -> Self {
         match err {
-            CookieError::InvalidFormat => SessionTokenError::InvalidFormat,
+            CookieError::InvalidFormat | CookieError::WeakKey => SessionTokenError::InvalidFormat,
             CookieError::InvalidBase64 | CookieError::InvalidSignature => {
                 SessionTokenError::InvalidSignature
             }
@@ -80,9 +80,14 @@ pub struct SessionTokenSigner {
 
 impl SessionTokenSigner {
     /// Create a signer with the given HMAC secret, token lifetime, and issuer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `secret` is shorter than 32 bytes. The caller is expected to
+    /// validate this at config load time.
     pub fn new(secret: impl AsRef<[u8]>, ttl_seconds: i64, issuer: impl Into<String>) -> Self {
         Self {
-            signer: CookieSigner::new(secret),
+            signer: CookieSigner::new(secret).expect("session token secret must be at least 32 bytes"),
             ttl_seconds,
             issuer: issuer.into(),
         }

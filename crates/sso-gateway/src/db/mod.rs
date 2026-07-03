@@ -19,6 +19,7 @@ mod permission;
 mod pool;
 mod saml_identity_mapping;
 mod saml_idp_key;
+mod saml_nameid_mapping;
 mod saml_provider;
 mod saml_replay_cache;
 mod saml_request;
@@ -46,6 +47,10 @@ pub use saml_identity_mapping::{
     PgSamlIdentityMappingStore, SamlIdentityMappingRow, SamlIdentityMappingStore,
 };
 pub use saml_idp_key::{PgSamlIdpKeyStore, SamlIdpKeyRow, SamlIdpKeyStore};
+pub use saml_nameid_mapping::{
+    PgSamlNameIdMappingStore, SamlNameIdMappingRow, SamlNameIdMappingStore,
+    compute_pairwise_name_id,
+};
 pub use saml_provider::{PgSamlProviderStore, SamlProviderRow, SamlProviderStore};
 pub use saml_replay_cache::{
     GamlastanReplayAdapter, ReplayCache as SamlReplayCacheTrait, SamlReplayCache,
@@ -68,6 +73,7 @@ pub use login_state::PgLoginStateStore as LoginStateRepo;
 pub use permission::PgPermissionTupleStore as PermissionTupleRepo;
 pub use saml_identity_mapping::PgSamlIdentityMappingStore as SamlIdentityMappingRepo;
 pub use saml_idp_key::PgSamlIdpKeyStore as SamlIdpKeyRepo;
+pub use saml_nameid_mapping::PgSamlNameIdMappingStore as SamlNameIdMappingRepo;
 pub use saml_provider::PgSamlProviderStore as SamlProviderRepo;
 pub use saml_request::PgSamlRequestStore as SamlRequestRepo;
 pub use saml_sp_client::PgSamlSpClientStore as SamlSpClientRepo;

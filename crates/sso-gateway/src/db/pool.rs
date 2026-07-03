@@ -18,10 +18,7 @@ pub type DbPool = Pool<Postgres>;
 /// `ssl_required` mirrors the `database_ssl_required` configuration value. When
 /// true, a URL containing `sslmode=disable` is rejected so the gateway cannot
 /// silently connect without TLS in production.
-pub async fn create_pool(
-    database_url: &str,
-    ssl_required: bool,
-) -> Result<DbPool, sqlx::Error> {
+pub async fn create_pool(database_url: &str, ssl_required: bool) -> Result<DbPool, sqlx::Error> {
     if !Postgres::database_exists(database_url)
         .await
         .unwrap_or(false)

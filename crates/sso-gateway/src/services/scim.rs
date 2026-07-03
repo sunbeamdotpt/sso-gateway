@@ -757,6 +757,7 @@ fn request_context(tenant_id: String) -> RequestContext {
         subject: "scim-subject".into(),
         scopes: vec![SCOPE_SCIM_READ.into(), SCOPE_SCIM_ADMIN.into()],
         token_hash: "hash".into(),
+        authentication_methods: Vec::new(),
     });
     ctx
 }
@@ -1895,6 +1896,7 @@ mod tests {
             subject: "scim-subject".into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }

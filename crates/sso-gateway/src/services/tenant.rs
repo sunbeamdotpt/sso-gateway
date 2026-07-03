@@ -190,6 +190,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: vec![SCOPE_TENANT_READ.into()],
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }
@@ -202,6 +203,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }
@@ -214,6 +216,7 @@ mod tests {
             subject: "sub-1".into(),
             scopes: vec!["other:scope".into()],
             token_hash: "hash".into(),
+            authentication_methods: Vec::new(),
         });
         ctx
     }

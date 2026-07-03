@@ -160,7 +160,9 @@ impl FederationServiceImpl {
         let schemas: Arc<dyn IdentitySchemaStore> = Arc::new(schemas);
         let identity_provisioner: Arc<dyn IdentityProvisioner> = Arc::new(
             KratosIdentityProvisioner::new(kratos.clone(), mappings.clone(), schemas.clone())
-                .with_saml_mappings(Arc::new(federation_mappings.clone()) as Arc<dyn SamlIdentityMappingStore>),
+                .with_saml_mappings(
+                    Arc::new(federation_mappings.clone()) as Arc<dyn SamlIdentityMappingStore>
+                ),
         );
         let hrd = Hrd::new(
             connections.clone(),

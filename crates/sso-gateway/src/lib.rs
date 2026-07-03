@@ -8,6 +8,7 @@ pub mod db;
 pub mod domain_verification;
 pub mod hrd;
 pub mod identity_provisioner;
+pub mod jwks;
 pub mod middleware;
 pub mod proto;
 pub mod services;

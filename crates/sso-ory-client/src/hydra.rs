@@ -17,7 +17,10 @@ impl HydraClient {
     /// Create a new Hydra client.
     pub fn new(admin_url: &str, public_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: parse_base_url(public_url)?,
         })
@@ -34,7 +37,9 @@ impl HydraClient {
     /// Get an OAuth 2.0 / OIDC client by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn get_oauth2_client(&self, id: &str) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("admin/clients/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/clients/{}", urlencoding::encode(id)))?;
         debug!(%url, "fetching hydra oauth2 client");
         self.send_json(Method::GET, url, None).await
     }
@@ -42,7 +47,9 @@ impl HydraClient {
     /// Delete an OAuth 2.0 / OIDC client by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError> {
-        let url = self.admin_url.join(&format!("admin/clients/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/clients/{}", urlencoding::encode(id)))?;
         debug!(%url, "deleting hydra oauth2 client");
         self.send_empty(Method::DELETE, url).await
     }
@@ -54,7 +61,9 @@ impl HydraClient {
         id: &str,
         payload: Value,
     ) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("admin/clients/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/clients/{}", urlencoding::encode(id)))?;
         debug!(%url, "updating hydra oauth2 client");
         self.send_json(Method::PUT, url, Some(payload)).await
     }
@@ -307,21 +316,31 @@ impl HydraClient {
     }
 
     /// Exchange credentials or a code for tokens at Hydra's public `/oauth2/token` endpoint.
+    ///
+    /// When `client_credentials` is provided, the client id and secret are sent
+    /// using HTTP Basic authentication (the method required by
+    /// `client_secret_basic` clients). Otherwise the credentials must be present
+    /// in the form body (for `client_secret_post` clients).
     #[instrument(skip(self, form))]
-    pub async fn token(&self, form: Vec<(String, String)>) -> Result<Value, OryClientError> {
+    pub async fn token(
+        &self,
+        form: Vec<(String, String)>,
+        client_credentials: Option<(&str, &str)>,
+    ) -> Result<Value, OryClientError> {
         let url = self
             .public_url
             .join("oauth2/token")
             .map_err(OryClientError::Url)?;
         debug!(%url, "exchanging token");
-        let response = self
+        let mut request = self
             .client
             .post(url)
             .form(&form)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .map_err(OryClientError::Http)?;
+            .header("accept", "application/json");
+        if let Some((client_id, client_secret)) = client_credentials {
+            request = request.basic_auth(client_id, Some(client_secret));
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
         handle_response(response).await
     }
 
@@ -369,20 +388,22 @@ impl HydraClient {
         &self,
         path: &str,
         form: Vec<(String, String)>,
+        client_credentials: Option<(&str, &str)>,
     ) -> Result<Value, OryClientError> {
         let url = self
             .public_url
-            .join(&format!("oauth2/device/{path}"))
+            .join(&format!("oauth2/device/{}", urlencoding::encode(path)))
             .map_err(OryClientError::Url)?;
         debug!(%url, "proxying device request");
-        let response = self
+        let mut request = self
             .client
             .post(url)
             .form(&form)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .map_err(OryClientError::Http)?;
+            .header("accept", "application/json");
+        if let Some((client_id, client_secret)) = client_credentials {
+            request = request.basic_auth(client_id, Some(client_secret));
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
         handle_response(response).await
     }
 
@@ -906,7 +927,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = HydraClient::new(&url, &url).unwrap();
         let resp = client
-            .token(vec![("code".to_string(), "code-1".to_string())])
+            .token(vec![("code".to_string(), "code-1".to_string())], None)
             .await
             .unwrap();
         assert_eq!(resp["access_token"], "code-1");
@@ -932,6 +953,7 @@ mod tests {
                     ("client_id".to_string(), "client-1".to_string()),
                     ("scope".to_string(), "openid".to_string()),
                 ],
+                None,
             )
             .await
             .unwrap();
@@ -949,6 +971,7 @@ mod tests {
             .device(
                 "token",
                 vec![("grant_type".to_string(), "device_code".to_string())],
+                None,
             )
             .await
             .unwrap();
@@ -1072,7 +1095,7 @@ mod tests {
         });
         let client =
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
-        let err = client.token(vec![]).await.unwrap_err();
+        let err = client.token(vec![], None).await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 
@@ -1086,7 +1109,7 @@ mod tests {
         });
         let client =
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
-        let err = client.device("auth", vec![]).await.unwrap_err();
+        let err = client.device("auth", vec![], None).await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 

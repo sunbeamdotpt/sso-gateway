@@ -5426,6 +5426,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonschema",
+ "jsonwebtoken",
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.12.28",
@@ -5466,6 +5467,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "urlencoding",
 ]
 
 [[package]]

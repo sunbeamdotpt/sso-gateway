@@ -579,6 +579,7 @@ mod tests {
                 sub: Some("sub-1".into()),
                 scope: scopes,
                 exp: None,
+                authentication_methods: vec![],
             })))),
         })
     }

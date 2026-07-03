@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_USER: ory
-      POSTGRES_PASSWORD: ory
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
       POSTGRES_DB: ory
-    ports:
-      - "5432:5432"
+    networks:
+      - internal
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ory"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?required}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -18,28 +18,33 @@ services:
   hydra-migrate:
     image: oryd/hydra:v2.2.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
     command: migrate -c /etc/config/hydra/hydra.yml sql -e --yes
     restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - internal
     volumes:
       - ./deploy/hydra.yml:/etc/config/hydra/hydra.yml:ro
 
   hydra:
     image: oryd/hydra:v2.2.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
       URLS_SELF_ISSUER: http://localhost:4444
       URLS_CONSENT: http://localhost:8080/oauth2/consent
       URLS_LOGIN: http://localhost:8080/oauth2/login
       URLS_LOGOUT: http://localhost:8080/oauth2/logout
-      SECRETS_SYSTEM: youReallyNeedToChangeThis
+      SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET:?required}
+      HYDRA_SYSTEM_SECRET: ${HYDRA_SYSTEM_SECRET:?required}
+      HYDRA_PAIRWISE_SALT: ${HYDRA_PAIRWISE_SALT:?required}
     command: serve -c /etc/config/hydra/hydra.yml all --dev
     ports:
       - "4444:4444"   # public
-      - "4445:4445"   # admin
+    networks:
+      - internal
     depends_on:
       hydra-migrate:
         condition: service_completed_successfully
@@ -49,23 +54,27 @@ services:
   kratos-migrate:
     image: oryd/kratos:v1.3.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
     command: migrate sql -e --yes
     restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - internal
     volumes:
       - ./deploy/kratos.yml:/etc/config/kratos/kratos.yml:ro
 
   kratos:
     image: oryd/kratos:v1.3.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
+      KRATOS_COOKIE_SECRET: ${KRATOS_COOKIE_SECRET:?required}
     command: serve -c /etc/config/kratos/kratos.yml --dev
     ports:
       - "4433:4433"   # public
-      - "4434:4434"   # admin
+    networks:
+      - internal
     depends_on:
       kratos-migrate:
         condition: service_completed_successfully
@@ -76,24 +85,26 @@ services:
   keto-migrate:
     image: oryd/keto:v0.14.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
     command: migrate up -y
     restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - internal
     volumes:
       - ./deploy/keto.yml:/etc/config/keto/keto.yml:ro
 
   keto:
     image: oryd/keto:v0.14.0
     environment:
-      DSN: postgres://ory:ory@postgres:5432/ory?sslmode=disable&max_conns=20&max_idle_conns=4
+      DSN: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}&max_conns=20&max_idle_conns=4
     command: serve -c /etc/config/keto/keto.yml
     ports:
       - "4466:4466"   # read
-      - "4467:4467"   # write
-      - "4469:4469"   # grpc
+    networks:
+      - internal
     depends_on:
       keto-migrate:
         condition: service_completed_successfully
@@ -105,7 +116,7 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      DATABASE_URL: postgres://ory:ory@postgres:5432/ory?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/ory?sslmode=${POSTGRES_SSLMODE:-require}
       HYDRA_ADMIN_URL: http://hydra:4445
       HYDRA_PUBLIC_URL: http://hydra:4444
       KRATOS_ADMIN_URL: http://kratos:4434
@@ -116,15 +127,24 @@ services:
       BIND_ADDR: 0.0.0.0:8080
       SYSTEM_TENANT_ULID: 01HZY9JTKKHK3Y6XJJYHZ9Q5TV
       SYSTEM_BOOTSTRAP_CLIENT_ID: system-bootstrap-client
-      SYSTEM_BOOTSTRAP_CLIENT_SECRET: system-bootstrap-secret
-      STATE_COOKIE_SECRET: change-me-in-production-cookie-secret
+      SYSTEM_BOOTSTRAP_CLIENT_SECRET: ${SYSTEM_BOOTSTRAP_CLIENT_SECRET:?required}
+      STATE_COOKIE_SECRET: ${STATE_COOKIE_SECRET:?required}
       ALLOWED_RETURN_TO_HOSTS: localhost
     ports:
       - "8080:8080"
+    networks:
+      - public
+      - internal
     depends_on:
       - hydra
       - kratos
       - keto
+    # volumes:
+    #   - ./path/to/ca.crt:/etc/ssl/certs/postgres-ca.crt:ro
 
 volumes:
   postgres-data:
+
+networks:
+  public:
+  internal:

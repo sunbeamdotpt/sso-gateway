@@ -85,7 +85,9 @@ pub fn validate_upstream_url(url_str: &str) -> Result<(), ServiceError> {
     // If the host is an IP literal, block loopback, link-local and private ranges.
     // `host_str()` keeps brackets around IPv6 literals, so strip them before parsing.
     let ip_host = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = ip_host.parse::<std::net::IpAddr>() && is_forbidden_ip(ip) {
+    if let Ok(ip) = ip_host.parse::<std::net::IpAddr>()
+        && is_forbidden_ip(ip)
+    {
         return Err(ServiceError::InvalidArgument(
             "upstream URL resolves to a forbidden IP address".into(),
         ));
@@ -94,11 +96,40 @@ pub fn validate_upstream_url(url_str: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
-fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_private(),
         std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0 == 0xfe80),
     }
+}
+
+/// Re-resolve an upstream URL's host and reject any forbidden IP addresses.
+///
+/// This is a second-line defense against DNS rebinding: even if the URL passes
+/// `validate_upstream_url`, the resolved IPs are checked again at request time.
+async fn validate_resolved_ips_for_url(url_str: &str) -> Result<(), UpstreamOAuthError> {
+    let url = reqwest::Url::parse(url_str).map_err(|e| {
+        UpstreamOAuthError::InvalidUrl(format!("invalid upstream URL '{url_str}': {e}"))
+    })?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| UpstreamOAuthError::InvalidUrl("upstream URL is missing a host".into()))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+        UpstreamOAuthError::InvalidUrl(format!("DNS resolution failed for '{host}': {e}"))
+    })?;
+
+    for addr in addrs {
+        if is_forbidden_ip(addr.ip()) {
+            return Err(UpstreamOAuthError::InvalidUrl(format!(
+                "upstream host '{host}' resolved to forbidden IP {}",
+                addr.ip()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Exchange authorization codes and fetch userinfo from upstream providers.
@@ -154,6 +185,7 @@ impl UpstreamOAuthClient for ReqwestUpstreamOAuthClient {
         if let Err(e) = validate_upstream_url(token_url) {
             return Err(UpstreamOAuthError::InvalidUrl(e.to_string()));
         }
+        validate_resolved_ips_for_url(token_url).await?;
 
         debug!(%token_url, "exchanging authorization code");
 
@@ -209,6 +241,7 @@ impl UpstreamOAuthClient for ReqwestUpstreamOAuthClient {
         if let Err(e) = validate_upstream_url(userinfo_url) {
             return Err(UpstreamOAuthError::InvalidUrl(e.to_string()));
         }
+        validate_resolved_ips_for_url(userinfo_url).await?;
 
         debug!(%userinfo_url, "fetching upstream userinfo");
 
@@ -357,5 +390,27 @@ mod tests {
     fn upstream_oauth_error_converts_invalid_url() {
         let err: ServiceError = UpstreamOAuthError::InvalidUrl("bad".into()).into();
         assert!(matches!(err, ServiceError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn connection_level_check_blocks_metadata_ip() {
+        let err = validate_resolved_ips_for_url("https://169.254.169.254/token")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpstreamOAuthError::InvalidUrl(ref msg) if msg.contains("forbidden IP")),
+            "expected forbidden IP error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_level_check_blocks_localhost_resolution() {
+        let err = validate_resolved_ips_for_url("https://localhost/token")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpstreamOAuthError::InvalidUrl(ref msg) if msg.contains("forbidden IP")),
+            "expected forbidden IP error, got {err:?}"
+        );
     }
 }

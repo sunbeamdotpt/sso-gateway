@@ -25,7 +25,10 @@ impl KratosClient {
     /// Create a new Kratos admin client.
     pub fn new(admin_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: None,
         })
@@ -34,7 +37,10 @@ impl KratosClient {
     /// Create a client with both admin and public endpoints configured.
     pub fn new_with_public(admin_url: &str, public_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: Some(parse_base_url(public_url)?),
         })
@@ -51,7 +57,9 @@ impl KratosClient {
     /// Get an identity by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn get_identity(&self, id: &str) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("admin/identities/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/identities/{}", urlencoding::encode(id)))?;
         debug!(%url, "fetching kratos identity");
         self.send_json(Method::GET, url, None).await
     }
@@ -59,7 +67,9 @@ impl KratosClient {
     /// Update an identity by its Ory global id.
     #[instrument(skip(self, payload), fields(admin_url = %self.admin_url))]
     pub async fn update_identity(&self, id: &str, payload: Value) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("admin/identities/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/identities/{}", urlencoding::encode(id)))?;
         debug!(%url, "updating kratos identity");
         self.send_json(Method::PUT, url, Some(payload)).await
     }
@@ -67,23 +77,29 @@ impl KratosClient {
     /// Delete an identity by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn delete_identity(&self, id: &str) -> Result<(), OryClientError> {
-        let url = self.admin_url.join(&format!("admin/identities/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/identities/{}", urlencoding::encode(id)))?;
         debug!(%url, "deleting kratos identity");
         self.send_empty(Method::DELETE, url).await
     }
 
-    /// List identities by a credential identifier (e.g. email address).
+    /// List identities by a tenant-scoped credential identifier (e.g. email address).
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn list_identities_by_identifier(
         &self,
+        tenant_id: &str,
         identifier: &str,
     ) -> Result<Value, OryClientError> {
         let url = self.admin_url.join("admin/identities")?;
-        debug!(%url, %identifier, "listing kratos identities by identifier");
+        debug!(%url, %tenant_id, %identifier, "listing kratos identities by identifier");
         let response = self
             .client
             .get(url)
-            .query(&[("credentials_identifier", identifier)])
+            .query(&[
+                ("credentials_identifier", identifier),
+                ("tenant_id", tenant_id),
+            ])
             .send()
             .await
             .map_err(OryClientError::Http)?;
@@ -99,9 +115,10 @@ impl KratosClient {
         identity_id: &str,
         amr: Option<&str>,
     ) -> Result<KratosResponse, OryClientError> {
-        let url = self
-            .admin_url
-            .join(&format!("admin/identities/{identity_id}/sessions"))?;
+        let url = self.admin_url.join(&format!(
+            "admin/identities/{}/sessions",
+            urlencoding::encode(identity_id)
+        ))?;
         debug!(%url, %identity_id, "creating kratos session for identity");
         let mut body = serde_json::json!({ "session_token": true });
         if let Some(amr) = amr {
@@ -120,7 +137,9 @@ impl KratosClient {
     /// Get the active identity schema.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn get_identity_schema(&self, id: &str) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("schemas/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("schemas/{}", urlencoding::encode(id)))?;
         debug!(%url, "fetching kratos identity schema");
         self.send_json(Method::GET, url, None).await
     }
@@ -128,7 +147,9 @@ impl KratosClient {
     /// Get a session by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn admin_get_session(&self, id: &str) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join(&format!("admin/sessions/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/sessions/{}", urlencoding::encode(id)))?;
         debug!(%url, "fetching kratos session");
         self.send_json(Method::GET, url, None).await
     }
@@ -154,7 +175,9 @@ impl KratosClient {
     /// Delete a session by its Ory global id.
     #[instrument(skip(self), fields(admin_url = %self.admin_url))]
     pub async fn delete_session(&self, id: &str) -> Result<(), OryClientError> {
-        let url = self.admin_url.join(&format!("admin/sessions/{id}"))?;
+        let url = self
+            .admin_url
+            .join(&format!("admin/sessions/{}", urlencoding::encode(id)))?;
         debug!(%url, "deleting kratos session");
         self.send_empty(Method::DELETE, url).await
     }
@@ -297,7 +320,10 @@ impl KratosClient {
             .public_url
             .as_ref()
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
-        let url = public_url.join(&format!("self-service/{flow_type}/flows"))?;
+        let url = public_url.join(&format!(
+            "self-service/{}/flows",
+            urlencoding::encode(flow_type)
+        ))?;
         let mut request = self
             .client
             .get(url)
@@ -376,7 +402,7 @@ impl KratosClient {
             .public_url
             .as_ref()
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
-        let url = public_url.join(&format!("self-service/{flow_type}"))?;
+        let url = public_url.join(&format!("self-service/{}", urlencoding::encode(flow_type)))?;
         let mut request = self
             .client
             .post(url)
@@ -511,7 +537,10 @@ impl KratosClient {
             .public_url
             .as_ref()
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
-        let url = public_url.join(&format!("self-service/{flow}/browser"))?;
+        let url = public_url.join(&format!(
+            "self-service/{}/browser",
+            urlencoding::encode(flow)
+        ))?;
         let mut request = self.client.get(url).header("accept", "application/json");
         if !query.is_empty() {
             request = request.query(query);
@@ -642,14 +671,20 @@ mod tests {
 
     fn app() -> Router {
         let admin = Router::new()
-            .route("/admin/identities", get(list_identities).post(create_identity))
+            .route(
+                "/admin/identities",
+                get(list_identities).post(create_identity),
+            )
             .route(
                 "/admin/identities/{id}",
                 get(get_identity)
                     .put(update_identity)
                     .delete(delete_identity),
             )
-            .route("/admin/identities/{id}/sessions", post(create_session_for_identity))
+            .route(
+                "/admin/identities/{id}/sessions",
+                post(create_session_for_identity),
+            )
             .route("/admin/sessions", get(list_sessions))
             .route(
                 "/admin/sessions/{id}",
@@ -681,8 +716,12 @@ mod tests {
     async fn list_identities(
         Query(params): Query<std::collections::HashMap<String, String>>,
     ) -> Json<Value> {
-        let identifier = params.get("credentials_identifier").cloned().unwrap_or_default();
-        if identifier == "found@example.com" {
+        let identifier = params
+            .get("credentials_identifier")
+            .cloned()
+            .unwrap_or_default();
+        let tenant_id = params.get("tenant_id").cloned().unwrap_or_default();
+        if identifier == "found@example.com" && tenant_id == "tenant-1" {
             Json(json!([
                 { "id": "identity-found", "traits": { "email": identifier } }
             ]))
@@ -1810,7 +1849,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new(&url).unwrap();
         let resp = client
-            .list_identities_by_identifier("found@example.com")
+            .list_identities_by_identifier("tenant-1", "found@example.com")
             .await
             .unwrap();
         let identities = resp.as_array().unwrap();
@@ -1823,7 +1862,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new(&url).unwrap();
         let resp = client
-            .list_identities_by_identifier("missing@example.com")
+            .list_identities_by_identifier("tenant-1", "missing@example.com")
             .await
             .unwrap();
         let identities = resp.as_array().unwrap();
@@ -1853,10 +1892,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_for_identity_error() {
-        let app = Router::new().route(
-            "/admin/identities/{id}/sessions",
-            post(error_handler),
-        );
+        let app = Router::new().route("/admin/identities/{id}/sessions", post(error_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _handle = tokio::spawn(async move {
