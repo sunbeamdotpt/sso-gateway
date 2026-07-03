@@ -1,9 +1,37 @@
 //! Upstream OAuth2 / OIDC token exchange and userinfo retrieval.
 
 use async_trait::async_trait;
+use reqwest::dns::{Addrs, Name, Resolve};
 use serde_json::Value;
+use std::sync::Arc;
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
+
+#[derive(Clone)]
+struct SafeDnsResolver;
+
+impl Resolve for SafeDnsResolver {
+    fn resolve(&self, name: Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let name_str = name.as_str().to_string();
+            let addrs = tokio::net::lookup_host((name_str.as_str(), 0)).await?;
+            let mut safe_addrs = Vec::new();
+            for addr in addrs {
+                if !is_forbidden_ip(addr.ip()) {
+                    safe_addrs.push(addr);
+                }
+            }
+            if safe_addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "host resolved to forbidden IP addresses",
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: Addrs = Box::new(safe_addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
 
 /// Token response from an upstream OAuth2 / OIDC token endpoint.
 #[derive(Debug, Clone)]
@@ -97,9 +125,18 @@ pub fn validate_upstream_url(url_str: &str) -> Result<(), ServiceError> {
 }
 
 pub(crate) fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
+    if ip.is_unspecified() {
+        return true;
+    }
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_private(),
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0 == 0xfe80),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                is_forbidden_ip(std::net::IpAddr::V4(v4))
+            } else {
+                v6.is_loopback() || (v6.segments()[0] & 0xffc0 == 0xfe80)
+            }
+        }
     }
 }
 
@@ -159,6 +196,14 @@ pub struct ReqwestUpstreamOAuthClient {
 impl ReqwestUpstreamOAuthClient {
     pub fn new(client: reqwest::Client) -> Self {
         Self { client }
+    }
+    
+    pub fn default_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .dns_resolver(Arc::new(SafeDnsResolver))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 }
 
@@ -412,5 +457,17 @@ mod tests {
             matches!(err, UpstreamOAuthError::InvalidUrl(ref msg) if msg.contains("forbidden IP")),
             "expected forbidden IP error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn is_forbidden_ip_blocks_ipv4_mapped_ipv6_loopback() {
+        let ip: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_forbidden_ip(ip));
+    }
+
+    #[test]
+    fn is_forbidden_ip_blocks_unspecified() {
+        assert!(is_forbidden_ip("0.0.0.0".parse().unwrap()));
+        assert!(is_forbidden_ip("::".parse().unwrap()));
     }
 }

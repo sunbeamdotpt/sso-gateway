@@ -155,10 +155,7 @@ pub async fn build_app_with_upstream(
     let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> = upstream_oauth
         .unwrap_or_else(|| {
             Arc::new(ReqwestUpstreamOAuthClient::new(
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new()),
+                ReqwestUpstreamOAuthClient::default_client(),
             ))
         });
     let jwks_client = reqwest::Client::builder()
