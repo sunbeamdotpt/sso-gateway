@@ -274,7 +274,12 @@ async fn self_service_and_consent_round_trip() {
         .expect("mapping should be created");
     support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
-    let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
+    let self_service = Arc::new(IdentitySelfServiceImpl::new(
+        kratos.clone(),
+        true,
+        kratos_url.clone(),
+        "http://gateway.test".to_string(),
+    ));
     let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
 
     let connect_router: ConnectRouter = self_service.register(ConnectRouter::new());

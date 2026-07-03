@@ -182,6 +182,53 @@ impl KratosClient {
         self.send_empty(Method::DELETE, url).await
     }
 
+    /// Create a recovery link for an identity via the admin API.
+    #[instrument(skip(self), fields(admin_url = %self.admin_url))]
+    pub async fn create_recovery_link(
+        &self,
+        identity_id: &str,
+        expires_in_seconds: Option<i64>,
+    ) -> Result<KratosResponse, OryClientError> {
+        let url = self.admin_url.join("admin/recovery/link")?;
+        debug!(%url, %identity_id, "creating kratos recovery link");
+        let mut body = serde_json::json!({ "identity_id": identity_id });
+        if let Some(seconds) = expires_in_seconds {
+            body["expires_in"] = serde_json::json!(format!("{seconds}s"));
+        }
+        let response = self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response_with_headers(response).await
+    }
+
+    /// List courier messages via the admin API.
+    #[instrument(skip(self), fields(admin_url = %self.admin_url))]
+    pub async fn list_courier_messages(
+        &self,
+        identity_id: Option<&str>,
+        message_type: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let url = self.admin_url.join("admin/courier/messages")?;
+        debug!(%url, "listing kratos courier messages");
+        let mut request = self.client.get(url);
+        let mut query = Vec::<(&str, &str)>::new();
+        if let Some(identity_id) = identity_id {
+            query.push(("identity_id", identity_id));
+        }
+        if let Some(message_type) = message_type {
+            query.push(("template_type", message_type));
+        }
+        if !query.is_empty() {
+            request = request.query(&query);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
     /// Validate a session token via the public whoami endpoint.
     #[instrument(skip(self))]
     pub async fn whoami(&self, session_token: &str) -> Result<Value, OryClientError> {
@@ -690,6 +737,8 @@ mod tests {
                 "/admin/sessions/{id}",
                 get(get_session).delete(delete_session),
             )
+            .route("/admin/recovery/link", post(create_recovery_link))
+            .route("/admin/courier/messages", get(list_courier_messages))
             .route("/schemas/{id}", get(get_schema));
 
         let public = Router::new()
@@ -786,6 +835,42 @@ mod tests {
 
     async fn delete_session() -> axum::http::StatusCode {
         axum::http::StatusCode::NO_CONTENT
+    }
+
+    async fn create_recovery_link(Json(body): Json<Value>) -> Json<Value> {
+        let identity_id = body
+            .get("identity_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("identity-1");
+        let expires_in = body
+            .get("expires_in")
+            .and_then(|v| v.as_str())
+            .unwrap_or("1h");
+        Json(json!({
+            "recovery_link": format!("http://kratos.example.com/self-service/recovery?token={identity_id}-recovery-token"),
+            "recovery_token": format!("{identity_id}-recovery-token"),
+            "expires_at": "2026-01-01T00:00:00Z",
+            "expires_in": expires_in,
+        }))
+    }
+
+    async fn list_courier_messages(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        let identity_id = params.get("identity_id").cloned().unwrap_or_default();
+        let template_type = params.get("template_type").cloned().unwrap_or_default();
+        Json(json!([
+            {
+                "id": "message-1",
+                "type": "email",
+                "subject": "Verify your email",
+                "body": format!("Click <a href=\"http://kratos.example.com/self-service/verification?token={identity_id}-verify-token\">here</a>"),
+                "status": "sent",
+                "recipient": "a@example.com",
+                "sent_at": "2025-01-01T00:00:00Z",
+                "template_type": template_type,
+            }
+        ]))
     }
 
     async fn create_api_flow(
@@ -1904,5 +1989,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_recovery_link_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .create_recovery_link("identity-1", Some(3600))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["recovery_token"], "identity-1-recovery-token");
+        assert!(resp.body["recovery_link"]
+            .as_str()
+            .unwrap()
+            .contains("token=identity-1-recovery-token"));
+    }
+
+    #[tokio::test]
+    async fn list_courier_messages_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new(&url).unwrap();
+        let resp = client
+            .list_courier_messages(Some("identity-1"), Some("verification"))
+            .await
+            .unwrap();
+        let messages = resp.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["id"], "message-1");
+        assert!(messages[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("verification?token=identity-1-verify-token"));
     }
 }

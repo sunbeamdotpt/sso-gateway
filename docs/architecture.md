@@ -18,7 +18,7 @@ The gateway is a vendor-neutral facade. Callers never see Ory paths or global ID
 1. **Authentication** — protected endpoints accept either `Authorization: Bearer <token>` or a session cookie (`__Host-sso_session`). The shared `auth_middleware` introspects bearer tokens via Hydra (caching the result in Postgres `token_introspection_cache`) and verifies session cookies locally; in both cases the caller's tenant is resolved from the token subject through `id_mappings`.
 2. **Authorization** — service code calls `require_scope` and can call Keto to check relation tuples scoped to the tenant.
 3. **Translation** — gateway ULIDs are mapped to Ory global IDs through `id_mappings`.
-4. **Audit** — the audit middleware records method, path, actor, tenant, and outcome asynchronously.
+4. **Audit** — the audit middleware records method, path, actor, tenant, and outcome, and emits them as structured logs tagged with `sso_gateway::audit`.
 
 Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) skip the shared bearer-token middleware and authenticate using protocol-specific mechanisms.
 
@@ -52,4 +52,5 @@ Callback handlers validate state, verify the upstream response, provision or lin
 
 ## Data stores
 
-- **Postgres** — gateway metadata, audit log, identity schemas, SAML replay cache, SAML key/cert rotation, token introspection cache, browser sessions (`gateway_sessions`), OIDC/OAuth2/SAML callback `login_state`, tenant connections, and verified tenant domains.
+- **Postgres** — gateway metadata, identity schemas, SAML replay cache, SAML key/cert rotation, token introspection cache, browser sessions (`gateway_sessions`), OIDC/OAuth2/SAML callback `login_state`, tenant connections, and verified tenant domains.
+- **Standard log stream** — request audit records emitted by `audit_middleware` as structured logs tagged with `sso_gateway::audit`.

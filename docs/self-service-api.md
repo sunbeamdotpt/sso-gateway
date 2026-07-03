@@ -121,6 +121,17 @@ gateway forwards it to Kratos unchanged.
 | `GetFlowError` | `GetFlowErrorRequest` | `FlowError` | Fetch a Kratos error page by ID. |
 | `GetWebAuthnJavaScript` | `google.protobuf.Empty` | `WebAuthnJsResponse` | Return Kratos WebAuthn JS bundle content. |
 
+### Tenant capabilities
+
+| Method | Request | Response | Purpose |
+|---|---|---|---|
+| `GetTenantCapabilities` | `GetTenantCapabilitiesRequest` | `GetTenantCapabilitiesResponse` | Discover which optional gateway features are enabled for the caller's tenant. |
+
+`GetTenantCapabilities` returns a `TenantCapabilities` message. The only flag today is
+`oauth2_consent_enabled`, which is `true` when the gateway has a Hydra admin URL
+configured for the tenant. The UI can use this flag to decide whether to register the
+`/consent` route instead of reading Hydra environment variables.
+
 ## The `SelfServiceFlow` message
 
 `SelfServiceFlow` is the gateway's vendor-neutral view of a Kratos flow. It
@@ -175,6 +186,46 @@ exposes `skip_consent` and `skip_logout_consent`. The UI can use these flags to
 skip the consent or logout confirmation screen when the client is configured to
 allow it.
 
+## IdentityService admin helpers
+
+The admin `IdentityService` also exposes two operations that are needed by
+browser self-service flows and by integration tests. Both require an
+`Authorization: Bearer <token>` with the `identity:admin` scope.
+
+| Method | Request | Response | Purpose |
+|---|---|---|---|
+| `CreateRecoveryLink` | `CreateRecoveryLinkRequest` | `RecoveryLink` | Create a recovery link for an identity. |
+| `GetVerificationMessage` | `GetVerificationMessageRequest` | `VerificationMessage` | Fetch the latest verification message for an identity, including the link to click. |
+
+`CreateRecoveryLink` calls the Kratos admin API and returns a gateway-hosted URL
+such as `https://gateway.example.com/self-service/recovery?token=...`. The
+`expires_in_seconds` field is optional; when zero the upstream default lifetime is
+used.
+
+`GetVerificationMessage` lists courier messages for the identity and returns the
+most recent verification message. The `link` field contains the first
+self-service URL found in the message body, rewritten to point at the gateway.
+Callers can pass `message_id` to retrieve a specific message.
+
+## Public self-service proxy
+
+Browser self-service flows still need plain HTTP endpoints for some Kratos
+features (for example, the `recovery_link` and `verification_link` URLs that are
+sent by email). The gateway exposes a public proxy so the browser never has to
+talk to Kratos directly:
+
+| Path | Upstream |
+|---|---|
+| `/self-service/{*path}` | `kratos-public-url/self-service/{*path}` |
+| `/.well-known/ory/webauthn.js` | `kratos-public-url/.well-known/ory/webauthn.js` |
+
+The proxy forwards method, query string, body, and cookies, and strips
+hop-by-hop headers. When the upstream returns JSON or HTML, the gateway rewrites
+any URLs that start with the configured Kratos public URL so they point at the
+gateway instead. This means recovery/verification links embedded in HTML email
+bodies and form `action` URLs in JSON flows are already gateway URLs when the
+browser sees them.
+
 ## Cookie handling
 
 Connect-RPC metadata does not natively carry cookies, so the browser client must
@@ -198,6 +249,26 @@ issue a `__Host-sso_session` session cookie. This cookie is signed and verified
 locally by the gateway and can be used in place of a bearer token for
 browser-facing Connect-RPC calls. The cookie is returned as `Set-Cookie` metadata
 and must be sent back on subsequent requests via the `Cookie` metadata header.
+
+## Error shape compatibility
+
+When a flow submission fails with an HTTP 400 from Kratos, the gateway maps the
+upstream response to a Connect-RPC `InvalidArgument` error. The raw Kratos JSON
+payload is preserved in the Connect error `message` (also available as
+`rawMessage` in the TypeScript client). The UI can therefore continue to parse
+the error body as a Kratos flow and re-render it, just as it did when calling
+Kratos directly.
+
+For example, an invalid password submission currently returns:
+
+```text
+code: InvalidArgument
+message: {"id":"flow-id","type":"login","state":"show_form",...}
+```
+
+Future gateway versions may move this payload into a typed `SelfServiceFlow` error
+detail, but the `InvalidArgument` code and the Kratos-shaped body in `message`
+will remain supported for backwards compatibility.
 
 ## Migration from `@ory/client`
 

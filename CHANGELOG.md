@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.9] - 2026-07-03
+
+### Added
+
+- `IdentitySelfService.GetTenantCapabilities` lets the UI detect whether OAuth2
+  consent is enabled for a tenant, removing the need for Hydra env vars in the
+  frontend.
+- `IdentityService.CreateRecoveryLink` and `IdentityService.GetVerificationMessage`
+  provide scope-protected (`identity:admin`) alternatives to Kratos admin
+  endpoints for integration testing and support flows.
+- Public self-service HTTP proxy routes (`/self-service/{*path}` and
+  `/.well-known/ory/webauthn.js`) that rewrite Kratos URLs to gateway URLs in
+  JSON, HTML, and redirect responses.
+
+### Changed
+
+- Audit logs are now emitted as structured logs to the standard log stream with
+  target `sso_gateway::audit` instead of being written to the `audit_log` table.
+  The `PgAuditLogStore`, `AuditLogStore` trait, and gateway wiring have been
+  removed.
+
+### Documentation
+
+- Documented the self-service error-shape contract in `docs/self-service-api.md`.
+- Updated `AGENTS.md` and `docs/architecture.md` to reflect structured-log audit
+  records.
+
 ## [1.0.0-rc.8] - 2026-07-03
 
 ### Fixed
@@ -171,6 +198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[1.0.0-rc.9]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc9
 [1.0.0-rc.8]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc8
 [1.0.0-rc.7]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc7
 [1.0.0-rc.6]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc6

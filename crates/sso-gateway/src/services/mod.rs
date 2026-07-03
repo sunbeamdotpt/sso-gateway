@@ -10,4 +10,5 @@ pub mod oauth2_device;
 pub mod permission;
 pub mod proto_util;
 pub mod scim;
+pub mod self_service_url_rewriter;
 pub mod tenant;

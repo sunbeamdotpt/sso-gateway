@@ -5406,7 +5406,7 @@ dependencies = [
 
 [[package]]
 name = "sso-gateway"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -5454,7 +5454,7 @@ dependencies = [
 
 [[package]]
 name = "sso-ory-client"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "axum",
  "rand 0.8.6",

@@ -14,8 +14,9 @@ use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     BrowserSession, CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
     CreateRegistrationFlowRequest, CreateSettingsFlowRequest, CreateVerificationFlowRequest,
-    FlowError, GetFlowErrorRequest, GetFlowRequest, IdentitySelfService, LogoutFlow,
-    SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, ToSessionRequest,
+    FlowError, GetFlowErrorRequest, GetFlowRequest, GetTenantCapabilitiesRequest,
+    GetTenantCapabilitiesResponse, IdentitySelfService, LogoutFlow, SelfServiceFlow,
+    SubmitFlowRequest, SubmitLogoutFlowRequest, TenantCapabilities, ToSessionRequest,
     WebAuthnJsResponse,
 };
 use buffa_types::google::protobuf::Empty;
@@ -24,6 +25,7 @@ use super::identity_self_service_mapper::{
     ory_flow_error_to_proto, ory_flow_to_proto, ory_logout_flow_to_proto, ory_session_to_proto,
     ory_webauthn_js_to_proto, proto_struct_to_json,
 };
+use super::self_service_url_rewriter::rewrite_url;
 
 /// Async trait abstracting the Kratos self-service operations used by this
 /// service. Keeps the service implementation decoupled from the concrete HTTP
@@ -313,12 +315,65 @@ impl KratosSelfService for KratosClient {
 #[derive(Clone)]
 pub struct IdentitySelfServiceImpl {
     kratos: Arc<dyn KratosSelfService>,
+    consent_enabled: bool,
+    kratos_public_url: String,
+    gateway_public_url: String,
 }
 
 impl IdentitySelfServiceImpl {
-    pub fn new(kratos: Arc<KratosClient>) -> Self {
+    pub fn new(
+        kratos: Arc<KratosClient>,
+        consent_enabled: bool,
+        kratos_public_url: String,
+        gateway_public_url: String,
+    ) -> Self {
         Self {
             kratos: kratos as Arc<dyn KratosSelfService>,
+            consent_enabled,
+            kratos_public_url,
+            gateway_public_url,
+        }
+    }
+
+    fn rewrite_flow_urls(&self, flow: &mut SelfServiceFlow) {
+        flow.return_to = rewrite_url(&flow.return_to, &self.kratos_public_url, &self.gateway_public_url);
+        flow.request_url = rewrite_url(&flow.request_url, &self.kratos_public_url, &self.gateway_public_url);
+        if let Some(ui) = flow.ui.as_option_mut() {
+            ui.action = rewrite_url(&ui.action, &self.kratos_public_url, &self.gateway_public_url);
+            for node in &mut ui.nodes {
+                if let Some(crate::proto::iam::v1::ui_node::Attributes::Anchor(attrs)) =
+                    node.attributes.as_mut()
+                {
+                    attrs.href = rewrite_url(&attrs.href, &self.kratos_public_url, &self.gateway_public_url);
+                }
+                if let Some(crate::proto::iam::v1::ui_node::Attributes::Image(attrs)) =
+                    node.attributes.as_mut()
+                {
+                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                }
+                if let Some(crate::proto::iam::v1::ui_node::Attributes::Script(attrs)) =
+                    node.attributes.as_mut()
+                {
+                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                }
+                if let Some(crate::proto::iam::v1::ui_node::Attributes::Input(attrs)) =
+                    node.attributes.as_mut()
+                {
+                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                }
+            }
+        }
+        if let Some(oauth2) = flow.oauth2_login_request.as_option_mut()
+            && let Some(client) = oauth2.client.as_option_mut()
+        {
+            for uri in &mut client.redirect_uris {
+                *uri = rewrite_url(uri, &self.kratos_public_url, &self.gateway_public_url);
+            }
+            client.client_uri = rewrite_url(&client.client_uri, &self.kratos_public_url, &self.gateway_public_url);
+            client.logo_uri = rewrite_url(&client.logo_uri, &self.kratos_public_url, &self.gateway_public_url);
+            client.policy_uri = rewrite_url(&client.policy_uri, &self.kratos_public_url, &self.gateway_public_url);
+            client.tos_uri = rewrite_url(&client.tos_uri, &self.kratos_public_url, &self.gateway_public_url);
+            client.jwks_uri = rewrite_url(&client.jwks_uri, &self.kratos_public_url, &self.gateway_public_url);
         }
     }
 }
@@ -384,6 +439,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -402,6 +458,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -420,6 +477,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -438,6 +496,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -456,6 +515,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -475,6 +535,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -494,6 +555,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -513,6 +575,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -532,6 +595,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -551,6 +615,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -591,6 +656,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -619,6 +685,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -642,6 +709,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -665,6 +733,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -688,6 +757,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_logout_flow_to_proto(&flow.body));
+        response.body.logout_url = rewrite_url(
+            &response.body.logout_url,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -731,6 +805,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -758,6 +833,22 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<WebAuthnJsResponse> {
         let content = self.kratos.get_webauthn_js().await.map_err(map_ory_error)?;
         Ok(Response::new(ory_webauthn_js_to_proto(&content)))
+    }
+
+    #[instrument(skip(self))]
+    async fn get_tenant_capabilities(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, GetTenantCapabilitiesRequest>,
+    ) -> ServiceResult<GetTenantCapabilitiesResponse> {
+        Ok(Response::new(GetTenantCapabilitiesResponse {
+            capabilities: Some(TenantCapabilities {
+                oauth2_consent_enabled: self.consent_enabled,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        }))
     }
 }
 
@@ -801,8 +892,8 @@ mod tests {
     use crate::proto::iam::v1::{
         CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
         CreateRegistrationFlowRequest, CreateSettingsFlowRequest, CreateVerificationFlowRequest,
-        GetFlowErrorRequest, GetFlowRequest, IdentitySelfService, SubmitFlowRequest,
-        SubmitLogoutFlowRequest, ToSessionRequest,
+        GetFlowErrorRequest, GetFlowRequest, GetTenantCapabilitiesRequest, IdentitySelfService,
+        SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, ToSessionRequest,
     };
 
     use super::{
@@ -1171,16 +1262,59 @@ mod tests {
     fn service(kratos: FakeKratos) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
         }
     }
 
     #[test]
     fn new_stores_kratos_client() {
         let kratos = Arc::new(KratosClient::new("http://localhost:4434").unwrap());
-        let svc = IdentitySelfServiceImpl::new(kratos.clone());
+        let svc = IdentitySelfServiceImpl::new(
+            kratos.clone(),
+            true,
+            "http://kratos.example.com".to_string(),
+            "https://gateway.example.com".to_string(),
+        );
         // Field is now a trait object; just verify the service was created.
         assert_eq!(Arc::strong_count(&kratos), 2);
         let _ = svc;
+    }
+
+    #[tokio::test]
+    async fn get_tenant_capabilities_returns_consent_flag() {
+        let svc = service(FakeKratos::default());
+        let req = GetTenantCapabilitiesRequest::default();
+        let svc_req = service_request(req);
+        let resp = IdentitySelfService::get_tenant_capabilities(
+            &svc,
+            request_context_without_cookie(),
+            svc_req,
+        )
+        .await
+        .unwrap()
+        .body;
+        let caps = resp.capabilities.as_option().unwrap();
+        assert!(caps.oauth2_consent_enabled);
+    }
+
+    #[test]
+    fn rewrite_flow_urls_rewrites_ui_action() {
+        let svc = service(FakeKratos::default());
+        let mut flow = SelfServiceFlow {
+            ui: Some(crate::proto::iam::v1::UiContainer {
+                action: "http://kratos.example.com/self-service/login?flow=1".into(),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        svc.rewrite_flow_urls(&mut flow);
+        assert_eq!(
+            flow.ui.as_option().unwrap().action,
+            "https://gateway.example.com/self-service/login?flow=1"
+        );
     }
 
     #[test]

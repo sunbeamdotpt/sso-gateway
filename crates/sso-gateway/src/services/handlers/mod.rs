@@ -9,3 +9,4 @@ pub mod oauth2;
 pub mod saml;
 pub mod saml_idp;
 pub mod scim;
+pub mod self_service;

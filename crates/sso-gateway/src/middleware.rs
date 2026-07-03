@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::auth::{
     AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_tenant_from_subject,
 };
-use crate::db::{AuditLogRepo, IdMappingStore, SessionStore};
+use crate::db::{IdMappingStore, SessionStore};
 use crate::session_token::SessionTokenSigner;
 
 /// Re-exported helper for RPC handlers that need stepped-up authentication.
@@ -93,7 +93,11 @@ fn is_public_path(path: &str) -> bool {
         "/callbacks/oidc" | "/callbacks/oauth2" => true,
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
         "/health" | "/health/ready" | "/health/live" => true,
-        _ => path.starts_with("/oauth2/device/"),
+        _ => {
+            path.starts_with("/oauth2/device/")
+                || path.starts_with("/self-service/")
+                || path.starts_with("/.well-known/ory/webauthn.js")
+        }
     }
 }
 
@@ -244,22 +248,12 @@ pub fn auth_error(status: StatusCode) -> Response {
         .into_response()
 }
 
-fn build_audit_metadata(status: StatusCode) -> serde_json::Value {
-    serde_json::json!({
-        "status": status.as_u16(),
-    })
-}
-
 /// Best-effort audit logging middleware.
 ///
 /// Captures the HTTP method, path, resolved tenant, authenticated actor, and
-/// response status. Insertions are performed in a spawned task so the response
-/// is never blocked on the database.
-pub async fn audit_middleware(
-    Extension(repo): Extension<AuditLogRepo>,
-    request: Request,
-    next: Next,
-) -> Response {
+/// response status, and emits a structured log event to the standard log
+/// stream tagged with `sso_gateway::audit`.
+pub async fn audit_middleware(request: Request, next: Next) -> Response {
     let tenant_id = request
         .extensions()
         .get::<AuthContext>()
@@ -286,24 +280,17 @@ pub async fn audit_middleware(
     } else {
         "failure"
     };
-    let metadata = build_audit_metadata(response.status());
 
-    let repo = repo.clone();
-    tokio::spawn(async move {
-        if let Err(err) = repo
-            .insert(
-                tenant_id.as_deref(),
-                actor.as_deref(),
-                &method,
-                &resource,
-                outcome,
-                metadata,
-            )
-            .await
-        {
-            tracing::warn!(%err, "audit log insertion failed");
-        }
-    });
+    tracing::info!(
+        target: "sso_gateway::audit",
+        tenant_id = tenant_id.as_deref(),
+        actor = actor.as_deref(),
+        action = method.as_str(),
+        resource = resource.as_str(),
+        outcome = outcome,
+        status = response.status().as_u16(),
+        "audit event"
+    );
 
     response
 }
@@ -316,6 +303,7 @@ mod tests {
     use axum::{Extension, Router, body::Body, http::Request, middleware::from_fn, routing::get};
     use std::sync::Mutex;
     use tower::ServiceExt;
+    use tracing_subscriber::prelude::*;
 
     struct StubIntrospector(Mutex<Option<Result<IntrospectionResult, crate::auth::AuthError>>>);
 
@@ -465,13 +453,10 @@ mod tests {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/health/ready"));
         assert!(is_public_path("/health/live"));
+        assert!(is_public_path("/self-service/login/browser"));
+        assert!(is_public_path("/self-service/login/flows"));
+        assert!(is_public_path("/.well-known/ory/webauthn.js"));
         assert!(!is_public_path("/iam/v1/tenants"));
-    }
-
-    #[test]
-    fn build_audit_metadata_contains_status() {
-        let metadata = build_audit_metadata(StatusCode::CREATED);
-        assert_eq!(metadata["status"], 201);
     }
 
     #[tokio::test]
@@ -661,5 +646,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[derive(Default, Clone)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone)]
+    struct CapturedEvent {
+        target: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.fields
+                .insert(field.name().to_string(), format!("{:?}", value));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_middleware_emits_structured_success_log() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let app = Router::new()
+            .route("/test", get(ok_handler))
+            .layer(from_fn(audit_middleware));
+        let response = app
+            .oneshot(Request::get("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let audit_events: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit_events.len(), 1);
+        let fields = &audit_events[0].fields;
+        assert_eq!(fields.get("resource"), Some(&"/test".to_string()));
+        assert_eq!(fields.get("action"), Some(&"GET".to_string()));
+        assert_eq!(fields.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(fields.get("status"), Some(&"200".to_string()));
+    }
+
+    #[tokio::test]
+    async fn audit_middleware_emits_structured_failure_log_with_context() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let app = Router::new()
+            .route("/err", get(|| async { StatusCode::FORBIDDEN }))
+            .layer(from_fn(audit_middleware))
+            .layer(Extension(TenantId("tenant-42".into())))
+            .layer(Extension(AuthContext {
+                tenant_id: "tenant-42".into(),
+                subject: "actor-7".into(),
+                scopes: vec![],
+                token_hash: "hash".into(),
+                authentication_methods: vec![],
+            }));
+        let response = app
+            .oneshot(Request::get("/err").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let audit_events: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit_events.len(), 1);
+        let fields = &audit_events[0].fields;
+        assert_eq!(fields.get("tenant_id"), Some(&"tenant-42".to_string()));
+        assert_eq!(fields.get("actor"), Some(&"actor-7".to_string()));
+        assert_eq!(fields.get("resource"), Some(&"/err".to_string()));
+        assert_eq!(fields.get("action"), Some(&"GET".to_string()));
+        assert_eq!(fields.get("outcome"), Some(&"failure".to_string()));
+        assert_eq!(fields.get("status"), Some(&"403".to_string()));
     }
 }

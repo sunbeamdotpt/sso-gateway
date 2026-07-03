@@ -73,6 +73,7 @@ async fn scim_users_and_groups_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        "http://gateway.test".to_string(),
     ));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),

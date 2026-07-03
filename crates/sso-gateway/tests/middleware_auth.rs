@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{Extension, Router, middleware::from_fn, response::IntoResponse, routing::get};
 use sso_gateway::{
-    db::{AuditLogRepo, IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
+    db::{IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
     middleware::{TenantId, audit_middleware, auth_middleware},
     services::handlers::oauth2::{Oauth2State, router as oauth2_router},
     session_token::SessionTokenSigner,
@@ -66,7 +66,6 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         IdMappingRepo::new(pool.clone()),
         "http://localhost".to_string(),
     ));
-    let audit_repo = AuditLogRepo::new(pool.clone());
     let mappings = IdMappingRepo::new(pool.clone());
     let kratos = Arc::new(
         KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
@@ -85,7 +84,6 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         )))
         .layer(Extension(support::test_introspector()))
         .layer(Extension(support::test_session_store()))
-        .layer(Extension(audit_repo))
         .layer(Extension(kratos))
         .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
@@ -138,18 +136,6 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         .await
         .expect("tenant header request should complete");
     assert_eq!(tenant_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    // Give the audit middleware's spawned insert task time to complete.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let audit_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE resource = '/echo'")
-            .fetch_one(&pool)
-            .await
-            .expect("audit log count should be readable");
-    assert!(
-        audit_count >= 1,
-        "audit log should contain at least one /echo entry"
-    );
 
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");

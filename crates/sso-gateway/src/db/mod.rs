@@ -6,7 +6,6 @@
 //! `db.rs`, the old `*Repo` names are re-exported as aliases to the concrete
 //! PostgreSQL stores.
 
-mod audit_log;
 mod connection;
 mod crypto;
 mod domain;
@@ -29,7 +28,6 @@ mod session_store;
 mod tenant;
 mod token_cache;
 
-pub use audit_log::{AuditLogStore, PgAuditLogStore};
 pub use connection::{
     ConnectionType, PgTenantConnectionStore, TenantConnectionRow, TenantConnectionStore,
 };
@@ -63,7 +61,6 @@ pub use tenant::{PgTenantStore, TenantRow, TenantStore};
 pub use token_cache::{PgTokenIntrospectionCache, TokenIntrospectionCache, TokenIntrospectionRow};
 
 // Backward-compatible concrete repo aliases.
-pub use audit_log::PgAuditLogStore as AuditLogRepo;
 pub use connection::PgTenantConnectionStore as TenantConnectionRepo;
 pub use domain::PgTenantDomainStore as TenantDomainRepo;
 pub use id_mapping::PgIdMappingStore as IdMappingRepo;

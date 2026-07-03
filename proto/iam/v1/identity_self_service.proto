@@ -408,6 +408,23 @@ message WebAuthnJsResponse {
   string content = 1;
 }
 
+// TenantCapabilities describes which optional gateway features are enabled for
+// the caller's tenant. The UI can query this instead of inspecting environment
+// variables or Ory URLs.
+message TenantCapabilities {
+  // Whether OAuth2 consent handling is configured for this tenant.
+  bool oauth2_consent_enabled = 1;
+}
+
+// GetTenantCapabilitiesRequest retrieves the capabilities for the caller's tenant.
+message GetTenantCapabilitiesRequest {}
+
+// GetTenantCapabilitiesResponse returns the tenant capabilities.
+message GetTenantCapabilitiesResponse {
+  // Capabilities for the caller's tenant.
+  TenantCapabilities capabilities = 1;
+}
+
 // IdentitySelfService exposes browser-facing Kratos self-service flows through
 // a gateway-owned, Ory-agnostic contract.
 service IdentitySelfService {
@@ -451,4 +468,6 @@ service IdentitySelfService {
   rpc GetFlowError(GetFlowErrorRequest) returns (FlowError);
   // GetWebAuthnJavaScript returns the WebAuthn JavaScript bundle.
   rpc GetWebAuthnJavaScript(google.protobuf.Empty) returns (WebAuthnJsResponse);
+  // GetTenantCapabilities returns the optional features enabled for the caller's tenant.
+  rpc GetTenantCapabilities(GetTenantCapabilitiesRequest) returns (GetTenantCapabilitiesResponse);
 }

@@ -207,6 +207,54 @@ message GetSessionRequest {
   string id = 1;
 }
 
+// CreateRecoveryLinkRequest creates a recovery link for an identity.
+message CreateRecoveryLinkRequest {
+  // Gateway identifier for the identity.
+  string identity_id = 1;
+  // Optional lifetime in seconds. When zero, the upstream default is used.
+  int64 expires_in_seconds = 2;
+}
+
+// RecoveryLink is a gateway-hosted recovery URL created by the admin API.
+message RecoveryLink {
+  // Gateway URL the user should visit to recover the account.
+  string recovery_link = 1;
+  // Opaque recovery token.
+  string recovery_token = 2;
+  // Timestamp when the link expires.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// GetVerificationMessageRequest fetches a verification message for an identity.
+message GetVerificationMessageRequest {
+  // Gateway identifier for the identity.
+  string identity_id = 1;
+  // Optional gateway identifier for a specific message. When empty, the latest
+  // verification message for the identity is returned.
+  string message_id = 2;
+}
+
+// VerificationMessage is a gateway view of a Kratos courier message containing
+// a verification link.
+message VerificationMessage {
+  // Gateway identifier for the message.
+  string id = 1;
+  // Delivery channel, e.g. email.
+  string type = 2;
+  // Message subject.
+  string subject = 3;
+  // Raw message body.
+  string body = 4;
+  // Delivery status, e.g. queued or sent.
+  string status = 5;
+  // Recipient address, e.g. an email address.
+  string recipient = 6;
+  // Timestamp when the message was sent.
+  google.protobuf.Timestamp sent_at = 7;
+  // Gateway URL extracted from the body that the user should visit.
+  string link = 8;
+}
+
 // ListSessionsRequest is the input for paginating an identity's sessions.
 message ListSessionsRequest {
   // Identity whose sessions should be listed.
@@ -263,4 +311,9 @@ service IdentityService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   // DeleteSession revokes a session.
   rpc DeleteSession(DeleteSessionRequest) returns (google.protobuf.Empty);
+  // CreateRecoveryLink creates a recovery link for an identity.
+  rpc CreateRecoveryLink(CreateRecoveryLinkRequest) returns (RecoveryLink);
+  // GetVerificationMessage returns the latest verification message for an identity,
+  // including the gateway-hosted verification link extracted from the message body.
+  rpc GetVerificationMessage(GetVerificationMessageRequest) returns (VerificationMessage);
 }

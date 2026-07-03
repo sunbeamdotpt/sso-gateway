@@ -7,7 +7,7 @@ use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        AuditLogRepo, DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo,
+        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo,
         PermissionTupleRepo, PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo,
         SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo,
         TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
@@ -28,6 +28,7 @@ use crate::{
             saml::{SamlState, router as saml_router},
             saml_idp::{SamlIdpState, router as saml_idp_router},
             scim::{ScimState, router as scim_router},
+            self_service::{SelfServiceState, router as self_service_router},
         },
         identity::IdentityServiceImpl,
         identity_self_service::IdentitySelfServiceImpl,
@@ -137,7 +138,6 @@ pub async fn build_app_with_upstream(
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
-    let audit_log = AuditLogRepo::new(pool.clone());
 
     // Keep trait-object handles for the public callback handlers; the concrete
     // repos are moved into FederationServiceImpl below.
@@ -220,6 +220,7 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        config.public_base_url.clone(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(keto.clone(), tuples));
     let scim_service = Arc::new(ScimServiceImpl::new(
@@ -230,7 +231,13 @@ pub async fn build_app_with_upstream(
         scim_groups,
     ));
     let oauth_mappings = mappings.clone();
-    let self_service = Arc::new(IdentitySelfServiceImpl::new(kratos.clone()));
+    let consent_enabled = !config.hydra_admin_url.is_empty();
+    let self_service = Arc::new(IdentitySelfServiceImpl::new(
+        kratos.clone(),
+        consent_enabled,
+        config.kratos_public_url.clone(),
+        config.public_base_url.clone(),
+    ));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
     let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(hydra.clone()));
 
@@ -258,6 +265,10 @@ pub async fn build_app_with_upstream(
     let oauth_state = Arc::new(Oauth2State::new(
         hydra.clone(),
         oauth_mappings,
+        config.public_base_url.clone(),
+    ));
+    let self_service_state = Arc::new(SelfServiceState::new(
+        config.kratos_public_url.clone(),
         config.public_base_url.clone(),
     ));
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
@@ -306,6 +317,7 @@ pub async fn build_app_with_upstream(
     let public_routes = AxumRouter::new()
         .route("/", get(root_handler))
         .merge(oauth2_router(oauth_state))
+        .merge(self_service_router(self_service_state))
         .merge(scim_router(scim_state))
         .merge(saml_router(saml_state))
         .merge(saml_idp_router(saml_idp_state))
@@ -328,7 +340,6 @@ pub async fn build_app_with_upstream(
         .app()
         // Audit must be outermost so that authentication failures are captured.
         .layer(from_fn(audit_middleware))
-        .layer(Extension(audit_log))
         .layer(from_fn(auth_middleware))
         .layer(Extension(introspector))
         .layer(Extension(session_signer))

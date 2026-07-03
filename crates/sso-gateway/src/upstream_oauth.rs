@@ -22,8 +22,7 @@ impl Resolve for SafeDnsResolver {
                 }
             }
             if safe_addrs.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(Box::new(std::io::Error::other(
                     "host resolved to forbidden IP addresses",
                 )) as Box<dyn std::error::Error + Send + Sync>);
             }

@@ -92,6 +92,7 @@ async fn identity_service_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas,
+        "http://gateway.test".to_string(),
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());

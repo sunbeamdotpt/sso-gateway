@@ -3,7 +3,7 @@ use std::sync::Arc;
 use buffa_types::google::protobuf::Struct as ProtoStruct;
 use buffa_types::google::protobuf::{Empty, Timestamp};
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
-use sso_ory_client::{error::OryClientError, kratos::KratosClient};
+use sso_ory_client::{error::OryClientError, kratos::{KratosClient, KratosResponse}};
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
@@ -14,12 +14,13 @@ use crate::{
     middleware::TenantId,
     proto::iam::v1::{
         CreateIdentityRequest, CreateIdentitySchemaRequest, CreateLoginFlowRequest,
-        CreateRegistrationFlowRequest, DeleteIdentityRequest, DeleteIdentitySchemaRequest,
-        DeleteSessionRequest, Flow, GetIdentityRequest, GetIdentitySchemaRequest,
-        GetSessionRequest, Identity, IdentitySchema, IdentityService, ListIdentitiesRequest,
-        ListIdentitiesResponse, ListIdentitySchemasRequest, ListIdentitySchemasResponse,
-        ListSessionsRequest, ListSessionsResponse, Session, SetDefaultIdentitySchemaRequest,
-        UpdateIdentityRequest, UpdateIdentitySchemaRequest,
+        CreateRecoveryLinkRequest, CreateRegistrationFlowRequest, DeleteIdentityRequest,
+        DeleteIdentitySchemaRequest, DeleteSessionRequest, Flow, GetIdentityRequest,
+        GetIdentitySchemaRequest, GetSessionRequest, GetVerificationMessageRequest, Identity,
+        IdentitySchema, IdentityService, ListIdentitiesRequest, ListIdentitiesResponse,
+        ListIdentitySchemasRequest, ListIdentitySchemasResponse, ListSessionsRequest,
+        ListSessionsResponse, RecoveryLink, Session, SetDefaultIdentitySchemaRequest,
+        UpdateIdentityRequest, UpdateIdentitySchemaRequest, VerificationMessage,
     },
 };
 
@@ -63,6 +64,18 @@ pub trait IdentityKratos: Send + Sync + 'static {
     ) -> Result<serde_json::Value, OryClientError>;
 
     async fn delete_session(&self, id: &str) -> Result<(), OryClientError>;
+
+    async fn create_recovery_link(
+        &self,
+        identity_id: &str,
+        expires_in_seconds: Option<i64>,
+    ) -> Result<KratosResponse, OryClientError>;
+
+    async fn list_courier_messages(
+        &self,
+        identity_id: Option<&str>,
+        message_type: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError>;
 }
 
 #[async_trait::async_trait]
@@ -118,6 +131,23 @@ impl IdentityKratos for KratosClient {
     async fn delete_session(&self, id: &str) -> Result<(), OryClientError> {
         self.delete_session(id).await
     }
+
+    async fn create_recovery_link(
+        &self,
+        identity_id: &str,
+        expires_in_seconds: Option<i64>,
+    ) -> Result<KratosResponse, OryClientError> {
+        self.create_recovery_link(identity_id, expires_in_seconds)
+            .await
+    }
+
+    async fn list_courier_messages(
+        &self,
+        identity_id: Option<&str>,
+        message_type: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.list_courier_messages(identity_id, message_type).await
+    }
 }
 
 #[derive(Clone)]
@@ -125,6 +155,7 @@ pub struct IdentityServiceImpl {
     kratos: Arc<dyn IdentityKratos>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
+    public_base_url: String,
 }
 
 impl IdentityServiceImpl {
@@ -132,11 +163,13 @@ impl IdentityServiceImpl {
         kratos: Arc<KratosClient>,
         mappings: crate::db::IdMappingRepo,
         schemas: crate::db::IdentitySchemaRepo,
+        public_base_url: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn IdentityKratos>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            public_base_url,
         }
     }
 }
@@ -567,6 +600,106 @@ impl IdentityService for IdentityServiceImpl {
             .map_err(map_ory_error)?;
         Ok(Response::new(Empty::default()))
     }
+
+    #[instrument(skip(self, request))]
+    async fn create_recovery_link(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateRecoveryLinkRequest>,
+    ) -> ServiceResult<RecoveryLink> {
+        let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
+        let req = request.to_owned_message();
+
+        let (ory_id, _) = self.resolve_identity(&tenant_id, &req.identity_id).await?;
+        let response = self
+            .kratos
+            .create_recovery_link(&ory_id, Some(req.expires_in_seconds))
+            .await
+            .map_err(map_ory_error)?;
+
+        let recovery_link = response.body["recovery_link"]
+            .as_str()
+            .ok_or_else(|| ServiceError::Internal("kratos response missing recovery_link".into()))?;
+        let recovery_token = response.body["recovery_token"]
+            .as_str()
+            .ok_or_else(|| {
+                ServiceError::Internal("kratos response missing recovery_token".into())
+            })?;
+
+        let gateway_link = self
+            .rewrite_self_service_url(recovery_link)
+            .unwrap_or_else(|| recovery_link.to_string());
+
+        Ok(Response::new(RecoveryLink {
+            recovery_link: gateway_link,
+            recovery_token: recovery_token.to_string(),
+            expires_at: response.body["expires_at"]
+                .as_str()
+                .and_then(parse_timestamp)
+                .map(Into::into)
+                .unwrap_or_default(),
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn get_verification_message(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetVerificationMessageRequest>,
+    ) -> ServiceResult<VerificationMessage> {
+        let tenant_id = require_tenant(&ctx)?;
+        require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
+        let req = request.to_owned_message();
+
+        let (ory_id, _) = self.resolve_identity(&tenant_id, &req.identity_id).await?;
+        let messages = self
+            .kratos
+            .list_courier_messages(Some(&ory_id), Some("verification"))
+            .await
+            .map_err(map_ory_error)?;
+        let messages = messages.as_array().ok_or_else(|| {
+            ServiceError::Internal("invalid courier messages response from kratos".into())
+        })?;
+
+        let message = if req.message_id.is_empty() {
+            messages
+                .iter()
+                .rev()
+                .find(|m| m["template_type"].as_str() == Some("verification"))
+                .or_else(|| messages.last())
+        } else {
+            messages.iter().find(|m| {
+                m["id"]
+                    .as_str()
+                    .map(|id| id == req.message_id)
+                    .unwrap_or(false)
+            })
+        }
+        .ok_or_else(|| ServiceError::NotFound("verification message not found".into()))?;
+
+        let body = message["body"].as_str().unwrap_or("");
+        let link = extract_first_self_service_link(body)
+            .map(|url| self.rewrite_self_service_url(&url).unwrap_or(url))
+            .unwrap_or_default();
+
+        Ok(Response::new(VerificationMessage {
+            id: message["id"].as_str().unwrap_or("").to_string(),
+            r#type: message["type"].as_str().unwrap_or("").to_string(),
+            subject: message["subject"].as_str().unwrap_or("").to_string(),
+            body: body.to_string(),
+            status: message["status"].as_str().unwrap_or("").to_string(),
+            recipient: message["recipient"].as_str().unwrap_or("").to_string(),
+            sent_at: message["sent_at"]
+                .as_str()
+                .and_then(parse_timestamp)
+                .map(Into::into)
+                .unwrap_or_default(),
+            link,
+            ..Default::default()
+        }))
+    }
 }
 
 impl IdentityServiceImpl {
@@ -587,6 +720,23 @@ impl IdentityServiceImpl {
             Err(_) => "default".to_string(),
         };
         Ok((ory_id, schema_id))
+    }
+
+    /// Rewrite a Kratos self-service URL to use the gateway public base URL.
+    /// Non-Kratos URLs are returned unchanged.
+    fn rewrite_self_service_url(&self, url: &str) -> Option<String> {
+        // Recovery/verification links returned by Kratos already use the public
+        // self-service path, so we only need to swap the origin.
+        url.trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split_once('/')
+            .map(|(_, path_and_query)| {
+                format!(
+                    "{}/{}",
+                    self.public_base_url.trim_end_matches('/'),
+                    path_and_query
+                )
+            })
     }
 
     async fn resolve_schema(
@@ -736,6 +886,34 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
     }
+}
+
+/// Extract the first self-service URL from a message body.
+///
+/// Kratos courier message bodies embed the recovery/verification URL in an
+/// HTML anchor or as plain text. This helper finds the first URL that looks
+/// like a gateway-recoverable self-service link.
+fn extract_first_self_service_link(body: &str) -> Option<String> {
+    // Prefer an explicit anchor href.
+    if let Some(start) = body.find("href=\"") {
+        let rest = &body[start + 6..];
+        if let Some(end) = rest.find('"') {
+            let url = &rest[..end];
+            if url.contains("/self-service/") {
+                return Some(url.to_string());
+            }
+        }
+    }
+    // Fall back to the first absolute URL containing a self-service path.
+    for word in body.split_whitespace() {
+        let stripped = word.trim_matches(|c: char| c == '"' || c == '\'' || c == '<' || c == '>');
+        if (stripped.starts_with("http://") || stripped.starts_with("https://"))
+            && stripped.contains("/self-service/")
+        {
+            return Some(stripped.to_string());
+        }
+    }
+    None
 }
 
 fn build_kratos_identity_payload(
@@ -934,6 +1112,8 @@ mod tests {
         sessions: Mutex<HashMap<String, serde_json::Value>>,
         sessions_by_identity: Mutex<HashMap<String, serde_json::Value>>,
         flows: Mutex<Vec<serde_json::Value>>,
+        recovery_link: Mutex<Option<KratosResponse>>,
+        courier_messages: Mutex<Option<serde_json::Value>>,
         error: Mutex<Option<OryClientError>>,
     }
 
@@ -943,6 +1123,20 @@ mod tests {
             map.insert(id.to_string(), identity);
             Self {
                 identities: Mutex::new(map),
+                ..Default::default()
+            }
+        }
+
+        fn with_recovery_link(link: KratosResponse) -> Self {
+            Self {
+                recovery_link: Mutex::new(Some(link)),
+                ..Default::default()
+            }
+        }
+
+        fn with_courier_messages(messages: serde_json::Value) -> Self {
+            Self {
+                courier_messages: Mutex::new(Some(messages)),
                 ..Default::default()
             }
         }
@@ -1084,6 +1278,42 @@ mod tests {
                 return Err(err);
             }
             Ok(())
+        }
+
+        async fn create_recovery_link(
+            &self,
+            _identity_id: &str,
+            _expires_in_seconds: Option<i64>,
+        ) -> Result<KratosResponse, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            self.recovery_link
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| OryClientError::Ory {
+                    status: 404,
+                    message: "recovery link not found".into(),
+                })
+        }
+
+        async fn list_courier_messages(
+            &self,
+            _identity_id: Option<&str>,
+            _message_type: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            if let Some(err) = self.error.lock().await.take() {
+                return Err(err);
+            }
+            self.courier_messages
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| OryClientError::Ory {
+                    status: 404,
+                    message: "courier messages not found".into(),
+                })
         }
     }
 
@@ -1327,6 +1557,7 @@ mod tests {
             kratos: Arc::new(kratos),
             mappings: Arc::new(mappings),
             schemas: Arc::new(schemas),
+            public_base_url: "https://gateway.example.com".to_string(),
         }
     }
 
@@ -1900,6 +2131,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_recovery_link_returns_gateway_url() {
+        let kratos = StubKratos::with_recovery_link(KratosResponse {
+            body: json!({
+                "recovery_link": "http://kratos.example.com/self-service/recovery?token=abc",
+                "recovery_token": "abc",
+                "expires_at": "2026-01-01T00:00:00Z",
+            }),
+            headers: http::HeaderMap::new(),
+        });
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = CreateRecoveryLinkRequest {
+            identity_id: "pub-1".into(),
+            expires_in_seconds: 3600,
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateRecoveryLinkRequest);
+        let resp = IdentityService::create_recovery_link(&svc, admin_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(
+            resp.recovery_link,
+            "https://gateway.example.com/self-service/recovery?token=abc"
+        );
+        assert_eq!(resp.recovery_token, "abc");
+        assert!(resp.expires_at.is_set());
+    }
+
+    #[tokio::test]
+    async fn get_verification_message_returns_gateway_link() {
+        let kratos = StubKratos::with_courier_messages(json!([
+            {
+                "id": "msg-1",
+                "type": "email",
+                "subject": "Verify",
+                "body": "<a href=\"http://kratos.example.com/self-service/verification?token=v1\">verify</a>",
+                "status": "sent",
+                "recipient": "a@example.com",
+                "sent_at": "2025-01-01T00:00:00Z",
+                "template_type": "verification",
+            }
+        ]));
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = GetVerificationMessageRequest {
+            identity_id: "pub-1".into(),
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, GetVerificationMessageRequest);
+        let resp = IdentityService::get_verification_message(&svc, admin_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.id, "msg-1");
+        assert_eq!(
+            resp.link,
+            "https://gateway.example.com/self-service/verification?token=v1"
+        );
+    }
+
+    #[test]
+    fn extract_first_self_service_link_prefers_anchor_href() {
+        let body = r#"<a href="http://kratos.example.com/self-service/verification?token=abc">link</a>"#;
+        assert_eq!(
+            extract_first_self_service_link(body),
+            Some("http://kratos.example.com/self-service/verification?token=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_first_self_service_link_falls_back_to_plain_url() {
+        let body = "Visit http://kratos.example.com/self-service/recovery?token=abc to recover";
+        assert_eq!(
+            extract_first_self_service_link(body),
+            Some("http://kratos.example.com/self-service/recovery?token=abc".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn missing_tenant_returns_unauthenticated() {
         let svc = make_service(
             StubKratos::default(),
@@ -1923,6 +2240,7 @@ mod tests {
             kratos.clone(),
             IdMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool),
+            "https://gateway.example.com".to_string(),
         );
         let _cloned = service.clone();
     }
@@ -1933,6 +2251,7 @@ mod tests {
             kratos: Arc::new(StubKratos::default()),
             mappings: Arc::new(StubMappingStore::default()),
             schemas: Arc::new(StubSchemaStore::default()),
+            public_base_url: "https://gateway.example.com".to_string(),
         };
         let _cloned = svc.clone();
     }
@@ -1951,6 +2270,14 @@ mod tests {
         assert!(client.admin_get_session("id").await.is_err());
         assert!(client.list_sessions_by_identity("id").await.is_err());
         assert!(client.delete_session("id").await.is_err());
+        assert!(client
+            .create_recovery_link("id", Some(3600))
+            .await
+            .is_err());
+        assert!(client
+            .list_courier_messages(Some("id"), Some("verification"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
