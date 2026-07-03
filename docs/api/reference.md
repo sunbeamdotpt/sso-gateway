@@ -66,6 +66,9 @@ via Hydra and the tenant is resolved from the token subject.
 
 | Method | Description |
 |---|---|
+| `DiscoverLoginMethod` | Home-realm discovery: decide how a user should authenticate based on email domain. |
+| `InitiateOidcLogin` | Start an OIDC login via a configured tenant connection. |
+| `InitiateOAuth2Login` | Start an OAuth2 login via a configured tenant connection. |
 | `GetOpenIDConfiguration` | OIDC discovery document. |
 | `GetJSONWebKeys` | JWKS endpoint. |
 | `InitiateSamlLogin` | Start a SAML SP login. |
@@ -123,6 +126,15 @@ Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-serv
 | `AcceptLogout` | Accept a logout request. |
 | `RejectLogout` | Reject a logout request. |
 
+### `iam.v1.OAuth2DeviceService`
+
+OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
+
+| Method | Description |
+|---|---|
+| `AuthorizeDevice` | Initiate a device authorization request. |
+| `GetDeviceToken` | Poll for tokens using the device code. |
+
 ## Protocol endpoints
 
 | Path | Purpose | Authentication |
@@ -134,6 +146,9 @@ Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-serv
 | `GET /oauth2/userinfo` | Userinfo endpoint | Bearer token |
 | `POST /oauth2/introspect` | Token introspection | Public (forwards to Hydra) |
 | `POST /oauth2/revoke` | Token revocation | Public (client credentials) |
+| `GET /oauth2/device/{*path}` | Device authorization grant proxy | Public (forwards to Hydra) |
+| `GET /callbacks/oidc` | OIDC upstream IdP callback | Public (OIDC callback state) |
+| `GET /callbacks/oauth2` | OAuth2 upstream IdP callback | Public (OAuth2 callback state) |
 | `GET /saml/metadata` | SAML SP metadata | Public |
 | `POST /saml/acs` | SAML Assertion Consumer Service | Public (SAML assertion) |
 | `GET /saml/sso` | SAML IdP SSO endpoint | Public (Kratos session token) |

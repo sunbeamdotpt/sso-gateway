@@ -37,6 +37,7 @@ Set the required environment variables and start the binary:
 export SYSTEM_TENANT_ULID="01JABCDEFGHIJKLMNOPQRSTUV"
 export DATABASE_URL="postgres://ory:ory@localhost:5432/ory?sslmode=disable"
 export PUBLIC_BASE_URL="http://localhost:8080"
+export STATE_COOKIE_SECRET="$(openssl rand -hex 32)"
 export SYSTEM_BOOTSTRAP_CLIENT_ID="system-bootstrap"
 export SYSTEM_BOOTSTRAP_CLIENT_SECRET="change-me"
 
@@ -44,7 +45,9 @@ cargo run -p sso-gateway
 ```
 
 The server listens on `http://localhost:8080`. On startup the gateway creates a
-system bootstrap OAuth2 client in Hydra and maps it to the system tenant.
+system bootstrap OAuth2 client in Hydra and maps it to the system tenant when
+both `SYSTEM_BOOTSTRAP_CLIENT_ID` and `SYSTEM_BOOTSTRAP_CLIENT_SECRET` are
+provided.
 
 ## Get an access token
 

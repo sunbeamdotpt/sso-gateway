@@ -22,9 +22,11 @@ The **SSO Gateway** is a backend-only unified identity and access management ser
 
 - **Identity management** — create, read, update, and delete identities with per-tenant JSON schemas.
 - **Applications / OAuth2 clients** — manage OAuth2/OIDC clients and rotate secrets.
-- **Sessions** — list and delete Kratos sessions through gateway IDs.
+- **Sessions** — list and delete Kratos sessions through gateway IDs; browser session cookies for UI flows.
 - **Permissions** — store and check relation tuples with tenant-prefixed namespaces.
-- **Federation** — OIDC discovery and JWKS; SAML 2.0 Service Provider and Identity Provider flows.
+- **Federation** — OIDC discovery and JWKS; upstream OIDC/OAuth2/SAML identity provider logins with home-realm discovery; SAML 2.0 Service Provider and Identity Provider flows.
+- **Self-service** — browser-facing login, registration, settings, recovery, verification, and consent flows over Connect-RPC.
+- **Device authorization** — OAuth 2.0 Device Authorization Grant proxy and Connect-RPC API.
 - **SCIM 2.0** — provision users and groups via standard REST endpoints.
 - **Audit logging** — asynchronous request audit trail to Postgres.
 

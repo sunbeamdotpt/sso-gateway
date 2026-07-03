@@ -179,8 +179,8 @@ allow it.
 
 Connect-RPC metadata does not natively carry cookies, so the browser client must
 pass the `Cookie` header in request metadata. The gateway re-injects it into the
-outgoing Kratos or Hydra call. Any `Set-Cookie` headers from the upstream flow
-through the gateway's HTTP layer.
+outgoing Kratos or Hydra call. `Set-Cookie` headers from the upstream are
+returned through the gateway's Connect-RPC response metadata.
 
 Typical metadata for a browser call:
 
@@ -190,6 +190,14 @@ cookie: ory_kratos_session=...; csrf_token_...=...
 
 For form submissions that require CSRF protection, also forward the
 `X-CSRF-Token` header through metadata.
+
+## Gateway session cookies
+
+When a user completes a successful login or federation callback, the gateway may
+issue a `__Host-sso_session` session cookie. This cookie is signed and verified
+locally by the gateway and can be used in place of a bearer token for
+browser-facing Connect-RPC calls. The cookie is returned as `Set-Cookie` metadata
+and must be sent back on subsequent requests via the `Cookie` metadata header.
 
 ## Migration from `@ory/client`
 

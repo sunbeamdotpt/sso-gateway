@@ -15,7 +15,7 @@ The gateway is a vendor-neutral facade. Callers never see Ory paths or global ID
 
 ## Request flow
 
-1. **Authentication** — protected endpoints require `Authorization: Bearer <token>`. The shared `auth_middleware` introspects the token via Hydra, caches the result in Postgres (`token_introspection_cache`), and resolves the caller's tenant from the token subject through `id_mappings`.
+1. **Authentication** — protected endpoints accept either `Authorization: Bearer <token>` or a session cookie (`__Host-sso_session`). The shared `auth_middleware` introspects bearer tokens via Hydra (caching the result in Postgres `token_introspection_cache`) and verifies session cookies locally; in both cases the caller's tenant is resolved from the token subject through `id_mappings`.
 2. **Authorization** — service code calls `require_scope` and can call Keto to check relation tuples scoped to the tenant.
 3. **Translation** — gateway ULIDs are mapped to Ory global IDs through `id_mappings`.
 4. **Audit** — the audit middleware records method, path, actor, tenant, and outcome asynchronously.
@@ -30,13 +30,26 @@ Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) s
 | Kratos | Identities are mapped through `id_mappings`; tenant ID is stored in identity traits. |
 | Keto | Namespaces and object IDs are prefixed with the tenant slug. |
 
+## Federation and home-realm discovery
+
+Tenants can configure upstream identity providers through `tenant_connections`:
+
+- **OIDC** — standard `authorization_code` flow with PKCE and nonce validation.
+- **OAuth2** — generic authorization-code flow with PKCE and configurable `userinfo_email_path`.
+- **SAML** — SP-initiated login via signed `AuthnRequest` and assertion consumer service.
+
+`DiscoverLoginMethod` performs home-realm discovery (HRD) from the email domain. The gateway looks up verified `tenant_domains`, selects the matching connection, and returns a redirect. Unverified or unknown domains redirect to a tenant-selection page.
+
+Callback handlers validate state, verify the upstream response, provision or link the identity through `id_mappings`, issue a gateway session cookie, and redirect back to the originally requested `return_to` URL.
+
 ## Service surface
 
-- **Connect-RPC** — primary API for identity, applications, permissions, tenants, federation, and SCIM.
-- **OAuth2/OIDC** — standard `/.well-known/openid-configuration`, `/oauth2/auth`, `/oauth2/token`, `/oauth2/userinfo`, etc.
+- **Connect-RPC** — primary API for identity, applications, permissions, tenants, federation, self-service, consent, device authorization, and SCIM.
+- **OAuth2/OIDC** — standard `/.well-known/openid-configuration`, `/oauth2/auth`, `/oauth2/token`, `/oauth2/userinfo`, device authorization, etc.
+- **Federation callbacks** — `/callbacks/oidc` and `/callbacks/oauth2` for upstream identity provider redirects.
 - **SCIM 2.0** — `/scim/v2/Users` and `/scim/v2/Groups`.
 - **SAML** — `/saml/metadata`, `/saml/acs`, and `/saml/sso` for SP and IdP flows.
 
 ## Data stores
 
-- **Postgres** — gateway metadata, audit log, identity schemas, SAML replay cache, SAML key/cert rotation, and token introspection cache.
+- **Postgres** — gateway metadata, audit log, identity schemas, SAML replay cache, SAML key/cert rotation, token introspection cache, browser sessions (`gateway_sessions`), OIDC/OAuth2/SAML callback `login_state`, tenant connections, and verified tenant domains.
