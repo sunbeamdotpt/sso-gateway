@@ -1,0 +1,33 @@
+name: Security
+
+on:
+  push:
+    branches:
+      - mainline
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Run daily at 06:00 UTC to catch newly published advisories.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
