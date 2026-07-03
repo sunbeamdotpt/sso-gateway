@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.8] - 2026-07-03
+
+### Fixed
+
+- Corrected `HydraClient::introspect_token` to call `/admin/oauth2/introspect`
+  on Hydra's admin port. Previously it used `/oauth2/introspect`, which Hydra
+  v2.2.0 redirects from, causing token introspection to fail in containerized
+  deployments.
+
+### Added
+
+- Regression test `introspect_token_uses_admin_path` to lock in the correct
+  Hydra admin introspection path.
+
 ## [1.0.0-rc.7] - 2026-07-03
 
 ### Added
@@ -157,6 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[1.0.0-rc.8]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc8
 [1.0.0-rc.7]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc7
 [1.0.0-rc.6]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc6
 [1.0.0-rc.5]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc5

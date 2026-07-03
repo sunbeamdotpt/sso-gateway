@@ -26,7 +26,7 @@ Build for multiple platforms:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f Dockerfile -t ghcr.io/sunbeamdotpt/sso-gateway:v1.0.0-rc7 .
+  -f Dockerfile -t ghcr.io/sunbeamdotpt/sso-gateway:v1.0.0-rc8 .
 ```
 
 The runtime image is based on `gcr.io/distroless/cc-debian12:nonroot` and exposes port `8080`.
@@ -65,7 +65,7 @@ spec:
     spec:
       containers:
         - name: sso-gateway
-          image: ghcr.io/sunbeamdotpt/sso-gateway:v1.0.0-rc7
+          image: ghcr.io/sunbeamdotpt/sso-gateway:v1.0.0-rc8
           ports:
             - containerPort: 8080
           envFrom:

@@ -90,7 +90,7 @@ impl HydraClient {
     /// Introspect an access or refresh token (admin endpoint).
     #[instrument(skip(self, token), fields(admin_url = %self.admin_url))]
     pub async fn introspect_token(&self, token: &str) -> Result<Value, OryClientError> {
-        let url = self.admin_url.join("oauth2/introspect")?;
+        let url = self.admin_url.join("admin/oauth2/introspect")?;
         debug!(%url, "introspecting token");
         let form = [("token", token)];
         let response = self
@@ -490,11 +490,14 @@ async fn ory_error(response: reqwest::Response) -> OryClientError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, atomic::{AtomicBool, Ordering}},
+    };
 
     use axum::{
         Json, Router,
-        extract::{Form, Query},
+        extract::{Form, Query, State},
         routing::{delete, get, post, put},
     };
     use serde_json::json;
@@ -508,7 +511,7 @@ mod tests {
                 "/admin/clients/{id}",
                 get(get_client).put(update_client).delete(delete_client),
             )
-            .route("/oauth2/introspect", post(introspect))
+            .route("/admin/oauth2/introspect", post(introspect))
             .route("/admin/oauth2/auth/requests/login", get(get_login_request))
             .route(
                 "/admin/oauth2/auth/requests/login/accept",
@@ -581,6 +584,22 @@ mod tests {
             "active": true,
             "sub": form.get("token").cloned().unwrap_or_default(),
         }))
+    }
+
+    async fn introspect_admin_path(
+        State(hit): State<Arc<AtomicBool>>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<Value> {
+        hit.store(true, Ordering::SeqCst);
+        Json(json!({
+            "active": true,
+            "sub": form.get("token").cloned().unwrap_or_default(),
+        }))
+    }
+
+    async fn introspect_public_path(State(hit): State<Arc<AtomicBool>>) -> Json<Value> {
+        hit.store(true, Ordering::SeqCst);
+        Json(json!({ "active": false }))
     }
 
     async fn get_login_request(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
@@ -793,6 +812,42 @@ mod tests {
         let resp = client.introspect_token("token-1").await.unwrap();
         assert_eq!(resp["active"], true);
         assert_eq!(resp["sub"], "token-1");
+    }
+
+    // Regression test for rc7: introspect_token must call Hydra's admin
+    // introspection endpoint (`/admin/oauth2/introspect`), not the legacy
+    // public path (`/oauth2/introspect`) on the admin port.
+    #[tokio::test]
+    async fn introspect_token_uses_admin_path() {
+        let admin_hit = Arc::new(AtomicBool::new(false));
+        let public_hit = Arc::new(AtomicBool::new(false));
+
+        let app = Router::new()
+            .route(
+                "/admin/oauth2/introspect",
+                post(introspect_admin_path).with_state(Arc::clone(&admin_hit)),
+            )
+            .route(
+                "/oauth2/introspect",
+                post(introspect_public_path).with_state(Arc::clone(&public_hit)),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let resp = client.introspect_token("token-1").await.unwrap();
+
+        assert_eq!(resp["active"], true);
+        assert!(admin_hit.load(Ordering::SeqCst), "must hit /admin/oauth2/introspect");
+        assert!(
+            !public_hit.load(Ordering::SeqCst),
+            "must not hit legacy /oauth2/introspect on admin port"
+        );
     }
 
     #[tokio::test]
@@ -1045,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn introspect_token_error() {
-        let app = Router::new().route("/oauth2/introspect", post(error_handler));
+        let app = Router::new().route("/admin/oauth2/introspect", post(error_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _handle = tokio::spawn(async move {
