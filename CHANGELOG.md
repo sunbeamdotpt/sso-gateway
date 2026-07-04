@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.10] - 2026-07-04
+
+### Fixed
+
+- `IdentityService.CreateRecoveryLink` now parses the recovery token from the
+  `token` query parameter of `recovery_link` when Kratos omits the
+  `recovery_token` field (Kratos v25.4.0 behaviour).
+- Public self-service proxy no longer follows upstream Kratos redirects, which
+  previously caused `502 upstream self-service request failed` when Kratos
+  redirected to an unreachable internal URL.
+
+### Added
+
+- Regression tests for both fixes above.
+
 ## [1.0.0-rc.9] - 2026-07-03
 
 ### Added

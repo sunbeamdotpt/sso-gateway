@@ -4,14 +4,14 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE, header::LOCATION},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 use serde_json::Value;
 use tracing::{instrument, warn};
 
-use crate::services::self_service_url_rewriter::rewrite_json_urls;
+use crate::services::self_service_url_rewriter::{rewrite_json_urls, rewrite_url};
 
 /// State shared by the public self-service proxy handlers.
 #[derive(Clone)]
@@ -26,6 +26,7 @@ impl SelfServiceState {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             kratos_public_url,
@@ -154,7 +155,17 @@ async fn proxy_request(
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
-        if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
+        let rewritten = if rewrite_urls && name == LOCATION {
+            value
+                .to_str()
+                .ok()
+                .map(|s| rewrite_url(s, &state.kratos_public_url, &state.gateway_public_url))
+                .and_then(|s| HeaderValue::from_str(&s).ok())
+                .unwrap_or_else(|| value.clone())
+        } else {
+            value.clone()
+        };
+        if let Ok(value) = HeaderValue::from_bytes(rewritten.as_bytes()) {
             response_headers.insert(name, value);
         }
     }
@@ -236,8 +247,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(upstream_url: String) -> Arc<SelfServiceState> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(SelfServiceState::with_client(
-            reqwest::Client::new(),
+            client,
             upstream_url.clone(),
             "https://gateway.example.com".to_string(),
         ))
@@ -446,5 +461,55 @@ mod tests {
         ] {
             assert!(is_hop_by_hop_header(name), "{name} should be hop-by-hop");
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_does_not_follow_upstream_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_origin = format!("http://{addr}");
+        let app = {
+            let upstream_origin = upstream_origin.clone();
+            axum::Router::new().route(
+                "/self-service/verify",
+                get(move || {
+                    let upstream_origin = upstream_origin.clone();
+                    async move {
+                        (
+                            StatusCode::FOUND,
+                            [(
+                                axum::http::header::LOCATION,
+                                format!("{upstream_origin}/self-service/verification?token=abc"),
+                            )],
+                        )
+                    }
+                }),
+            )
+        };
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = test_state(upstream_origin);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/self-service/verify?token=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            location,
+            "https://gateway.example.com/self-service/verification?token=abc"
+        );
     }
 }

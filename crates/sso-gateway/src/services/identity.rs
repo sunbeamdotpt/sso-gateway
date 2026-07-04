@@ -623,8 +623,20 @@ impl IdentityService for IdentityServiceImpl {
             .ok_or_else(|| ServiceError::Internal("kratos response missing recovery_link".into()))?;
         let recovery_token = response.body["recovery_token"]
             .as_str()
+            .map(|t| t.to_string())
+            .or_else(|| {
+                reqwest::Url::parse(recovery_link)
+                    .ok()
+                    .and_then(|u| {
+                        u.query_pairs()
+                            .find(|(k, _)| k == "token")
+                            .map(|(_, v)| v.into_owned())
+                    })
+            })
             .ok_or_else(|| {
-                ServiceError::Internal("kratos response missing recovery_token".into())
+                ServiceError::Internal(
+                    "kratos response missing recovery_token and token query param".into(),
+                )
             })?;
 
         let gateway_link = self
@@ -2160,6 +2172,38 @@ mod tests {
             "https://gateway.example.com/self-service/recovery?token=abc"
         );
         assert_eq!(resp.recovery_token, "abc");
+        assert!(resp.expires_at.is_set());
+    }
+
+    #[tokio::test]
+    async fn create_recovery_link_parses_token_from_url_when_field_missing() {
+        let kratos = StubKratos::with_recovery_link(KratosResponse {
+            body: json!({
+                "recovery_link": "http://kratos.example.com/self-service/recovery?token=kratos-v25-token",
+                "expires_at": "2026-01-01T00:00:00Z",
+            }),
+            headers: http::HeaderMap::new(),
+        });
+        let svc = make_service(
+            kratos,
+            StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
+            StubSchemaStore::default(),
+        );
+        let req = CreateRecoveryLinkRequest {
+            identity_id: "pub-1".into(),
+            expires_in_seconds: 3600,
+            ..Default::default()
+        };
+        svc_req!(svc_req, req, CreateRecoveryLinkRequest);
+        let resp = IdentityService::create_recovery_link(&svc, admin_ctx("tenant-1"), svc_req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(
+            resp.recovery_link,
+            "https://gateway.example.com/self-service/recovery?token=kratos-v25-token"
+        );
+        assert_eq!(resp.recovery_token, "kratos-v25-token");
         assert!(resp.expires_at.is_set());
     }
 
