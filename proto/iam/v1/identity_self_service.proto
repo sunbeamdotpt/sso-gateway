@@ -400,6 +400,9 @@ message CreateVerificationFlowRequest {
 message SubmitRecoveryTokenRequest {
   // Recovery token from the magic link.
   string token = 1;
+  // Flow identifier from the magic link. Kratos v25.4.0 requires this when
+  // validating a recovery token through the JSON-facing code path.
+  string flow = 2;
 }
 
 // SubmitRecoveryTokenResponse returns where the browser should be redirected
@@ -414,6 +417,9 @@ message SubmitRecoveryTokenResponse {
 message SubmitVerificationTokenRequest {
   // Verification token from the magic link.
   string token = 1;
+  // Flow identifier from the magic link. Kratos v25.4.0 requires this when
+  // validating a verification token through the JSON-facing code path.
+  string flow = 2;
 }
 
 // SubmitVerificationTokenResponse returns where the browser should be redirected

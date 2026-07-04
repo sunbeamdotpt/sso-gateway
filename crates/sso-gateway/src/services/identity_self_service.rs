@@ -154,6 +154,7 @@ pub trait KratosSelfService: Send + Sync {
     async fn submit_recovery_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError>;
@@ -161,6 +162,7 @@ pub trait KratosSelfService: Send + Sync {
     async fn submit_verification_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError>;
@@ -329,19 +331,21 @@ impl KratosSelfService for KratosClient {
     async fn submit_recovery_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError> {
-        self.submit_recovery_token(token, cookie, csrf_token).await
+        self.submit_recovery_token(token, flow, cookie, csrf_token).await
     }
 
     async fn submit_verification_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError> {
-        self.submit_verification_token(token, cookie, csrf_token)
+        self.submit_verification_token(token, flow, cookie, csrf_token)
             .await
     }
 }
@@ -908,9 +912,20 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
         let csrf_token = csrf_token_from_context(&ctx);
+        if req.flow.is_empty() {
+            return Err(ServiceError::InvalidArgument(
+                "flow is required to exchange a recovery token".into(),
+            )
+            .into());
+        }
         let redirect = self
             .kratos
-            .submit_recovery_token(&req.token, cookie.as_deref(), csrf_token.as_deref())
+            .submit_recovery_token(
+                &req.token,
+                &req.flow,
+                cookie.as_deref(),
+                csrf_token.as_deref(),
+            )
             .await
             .map_err(map_ory_error)?;
         let redirect_to = redirect.location.ok_or_else(|| {
@@ -933,9 +948,20 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
         let csrf_token = csrf_token_from_context(&ctx);
+        if req.flow.is_empty() {
+            return Err(ServiceError::InvalidArgument(
+                "flow is required to exchange a verification token".into(),
+            )
+            .into());
+        }
         let redirect = self
             .kratos
-            .submit_verification_token(&req.token, cookie.as_deref(), csrf_token.as_deref())
+            .submit_verification_token(
+                &req.token,
+                &req.flow,
+                cookie.as_deref(),
+                csrf_token.as_deref(),
+            )
             .await
             .map_err(map_ory_error)?;
         let redirect_to = redirect.location.ok_or_else(|| {
@@ -1435,11 +1461,12 @@ mod tests {
         async fn submit_recovery_token(
             &self,
             token: &str,
+            flow: &str,
             cookie: Option<&str>,
             csrf_token: Option<&str>,
         ) -> Result<KratosRedirectResponse, OryClientError> {
             self.record(format!(
-                "submit_recovery_token(token={token}, cookie={:?}, csrf_token={:?})",
+                "submit_recovery_token(token={token}, flow={flow}, cookie={:?}, csrf_token={:?})",
                 cookie, csrf_token
             ));
             self.take_token_submit()
@@ -1448,11 +1475,12 @@ mod tests {
         async fn submit_verification_token(
             &self,
             token: &str,
+            flow: &str,
             cookie: Option<&str>,
             csrf_token: Option<&str>,
         ) -> Result<KratosRedirectResponse, OryClientError> {
             self.record(format!(
-                "submit_verification_token(token={token}, cookie={:?}, csrf_token={:?})",
+                "submit_verification_token(token={token}, flow={flow}, cookie={:?}, csrf_token={:?})",
                 cookie, csrf_token
             ));
             self.take_token_submit()
@@ -1946,6 +1974,7 @@ mod tests {
         let ctx = request_context_with_cookie_and_csrf("session=prev", "csrf-header-value");
         let req = service_request(SubmitRecoveryTokenRequest {
             token: "recovery-token-1".to_string(),
+            flow: "recovery-flow-1".to_string(),
             ..Default::default()
         });
 
@@ -1958,7 +1987,7 @@ mod tests {
         assert_eq!(cookies.len(), 2);
         assert_eq!(
             fake.calls.lock().unwrap()[0],
-            "submit_recovery_token(token=recovery-token-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
+            "submit_recovery_token(token=recovery-token-1, flow=recovery-flow-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
         );
     }
 
@@ -1970,11 +1999,26 @@ mod tests {
         let ctx = request_context_without_cookie();
         let req = service_request(SubmitRecoveryTokenRequest {
             token: "token".to_string(),
+            flow: "recovery-flow-1".to_string(),
             ..Default::default()
         });
 
         let err = svc.submit_recovery_token(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_missing_flow_returns_invalid_argument() {
+        let fake = FakeKratos::default();
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitRecoveryTokenRequest {
+            token: "token".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_recovery_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1990,6 +2034,7 @@ mod tests {
         let ctx = request_context_without_cookie();
         let req = service_request(SubmitRecoveryTokenRequest {
             token: "expired".to_string(),
+            flow: "recovery-flow-1".to_string(),
             ..Default::default()
         });
 
@@ -2008,6 +2053,7 @@ mod tests {
         let ctx = request_context_with_cookie_and_csrf("session=prev", "csrf-header-value");
         let req = service_request(SubmitVerificationTokenRequest {
             token: "verification-token-1".to_string(),
+            flow: "verification-flow-1".to_string(),
             ..Default::default()
         });
 
@@ -2020,7 +2066,7 @@ mod tests {
         assert_eq!(cookies.len(), 1);
         assert_eq!(
             fake.calls.lock().unwrap()[0],
-            "submit_verification_token(token=verification-token-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
+            "submit_verification_token(token=verification-token-1, flow=verification-flow-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
         );
     }
 
@@ -2032,11 +2078,26 @@ mod tests {
         let ctx = request_context_without_cookie();
         let req = service_request(SubmitVerificationTokenRequest {
             token: "token".to_string(),
+            flow: "verification-flow-1".to_string(),
             ..Default::default()
         });
 
         let err = svc.submit_verification_token(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_missing_flow_returns_invalid_argument() {
+        let fake = FakeKratos::default();
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitVerificationTokenRequest {
+            token: "token".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_verification_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]
@@ -2052,6 +2113,7 @@ mod tests {
         let ctx = request_context_without_cookie();
         let req = service_request(SubmitVerificationTokenRequest {
             token: "missing".to_string(),
+            flow: "verification-flow-1".to_string(),
             ..Default::default()
         });
 
@@ -2616,13 +2678,13 @@ mod tests {
         );
         assert!(
             client
-                .submit_recovery_token("token", None, None)
+                .submit_recovery_token("token", "flow", None, None)
                 .await
                 .is_err()
         );
         assert!(
             client
-                .submit_verification_token("token", None, None)
+                .submit_verification_token("token", "flow", None, None)
                 .await
                 .is_err()
         );

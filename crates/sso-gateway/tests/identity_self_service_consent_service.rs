@@ -33,9 +33,15 @@ fn kratos_app() -> Router {
         .route("/self-service/settings/flows", get(kratos_get_flow))
         .route("/self-service/settings", post(kratos_submit_flow))
         .route("/self-service/recovery/flows", get(kratos_get_flow))
-        .route("/self-service/recovery", post(kratos_submit_flow))
+        .route(
+            "/self-service/recovery",
+            get(kratos_submit_recovery_token).post(kratos_submit_flow),
+        )
         .route("/self-service/verification/flows", get(kratos_get_flow))
-        .route("/self-service/verification", post(kratos_submit_flow))
+        .route(
+            "/self-service/verification",
+            get(kratos_submit_verification_token).post(kratos_submit_flow),
+        )
         .route("/self-service/{flow}/browser", get(kratos_get_flow))
         .route(
             "/self-service/logout/browser",
@@ -158,6 +164,70 @@ async fn kratos_get_flow_error(
         "id": params.get("id").cloned().unwrap_or_default(),
         "error": { "message": "oops" }
     }))
+}
+
+async fn kratos_submit_recovery_token(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<serde_json::Value>), axum::http::StatusCode>
+{
+    let token = params.get("token").cloned().unwrap_or_default();
+    let flow = params.get("flow").cloned().unwrap_or_default();
+    if token != "valid-recovery-token" || flow != "recovery-flow-id" {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mut resp_headers = axum::http::HeaderMap::new();
+    resp_headers.append(
+        "set-cookie",
+        format!("ory_kratos_session=recovery-{csrf}; Path=/; HttpOnly")
+            .parse()
+            .unwrap(),
+    );
+    resp_headers.append(
+        "set-cookie",
+        "csrf_token_1234=abc; Path=/; HttpOnly".parse().unwrap(),
+    );
+    resp_headers.insert(
+        "location",
+        "https://ui.example.com/settings?flow=privileged"
+            .parse()
+            .unwrap(),
+    );
+    Ok((axum::http::StatusCode::SEE_OTHER, resp_headers, Json(json!({}))))
+}
+
+async fn kratos_submit_verification_token(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<serde_json::Value>), axum::http::StatusCode>
+{
+    let token = params.get("token").cloned().unwrap_or_default();
+    let flow = params.get("flow").cloned().unwrap_or_default();
+    if token != "valid-verification-token" || flow != "verification-flow-id" {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+    let cookie = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mut resp_headers = axum::http::HeaderMap::new();
+    resp_headers.insert(
+        "set-cookie",
+        "ory_kratos_session=verification; Path=/; HttpOnly"
+            .parse()
+            .unwrap(),
+    );
+    resp_headers.insert(
+        "location",
+        format!("https://ui.example.com/welcome?verified={cookie}")
+            .parse()
+            .unwrap(),
+    );
+    Ok((axum::http::StatusCode::SEE_OTHER, resp_headers, Json(json!({}))))
 }
 
 async fn kratos_webauthn_js() -> &'static str {
@@ -617,6 +687,70 @@ async fn self_service_and_consent_round_trip() {
         resp.status().is_success(),
         "create_verification_flow failed: {}",
         resp.text().await.unwrap_or_default()
+    );
+
+    // IdentitySelfService::SubmitRecoveryToken
+    let resp = client
+        .post(format!(
+            "{base}/iam.v1.IdentitySelfService/SubmitRecoveryToken"
+        ))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .header("x-csrf-token", "csrf-1")
+        .json(&json!({ "token": "valid-recovery-token", "flow": "recovery-flow-id" }))
+        .send()
+        .await
+        .expect("submit_recovery_token request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "submit_recovery_token failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let recovery_cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+    assert!(
+        recovery_cookies
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
+        "submit_recovery_token should propagate Set-Cookie headers"
+    );
+    let recovery_submit: serde_json::Value = resp
+        .json()
+        .await
+        .expect("submit_recovery_token response should be json");
+    assert_eq!(
+        recovery_submit["redirectTo"].as_str().unwrap_or(""),
+        "https://ui.example.com/settings?flow=privileged"
+    );
+
+    // IdentitySelfService::SubmitVerificationToken
+    let resp = client
+        .post(format!(
+            "{base}/iam.v1.IdentitySelfService/SubmitVerificationToken"
+        ))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .json(&json!({ "token": "valid-verification-token", "flow": "verification-flow-id" }))
+        .send()
+        .await
+        .expect("submit_verification_token request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "submit_verification_token failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let verification_submit: serde_json::Value = resp
+        .json()
+        .await
+        .expect("submit_verification_token response should be json");
+    assert!(
+        verification_submit["redirectTo"]
+            .as_str()
+            .unwrap_or("")
+            .contains("https://ui.example.com/welcome?verified="),
+        "unexpected redirect: {}",
+        verification_submit["redirectTo"].as_str().unwrap_or("")
     );
 
     // IdentitySelfService::CreateLogoutFlow

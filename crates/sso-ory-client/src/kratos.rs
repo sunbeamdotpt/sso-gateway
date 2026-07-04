@@ -663,10 +663,11 @@ impl KratosClient {
     pub async fn submit_recovery_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<KratosRedirectResponse, OryClientError> {
-        self.submit_token("recovery", token, cookie, csrf_token)
+        self.submit_token("recovery", token, Some(flow), cookie, csrf_token)
             .await
     }
 
@@ -675,17 +676,19 @@ impl KratosClient {
     pub async fn submit_verification_token(
         &self,
         token: &str,
+        flow: &str,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<KratosRedirectResponse, OryClientError> {
-        self.submit_token("verification", token, cookie, csrf_token)
+        self.submit_token("verification", token, Some(flow), cookie, csrf_token)
             .await
     }
 
     async fn submit_token(
         &self,
-        flow: &str,
+        flow_type: &str,
         token: &str,
+        flow: Option<&str>,
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<KratosRedirectResponse, OryClientError> {
@@ -693,12 +696,17 @@ impl KratosClient {
             .public_url
             .as_ref()
             .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
-        let url = public_url.join(&format!("self-service/{}", urlencoding::encode(flow)))?;
+        let url = public_url.join(&format!("self-service/{}", urlencoding::encode(flow_type)))?;
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(flow) = flow {
+            query.push(("flow", flow));
+        }
+        query.push(("token", token));
         let mut request = self
             .no_redirect_client
             .get(url)
-            .query(&[("token", token)])
-            .header("accept", "application/json");
+            .query(&query)
+            .header("accept", "text/html");
         if let Some(cookie) = cookie {
             request = request.header("Cookie", cookie);
         }
@@ -706,8 +714,7 @@ impl KratosClient {
             request = request.header("X-CSRF-Token", csrf_token);
         }
         let response = request.send().await.map_err(OryClientError::Http)?;
-        let status = response.status().as_u16();
-        if status == 302 || response.status().is_success() {
+        if response.status().is_redirection() {
             let headers = response.headers().clone();
             Ok(KratosRedirectResponse {
                 location: headers
@@ -938,7 +945,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("1h");
         Json(json!({
-            "recovery_link": format!("http://kratos.example.com/self-service/recovery?token={identity_id}-recovery-token"),
+            "recovery_link": format!("http://kratos.example.com/self-service/recovery?flow={identity_id}-recovery-flow&token={identity_id}-recovery-token"),
             "recovery_token": format!("{identity_id}-recovery-token"),
             "expires_at": "2026-01-01T00:00:00Z",
             "expires_in": expires_in,
@@ -955,7 +962,7 @@ mod tests {
                 "id": "message-1",
                 "type": "email",
                 "subject": "Verify your email",
-                "body": format!("Click <a href=\"http://kratos.example.com/self-service/verification?token={identity_id}-verify-token\">here</a>"),
+                "body": format!("Click <a href=\"http://kratos.example.com/self-service/verification?flow={identity_id}-verification-flow&token={identity_id}-verify-token\">here</a>"),
                 "status": "sent",
                 "recipient": "a@example.com",
                 "sent_at": "2025-01-01T00:00:00Z",
@@ -1088,7 +1095,8 @@ mod tests {
     ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<Value>), axum::http::StatusCode>
     {
         let token = params.get("token").cloned().unwrap_or_default();
-        if token != "valid-recovery-token" {
+        let flow = params.get("flow").cloned().unwrap_or_default();
+        if token != "valid-recovery-token" || flow != "recovery-flow-id" {
             return Err(axum::http::StatusCode::BAD_REQUEST);
         }
         let csrf = headers
@@ -1121,7 +1129,8 @@ mod tests {
     ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<Value>), axum::http::StatusCode>
     {
         let token = params.get("token").cloned().unwrap_or_default();
-        if token != "valid-verification-token" {
+        let flow = params.get("flow").cloned().unwrap_or_default();
+        if token != "valid-verification-token" || flow != "verification-flow-id" {
             return Err(axum::http::StatusCode::BAD_REQUEST);
         }
         let cookie = headers
@@ -1435,7 +1444,12 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client
-            .submit_recovery_token("valid-recovery-token", Some("session=abc"), Some("csrf-1"))
+            .submit_recovery_token(
+                "valid-recovery-token",
+                "recovery-flow-id",
+                Some("session=abc"),
+                Some("csrf-1"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1457,7 +1471,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let err = client
-            .submit_recovery_token("invalid", None, None)
+            .submit_recovery_token("invalid", "recovery-flow-id", None, None)
             .await
             .unwrap_err();
         match err {
@@ -1471,7 +1485,12 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client
-            .submit_verification_token("valid-verification-token", Some("session=xyz"), None)
+            .submit_verification_token(
+                "valid-verification-token",
+                "verification-flow-id",
+                Some("session=xyz"),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1493,7 +1512,7 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let err = client
-            .submit_verification_token("invalid", None, None)
+            .submit_verification_token("invalid", "verification-flow-id", None, None)
             .await
             .unwrap_err();
         match err {
@@ -2266,11 +2285,9 @@ mod tests {
         let messages = resp.as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["id"], "message-1");
-        assert!(
-            messages[0]["body"]
-                .as_str()
-                .unwrap()
-                .contains("verification?token=identity-1-verify-token")
-        );
+        let body = messages[0]["body"].as_str().unwrap();
+        assert!(body.contains("verification?"));
+        assert!(body.contains("flow=identity-1-verification-flow"));
+        assert!(body.contains("token=identity-1-verify-token"));
     }
 }

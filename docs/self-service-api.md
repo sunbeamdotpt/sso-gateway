@@ -126,6 +126,11 @@ capture any `Set-Cookie` headers (including `ory_kratos_session` and CSRF cookie
 and return Kratos's final `redirect_to` URL in the response. The browser should
 follow the redirect and send the returned cookies along.
 
+The request must include both `token` and `flow`. Kratos v25.4.0 requires the
+`flow` query parameter when validating a magic link through the JSON-facing code
+path. The UI should parse the `flow` value from the magic-link URL returned by
+`CreateRecoveryLink` or `GetVerificationMessage` and pass it unchanged.
+
 ### Errors and static assets
 
 | Method | Request | Response | Purpose |
@@ -210,15 +215,20 @@ browser self-service flows and by integration tests. Both require an
 | `GetVerificationMessage` | `GetVerificationMessageRequest` | `VerificationMessage` | Fetch the latest verification message for an identity, including the link to click. |
 
 `CreateRecoveryLink` calls the Kratos admin API and returns a UI-hosted URL
-such as `{UI_PUBLIC_URL}/recovery?token=...`. The token is extracted from the
-Kratos response (the `recovery_token` field in older versions, or the `token`
-query parameter in Kratos v25.4.0). The `expires_in_seconds` field is optional;
-when zero the upstream default lifetime is used.
+such as `{UI_PUBLIC_URL}/recovery?flow=...&token=...`. The token is extracted from
+the Kratos response (the `recovery_token` field in older versions, or the `token`
+query parameter in Kratos v25.4.0). The `flow` value is extracted from the
+`flow` query parameter of the upstream `recovery_link`. The `expires_in_seconds`
+field is optional; when zero the upstream default lifetime is used. The response
+also exposes the raw `recovery_token` and `flow` fields so the UI can use them
+directly instead of parsing the URL.
 
 `GetVerificationMessage` lists courier messages for the identity and returns the
 most recent verification message. The `link` field contains the first
-self-service URL found in the message body, rewritten to `{UI_PUBLIC_URL}/verification?token=...`.
-Callers can pass `message_id` to retrieve a specific message.
+self-service URL found in the message body, rewritten to
+`{UI_PUBLIC_URL}/verification?flow=...&token=...`. The `flow` and token are
+extracted from the upstream link's query parameters. Callers can pass
+`message_id` to retrieve a specific message.
 
 `UI_PUBLIC_URL` is a gateway configuration value. When unset it defaults to
 `PUBLIC_BASE_URL`.

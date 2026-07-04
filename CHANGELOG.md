@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.12] - 2026-07-04
+
+### Changed
+
+- Magic-link URLs returned by `IdentityService.CreateRecoveryLink` and
+  `IdentityService.GetVerificationMessage` now include a `flow` query parameter
+  (`/recovery?flow=...&token=...` and `/verification?flow=...&token=...`). The
+  `flow` value is extracted from the upstream Kratos link so the UI can pass it
+  to `IdentitySelfService.SubmitRecoveryToken` / `SubmitVerificationToken`.
+- `IdentitySelfService.SubmitRecoveryToken` and
+  `IdentitySelfService.SubmitVerificationToken` now require a `flow` field and
+  send it to Kratos as a query parameter. This matches Kratos v25.4.0, which
+  rejects token-only validation in the JSON-facing code path with
+  "The flow query parameter is missing or malformed."
+
+### Added
+
+- `flow` field to `RecoveryLink`, `VerificationMessage`,
+  `SubmitRecoveryTokenRequest`, and `SubmitVerificationTokenRequest` protobuf
+  messages.
+- Unit and integration regression coverage for the `flow` parameter exchange.
+
 ## [1.0.0-rc.11] - 2026-07-04
 
 ### Changed

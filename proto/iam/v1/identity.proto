@@ -221,8 +221,11 @@ message RecoveryLink {
   string recovery_link = 1;
   // Opaque recovery token.
   string recovery_token = 2;
+  // Flow identifier included in the magic link so the UI can exchange the
+  // token with SubmitRecoveryToken.
+  string flow = 3;
   // Timestamp when the link expires.
-  google.protobuf.Timestamp expires_at = 3;
+  google.protobuf.Timestamp expires_at = 4;
 }
 
 // GetVerificationMessageRequest fetches a verification message for an identity.
@@ -253,6 +256,9 @@ message VerificationMessage {
   google.protobuf.Timestamp sent_at = 7;
   // Gateway URL extracted from the body that the user should visit.
   string link = 8;
+  // Flow identifier included in the magic link so the UI can exchange the
+  // token with SubmitVerificationToken.
+  string flow = 9;
 }
 
 // ListSessionsRequest is the input for paginating an identity's sessions.

@@ -624,31 +624,48 @@ impl IdentityService for IdentityServiceImpl {
         let recovery_link = response.body["recovery_link"].as_str().ok_or_else(|| {
             ServiceError::Internal("kratos response missing recovery_link".into())
         })?;
+        let recovery_url = reqwest::Url::parse(recovery_link).map_err(|e| {
+            ServiceError::Internal(format!("kratos recovery_link is not a valid URL: {e}"))
+        })?;
         let recovery_token = response.body["recovery_token"]
             .as_str()
             .map(|t| t.to_string())
             .or_else(|| {
-                reqwest::Url::parse(recovery_link).ok().and_then(|u| {
-                    u.query_pairs()
-                        .find(|(k, _)| k == "token")
-                        .map(|(_, v)| v.into_owned())
-                })
+                recovery_url
+                    .query_pairs()
+                    .find(|(k, _)| k == "token")
+                    .map(|(_, v)| v.into_owned())
             })
             .ok_or_else(|| {
                 ServiceError::Internal(
                     "kratos response missing recovery_token and token query param".into(),
                 )
             })?;
+        let flow = recovery_url
+            .query_pairs()
+            .find(|(k, _)| k == "flow")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
 
-        let gateway_link = format!(
-            "{}/recovery?token={}",
-            self.ui_public_url.trim_end_matches('/'),
-            urlencoding::encode(&recovery_token)
-        );
+        let gateway_link = if flow.is_empty() {
+            format!(
+                "{}/recovery?token={}",
+                self.ui_public_url.trim_end_matches('/'),
+                urlencoding::encode(&recovery_token)
+            )
+        } else {
+            format!(
+                "{}/recovery?flow={}&token={}",
+                self.ui_public_url.trim_end_matches('/'),
+                urlencoding::encode(&flow),
+                urlencoding::encode(&recovery_token)
+            )
+        };
 
         Ok(Response::new(RecoveryLink {
             recovery_link: gateway_link,
             recovery_token: recovery_token.to_string(),
+            flow,
             expires_at: response.body["expires_at"]
                 .as_str()
                 .and_then(parse_timestamp)
@@ -695,22 +712,37 @@ impl IdentityService for IdentityServiceImpl {
         .ok_or_else(|| ServiceError::NotFound("verification message not found".into()))?;
 
         let body = message["body"].as_str().unwrap_or("");
-        let link = extract_first_self_service_link(body)
+        let (link, flow) = extract_first_self_service_link(body)
             .and_then(|url| {
-                reqwest::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| {
-                        u.query_pairs()
-                            .find(|(k, _)| k == "token")
-                            .map(|(_, v)| v.into_owned())
-                    })
-                    .map(|token| {
+                reqwest::Url::parse(&url).ok().map(|u| {
+                    let token = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "token")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let flow = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "flow")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let link = if token.is_empty() {
+                        String::new()
+                    } else if flow.is_empty() {
                         format!(
                             "{}/verification?token={}",
                             self.ui_public_url.trim_end_matches('/'),
                             urlencoding::encode(&token)
                         )
-                    })
+                    } else {
+                        format!(
+                            "{}/verification?flow={}&token={}",
+                            self.ui_public_url.trim_end_matches('/'),
+                            urlencoding::encode(&flow),
+                            urlencoding::encode(&token)
+                        )
+                    };
+                    (link, flow)
+                })
             })
             .unwrap_or_default();
 
@@ -727,6 +759,7 @@ impl IdentityService for IdentityServiceImpl {
                 .map(Into::into)
                 .unwrap_or_default(),
             link,
+            flow,
             ..Default::default()
         }))
     }
@@ -2144,10 +2177,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_recovery_link_returns_gateway_url() {
+    async fn create_recovery_link_returns_gateway_url_with_flow() {
         let kratos = StubKratos::with_recovery_link(KratosResponse {
             body: json!({
-                "recovery_link": "http://kratos.example.com/self-service/recovery?token=abc",
+                "recovery_link": "http://kratos.example.com/self-service/recovery?flow=flow-abc&token=abc",
                 "recovery_token": "abc",
                 "expires_at": "2026-01-01T00:00:00Z",
             }),
@@ -2170,17 +2203,18 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://ui.example.com/recovery?token=abc"
+            "https://ui.example.com/recovery?flow=flow-abc&token=abc"
         );
         assert_eq!(resp.recovery_token, "abc");
+        assert_eq!(resp.flow, "flow-abc");
         assert!(resp.expires_at.is_set());
     }
 
     #[tokio::test]
-    async fn create_recovery_link_parses_token_from_url_when_field_missing() {
+    async fn create_recovery_link_parses_token_and_flow_from_url_when_token_field_missing() {
         let kratos = StubKratos::with_recovery_link(KratosResponse {
             body: json!({
-                "recovery_link": "http://kratos.example.com/self-service/recovery?token=kratos-v25-token",
+                "recovery_link": "http://kratos.example.com/self-service/recovery?flow=flow-v25&token=kratos-v25-token",
                 "expires_at": "2026-01-01T00:00:00Z",
             }),
             headers: http::HeaderMap::new(),
@@ -2202,20 +2236,21 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://ui.example.com/recovery?token=kratos-v25-token"
+            "https://ui.example.com/recovery?flow=flow-v25&token=kratos-v25-token"
         );
         assert_eq!(resp.recovery_token, "kratos-v25-token");
+        assert_eq!(resp.flow, "flow-v25");
         assert!(resp.expires_at.is_set());
     }
 
     #[tokio::test]
-    async fn get_verification_message_returns_gateway_link() {
+    async fn get_verification_message_returns_gateway_link_with_flow() {
         let kratos = StubKratos::with_courier_messages(json!([
             {
                 "id": "msg-1",
                 "type": "email",
                 "subject": "Verify",
-                "body": "<a href=\"http://kratos.example.com/self-service/verification?token=v1\">verify</a>",
+                "body": "<a href=\"http://kratos.example.com/self-service/verification?flow=flow-v1&token=v1\">verify</a>",
                 "status": "sent",
                 "recipient": "a@example.com",
                 "sent_at": "2025-01-01T00:00:00Z",
@@ -2237,7 +2272,11 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(resp.id, "msg-1");
-        assert_eq!(resp.link, "https://ui.example.com/verification?token=v1");
+        assert_eq!(
+            resp.link,
+            "https://ui.example.com/verification?flow=flow-v1&token=v1"
+        );
+        assert_eq!(resp.flow, "flow-v1");
     }
 
     #[test]
