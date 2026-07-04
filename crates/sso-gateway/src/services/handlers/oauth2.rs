@@ -149,11 +149,8 @@ fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        payload.trim(),
-    )
-    .ok()?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim()).ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
     let (id, secret) = decoded.split_once(':')?;
     Some((id.to_string(), secret.to_string()))
@@ -239,7 +236,11 @@ async fn token(
         return *err;
     }
 
-    match state.hydra.token(form.into_iter().collect(), client_credentials).await {
+    match state
+        .hydra
+        .token(form.into_iter().collect(), client_credentials)
+        .await
+    {
         Ok(value) => json_response(value),
         Err(err) => map_ory_error(err),
     }
@@ -922,9 +923,14 @@ mod tests {
             ("client_id".to_string(), "client-1".to_string()),
             ("client_secret".to_string(), "secret".to_string()),
         ]);
-        let resp = device(State(state), HeaderMap::new(), Path("auth".to_string()), Form(form))
-            .await
-            .into_response();
+        let resp = device(
+            State(state),
+            HeaderMap::new(),
+            Path("auth".to_string()),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1117,9 +1123,14 @@ mod tests {
             ("client_id".to_string(), "client-1".to_string()),
             ("client_secret".to_string(), "secret".to_string()),
         ]);
-        let resp = device(State(state), HeaderMap::new(), Path("auth".to_string()), Form(form))
-            .await
-            .into_response();
+        let resp = device(
+            State(state),
+            HeaderMap::new(),
+            Path("auth".to_string()),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 

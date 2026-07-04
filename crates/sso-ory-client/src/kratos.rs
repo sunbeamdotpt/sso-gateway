@@ -13,22 +13,44 @@ pub struct KratosResponse {
     pub headers: HeaderMap,
 }
 
+/// A redirect-style Kratos response, carrying the `Location` header and any
+/// `Set-Cookie` headers from a 302 self-service token exchange.
+#[derive(Debug, Clone)]
+pub struct KratosRedirectResponse {
+    pub location: Option<String>,
+    pub headers: HeaderMap,
+}
+
 /// Internal client for Ory Kratos (admin and public endpoints).
 #[derive(Debug, Clone)]
 pub struct KratosClient {
     client: Client,
+    no_redirect_client: Client,
     admin_url: Url,
     public_url: Option<Url>,
 }
 
 impl KratosClient {
+    fn build_client() -> Result<Client, OryClientError> {
+        Ok(Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()?)
+    }
+
+    fn build_no_redirect_client() -> Result<Client, OryClientError> {
+        Ok(Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?)
+    }
+
     /// Create a new Kratos admin client.
     pub fn new(admin_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()?,
+            client: Self::build_client()?,
+            no_redirect_client: Self::build_no_redirect_client()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: None,
         })
@@ -37,10 +59,8 @@ impl KratosClient {
     /// Create a client with both admin and public endpoints configured.
     pub fn new_with_public(admin_url: &str, public_url: &str) -> Result<Self, OryClientError> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()?,
+            client: Self::build_client()?,
+            no_redirect_client: Self::build_no_redirect_client()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: Some(parse_base_url(public_url)?),
         })
@@ -638,6 +658,69 @@ impl KratosClient {
         }
     }
 
+    /// Submit a recovery magic-link token to Kratos and capture the redirect.
+    #[instrument(skip(self, cookie, csrf_token))]
+    pub async fn submit_recovery_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<KratosRedirectResponse, OryClientError> {
+        self.submit_token("recovery", token, cookie, csrf_token)
+            .await
+    }
+
+    /// Submit a verification magic-link token to Kratos and capture the redirect.
+    #[instrument(skip(self, cookie, csrf_token))]
+    pub async fn submit_verification_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<KratosRedirectResponse, OryClientError> {
+        self.submit_token("verification", token, cookie, csrf_token)
+            .await
+    }
+
+    async fn submit_token(
+        &self,
+        flow: &str,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<KratosRedirectResponse, OryClientError> {
+        let public_url = self
+            .public_url
+            .as_ref()
+            .ok_or_else(|| OryClientError::InvalidResponse("kratos public url not set".into()))?;
+        let url = public_url.join(&format!("self-service/{}", urlencoding::encode(flow)))?;
+        let mut request = self
+            .no_redirect_client
+            .get(url)
+            .query(&[("token", token)])
+            .header("accept", "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        if let Some(csrf_token) = csrf_token {
+            request = request.header("X-CSRF-Token", csrf_token);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+        let status = response.status().as_u16();
+        if status == 302 || response.status().is_success() {
+            let headers = response.headers().clone();
+            Ok(KratosRedirectResponse {
+                location: headers
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from),
+                headers,
+            })
+        } else {
+            Err(ory_error(response).await)
+        }
+    }
+
     async fn send_json(
         &self,
         method: Method,
@@ -749,6 +832,14 @@ mod tests {
             .route("/self-service/logout", get(submit_logout_flow))
             .route("/self-service/logout/browser", get(create_logout_flow))
             .route("/self-service/errors", get(get_flow_error))
+            .route(
+                "/self-service/recovery",
+                get(submit_recovery_token).post(submit_recovery_flow_post),
+            )
+            .route(
+                "/self-service/verification",
+                get(submit_verification_token).post(submit_verification_flow_post),
+            )
             .route("/self-service/{flow}", post(submit_flow))
             .route("/.well-known/ory/webauthn.js", get(webauthn_js));
 
@@ -950,6 +1041,14 @@ mod tests {
         Query(params): Query<std::collections::HashMap<String, String>>,
         Json(body): Json<Value>,
     ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        submit_flow_inner(&flow, params, body).await
+    }
+
+    async fn submit_flow_inner(
+        flow: &str,
+        params: std::collections::HashMap<String, String>,
+        body: Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "set-cookie",
@@ -967,6 +1066,82 @@ mod tests {
                 "body": body
             })),
         )
+    }
+
+    async fn submit_recovery_flow_post(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        submit_flow_inner("recovery", params, body).await
+    }
+
+    async fn submit_verification_flow_post(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        submit_flow_inner("verification", params, body).await
+    }
+
+    async fn submit_recovery_token(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+        headers: axum::http::HeaderMap,
+    ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<Value>), axum::http::StatusCode>
+    {
+        let token = params.get("token").cloned().unwrap_or_default();
+        if token != "valid-recovery-token" {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        let csrf = headers
+            .get("x-csrf-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let mut resp_headers = axum::http::HeaderMap::new();
+        resp_headers.append(
+            "set-cookie",
+            format!("ory_kratos_session=recovery-{csrf}; Path=/; HttpOnly")
+                .parse()
+                .unwrap(),
+        );
+        resp_headers.append(
+            "set-cookie",
+            "csrf_token_1234=abc; Path=/; HttpOnly".parse().unwrap(),
+        );
+        resp_headers.insert(
+            "location",
+            "https://ui.example.com/recovery?flow=recovery-flow-id"
+                .parse()
+                .unwrap(),
+        );
+        Ok((axum::http::StatusCode::FOUND, resp_headers, Json(json!({}))))
+    }
+
+    async fn submit_verification_token(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+        headers: axum::http::HeaderMap,
+    ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<Value>), axum::http::StatusCode>
+    {
+        let token = params.get("token").cloned().unwrap_or_default();
+        if token != "valid-verification-token" {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        let cookie = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let mut resp_headers = axum::http::HeaderMap::new();
+        resp_headers.insert(
+            "set-cookie",
+            "ory_kratos_session=verification; Path=/; HttpOnly"
+                .parse()
+                .unwrap(),
+        );
+        resp_headers.insert(
+            "location",
+            format!("https://ui.example.com/verification?flow={cookie}")
+                .parse()
+                .unwrap(),
+        );
+        Ok((axum::http::StatusCode::FOUND, resp_headers, Json(json!({}))))
     }
 
     async fn create_logout_flow(
@@ -1253,6 +1428,78 @@ mod tests {
         let client = KratosClient::new_with_public(&url, &url).unwrap();
         let resp = client.get_webauthn_js().await.unwrap();
         assert_eq!(resp, "console.log('webauthn');");
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_recovery_token("valid-recovery-token", Some("session=abc"), Some("csrf-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.location,
+            Some("https://ui.example.com/recovery?flow=recovery-flow-id".to_string())
+        );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
+        let cookie_strs: Vec<String> = cookies
+            .iter()
+            .map(|c| c.to_str().unwrap().to_string())
+            .collect();
+        assert!(cookie_strs.iter().any(|c| c.contains("ory_kratos_session")));
+        assert!(cookie_strs.iter().any(|c| c.contains("csrf_token_1234")));
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_rejects_invalid_token() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let err = client
+            .submit_recovery_token("invalid", None, None)
+            .await
+            .unwrap_err();
+        match err {
+            OryClientError::Ory { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Ory error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let resp = client
+            .submit_verification_token("valid-verification-token", Some("session=xyz"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.location,
+            Some("https://ui.example.com/verification?flow=session=xyz".to_string())
+        );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=verification")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_rejects_invalid_token() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let err = client
+            .submit_verification_token("invalid", None, None)
+            .await
+            .unwrap_err();
+        match err {
+            OryClientError::Ory { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Ory error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2000,10 +2247,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body["recovery_token"], "identity-1-recovery-token");
-        assert!(resp.body["recovery_link"]
-            .as_str()
-            .unwrap()
-            .contains("token=identity-1-recovery-token"));
+        assert!(
+            resp.body["recovery_link"]
+                .as_str()
+                .unwrap()
+                .contains("token=identity-1-recovery-token")
+        );
     }
 
     #[tokio::test]
@@ -2017,9 +2266,11 @@ mod tests {
         let messages = resp.as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["id"], "message-1");
-        assert!(messages[0]["body"]
-            .as_str()
-            .unwrap()
-            .contains("verification?token=identity-1-verify-token"));
+        assert!(
+            messages[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("verification?token=identity-1-verify-token")
+        );
     }
 }

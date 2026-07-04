@@ -67,7 +67,11 @@ mod tests {
     #[test]
     fn rewrite_url_preserves_unrelated_urls() {
         let url = "https://other.example.com/self-service/recovery?token=abc";
-        let rewritten = rewrite_url(url, "http://kratos.example.com", "https://gateway.example.com");
+        let rewritten = rewrite_url(
+            url,
+            "http://kratos.example.com",
+            "https://gateway.example.com",
+        );
         assert_eq!(rewritten, url);
     }
 

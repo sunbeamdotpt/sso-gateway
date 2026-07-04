@@ -16,8 +16,9 @@ use crate::proto::iam::v1::{
     CreateRegistrationFlowRequest, CreateSettingsFlowRequest, CreateVerificationFlowRequest,
     FlowError, GetFlowErrorRequest, GetFlowRequest, GetTenantCapabilitiesRequest,
     GetTenantCapabilitiesResponse, IdentitySelfService, LogoutFlow, SelfServiceFlow,
-    SubmitFlowRequest, SubmitLogoutFlowRequest, TenantCapabilities, ToSessionRequest,
-    WebAuthnJsResponse,
+    SubmitFlowRequest, SubmitLogoutFlowRequest, SubmitRecoveryTokenRequest,
+    SubmitRecoveryTokenResponse, SubmitVerificationTokenRequest, SubmitVerificationTokenResponse,
+    TenantCapabilities, ToSessionRequest, WebAuthnJsResponse,
 };
 use buffa_types::google::protobuf::Empty;
 
@@ -149,6 +150,20 @@ pub trait KratosSelfService: Send + Sync {
     async fn get_flow_error(&self, id: &str) -> Result<Value, OryClientError>;
 
     async fn get_webauthn_js(&self) -> Result<String, OryClientError>;
+
+    async fn submit_recovery_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError>;
+
+    async fn submit_verification_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError>;
 }
 
 #[async_trait]
@@ -310,6 +325,25 @@ impl KratosSelfService for KratosClient {
     async fn get_webauthn_js(&self) -> Result<String, OryClientError> {
         self.get_webauthn_js().await
     }
+
+    async fn submit_recovery_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError> {
+        self.submit_recovery_token(token, cookie, csrf_token).await
+    }
+
+    async fn submit_verification_token(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError> {
+        self.submit_verification_token(token, cookie, csrf_token)
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -336,30 +370,58 @@ impl IdentitySelfServiceImpl {
     }
 
     fn rewrite_flow_urls(&self, flow: &mut SelfServiceFlow) {
-        flow.return_to = rewrite_url(&flow.return_to, &self.kratos_public_url, &self.gateway_public_url);
-        flow.request_url = rewrite_url(&flow.request_url, &self.kratos_public_url, &self.gateway_public_url);
+        flow.return_to = rewrite_url(
+            &flow.return_to,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
+        flow.request_url = rewrite_url(
+            &flow.request_url,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
         if let Some(ui) = flow.ui.as_option_mut() {
-            ui.action = rewrite_url(&ui.action, &self.kratos_public_url, &self.gateway_public_url);
+            ui.action = rewrite_url(
+                &ui.action,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
             for node in &mut ui.nodes {
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Anchor(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.href = rewrite_url(&attrs.href, &self.kratos_public_url, &self.gateway_public_url);
+                    attrs.href = rewrite_url(
+                        &attrs.href,
+                        &self.kratos_public_url,
+                        &self.gateway_public_url,
+                    );
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Image(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                    attrs.src = rewrite_url(
+                        &attrs.src,
+                        &self.kratos_public_url,
+                        &self.gateway_public_url,
+                    );
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Script(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                    attrs.src = rewrite_url(
+                        &attrs.src,
+                        &self.kratos_public_url,
+                        &self.gateway_public_url,
+                    );
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Input(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(&attrs.src, &self.kratos_public_url, &self.gateway_public_url);
+                    attrs.src = rewrite_url(
+                        &attrs.src,
+                        &self.kratos_public_url,
+                        &self.gateway_public_url,
+                    );
                 }
             }
         }
@@ -369,11 +431,31 @@ impl IdentitySelfServiceImpl {
             for uri in &mut client.redirect_uris {
                 *uri = rewrite_url(uri, &self.kratos_public_url, &self.gateway_public_url);
             }
-            client.client_uri = rewrite_url(&client.client_uri, &self.kratos_public_url, &self.gateway_public_url);
-            client.logo_uri = rewrite_url(&client.logo_uri, &self.kratos_public_url, &self.gateway_public_url);
-            client.policy_uri = rewrite_url(&client.policy_uri, &self.kratos_public_url, &self.gateway_public_url);
-            client.tos_uri = rewrite_url(&client.tos_uri, &self.kratos_public_url, &self.gateway_public_url);
-            client.jwks_uri = rewrite_url(&client.jwks_uri, &self.kratos_public_url, &self.gateway_public_url);
+            client.client_uri = rewrite_url(
+                &client.client_uri,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
+            client.logo_uri = rewrite_url(
+                &client.logo_uri,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
+            client.policy_uri = rewrite_url(
+                &client.policy_uri,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
+            client.tos_uri = rewrite_url(
+                &client.tos_uri,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
+            client.jwks_uri = rewrite_url(
+                &client.jwks_uri,
+                &self.kratos_public_url,
+                &self.gateway_public_url,
+            );
         }
     }
 }
@@ -381,6 +463,13 @@ impl IdentitySelfServiceImpl {
 fn cookie_from_context(ctx: &RequestContext) -> Option<String> {
     ctx.headers()
         .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+}
+
+fn csrf_token_from_context(ctx: &RequestContext) -> Option<String> {
+    ctx.headers()
+        .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
 }
@@ -811,6 +900,56 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     }
 
     #[instrument(skip(self, request))]
+    async fn submit_recovery_token(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SubmitRecoveryTokenRequest>,
+    ) -> ServiceResult<SubmitRecoveryTokenResponse> {
+        let req = request.to_owned_message();
+        let cookie = cookie_from_context(&ctx);
+        let csrf_token = csrf_token_from_context(&ctx);
+        let redirect = self
+            .kratos
+            .submit_recovery_token(&req.token, cookie.as_deref(), csrf_token.as_deref())
+            .await
+            .map_err(map_ory_error)?;
+        let redirect_to = redirect.location.ok_or_else(|| {
+            ServiceError::Internal("kratos recovery token response missing location".into())
+        })?;
+        let mut response = Response::new(SubmitRecoveryTokenResponse {
+            redirect_to,
+            __buffa_unknown_fields: Default::default(),
+        });
+        attach_set_cookies(&mut response, &redirect.headers);
+        Ok(response)
+    }
+
+    #[instrument(skip(self, request))]
+    async fn submit_verification_token(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SubmitVerificationTokenRequest>,
+    ) -> ServiceResult<SubmitVerificationTokenResponse> {
+        let req = request.to_owned_message();
+        let cookie = cookie_from_context(&ctx);
+        let csrf_token = csrf_token_from_context(&ctx);
+        let redirect = self
+            .kratos
+            .submit_verification_token(&req.token, cookie.as_deref(), csrf_token.as_deref())
+            .await
+            .map_err(map_ory_error)?;
+        let redirect_to = redirect.location.ok_or_else(|| {
+            ServiceError::Internal("kratos verification token response missing location".into())
+        })?;
+        let mut response = Response::new(SubmitVerificationTokenResponse {
+            redirect_to,
+            __buffa_unknown_fields: Default::default(),
+        });
+        attach_set_cookies(&mut response, &redirect.headers);
+        Ok(response)
+    }
+
+    #[instrument(skip(self, request))]
     async fn get_flow_error(
         &self,
         _ctx: RequestContext,
@@ -884,7 +1023,7 @@ mod tests {
     use serde_json::{Value, json};
     use sso_ory_client::{
         error::OryClientError,
-        kratos::{KratosClient, KratosResponse},
+        kratos::{KratosClient, KratosRedirectResponse, KratosResponse},
     };
     use sunbeam_g2v::error::ServiceError;
 
@@ -893,17 +1032,25 @@ mod tests {
         CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
         CreateRegistrationFlowRequest, CreateSettingsFlowRequest, CreateVerificationFlowRequest,
         GetFlowErrorRequest, GetFlowRequest, GetTenantCapabilitiesRequest, IdentitySelfService,
-        SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, ToSessionRequest,
+        SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, SubmitRecoveryTokenRequest,
+        SubmitVerificationTokenRequest, ToSessionRequest,
     };
 
     use super::{
-        IdentitySelfServiceImpl, KratosSelfService, cookie_from_context, map_ory_error,
-        tenant_from_context,
+        IdentitySelfServiceImpl, KratosSelfService, cookie_from_context, csrf_token_from_context,
+        map_ory_error, tenant_from_context,
     };
 
     fn request_context_with_cookie(cookie: &str) -> RequestContext {
         let mut headers = HeaderMap::new();
         headers.insert("cookie", cookie.parse().unwrap());
+        RequestContext::new(headers)
+    }
+
+    fn request_context_with_cookie_and_csrf(cookie: &str, csrf: &str) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie.parse().unwrap());
+        headers.insert("x-csrf-token", csrf.parse().unwrap());
         RequestContext::new(headers)
     }
 
@@ -974,6 +1121,7 @@ mod tests {
         logout_submit: Arc<Mutex<Option<Result<(), OryClientError>>>>,
         flow_error: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
         webauthn_js: Arc<Mutex<Option<Result<String, OryClientError>>>>,
+        token_submit: Arc<Mutex<Option<Result<KratosRedirectResponse, OryClientError>>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1005,6 +1153,32 @@ mod tests {
             *self.flow.lock().unwrap() = Some(Err(OryClientError::Ory {
                 status,
                 message: message.to_string(),
+            }));
+        }
+
+        fn take_token_submit(&self) -> Result<KratosRedirectResponse, OryClientError> {
+            self.token_submit
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::MissingTenant))
+        }
+
+        fn reseed_token_submit(&self, location: &str, cookies: &[&str]) {
+            let mut headers = http::HeaderMap::new();
+            for cookie in cookies {
+                headers.append("set-cookie", cookie.parse().unwrap());
+            }
+            *self.token_submit.lock().unwrap() = Some(Ok(KratosRedirectResponse {
+                location: Some(location.to_string()),
+                headers,
+            }));
+        }
+
+        fn reseed_token_submit_without_location(&self) {
+            *self.token_submit.lock().unwrap() = Some(Ok(KratosRedirectResponse {
+                location: None,
+                headers: http::HeaderMap::new(),
             }));
         }
 
@@ -1256,6 +1430,32 @@ mod tests {
                 .unwrap()
                 .take()
                 .unwrap_or_else(|| Err(OryClientError::MissingTenant))
+        }
+
+        async fn submit_recovery_token(
+            &self,
+            token: &str,
+            cookie: Option<&str>,
+            csrf_token: Option<&str>,
+        ) -> Result<KratosRedirectResponse, OryClientError> {
+            self.record(format!(
+                "submit_recovery_token(token={token}, cookie={:?}, csrf_token={:?})",
+                cookie, csrf_token
+            ));
+            self.take_token_submit()
+        }
+
+        async fn submit_verification_token(
+            &self,
+            token: &str,
+            cookie: Option<&str>,
+            csrf_token: Option<&str>,
+        ) -> Result<KratosRedirectResponse, OryClientError> {
+            self.record(format!(
+                "submit_verification_token(token={token}, cookie={:?}, csrf_token={:?})",
+                cookie, csrf_token
+            ));
+            self.take_token_submit()
         }
     }
 
@@ -1730,6 +1930,150 @@ mod tests {
 
         let err = svc.get_web_authn_java_script(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_happy_path() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit(
+            "https://ui.example.com/settings?flow=privileged",
+            &[
+                "ory_kratos_session=abc; Path=/; HttpOnly",
+                "csrf_token_1234=xyz; Path=/; SameSite=Lax",
+            ],
+        );
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie_and_csrf("session=prev", "csrf-header-value");
+        let req = service_request(SubmitRecoveryTokenRequest {
+            token: "recovery-token-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_recovery_token(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_to,
+            "https://ui.example.com/settings?flow=privileged"
+        );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            "submit_recovery_token(token=recovery-token-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_missing_location_returns_internal() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit_without_location();
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitRecoveryTokenRequest {
+            token: "token".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_recovery_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_error_path() {
+        let fake = FakeKratos {
+            token_submit: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 410,
+                message: "token expired".into(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitRecoveryTokenRequest {
+            token: "expired".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_recovery_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_happy_path() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit(
+            "https://ui.example.com/welcome?verified=true",
+            &["ory_kratos_session=abc; Path=/; HttpOnly"],
+        );
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie_and_csrf("session=prev", "csrf-header-value");
+        let req = service_request(SubmitVerificationTokenRequest {
+            token: "verification-token-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_verification_token(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_to,
+            "https://ui.example.com/welcome?verified=true"
+        );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            "submit_verification_token(token=verification-token-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_missing_location_returns_internal() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit_without_location();
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitVerificationTokenRequest {
+            token: "token".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_verification_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_error_path() {
+        let fake = FakeKratos {
+            token_submit: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 404,
+                message: "token not found".into(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitVerificationTokenRequest {
+            token: "missing".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_verification_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn csrf_token_from_context_extracts_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "token-value".parse().unwrap());
+        let ctx = RequestContext::new(headers);
+        assert_eq!(
+            csrf_token_from_context(&ctx),
+            Some("token-value".to_string())
+        );
+    }
+
+    #[test]
+    fn csrf_token_from_context_returns_none_when_missing() {
+        let ctx = RequestContext::new(HeaderMap::new());
+        assert_eq!(csrf_token_from_context(&ctx), None);
     }
 
     macro_rules! assert_flow_call {
@@ -2267,6 +2611,18 @@ mod tests {
         assert!(
             client
                 .submit_verification_flow("id", None, json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .submit_recovery_token("token", None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .submit_verification_token("token", None, None)
                 .await
                 .is_err()
         );

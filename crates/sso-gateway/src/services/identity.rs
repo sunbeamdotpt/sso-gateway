@@ -3,7 +3,10 @@ use std::sync::Arc;
 use buffa_types::google::protobuf::Struct as ProtoStruct;
 use buffa_types::google::protobuf::{Empty, Timestamp};
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
-use sso_ory_client::{error::OryClientError, kratos::{KratosClient, KratosResponse}};
+use sso_ory_client::{
+    error::OryClientError,
+    kratos::{KratosClient, KratosResponse},
+};
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
@@ -155,7 +158,7 @@ pub struct IdentityServiceImpl {
     kratos: Arc<dyn IdentityKratos>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
-    public_base_url: String,
+    ui_public_url: String,
 }
 
 impl IdentityServiceImpl {
@@ -163,13 +166,13 @@ impl IdentityServiceImpl {
         kratos: Arc<KratosClient>,
         mappings: crate::db::IdMappingRepo,
         schemas: crate::db::IdentitySchemaRepo,
-        public_base_url: String,
+        ui_public_url: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn IdentityKratos>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
-            public_base_url,
+            ui_public_url,
         }
     }
 }
@@ -618,20 +621,18 @@ impl IdentityService for IdentityServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
-        let recovery_link = response.body["recovery_link"]
-            .as_str()
-            .ok_or_else(|| ServiceError::Internal("kratos response missing recovery_link".into()))?;
+        let recovery_link = response.body["recovery_link"].as_str().ok_or_else(|| {
+            ServiceError::Internal("kratos response missing recovery_link".into())
+        })?;
         let recovery_token = response.body["recovery_token"]
             .as_str()
             .map(|t| t.to_string())
             .or_else(|| {
-                reqwest::Url::parse(recovery_link)
-                    .ok()
-                    .and_then(|u| {
-                        u.query_pairs()
-                            .find(|(k, _)| k == "token")
-                            .map(|(_, v)| v.into_owned())
-                    })
+                reqwest::Url::parse(recovery_link).ok().and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "token")
+                        .map(|(_, v)| v.into_owned())
+                })
             })
             .ok_or_else(|| {
                 ServiceError::Internal(
@@ -639,9 +640,11 @@ impl IdentityService for IdentityServiceImpl {
                 )
             })?;
 
-        let gateway_link = self
-            .rewrite_self_service_url(recovery_link)
-            .unwrap_or_else(|| recovery_link.to_string());
+        let gateway_link = format!(
+            "{}/recovery?token={}",
+            self.ui_public_url.trim_end_matches('/'),
+            urlencoding::encode(&recovery_token)
+        );
 
         Ok(Response::new(RecoveryLink {
             recovery_link: gateway_link,
@@ -693,7 +696,22 @@ impl IdentityService for IdentityServiceImpl {
 
         let body = message["body"].as_str().unwrap_or("");
         let link = extract_first_self_service_link(body)
-            .map(|url| self.rewrite_self_service_url(&url).unwrap_or(url))
+            .and_then(|url| {
+                reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| {
+                        u.query_pairs()
+                            .find(|(k, _)| k == "token")
+                            .map(|(_, v)| v.into_owned())
+                    })
+                    .map(|token| {
+                        format!(
+                            "{}/verification?token={}",
+                            self.ui_public_url.trim_end_matches('/'),
+                            urlencoding::encode(&token)
+                        )
+                    })
+            })
             .unwrap_or_default();
 
         Ok(Response::new(VerificationMessage {
@@ -732,23 +750,6 @@ impl IdentityServiceImpl {
             Err(_) => "default".to_string(),
         };
         Ok((ory_id, schema_id))
-    }
-
-    /// Rewrite a Kratos self-service URL to use the gateway public base URL.
-    /// Non-Kratos URLs are returned unchanged.
-    fn rewrite_self_service_url(&self, url: &str) -> Option<String> {
-        // Recovery/verification links returned by Kratos already use the public
-        // self-service path, so we only need to swap the origin.
-        url.trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split_once('/')
-            .map(|(_, path_and_query)| {
-                format!(
-                    "{}/{}",
-                    self.public_base_url.trim_end_matches('/'),
-                    path_and_query
-                )
-            })
     }
 
     async fn resolve_schema(
@@ -1569,7 +1570,7 @@ mod tests {
             kratos: Arc::new(kratos),
             mappings: Arc::new(mappings),
             schemas: Arc::new(schemas),
-            public_base_url: "https://gateway.example.com".to_string(),
+            ui_public_url: "https://ui.example.com".to_string(),
         }
     }
 
@@ -2169,7 +2170,7 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://gateway.example.com/self-service/recovery?token=abc"
+            "https://ui.example.com/recovery?token=abc"
         );
         assert_eq!(resp.recovery_token, "abc");
         assert!(resp.expires_at.is_set());
@@ -2201,7 +2202,7 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://gateway.example.com/self-service/recovery?token=kratos-v25-token"
+            "https://ui.example.com/recovery?token=kratos-v25-token"
         );
         assert_eq!(resp.recovery_token, "kratos-v25-token");
         assert!(resp.expires_at.is_set());
@@ -2236,15 +2237,13 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(resp.id, "msg-1");
-        assert_eq!(
-            resp.link,
-            "https://gateway.example.com/self-service/verification?token=v1"
-        );
+        assert_eq!(resp.link, "https://ui.example.com/verification?token=v1");
     }
 
     #[test]
     fn extract_first_self_service_link_prefers_anchor_href() {
-        let body = r#"<a href="http://kratos.example.com/self-service/verification?token=abc">link</a>"#;
+        let body =
+            r#"<a href="http://kratos.example.com/self-service/verification?token=abc">link</a>"#;
         assert_eq!(
             extract_first_self_service_link(body),
             Some("http://kratos.example.com/self-service/verification?token=abc".to_string())
@@ -2284,7 +2283,7 @@ mod tests {
             kratos.clone(),
             IdMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool),
-            "https://gateway.example.com".to_string(),
+            "https://ui.example.com".to_string(),
         );
         let _cloned = service.clone();
     }
@@ -2295,7 +2294,7 @@ mod tests {
             kratos: Arc::new(StubKratos::default()),
             mappings: Arc::new(StubMappingStore::default()),
             schemas: Arc::new(StubSchemaStore::default()),
-            public_base_url: "https://gateway.example.com".to_string(),
+            ui_public_url: "https://ui.example.com".to_string(),
         };
         let _cloned = svc.clone();
     }
@@ -2314,14 +2313,13 @@ mod tests {
         assert!(client.admin_get_session("id").await.is_err());
         assert!(client.list_sessions_by_identity("id").await.is_err());
         assert!(client.delete_session("id").await.is_err());
-        assert!(client
-            .create_recovery_link("id", Some(3600))
-            .await
-            .is_err());
-        assert!(client
-            .list_courier_messages(Some("id"), Some("verification"))
-            .await
-            .is_err());
+        assert!(client.create_recovery_link("id", Some(3600)).await.is_err());
+        assert!(
+            client
+                .list_courier_messages(Some("id"), Some("verification"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

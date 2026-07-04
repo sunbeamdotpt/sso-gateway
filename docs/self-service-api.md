@@ -114,6 +114,18 @@ fetches the flow.
 `SubmitFlowRequest.body` is the raw JSON or form payload from the browser. The
 gateway forwards it to Kratos unchanged.
 
+### Magic-link token exchange
+
+| Method | Request | Response | Purpose |
+|---|---|---|---|
+| `SubmitRecoveryToken` | `SubmitRecoveryTokenRequest` | `SubmitRecoveryTokenResponse` | Validate a recovery magic-link token and return the privileged settings flow URL. |
+| `SubmitVerificationToken` | `SubmitVerificationTokenRequest` | `SubmitVerificationTokenResponse` | Validate a verification magic-link token and return the redirect target. |
+
+Both methods forward the browser's `Cookie` and `X-CSRF-Token` metadata to Kratos,
+capture any `Set-Cookie` headers (including `ory_kratos_session` and CSRF cookies),
+and return Kratos's final `redirect_to` URL in the response. The browser should
+follow the redirect and send the returned cookies along.
+
 ### Errors and static assets
 
 | Method | Request | Response | Purpose |
@@ -197,34 +209,36 @@ browser self-service flows and by integration tests. Both require an
 | `CreateRecoveryLink` | `CreateRecoveryLinkRequest` | `RecoveryLink` | Create a recovery link for an identity. |
 | `GetVerificationMessage` | `GetVerificationMessageRequest` | `VerificationMessage` | Fetch the latest verification message for an identity, including the link to click. |
 
-`CreateRecoveryLink` calls the Kratos admin API and returns a gateway-hosted URL
-such as `https://gateway.example.com/self-service/recovery?token=...`. The
-`expires_in_seconds` field is optional; when zero the upstream default lifetime is
-used.
+`CreateRecoveryLink` calls the Kratos admin API and returns a UI-hosted URL
+such as `{UI_PUBLIC_URL}/recovery?token=...`. The token is extracted from the
+Kratos response (the `recovery_token` field in older versions, or the `token`
+query parameter in Kratos v25.4.0). The `expires_in_seconds` field is optional;
+when zero the upstream default lifetime is used.
 
 `GetVerificationMessage` lists courier messages for the identity and returns the
 most recent verification message. The `link` field contains the first
-self-service URL found in the message body, rewritten to point at the gateway.
+self-service URL found in the message body, rewritten to `{UI_PUBLIC_URL}/verification?token=...`.
 Callers can pass `message_id` to retrieve a specific message.
+
+`UI_PUBLIC_URL` is a gateway configuration value. When unset it defaults to
+`PUBLIC_BASE_URL`.
 
 ## Public self-service proxy
 
-Browser self-service flows still need plain HTTP endpoints for some Kratos
-features (for example, the `recovery_link` and `verification_link` URLs that are
-sent by email). The gateway exposes a public proxy so the browser never has to
-talk to Kratos directly:
+The general `/self-service/{*path}` HTTP proxy has been removed. Self-service
+flows are now handled entirely through `IdentitySelfService` Connect-RPC methods,
+and magic-link URLs point directly at the UI via `UI_PUBLIC_URL`.
+
+The only remaining plain-HTTP Kratos proxy endpoint is the WebAuthn JavaScript
+bundle:
 
 | Path | Upstream |
 |---|---|
-| `/self-service/{*path}` | `kratos-public-url/self-service/{*path}` |
 | `/.well-known/ory/webauthn.js` | `kratos-public-url/.well-known/ory/webauthn.js` |
 
-The proxy forwards method, query string, body, and cookies, and strips
-hop-by-hop headers. When the upstream returns JSON or HTML, the gateway rewrites
-any URLs that start with the configured Kratos public URL so they point at the
-gateway instead. This means recovery/verification links embedded in HTML email
-bodies and form `action` URLs in JSON flows are already gateway URLs when the
-browser sees them.
+The proxy forwards method and cookies, strips hop-by-hop headers, and returns
+the upstream JavaScript body unchanged. The browser should fetch this bundle from
+the gateway rather than from Kratos directly.
 
 ## Cookie handling
 

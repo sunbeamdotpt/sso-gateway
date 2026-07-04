@@ -396,6 +396,33 @@ message CreateVerificationFlowRequest {
   string return_to = 1;
 }
 
+// SubmitRecoveryTokenRequest validates a recovery magic link token.
+message SubmitRecoveryTokenRequest {
+  // Recovery token from the magic link.
+  string token = 1;
+}
+
+// SubmitRecoveryTokenResponse returns where the browser should be redirected
+// after the recovery token has been exchanged with Kratos.
+message SubmitRecoveryTokenResponse {
+  // URL the UI should redirect the browser to (typically a privileged settings
+  // flow on the configured UI_PUBLIC_URL).
+  string redirect_to = 1;
+}
+
+// SubmitVerificationTokenRequest validates a verification magic link token.
+message SubmitVerificationTokenRequest {
+  // Verification token from the magic link.
+  string token = 1;
+}
+
+// SubmitVerificationTokenResponse returns where the browser should be redirected
+// after the verification token has been exchanged with Kratos.
+message SubmitVerificationTokenResponse {
+  // URL the UI should redirect the browser to.
+  string redirect_to = 1;
+}
+
 // GetFlowErrorRequest fetches the error associated with a flow.
 message GetFlowErrorRequest {
   // Gateway identifier for the error.
@@ -464,6 +491,12 @@ service IdentitySelfService {
   rpc SubmitLogoutFlow(SubmitLogoutFlowRequest) returns (google.protobuf.Empty);
   // CreateVerificationFlow creates a new browser verification flow.
   rpc CreateVerificationFlow(CreateVerificationFlowRequest) returns (SelfServiceFlow);
+  // SubmitRecoveryToken validates a recovery magic link token and returns the
+  // Kratos redirect target.
+  rpc SubmitRecoveryToken(SubmitRecoveryTokenRequest) returns (SubmitRecoveryTokenResponse);
+  // SubmitVerificationToken validates a verification magic link token and
+  // returns the Kratos redirect target.
+  rpc SubmitVerificationToken(SubmitVerificationTokenRequest) returns (SubmitVerificationTokenResponse);
   // GetFlowError retrieves the error for a flow.
   rpc GetFlowError(GetFlowErrorRequest) returns (FlowError);
   // GetWebAuthnJavaScript returns the WebAuthn JavaScript bundle.

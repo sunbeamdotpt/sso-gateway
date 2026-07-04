@@ -87,7 +87,8 @@ impl SessionTokenSigner {
     /// validate this at config load time.
     pub fn new(secret: impl AsRef<[u8]>, ttl_seconds: i64, issuer: impl Into<String>) -> Self {
         Self {
-            signer: CookieSigner::new(secret).expect("session token secret must be at least 32 bytes"),
+            signer: CookieSigner::new(secret)
+                .expect("session token secret must be at least 32 bytes"),
             ttl_seconds,
             issuer: issuer.into(),
         }

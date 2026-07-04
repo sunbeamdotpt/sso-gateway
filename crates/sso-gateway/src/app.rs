@@ -7,13 +7,13 @@ use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo,
-        PermissionTupleRepo, PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo,
-        SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo,
-        TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
+        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionTupleRepo,
+        PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
+        SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
+        TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
-    middleware::{audit_middleware, auth_middleware, rate_limit_middleware, RateLimiter},
+    middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
     proto::iam::v1::{
         ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
         OAuth2ConsentServiceExt, OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt,
@@ -41,8 +41,10 @@ use crate::{
     session_token::SessionTokenSigner,
 };
 use axum::{
-    Extension, Router as AxumRouter, extract::DefaultBodyLimit,
-    middleware::{from_fn, from_fn_with_state}, routing::get,
+    Extension, Router as AxumRouter,
+    extract::DefaultBodyLimit,
+    middleware::{from_fn, from_fn_with_state},
+    routing::get,
 };
 use connectrpc::Router as ConnectRouter;
 use gamlastan::crypto::SamlSigner;
@@ -220,7 +222,7 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
-        config.public_base_url.clone(),
+        config.ui_public_url.clone(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(keto.clone(), tuples));
     let scim_service = Arc::new(ScimServiceImpl::new(
@@ -267,10 +269,7 @@ pub async fn build_app_with_upstream(
         oauth_mappings,
         config.public_base_url.clone(),
     ));
-    let self_service_state = Arc::new(SelfServiceState::new(
-        config.kratos_public_url.clone(),
-        config.public_base_url.clone(),
-    ));
+    let self_service_state = Arc::new(SelfServiceState::new(config.kratos_public_url.clone()));
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
     let saml_state = Arc::new(SamlState::new(federation_service.clone()));
     let saml_idp_state = Arc::new(
@@ -475,6 +474,7 @@ mod tests {
             keto_read_url: "http://127.0.0.1:4466".to_string(),
             keto_write_url: "http://127.0.0.1:4467".to_string(),
             public_base_url: "http://127.0.0.1:8080".to_string(),
+            ui_public_url: "http://ui.example.com".to_string(),
             saml_sp_private_key_pem_path: None,
             saml_sp_certificate_pem_path: None,
             saml_idp_entity_id: None,

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.11] - 2026-07-04
+
+### Changed
+
+- Magic-link URLs returned by `IdentityService.CreateRecoveryLink` and
+  `IdentityService.GetVerificationMessage` now point to `UI_PUBLIC_URL`
+  (`/recovery?token=...` and `/verification?token=...`) instead of being
+  proxied through `/self-service/{*path}`. `UI_PUBLIC_URL` defaults to
+  `PUBLIC_BASE_URL` when unset.
+- The general `/self-service/{*path}` HTTP proxy has been removed. Browser
+  self-service flows now go exclusively through `IdentitySelfService`
+  Connect-RPC methods.
+
+### Added
+
+- `IdentitySelfService.SubmitRecoveryToken` and
+  `IdentitySelfService.SubmitVerificationToken` let the UI exchange Kratos
+  magic-link tokens. They return the upstream `redirect_to` URL and propagate
+  `Set-Cookie` headers (including session and CSRF cookies) through Connect-RPC
+  response metadata.
+- Gateway configuration field `UI_PUBLIC_URL` for UI-facing magic-link URLs.
+- Unit and integration regression coverage for the new magic-link flow.
+
 ## [1.0.0-rc.10] - 2026-07-04
 
 ### Fixed
@@ -213,6 +236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[1.0.0-rc.11]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc11
+[1.0.0-rc.10]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc10
 [1.0.0-rc.9]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc9
 [1.0.0-rc.8]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc8
 [1.0.0-rc.7]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc7

@@ -34,6 +34,7 @@ All configuration is read from environment variables.
 | `KETO_READ_URL` | `http://127.0.0.1:4466` | Ory Keto read endpoint. |
 | `KETO_WRITE_URL` | `http://127.0.0.1:4467` | Ory Keto write endpoint. |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8080` | Public URL used in discovery, SAML metadata, and session cookie issuer. |
+| `UI_PUBLIC_URL` | `PUBLIC_BASE_URL` | Public URL of the UI application. Magic-link recovery and verification URLs point here. |
 | `SYSTEM_BOOTSTRAP_CLIENT_ID` | — | Client ID of the system bootstrap OAuth2 client created in Hydra. Both ID and secret must be provided for bootstrap to run. |
 | `SYSTEM_BOOTSTRAP_CLIENT_SECRET` | — | Client secret for the system bootstrap OAuth2 client. |
 | `SAML_IDP_ENTITY_ID` | `PUBLIC_BASE_URL` | Entity ID for the gateway SAML IdP. |

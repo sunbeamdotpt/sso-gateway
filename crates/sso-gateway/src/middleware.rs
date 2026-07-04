@@ -94,9 +94,7 @@ fn is_public_path(path: &str) -> bool {
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
         "/health" | "/health/ready" | "/health/live" => true,
         _ => {
-            path.starts_with("/oauth2/device/")
-                || path.starts_with("/self-service/")
-                || path.starts_with("/.well-known/ory/webauthn.js")
+            path.starts_with("/oauth2/device/") || path.starts_with("/.well-known/ory/webauthn.js")
         }
     }
 }
@@ -453,9 +451,8 @@ mod tests {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/health/ready"));
         assert!(is_public_path("/health/live"));
-        assert!(is_public_path("/self-service/login/browser"));
-        assert!(is_public_path("/self-service/login/flows"));
         assert!(is_public_path("/.well-known/ory/webauthn.js"));
+        assert!(!is_public_path("/self-service/login/browser"));
         assert!(!is_public_path("/iam/v1/tenants"));
     }
 
@@ -666,18 +663,16 @@ mod tests {
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.fields.insert(field.name().to_string(), value.to_string());
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
         }
 
         fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            self.fields.insert(field.name().to_string(), value.to_string());
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
         }
 
-        fn record_debug(
-            &mut self,
-            field: &tracing::field::Field,
-            value: &dyn std::fmt::Debug,
-        ) {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             self.fields
                 .insert(field.name().to_string(), format!("{:?}", value));
         }

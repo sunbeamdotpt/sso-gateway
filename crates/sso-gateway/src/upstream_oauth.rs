@@ -24,7 +24,8 @@ impl Resolve for SafeDnsResolver {
             if safe_addrs.is_empty() {
                 return Err(Box::new(std::io::Error::other(
                     "host resolved to forbidden IP addresses",
-                )) as Box<dyn std::error::Error + Send + Sync>);
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
             let addrs: Addrs = Box::new(safe_addrs.into_iter());
             Ok(addrs)
@@ -196,7 +197,7 @@ impl ReqwestUpstreamOAuthClient {
     pub fn new(client: reqwest::Client) -> Self {
         Self { client }
     }
-    
+
     pub fn default_client() -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))

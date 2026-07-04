@@ -393,7 +393,12 @@ async fn build_session_redirect(
         .map_err(|e| CallbackError::Configuration(e.to_string()))
 }
 
-fn build_session_cookie(value: &str, secure: bool, same_site: &str, max_age_seconds: u64) -> String {
+fn build_session_cookie(
+    value: &str,
+    secure: bool,
+    same_site: &str,
+    max_age_seconds: u64,
+) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     format!(
         "{}={}; Path=/; HttpOnly; SameSite={}; Max-Age={}{}",

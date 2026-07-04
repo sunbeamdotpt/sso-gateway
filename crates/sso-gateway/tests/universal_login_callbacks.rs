@@ -133,6 +133,7 @@ impl CallbackHarness {
             keto_read_url,
             keto_write_url,
             public_base_url: public_base_url.clone(),
+            ui_public_url: public_base_url.clone(),
             saml_sp_private_key_pem_path: None,
             saml_sp_certificate_pem_path: None,
             saml_idp_entity_id: Some("https://gateway.example.com/saml/idp".to_string()),

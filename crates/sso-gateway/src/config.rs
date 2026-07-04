@@ -14,6 +14,7 @@ pub struct Config {
     pub keto_read_url: String,
     pub keto_write_url: String,
     pub public_base_url: String,
+    pub ui_public_url: String,
     pub saml_sp_private_key_pem_path: Option<String>,
     pub saml_sp_certificate_pem_path: Option<String>,
     pub saml_idp_entity_id: Option<String>,
@@ -54,6 +55,7 @@ impl std::fmt::Debug for Config {
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
             .field("public_base_url", &self.public_base_url)
+            .field("ui_public_url", &self.ui_public_url)
             .field(
                 "saml_sp_private_key_pem_path",
                 &self.saml_sp_private_key_pem_path,
@@ -119,7 +121,10 @@ impl std::fmt::Debug for Config {
                 &self.token_introspection_cache_ttl_seconds,
             )
             .field("session_ttl_seconds", &self.session_ttl_seconds)
-            .field("public_rate_limit_requests", &self.public_rate_limit_requests)
+            .field(
+                "public_rate_limit_requests",
+                &self.public_rate_limit_requests,
+            )
             .field(
                 "public_rate_limit_window_seconds",
                 &self.public_rate_limit_window_seconds,
@@ -157,6 +162,9 @@ impl Config {
 
         let public_base_url = std::env::var("PUBLIC_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+
+        let ui_public_url =
+            std::env::var("UI_PUBLIC_URL").unwrap_or_else(|_| public_base_url.clone());
 
         let mut allowed_return_to_hosts: Vec<String> = std::env::var("ALLOWED_RETURN_TO_HOSTS")
             .ok()
@@ -246,6 +254,7 @@ impl Config {
             keto_write_url: std::env::var("KETO_WRITE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:4467".to_string()),
             public_base_url,
+            ui_public_url,
             saml_sp_private_key_pem_path: std::env::var("SAML_SP_PRIVATE_KEY_PEM_PATH").ok(),
             saml_sp_certificate_pem_path: std::env::var("SAML_SP_CERTIFICATE_PEM_PATH").ok(),
             saml_idp_entity_id: std::env::var("SAML_IDP_ENTITY_ID").ok(),
@@ -431,6 +440,7 @@ mod tests {
         clear_env("SESSION_TTL_SECONDS");
         clear_env("PUBLIC_RATE_LIMIT_REQUESTS");
         clear_env("PUBLIC_RATE_LIMIT_WINDOW_SECONDS");
+        clear_env("UI_PUBLIC_URL");
     }
 
     #[test]
@@ -459,6 +469,7 @@ mod tests {
         assert_eq!(config.keto_read_url, "http://127.0.0.1:4466");
         assert_eq!(config.keto_write_url, "http://127.0.0.1:4467");
         assert_eq!(config.public_base_url, "http://127.0.0.1:8080");
+        assert_eq!(config.ui_public_url, "http://127.0.0.1:8080");
         assert_eq!(config.saml_idp_entity_id, None);
         assert_eq!(config.saml_request_ttl_seconds, 900);
         assert_eq!(config.session_ttl_seconds, 86400);
@@ -488,6 +499,7 @@ mod tests {
         set_env("KETO_READ_URL", "http://keto:4466");
         set_env("KETO_WRITE_URL", "http://keto:4467");
         set_env("PUBLIC_BASE_URL", "https://gateway.example.com");
+        set_env("UI_PUBLIC_URL", "https://ui.example.com");
         set_env("SAML_IDP_ENTITY_ID", "https://idp.example.com");
         set_env("SAML_REQUEST_TTL_SECONDS", "600");
         set_env("SAML_REQUIRE_SIGNED_ASSERTIONS", "false");
@@ -507,6 +519,7 @@ mod tests {
         assert_eq!(config.bind_addr, "0.0.0.0:3000".parse().unwrap());
         assert_eq!(config.hydra_admin_url, "http://hydra:4445");
         assert_eq!(config.public_base_url, "https://gateway.example.com");
+        assert_eq!(config.ui_public_url, "https://ui.example.com");
         assert_eq!(
             config.saml_idp_entity_id,
             Some("https://idp.example.com".to_string())

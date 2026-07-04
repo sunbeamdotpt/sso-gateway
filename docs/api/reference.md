@@ -112,6 +112,8 @@ Browser-facing Kratos self-service flows. See [`self-service-api.md`](./self-ser
 | `SubmitRecoveryFlow` | Submit a recovery form. |
 | `SubmitVerificationFlow` | Submit a verification form. |
 | `SubmitLogoutFlow` | Submit a logout request. |
+| `SubmitRecoveryToken` | Exchange a recovery magic-link token for a privileged settings flow URL. |
+| `SubmitVerificationToken` | Exchange a verification magic-link token for its redirect target. |
 | `GetFlowError` | Fetch a flow error by ID. |
 | `GetWebAuthnJavaScript` | Return the WebAuthn JS bundle content. |
 | `GetTenantCapabilities` | Return optional features enabled for the tenant (e.g. OAuth2 consent). |
@@ -150,7 +152,6 @@ OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
 | `POST /oauth2/introspect` | Token introspection | Public (forwards to Hydra) |
 | `POST /oauth2/revoke` | Token revocation | Public (client credentials) |
 | `GET /oauth2/device/{*path}` | Device authorization grant proxy | Public (forwards to Hydra) |
-| `/self-service/{*path}` | Kratos self-service flow proxy | Public (forwards to Kratos) |
 | `GET /.well-known/ory/webauthn.js` | Kratos WebAuthn JS bundle | Public (forwards to Kratos) |
 | `GET /callbacks/oidc` | OIDC upstream IdP callback | Public (OIDC callback state) |
 | `GET /callbacks/oauth2` | OAuth2 upstream IdP callback | Public (OAuth2 callback state) |

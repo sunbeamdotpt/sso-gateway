@@ -492,7 +492,10 @@ async fn ory_error(response: reqwest::Response) -> OryClientError {
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, atomic::{AtomicBool, Ordering}},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use axum::{
@@ -843,7 +846,10 @@ mod tests {
         let resp = client.introspect_token("token-1").await.unwrap();
 
         assert_eq!(resp["active"], true);
-        assert!(admin_hit.load(Ordering::SeqCst), "must hit /admin/oauth2/introspect");
+        assert!(
+            admin_hit.load(Ordering::SeqCst),
+            "must hit /admin/oauth2/introspect"
+        );
         assert!(
             !public_hit.load(Ordering::SeqCst),
             "must not hit legacy /oauth2/introspect on admin port"
