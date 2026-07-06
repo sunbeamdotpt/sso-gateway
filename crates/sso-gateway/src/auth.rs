@@ -235,19 +235,25 @@ pub fn hash_token(token: &str) -> String {
 }
 
 /// Resolve an authenticated subject to a tenant using gateway id_mappings.
+///
+/// The subject may be a Hydra client ID (client-credentials tokens) or a
+/// Kratos identity ID (user tokens), so both backends are queried. The first
+/// match wins; if neither backend has a mapping the subject is unknown.
 pub async fn resolve_tenant_from_subject(
     mappings: &dyn IdMappingStore,
     subject: &str,
 ) -> Result<String, AuthError> {
-    let tenant_id = mappings
-        .get_tenant_id_by_ory_id("hydra", subject)
-        .await
-        .map_err(|e| {
-            warn!("failed to resolve tenant for subject {}: {}", subject, e);
-            AuthError::Database(e)
-        })?
-        .ok_or(AuthError::UnknownSubject)?;
-    Ok(tenant_id)
+    for backend in ["hydra", "kratos"] {
+        match mappings.get_tenant_id_by_ory_id(backend, subject).await {
+            Ok(Some(tenant_id)) => return Ok(tenant_id),
+            Ok(None) => continue,
+            Err(e) => {
+                warn!("failed to resolve tenant for subject {}: {}", subject, e);
+                return Err(AuthError::Database(e));
+            }
+        }
+    }
+    Err(AuthError::UnknownSubject)
 }
 
 /// Build an `AuthContext` from an introspection result and tenant mapping.
@@ -469,5 +475,124 @@ mod tests {
         let ctx = RequestContext::default();
         let err = require_amr(&ctx, "password").unwrap_err();
         assert!(matches!(err, ServiceError::Unauthenticated(_)));
+    }
+
+    /// Stub mapping store that returns a tenant only for a specific backend.
+    struct BackendMappingStore {
+        hydra_tenant: Option<String>,
+        kratos_tenant: Option<String>,
+        queried_backends: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for BackendMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            self.queried_backends
+                .lock()
+                .unwrap()
+                .push(backend.to_string());
+            match backend {
+                "hydra" => Ok(self.hydra_tenant.clone()),
+                "kratos" => Ok(self.kratos_tenant.clone()),
+                _ => Ok(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_queries_hydra_then_kratos() {
+        let store = BackendMappingStore {
+            hydra_tenant: None,
+            kratos_tenant: Some("tenant-k".to_string()),
+            queried_backends: std::sync::Mutex::new(Vec::new()),
+        };
+        let tenant = resolve_tenant_from_subject(&store, "subject-1")
+            .await
+            .unwrap();
+        assert_eq!(tenant, "tenant-k");
+        let backends = store.queried_backends.lock().unwrap();
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0], "hydra");
+        assert_eq!(backends[1], "kratos");
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_prefers_hydra_mapping() {
+        let store = BackendMappingStore {
+            hydra_tenant: Some("tenant-h".to_string()),
+            kratos_tenant: Some("tenant-k".to_string()),
+            queried_backends: std::sync::Mutex::new(Vec::new()),
+        };
+        let tenant = resolve_tenant_from_subject(&store, "subject-1")
+            .await
+            .unwrap();
+        assert_eq!(tenant, "tenant-h");
+        let backends = store.queried_backends.lock().unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0], "hydra");
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_returns_unknown_for_missing_mapping() {
+        let store = BackendMappingStore {
+            hydra_tenant: None,
+            kratos_tenant: None,
+            queried_backends: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = resolve_tenant_from_subject(&store, "subject-1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownSubject));
+        let backends = store.queried_backends.lock().unwrap();
+        assert_eq!(backends.len(), 2);
     }
 }

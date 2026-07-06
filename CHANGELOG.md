@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.13] - 2026-07-06
+
+### Added
+
+- `tenant_id` is now included in the gateway's `/oauth2/introspect` response.
+  The tenant is resolved from the token subject using gateway `id_mappings`,
+  querying both the `hydra` and `kratos` backends so the field is present for
+  client-credentials tokens and user tokens alike.
+
+### Changed
+
+- `resolve_tenant_from_subject` now queries `hydra` first and falls back to
+  `kratos` before treating a subject as unknown. This makes bearer-token
+  authentication work for user access tokens whose subject is a Kratos identity
+  ID, not just client-credentials tokens whose subject is a Hydra client ID.
+
+### Fixed
+
+- `/oauth2/introspect` now fails introspection (`{"active": false}`) when
+  Hydra reports an active token but the gateway has no tenant mapping for its
+  subject. Every bearer token consumed by the gateway must be attributable to a
+  tenant.
+
 ## [1.0.0-rc.12] - 2026-07-04
 
 ### Changed

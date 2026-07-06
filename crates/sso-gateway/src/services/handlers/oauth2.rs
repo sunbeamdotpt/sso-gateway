@@ -14,7 +14,10 @@ use serde_json::json;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use tracing::{instrument, warn};
 
-use crate::auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN, hash_token};
+use crate::auth::{
+    AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN, hash_token,
+    resolve_tenant_from_subject,
+};
 use crate::db::{IdMappingRepo, IdMappingStore, TokenIntrospectionCache};
 
 const BACKEND_HYDRA: &str = "hydra";
@@ -335,9 +338,39 @@ async fn introspect(
         None => return bad_request("missing token"),
     };
 
-    match state.hydra.introspect_token(token).await {
-        Ok(value) => json_response(value),
-        Err(err) => map_ory_error(err),
+    let mut value = match state.hydra.introspect_token(token).await {
+        Ok(value) => value,
+        Err(err) => return map_ory_error(err),
+    };
+
+    if !value
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return json_response(value);
+    }
+
+    let subject = match value.get("sub").and_then(|v| v.as_str()) {
+        Some(sub) => sub,
+        None => return json_response(value),
+    };
+
+    match resolve_tenant_from_subject(state.mappings.as_ref(), subject).await {
+        Ok(tenant_id) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("tenant_id".to_string(), json!(tenant_id));
+            }
+            json_response(value)
+        }
+        Err(crate::auth::AuthError::UnknownSubject) => {
+            warn!("introspected token has active=true but no tenant mapping; treating as inactive");
+            json_response(json!({"active": false}))
+        }
+        Err(err) => {
+            warn!("failed to resolve tenant for introspected token: {}", err);
+            internal_error()
+        }
     }
 }
 
@@ -548,11 +581,11 @@ mod tests {
             _backend: &str,
             _ory_global_id: &str,
         ) -> Result<Option<String>, crate::db::DbError> {
-            self.tenant_by_ory_id
-                .lock()
-                .unwrap()
-                .take()
-                .expect("stub not configured")
+            let guard = self.tenant_by_ory_id.lock().unwrap();
+            match guard.as_ref().expect("stub not configured") {
+                Ok(tenant) => Ok(tenant.clone()),
+                Err(_) => Err(crate::db::DbError::ConnectionNotFound),
+            }
         }
     }
 
@@ -1179,6 +1212,78 @@ mod tests {
         let _ = store.get_public_id("t", "hydra", "ory").await;
         let _ = store.delete("t", "hydra", "pub").await;
         let _ = store.list_public_ids("t", "hydra").await;
+    }
+
+    #[tokio::test]
+    async fn introspect_includes_tenant_id_when_mapping_exists() {
+        let hydra = Arc::new(AlwaysOkHydra {
+            response: json!({
+                "active": true,
+                "sub": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+        });
+        let state = Arc::new(Oauth2State {
+            hydra,
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "tenant-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let auth = AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            scopes: vec![SCOPE_TENANT_ADMIN.into()],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        };
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), Extension(auth), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["active"], true);
+        assert_eq!(value["tenant_id"], "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn introspect_returns_inactive_when_mapping_missing() {
+        let hydra = Arc::new(AlwaysOkHydra {
+            response: json!({
+                "active": true,
+                "sub": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+        });
+        let state = Arc::new(Oauth2State {
+            hydra,
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(None)))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let auth = AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            scopes: vec![SCOPE_TENANT_ADMIN.into()],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        };
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), Extension(auth), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["active"], false);
+        assert!(value.get("tenant_id").is_none());
     }
 
     #[tokio::test]

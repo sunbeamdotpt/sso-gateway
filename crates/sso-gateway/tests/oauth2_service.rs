@@ -214,6 +214,11 @@ async fn oauth2_public_endpoints_round_trip() {
         .await
         .expect("introspect should be json");
     assert_eq!(introspect["active"], true);
+    assert_eq!(
+        introspect["tenant_id"].as_str(),
+        Some(system_tenant_ulid.as_str()),
+        "introspection response must include the token's tenant_id"
+    );
 
     // Unknown client_id is rejected.
     let unknown_auth_resp = client
