@@ -14,8 +14,9 @@ use crate::{
     middleware::TenantId,
     proto::iam::v1::{
         CheckPermissionRequest, CheckPermissionResponse, CreateRelationTupleRequest,
-        DeleteRelationTupleRequest, ExpandPermissionsRequest, ExpandPermissionsResponse,
-        ListRelationTuplesRequest, ListRelationTuplesResponse, PermissionService, RelationTuple,
+        DeleteRelationTupleRequest, ExpandObjectsRequest, ExpandObjectsResponse,
+        ExpandPermissionsRequest, ExpandPermissionsResponse, ListRelationTuplesRequest,
+        ListRelationTuplesResponse, PermissionService, RelationTuple,
     },
 };
 
@@ -51,6 +52,13 @@ trait PermissionKeto: Send + Sync + 'static {
         namespace: &str,
         object: &str,
         relation: &str,
+    ) -> Result<Value, OryClientError>;
+
+    async fn expand_objects(
+        &self,
+        namespace: &str,
+        relation: &str,
+        query: &sso_ory_client::keto::ExpandObjectsQuery<'_>,
     ) -> Result<Value, OryClientError>;
 }
 
@@ -96,6 +104,15 @@ impl PermissionKeto for KetoClient {
         relation: &str,
     ) -> Result<Value, OryClientError> {
         self.expand(namespace, object, relation).await
+    }
+
+    async fn expand_objects(
+        &self,
+        namespace: &str,
+        relation: &str,
+        query: &sso_ory_client::keto::ExpandObjectsQuery<'_>,
+    ) -> Result<Value, OryClientError> {
+        self.expand_objects(namespace, relation, query).await
     }
 }
 
@@ -217,6 +234,49 @@ impl PermissionService for PermissionServiceImpl {
     }
 
     #[instrument(skip(self, request))]
+    async fn expand_objects(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ExpandObjectsRequest>,
+    ) -> ServiceResult<ExpandObjectsResponse> {
+        let tenant_id = require_tenant(&ctx)?;
+        require_scope_any(&ctx, &[SCOPE_PERMISSION_READ, SCOPE_PERMISSION_ADMIN])?;
+        let req = request.to_owned_message();
+
+        let query = sso_ory_client::keto::ExpandObjectsQuery {
+            subject_id: subject_id_filter(&req.subject_id),
+            subject_set_namespace: subject_set_filter(&req.subject_set_namespace),
+            subject_set_object: subject_set_filter(&req.subject_set_object),
+            subject_set_relation: subject_set_filter(&req.subject_set_relation),
+            max_depth: max_depth_filter(req.max_depth),
+        };
+        let expanded = self
+            .keto
+            .expand_objects(&req.namespace, &req.relation, &query)
+            .await
+            .map_err(map_ory_error)?;
+
+        let objects = expanded
+            .get("relation_tuples")
+            .and_then(|v| v.as_array())
+            .map(|tuples| {
+                tuples
+                    .iter()
+                    .filter_map(|tuple| tuple.get("object").and_then(|o| o.as_str()))
+                    .filter_map(|object| strip_tenant_object_prefix(&tenant_id, object))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let tree = serde_json::to_string(&expanded).unwrap_or_default();
+        Ok(Response::new(ExpandObjectsResponse {
+            objects,
+            tree,
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self, request))]
     async fn list_relation_tuples(
         &self,
         ctx: RequestContext,
@@ -247,6 +307,13 @@ fn tenant_object(tenant_id: &str, object: &str) -> String {
     format!("{tenant_id}:{object}")
 }
 
+fn strip_tenant_object_prefix(tenant_id: &str, object: &str) -> Option<String> {
+    let prefix = format!("{tenant_id}:");
+    object
+        .strip_prefix(&prefix)
+        .map(|rest| rest.to_string())
+}
+
 fn namespace_filter(namespace: &str) -> Option<&str> {
     if namespace.is_empty() {
         None
@@ -268,6 +335,30 @@ fn relation_filter(relation: &str) -> Option<&str> {
         None
     } else {
         Some(relation)
+    }
+}
+
+fn subject_id_filter(subject_id: &str) -> Option<&str> {
+    if subject_id.is_empty() {
+        None
+    } else {
+        Some(subject_id)
+    }
+}
+
+fn subject_set_filter(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn max_depth_filter(max_depth: i32) -> Option<i32> {
+    if max_depth <= 0 {
+        None
+    } else {
+        Some(max_depth)
     }
 }
 
@@ -397,6 +488,7 @@ mod tests {
         create_result: Result<Value, KetoError>,
         delete_result: Result<(), KetoError>,
         expand_result: Result<Value, KetoError>,
+        expand_objects_result: Result<Value, KetoError>,
         calls: Arc<Mutex<Vec<KetoCall>>>,
     }
 
@@ -425,6 +517,15 @@ mod tests {
             object: String,
             relation: String,
         },
+        ExpandObjects {
+            namespace: String,
+            relation: String,
+            subject_id: Option<String>,
+            subject_set_namespace: Option<String>,
+            subject_set_object: Option<String>,
+            subject_set_relation: Option<String>,
+            max_depth: Option<i32>,
+        },
     }
 
     impl FakeKeto {
@@ -434,6 +535,7 @@ mod tests {
                 create_result: Ok(Value::Null),
                 delete_result: Ok(()),
                 expand_result: Ok(Value::Null),
+                expand_objects_result: Ok(Value::Null),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -501,6 +603,24 @@ mod tests {
                 relation: relation.into(),
             });
             self.expand_result.clone().map_err(Into::into)
+        }
+
+        async fn expand_objects(
+            &self,
+            namespace: &str,
+            relation: &str,
+            query: &sso_ory_client::keto::ExpandObjectsQuery<'_>,
+        ) -> Result<Value, OryClientError> {
+            self.calls.lock().unwrap().push(KetoCall::ExpandObjects {
+                namespace: namespace.into(),
+                relation: relation.into(),
+                subject_id: query.subject_id.map(Into::into),
+                subject_set_namespace: query.subject_set_namespace.map(Into::into),
+                subject_set_object: query.subject_set_object.map(Into::into),
+                subject_set_relation: query.subject_set_relation.map(Into::into),
+                max_depth: query.max_depth,
+            });
+            self.expand_objects_result.clone().map_err(Into::into)
         }
     }
 
@@ -658,6 +778,15 @@ mod tests {
             namespace: "ns".into(),
             object: "obj".into(),
             relation: "viewer".into(),
+            ..Default::default()
+        }
+    }
+
+    fn expand_objects_req() -> ExpandObjectsRequest {
+        ExpandObjectsRequest {
+            namespace: "ns".into(),
+            relation: "viewer".into(),
+            subject_id: "user-1".into(),
             ..Default::default()
         }
     }
@@ -1088,6 +1217,163 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // expand_objects
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn expand_objects_happy_path() {
+        let keto = FakeKeto {
+            expand_objects_result: Ok(serde_json::json!({
+                "relation_tuples": [
+                    { "namespace": "ns", "object": "tenant-1:obj-1", "relation": "viewer", "subject_id": "user-1" },
+                    { "namespace": "ns", "object": "tenant-1:obj-2", "relation": "viewer", "subject_id": "user-1" },
+                ]
+            })),
+            ..FakeKeto::new()
+        };
+        let tuples = FakeTupleStore::new();
+        let service = service_with(keto.clone(), tuples);
+
+        let owned =
+            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&expand_objects_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+
+        let resp = service.expand_objects(tenant_ctx(), req).await.unwrap();
+        assert_eq!(resp.body.objects, vec!["obj-1", "obj-2"]);
+        assert!(resp.body.tree.contains("relation_tuples"));
+
+        let calls = keto.calls.lock().unwrap();
+        assert!(
+            matches!(&calls[0], KetoCall::ExpandObjects { namespace, relation, subject_id, .. } if
+                namespace == "ns" && relation == "viewer" && subject_id.as_deref() == Some("user-1")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_objects_with_subject_set() {
+        let keto = FakeKeto {
+            expand_objects_result: Ok(serde_json::json!({
+                "relation_tuples": [
+                    { "namespace": "ns", "object": "tenant-1:obj-1", "relation": "viewer", "subject_set": { "namespace": "groups", "object": "g1", "relation": "member" } },
+                ]
+            })),
+            ..FakeKeto::new()
+        };
+        let tuples = FakeTupleStore::new();
+        let service = service_with(keto.clone(), tuples);
+
+        let req = ExpandObjectsRequest {
+            namespace: "ns".into(),
+            relation: "viewer".into(),
+            subject_set_namespace: "groups".into(),
+            subject_set_object: "g1".into(),
+            subject_set_relation: "member".into(),
+            max_depth: 3,
+            ..Default::default()
+        };
+        let owned =
+            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+
+        let resp = service.expand_objects(tenant_ctx(), req).await.unwrap();
+        assert_eq!(resp.body.objects, vec!["obj-1"]);
+
+        let calls = keto.calls.lock().unwrap();
+        assert!(
+            matches!(&calls[0], KetoCall::ExpandObjects { namespace, relation, subject_id, subject_set_namespace, subject_set_object, subject_set_relation, max_depth } if
+                namespace == "ns" &&
+                relation == "viewer" &&
+                subject_id.is_none() &&
+                subject_set_namespace.as_deref() == Some("groups") &&
+                subject_set_object.as_deref() == Some("g1") &&
+                subject_set_relation.as_deref() == Some("member") &&
+                *max_depth == Some(3)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_objects_missing_tenant() {
+        let service = service_with(FakeKeto::new(), FakeTupleStore::new());
+        let ctx = RequestContext::new(http::HeaderMap::new());
+
+        let owned =
+            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&expand_objects_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+
+        let err = service.expand_objects(ctx, req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unauthenticated,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expand_objects_keto_error_maps_to_service_error() {
+        let keto = FakeKeto {
+            expand_objects_result: Err(KetoError::Ory(503, "keto unavailable".into())),
+            ..FakeKeto::new()
+        };
+        let tuples = FakeTupleStore::new();
+        let service = service_with(keto, tuples);
+
+        let owned =
+            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&expand_objects_req())
+                .unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+
+        let err = service.expand_objects(tenant_ctx(), req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            connectrpc::ConnectError {
+                code: connectrpc::ErrorCode::Unavailable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expand_objects_ignores_empty_filters() {
+        let keto = FakeKeto {
+            expand_objects_result: Ok(serde_json::json!({ "relation_tuples": [] })),
+            ..FakeKeto::new()
+        };
+        let tuples = FakeTupleStore::new();
+        let service = service_with(keto.clone(), tuples);
+
+        let req = ExpandObjectsRequest {
+            namespace: "ns".into(),
+            relation: "viewer".into(),
+            max_depth: 0,
+            ..Default::default()
+        };
+        let owned =
+            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
+        let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
+
+        service.expand_objects(tenant_ctx(), req).await.unwrap();
+
+        let calls = keto.calls.lock().unwrap();
+        assert!(
+            matches!(&calls[0], KetoCall::ExpandObjects { namespace, relation, subject_id, subject_set_namespace, subject_set_object, subject_set_relation, max_depth } if
+                namespace == "ns" &&
+                relation == "viewer" &&
+                subject_id.is_none() &&
+                subject_set_namespace.is_none() &&
+                subject_set_object.is_none() &&
+                subject_set_relation.is_none() &&
+                max_depth.is_none()
+            )
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // list_relation_tuples
     // -------------------------------------------------------------------------
 
@@ -1175,6 +1461,20 @@ mod tests {
     #[test]
     fn tenant_object_prefixes_with_colon() {
         assert_eq!(tenant_object("tenant-1", "doc"), "tenant-1:doc");
+    }
+
+    #[test]
+    fn strip_tenant_object_prefix_strips_matching_prefix() {
+        assert_eq!(
+            strip_tenant_object_prefix("tenant-1", "tenant-1:doc"),
+            Some("doc".into())
+        );
+    }
+
+    #[test]
+    fn strip_tenant_object_prefix_returns_none_for_mismatch() {
+        assert_eq!(strip_tenant_object_prefix("tenant-1", "other:doc"), None);
+        assert_eq!(strip_tenant_object_prefix("tenant-1", "doc"), None);
     }
 
     #[test]
@@ -1275,6 +1575,25 @@ mod tests {
         assert_eq!(namespace_filter("  "), Some("  "));
         assert_eq!(object_filter("ns:obj"), Some("ns:obj"));
         assert_eq!(relation_filter("member"), Some("member"));
+        assert_eq!(subject_id_filter("user-1"), Some("user-1"));
+        assert_eq!(subject_set_filter("groups"), Some("groups"));
+        assert_eq!(max_depth_filter(3), Some(3));
+    }
+
+    #[test]
+    fn subject_id_filter_returns_none_when_empty() {
+        assert_eq!(subject_id_filter(""), None);
+    }
+
+    #[test]
+    fn subject_set_filter_returns_none_when_empty() {
+        assert_eq!(subject_set_filter(""), None);
+    }
+
+    #[test]
+    fn max_depth_filter_returns_none_for_non_positive() {
+        assert_eq!(max_depth_filter(0), None);
+        assert_eq!(max_depth_filter(-1), None);
     }
 
     #[tokio::test]
@@ -1300,6 +1619,19 @@ mod tests {
                 .is_err()
         );
         assert!(client.expand("ns", "obj", "rel").await.is_err());
+        assert!(
+            client
+                .expand_objects(
+                    "ns",
+                    "rel",
+                    &sso_ory_client::keto::ExpandObjectsQuery {
+                        subject_id: Some("subject"),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

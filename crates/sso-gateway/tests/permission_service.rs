@@ -228,6 +228,34 @@ async fn permission_service_round_trip() {
     let expanded: serde_json::Value = expand_resp.json().await.expect("expand should be json");
     assert!(expanded["tree"].as_str().is_some());
 
+    // Expand objects for alice.
+    let expand_objects_resp = client
+        .post(format!("{base}/iam.v1.PermissionService/ExpandObjects"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "namespace": "app",
+            "relation": "read",
+            "subjectId": "alice"
+        }))
+        .send()
+        .await
+        .expect("expand objects request should succeed");
+
+    assert!(
+        expand_objects_resp.status().is_success(),
+        "expand objects failed: {}",
+        expand_objects_resp.text().await.unwrap_or_default()
+    );
+    let expanded_objects: serde_json::Value = expand_objects_resp
+        .json()
+        .await
+        .expect("expand objects should be json");
+    let objects = expanded_objects["objects"]
+        .as_array()
+        .expect("objects array should exist");
+    assert!(objects.iter().any(|o| o == "doc-1"));
+
     // Delete the tuple.
     let delete_resp = client
         .post(format!(

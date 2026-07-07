@@ -154,6 +154,60 @@ impl KetoClient {
             .map_err(OryClientError::Http)?;
         handle_response(response).await
     }
+
+    /// Expand the objects a subject has a relation on.
+    #[instrument(skip(self), fields(read_url = %self.read_url))]
+    pub async fn expand_objects(
+        &self,
+        namespace: &str,
+        relation: &str,
+        query: &ExpandObjectsQuery<'_>,
+    ) -> Result<Value, OryClientError> {
+        let url = self.read_url.join("relation-tuples")?;
+        debug!(%url, %namespace, %relation, "expanding keto objects");
+        let mut params: Vec<(&str, String)> = vec![
+            ("namespace", namespace.to_string()),
+            ("relation", relation.to_string()),
+        ];
+        if let Some(subject_id) = query.subject_id {
+            params.push(("subject_id", subject_id.to_string()));
+        }
+        if let Some(namespace) = query.subject_set_namespace {
+            params.push(("subject_set.namespace", namespace.to_string()));
+        }
+        if let Some(object) = query.subject_set_object {
+            params.push(("subject_set.object", object.to_string()));
+        }
+        if let Some(relation) = query.subject_set_relation {
+            params.push(("subject_set.relation", relation.to_string()));
+        }
+        if let Some(max_depth) = query.max_depth {
+            params.push(("max-depth", max_depth.to_string()));
+        }
+        let response = self
+            .client
+            .get(url)
+            .query(&params)
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+}
+
+/// Query parameters for [`KetoClient::expand_objects`].
+#[derive(Debug, Clone, Default)]
+pub struct ExpandObjectsQuery<'a> {
+    /// Direct subject identifier.
+    pub subject_id: Option<&'a str>,
+    /// Namespace of a subject set.
+    pub subject_set_namespace: Option<&'a str>,
+    /// Object of a subject set.
+    pub subject_set_object: Option<&'a str>,
+    /// Relation of a subject set.
+    pub subject_set_relation: Option<&'a str>,
+    /// Maximum depth to traverse.
+    pub max_depth: Option<i32>,
 }
 
 fn parse_base_url(url: &str) -> Result<Url, OryClientError> {
@@ -200,6 +254,7 @@ mod tests {
         Router::new()
             .route("/relation-tuples/check", get(check_permission))
             .route("/relation-tuples/expand", get(expand))
+            .route("/relation-tuples", get(expand_objects))
             .route(
                 "/admin/relation-tuples",
                 patch(create_tuple).delete(delete_tuple),
@@ -213,6 +268,56 @@ mod tests {
 
     async fn expand() -> Json<Value> {
         Json(json!({ "children": [] }))
+    }
+
+    async fn expand_objects(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        let namespace = params.get("namespace").cloned().unwrap_or_default();
+        let relation = params.get("relation").cloned().unwrap_or_default();
+        let subject_id = params.get("subject_id").cloned().unwrap_or_default();
+        let subject_set_namespace = params
+            .get("subject_set.namespace")
+            .cloned()
+            .unwrap_or_default();
+        let subject_set_object = params.get("subject_set.object").cloned().unwrap_or_default();
+        let subject_set_relation = params
+            .get("subject_set.relation")
+            .cloned()
+            .unwrap_or_default();
+
+        let tuples = if !subject_id.is_empty() {
+            vec![
+                json!({
+                    "namespace": namespace,
+                    "object": "doc-1",
+                    "relation": relation,
+                    "subject_id": subject_id,
+                }),
+                json!({
+                    "namespace": namespace,
+                    "object": "doc-2",
+                    "relation": relation,
+                    "subject_id": subject_id,
+                }),
+            ]
+        } else if !subject_set_namespace.is_empty()
+            && !subject_set_object.is_empty()
+            && !subject_set_relation.is_empty()
+        {
+            vec![json!({
+                "namespace": namespace,
+                "object": "doc-3",
+                "relation": relation,
+                "subject_set": {
+                    "namespace": subject_set_namespace,
+                    "object": subject_set_object,
+                    "relation": subject_set_relation,
+                },
+            })]
+        } else {
+            vec![]
+        };
+
+        Json(json!({ "relation_tuples": tuples }))
     }
 
     async fn create_tuple(Json(body): Json<Value>) -> Json<Value> {
@@ -362,6 +467,73 @@ mod tests {
         });
         let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client.expand("app", "doc-1", "read").await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn expand_objects_round_trip_with_subject_id() {
+        let (_handle, url) = start_server().await;
+        let client = KetoClient::new(&url, &url).unwrap();
+        let resp = client
+            .expand_objects(
+                "app",
+                "read",
+                &ExpandObjectsQuery {
+                    subject_id: Some("alice"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let tuples = resp["relation_tuples"].as_array().unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0]["object"], "doc-1");
+        assert_eq!(tuples[1]["object"], "doc-2");
+    }
+
+    #[tokio::test]
+    async fn expand_objects_round_trip_with_subject_set() {
+        let (_handle, url) = start_server().await;
+        let client = KetoClient::new(&url, &url).unwrap();
+        let resp = client
+            .expand_objects(
+                "app",
+                "read",
+                &ExpandObjectsQuery {
+                    subject_set_namespace: Some("Group"),
+                    subject_set_object: Some("admins"),
+                    subject_set_relation: Some("member"),
+                    max_depth: Some(5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let tuples = resp["relation_tuples"].as_array().unwrap();
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0]["object"], "doc-3");
+    }
+
+    #[tokio::test]
+    async fn expand_objects_error() {
+        let app = Router::new().route("/relation-tuples", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .expand_objects(
+                "app",
+                "read",
+                &ExpandObjectsQuery {
+                    subject_id: Some("alice"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 
