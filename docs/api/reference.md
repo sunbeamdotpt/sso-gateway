@@ -62,6 +62,7 @@ via Hydra and the tenant is resolved from the token subject.
 | `CreateRelationTuple` | Create a relation tuple. |
 | `DeleteRelationTuple` | Delete a relation tuple. |
 | `ExpandPermissions` | Expand a permission set. |
+| `ExpandObjects` | Expand the objects a subject has a relation on. |
 | `ListRelationTuples` | List relation tuples. |
 
 ### `iam.v1.FederationService`
