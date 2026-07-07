@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.14] - 2026-07-07
+
+### Added
+
+- `PermissionService.ExpandObjects` RPC and protobuf messages
+  (`ExpandObjectsRequest`, `ExpandObjectsResponse`). This queries Keto for all
+  objects a subject (or subject set) has a given relation on, returning the
+  gateway-level object identifiers with the tenant prefix stripped.
+
+### Fixed
+
+- Hardened `sso-ory-client` integration test container startup against
+  RootlessKit ephemeral-port races and IPv6 connection failures by retrying
+  startup, cleaning up leaked testcontainers, and binding to `127.0.0.1`
+  explicitly.
+
 ## [1.0.0-rc.13] - 2026-07-06
 
 ### Added
