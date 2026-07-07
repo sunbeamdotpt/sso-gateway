@@ -86,6 +86,32 @@ message ExpandPermissionsResponse {
   string tree = 2;
 }
 
+// ExpandObjectsRequest expands all objects a subject has a relation on.
+message ExpandObjectsRequest {
+  // Namespace of the objects.
+  string namespace = 1;
+  // Relation to expand.
+  string relation = 2;
+  // Direct subject identifier.
+  string subject_id = 3;
+  // Namespace of a subject set, if the subject is a set.
+  string subject_set_namespace = 4;
+  // Object of a subject set, if the subject is a set.
+  string subject_set_object = 5;
+  // Relation of a subject set, if the subject is a set.
+  string subject_set_relation = 6;
+  // Maximum depth to traverse when resolving subject sets.
+  int32 max_depth = 7;
+}
+
+// ExpandObjectsResponse is the result of expanding objects for a subject.
+message ExpandObjectsResponse {
+  // Object identifiers the subject has the relation on.
+  repeated string objects = 1;
+  // String representation of the expansion tree.
+  string tree = 2;
+}
+
 // ListRelationTuplesRequest is the input for paginating relation tuples.
 message ListRelationTuplesRequest {
   // Filter by namespace.
@@ -116,6 +142,8 @@ service PermissionService {
   rpc DeleteRelationTuple(DeleteRelationTupleRequest) returns (google.protobuf.Empty);
   // ExpandPermissions returns the expanded permission tree for an object relation.
   rpc ExpandPermissions(ExpandPermissionsRequest) returns (ExpandPermissionsResponse);
+  // ExpandObjects returns the objects a subject has a relation on.
+  rpc ExpandObjects(ExpandObjectsRequest) returns (ExpandObjectsResponse);
   // ListRelationTuples returns a paginated list of relation tuples.
   rpc ListRelationTuples(ListRelationTuplesRequest) returns (ListRelationTuplesResponse);
 }
