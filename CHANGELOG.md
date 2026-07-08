@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.15] - 2026-07-08
+
+### Added
+
+- `ClientCredentialService` Connect-RPC service and protobuf messages
+  (`ClientCredential`, `ClientCredentialSecret`, `CreateClientCredentialRequest`,
+  `GetClientCredentialRequest`, `ListClientCredentialsRequest`,
+  `UpdateClientCredentialRequest`, `DeleteClientCredentialRequest`,
+  `RotateClientCredentialSecretRequest`). This provides lifecycle management for
+  machine-to-machine OAuth2 clients (`client_credentials` grant), protected by
+  `application:read` / `application:admin`.
+
+### Fixed
+
+- The system bootstrap OAuth2 client is now created with scopes
+  `tenant:read tenant:admin application:admin` and, on startup, existing mapped
+  bootstrap clients are updated to match if their scopes differ. This fixes
+  `ListTenants` returning `PermissionDenied` when the bootstrap token did not
+  carry `tenant:read` / `tenant:admin`.
+
 ## [1.0.0-rc.14] - 2026-07-07
 
 ### Added
