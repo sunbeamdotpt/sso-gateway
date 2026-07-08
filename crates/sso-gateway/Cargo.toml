@@ -17,7 +17,8 @@ buffa = { workspace = true }
 buffa-types = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
-sso-ory-client = { path = "../sso-ory-client" }
+sso-ory-client = { path = "../sso-ory-client", default-features = false }
+sso-openfga-client = { workspace = true, optional = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
@@ -55,6 +56,11 @@ testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 reqwest = { workspace = true, features = ["cookies"] }
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = ["openfga"]
+keto = ["sso-ory-client/keto"]
+openfga = ["sso-openfga-client"]
 
 [build-dependencies]
 connectrpc-build = "0.7"

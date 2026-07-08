@@ -263,6 +263,36 @@ pub async fn start_keto()
     Ok((container, read_url, write_url))
 }
 
+pub async fn start_openfga()
+-> Result<(ContainerAsync<GenericImage>, String), Box<dyn std::error::Error + Send + Sync>> {
+    cleanup_lingering_testcontainers();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    const HTTP_PORT: u16 = 8080;
+
+    let container = retry_start("openfga", || async move {
+        GenericImage::new("openfga/openfga", "v1.8.3")
+            .with_exposed_port(ContainerPort::Tcp(HTTP_PORT))
+            .with_wait_for(WaitFor::message_on_either_std(
+                "starting openfga service",
+            ))
+            .with_mapped_port(0, HTTP_PORT.tcp())
+            .with_cmd(["run"])
+            .with_startup_timeout(Duration::from_secs(120))
+            .start()
+            .await
+    })
+    .await?;
+
+    let host = container.get_host().await?.to_string();
+    let http_port = container.get_host_port_ipv4(HTTP_PORT.tcp()).await?;
+    let url = format!("http://{host}:{http_port}");
+
+    wait_for_ok(format!("{url}/healthz")).await?;
+
+    Ok((container, url))
+}
+
 pub async fn start_kratos()
 -> Result<(ContainerAsync<GenericImage>, String, String), Box<dyn std::error::Error + Send + Sync>>
 {

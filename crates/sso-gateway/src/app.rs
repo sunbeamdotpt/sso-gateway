@@ -50,7 +50,14 @@ use axum::{
 use connectrpc::Router as ConnectRouter;
 use gamlastan::crypto::SamlSigner;
 use gamlastan::crypto::keys::build_idp_keys_manager;
-use sso_ory_client::{HydraClient, KetoClient, KratosClient, error::OryClientError};
+use sso_ory_client::{HydraClient, KratosClient, error::OryClientError};
+#[cfg(feature = "keto")]
+use sso_ory_client::KetoClient;
+#[cfg(feature = "openfga")]
+use sso_openfga_client::OpenFgaClient;
+use crate::services::permission::PermissionBackend;
+#[cfg(feature = "openfga")]
+use crate::services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend};
 use sunbeam_g2v::{
     error::ServiceResult,
     health::HealthRouter,
@@ -120,10 +127,34 @@ pub async fn build_app_with_upstream(
         KratosClient::new_with_public(&config.kratos_admin_url, &config.kratos_public_url)
             .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
     );
-    let keto = Arc::new(
-        KetoClient::new(&config.keto_read_url, &config.keto_write_url)
-            .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
-    );
+
+    let backend: Arc<dyn PermissionBackend> = match config.permissions_backend {
+        #[cfg(feature = "keto")]
+        crate::config::PermissionsBackend::Keto => Arc::new(
+            KetoClient::new(&config.keto_read_url, &config.keto_write_url)
+                .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
+        ),
+        #[cfg(not(feature = "keto"))]
+        crate::config::PermissionsBackend::Keto => {
+            return Err(sunbeam_g2v::error::ServiceError::Configuration(
+                "keto backend selected but keto feature not compiled".to_string(),
+            ));
+        }
+        #[cfg(feature = "openfga")]
+        crate::config::PermissionsBackend::OpenFga => {
+            let client = OpenFgaClient::new(&config.openfga_url)
+                .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?;
+            let mappings: Arc<dyn crate::services::permission::NamespaceMappingRepo> =
+                Arc::new(MemoryNamespaceMappingRepo::default());
+            Arc::new(OpenFgaPermissionBackend::new(client, mappings))
+        }
+        #[cfg(not(feature = "openfga"))]
+        crate::config::PermissionsBackend::OpenFga => {
+            return Err(sunbeam_g2v::error::ServiceError::Configuration(
+                "openfga backend selected but openfga feature not compiled".to_string(),
+            ));
+        }
+    };
 
     let mappings = IdMappingRepo::new(pool.clone());
     let schemas = IdentitySchemaRepo::new(pool.clone());
@@ -227,10 +258,10 @@ pub async fn build_app_with_upstream(
         schemas.clone(),
         config.ui_public_url.clone(),
     ));
-    let permission_service = Arc::new(PermissionServiceImpl::new(keto.clone(), tuples));
+    let permission_service = Arc::new(PermissionServiceImpl::new(backend.clone(), tuples));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),
-        keto,
+        backend,
         mappings.clone(),
         schemas.clone(),
         scim_groups,
@@ -355,9 +386,12 @@ pub async fn build_app_with_upstream(
 }
 
 /// OAuth2 scopes assigned to the system bootstrap client. The bootstrap token
-/// needs tenant read/admin access to manage the gateway, plus application:admin
-/// so it can provision further OAuth2 clients.
-const BOOTSTRAP_CLIENT_SCOPE: &str = "tenant:read tenant:admin application:admin";
+/// receives full administrative access to every gateway service so it can
+/// provision tenants, identities, applications, SCIM resources, and permission
+/// tuples without requiring a second client.
+const BOOTSTRAP_CLIENT_SCOPE: &str =
+    "tenant:read tenant:admin identity:read identity:admin application:read application:admin \
+     scim:read scim:admin permission:read permission:admin";
 
 async fn bootstrap_system_client(
     hydra: &HydraClient,
@@ -512,8 +546,10 @@ mod tests {
             hydra_public_url: "http://127.0.0.1:4444".to_string(),
             kratos_admin_url: "http://127.0.0.1:4434".to_string(),
             kratos_public_url: "http://127.0.0.1:4433".to_string(),
+            permissions_backend: crate::config::default_permissions_backend(),
             keto_read_url: "http://127.0.0.1:4466".to_string(),
             keto_write_url: "http://127.0.0.1:4467".to_string(),
+            openfga_url: "http://127.0.0.1:8081".to_string(),
             public_base_url: "http://127.0.0.1:8080".to_string(),
             ui_public_url: "http://ui.example.com".to_string(),
             saml_sp_private_key_pem_path: None,
@@ -541,6 +577,26 @@ mod tests {
             session_ttl_seconds: 86400,
             public_rate_limit_requests: 100,
             public_rate_limit_window_seconds: 60,
+        }
+    }
+
+    #[test]
+    fn bootstrap_client_scope_includes_all_service_admins() {
+        let scopes: std::collections::HashSet<_> =
+            BOOTSTRAP_CLIENT_SCOPE.split_whitespace().collect();
+        for scope in [
+            "tenant:read",
+            "tenant:admin",
+            "identity:read",
+            "identity:admin",
+            "application:read",
+            "application:admin",
+            "scim:read",
+            "scim:admin",
+            "permission:read",
+            "permission:admin",
+        ] {
+            assert!(scopes.contains(scope), "missing bootstrap scope {scope}");
         }
     }
 
@@ -733,6 +789,21 @@ mod tests {
         assert!(build_app(&config, pool).await.is_err());
     }
 
+    #[cfg(feature = "openfga")]
+    #[tokio::test]
+    async fn build_app_returns_error_for_invalid_openfga_url() {
+        let base = postgres_url().await;
+        let url = db_url_with_name(
+            base,
+            &format!("app_openfga_url_{}", Ulid::new().to_string().to_lowercase()),
+        );
+        let pool = create_pool(&url, false).await.unwrap();
+        let mut config = test_config(url, Ulid::new().to_string());
+        config.openfga_url = "not a valid url".to_string();
+        assert!(build_app(&config, pool).await.is_err());
+    }
+
+    #[cfg(feature = "keto")]
     #[tokio::test]
     async fn build_app_returns_error_for_invalid_keto_url() {
         let base = postgres_url().await;
@@ -742,6 +813,7 @@ mod tests {
         );
         let pool = create_pool(&url, false).await.unwrap();
         let mut config = test_config(url, Ulid::new().to_string());
+        config.permissions_backend = crate::config::PermissionsBackend::Keto;
         config.keto_read_url = "not a valid url".to_string();
         assert!(build_app(&config, pool).await.is_err());
     }

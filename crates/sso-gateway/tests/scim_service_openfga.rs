@@ -1,4 +1,4 @@
-#![cfg(feature = "keto")]
+#![cfg(feature = "openfga")]
 
 use std::sync::Arc;
 
@@ -12,15 +12,17 @@ use sso_gateway::{
     },
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt},
-    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
-    services::handlers::scim::{ScimState, router as scim_router},
     services::{
         application::ApplicationServiceImpl, identity::IdentityServiceImpl, scim::ScimServiceImpl,
         tenant::TenantServiceImpl,
     },
+    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
+    services::handlers::scim::{ScimState, router as scim_router},
+    services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend, PermissionBackend},
     session_token::SessionTokenSigner,
 };
-use sso_ory_client::{HydraClient, KetoClient, KratosClient};
+use sso_openfga_client::OpenFgaClient;
+use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
     router::ServiceRouter,
@@ -30,7 +32,7 @@ use sunbeam_g2v::{
 mod support;
 
 #[tokio::test]
-async fn scim_users_and_groups_round_trip() {
+async fn scim_users_and_groups_round_trip_with_openfga() {
     let (_pg, database_url) = support::start_postgres()
         .await
         .expect("postgres should start");
@@ -38,8 +40,8 @@ async fn scim_users_and_groups_round_trip() {
         support::start_hydra().await.expect("hydra should start");
     let (_kratos, kratos_admin_url, _kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
-    let (_keto, keto_read_url, keto_write_url) =
-        support::start_keto().await.expect("keto should start");
+    let (_openfga, openfga_url) =
+        support::start_openfga().await.expect("openfga should start");
 
     let pool = create_pool(&database_url, false)
         .await
@@ -56,9 +58,10 @@ async fn scim_users_and_groups_round_trip() {
     );
     let kratos =
         Arc::new(KratosClient::new(&kratos_admin_url).expect("kratos client should build"));
-    let keto = Arc::new(
-        KetoClient::new(&keto_read_url, &keto_write_url).expect("keto client should build"),
-    );
+    let backend: Arc<dyn PermissionBackend> = Arc::new(OpenFgaPermissionBackend::new(
+        OpenFgaClient::new(&openfga_url).expect("openfga client should build"),
+        Arc::new(MemoryNamespaceMappingRepo::default()),
+    ));
 
     let mappings = IdMappingRepo::new(pool.clone());
     let schemas = IdentitySchemaRepo::new(pool.clone());
@@ -79,7 +82,7 @@ async fn scim_users_and_groups_round_trip() {
     ));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),
-        keto.clone(),
+        backend.clone(),
         mappings.clone(),
         schemas.clone(),
         groups.clone(),
@@ -341,6 +344,14 @@ async fn scim_users_and_groups_round_trip() {
         .as_array()
         .expect("members should be array");
     assert_eq!(members.len(), 1);
+
+    // Verify the group membership is reflected in OpenFGA. SCIM requests in this
+    // test run under the system tenant resolved from the test token subject.
+    let allowed = backend
+        .check_permission(&system_tenant_ulid, "scim_group", group_id, "member", user_id)
+        .await
+        .expect("check should succeed");
+    assert!(allowed, "user should be a member of the group in openfga");
 
     // List groups.
     let list_groups_resp = client

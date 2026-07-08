@@ -1,3 +1,5 @@
+#![cfg(feature = "keto")]
+
 use std::sync::Arc;
 
 use axum::{Extension, Router, middleware::from_fn};

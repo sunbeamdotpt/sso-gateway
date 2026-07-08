@@ -5406,7 +5406,7 @@ dependencies = [
 
 [[package]]
 name = "sso-gateway"
-version = "1.0.0-rc.15"
+version = "2026.7.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -5435,6 +5435,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx 0.8.6",
+ "sso-openfga-client",
  "sso-ory-client",
  "subtle",
  "sunbeam-g2v",
@@ -5453,8 +5454,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sso-openfga-client"
+version = "2026.7.1"
+dependencies = [
+ "axum",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "sso-ory-client"
-version = "1.0.0-rc.15"
+version = "2026.7.1"
 dependencies = [
  "axum",
  "rand 0.8.6",

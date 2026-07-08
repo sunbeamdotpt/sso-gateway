@@ -11,8 +11,10 @@ pub struct Config {
     pub hydra_public_url: String,
     pub kratos_admin_url: String,
     pub kratos_public_url: String,
+    pub permissions_backend: PermissionsBackend,
     pub keto_read_url: String,
     pub keto_write_url: String,
+    pub openfga_url: String,
     pub public_base_url: String,
     pub ui_public_url: String,
     pub saml_sp_private_key_pem_path: Option<String>,
@@ -52,8 +54,10 @@ impl std::fmt::Debug for Config {
             .field("hydra_public_url", &self.hydra_public_url)
             .field("kratos_admin_url", &self.kratos_admin_url)
             .field("kratos_public_url", &self.kratos_public_url)
+            .field("permissions_backend", &self.permissions_backend)
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
+            .field("openfga_url", &self.openfga_url)
             .field("public_base_url", &self.public_base_url)
             .field("ui_public_url", &self.ui_public_url)
             .field(
@@ -130,6 +134,39 @@ impl std::fmt::Debug for Config {
                 &self.public_rate_limit_window_seconds,
             )
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionsBackend {
+    Keto,
+    OpenFga,
+}
+
+/// Choose the default permissions backend based on compiled features.
+/// OpenFGA is preferred when both are available.
+pub(crate) fn default_permissions_backend() -> PermissionsBackend {
+    #[cfg(feature = "openfga")]
+    {
+        PermissionsBackend::OpenFga
+    }
+    #[cfg(not(feature = "openfga"))]
+    {
+        PermissionsBackend::Keto
+    }
+}
+
+impl std::str::FromStr for PermissionsBackend {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "keto" => Ok(Self::Keto),
+            "openfga" => Ok(Self::OpenFga),
+            _ => Err(ConfigError::InvalidConfig(format!(
+                "invalid permissions backend: {s}; expected 'keto' or 'openfga'"
+            ))),
+        }
     }
 }
 
@@ -235,6 +272,33 @@ impl Config {
         let tenant_connection_encryption_key =
             Self::parse_optional_base64_key("TENANT_CONNECTION_ENCRYPTION_KEY")?;
 
+        let permissions_backend = std::env::var("PERMISSIONS_BACKEND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_permissions_backend);
+
+        match permissions_backend {
+            PermissionsBackend::Keto => {
+                #[cfg(not(feature = "keto"))]
+                return Err(ConfigError::InvalidConfig(
+                    "PERMISSIONS_BACKEND=keto requires the keto feature".to_string(),
+                ));
+            }
+            PermissionsBackend::OpenFga => {
+                #[cfg(not(feature = "openfga"))]
+                return Err(ConfigError::InvalidConfig(
+                    "PERMISSIONS_BACKEND=openfga requires the openfga feature".to_string(),
+                ));
+            }
+        }
+
+        let keto_read_url = std::env::var("KETO_READ_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:4466".to_string());
+        let keto_write_url = std::env::var("KETO_WRITE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:4467".to_string());
+        let openfga_url = std::env::var("OPENFGA_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
+
         Ok(Self {
             bind_addr: std::env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -249,10 +313,10 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:4434".to_string()),
             kratos_public_url: std::env::var("KRATOS_PUBLIC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:4433".to_string()),
-            keto_read_url: std::env::var("KETO_READ_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4466".to_string()),
-            keto_write_url: std::env::var("KETO_WRITE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4467".to_string()),
+            permissions_backend,
+            keto_read_url,
+            keto_write_url,
+            openfga_url,
             public_base_url,
             ui_public_url,
             saml_sp_private_key_pem_path: std::env::var("SAML_SP_PRIVATE_KEY_PEM_PATH").ok(),
@@ -416,6 +480,8 @@ mod tests {
         clear_env("KRATOS_PUBLIC_URL");
         clear_env("KETO_READ_URL");
         clear_env("KETO_WRITE_URL");
+        clear_env("OPENFGA_URL");
+        clear_env("PERMISSIONS_BACKEND");
         clear_env("PUBLIC_BASE_URL");
         clear_env("SAML_IDP_ENTITY_ID");
         clear_env("SAML_REQUEST_TTL_SECONDS");
@@ -466,8 +532,13 @@ mod tests {
         assert_eq!(config.hydra_public_url, "http://127.0.0.1:4444");
         assert_eq!(config.kratos_admin_url, "http://127.0.0.1:4434");
         assert_eq!(config.kratos_public_url, "http://127.0.0.1:4433");
+        #[cfg(feature = "openfga")]
+        assert!(matches!(config.permissions_backend, PermissionsBackend::OpenFga));
+        #[cfg(all(not(feature = "openfga"), feature = "keto"))]
+        assert!(matches!(config.permissions_backend, PermissionsBackend::Keto));
         assert_eq!(config.keto_read_url, "http://127.0.0.1:4466");
         assert_eq!(config.keto_write_url, "http://127.0.0.1:4467");
+        assert_eq!(config.openfga_url, "http://127.0.0.1:8081");
         assert_eq!(config.public_base_url, "http://127.0.0.1:8080");
         assert_eq!(config.ui_public_url, "http://127.0.0.1:8080");
         assert_eq!(config.saml_idp_entity_id, None);
@@ -484,6 +555,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "openfga")]
     #[test]
     fn config_from_env_uses_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -498,6 +570,8 @@ mod tests {
         set_env("KRATOS_PUBLIC_URL", "http://kratos:4433");
         set_env("KETO_READ_URL", "http://keto:4466");
         set_env("KETO_WRITE_URL", "http://keto:4467");
+        set_env("OPENFGA_URL", "http://openfga:8081");
+        set_env("PERMISSIONS_BACKEND", "openfga");
         set_env("PUBLIC_BASE_URL", "https://gateway.example.com");
         set_env("UI_PUBLIC_URL", "https://ui.example.com");
         set_env("SAML_IDP_ENTITY_ID", "https://idp.example.com");
@@ -517,7 +591,9 @@ mod tests {
         drop(_guard);
         assert_eq!(config.system_tenant_ulid, ulid);
         assert_eq!(config.bind_addr, "0.0.0.0:3000".parse().unwrap());
+        assert!(matches!(config.permissions_backend, PermissionsBackend::OpenFga));
         assert_eq!(config.hydra_admin_url, "http://hydra:4445");
+        assert_eq!(config.openfga_url, "http://openfga:8081");
         assert_eq!(config.public_base_url, "https://gateway.example.com");
         assert_eq!(config.ui_public_url, "https://ui.example.com");
         assert_eq!(
@@ -540,6 +616,27 @@ mod tests {
             config.system_bootstrap_client_secret,
             Some("bootstrap-secret-key".to_string())
         );
+    }
+
+    #[cfg(feature = "keto")]
+    #[test]
+    fn config_from_env_uses_keto_backend_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("PERMISSIONS_BACKEND", "keto");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert!(matches!(config.permissions_backend, PermissionsBackend::Keto));
     }
 
     #[test]

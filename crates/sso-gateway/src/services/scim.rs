@@ -9,7 +9,9 @@ use buffa_types::google::protobuf::Struct as ProtoStruct;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use http::HeaderMap;
 use serde_json::{Value, json};
-use sso_ory_client::{error::OryClientError, keto::KetoClient, kratos::KratosClient};
+use sso_ory_client::{error::OryClientError, kratos::KratosClient};
+#[cfg(all(feature = "keto", test))]
+use sso_ory_client::keto::KetoClient;
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
@@ -27,6 +29,7 @@ use crate::{
         ScimListGroupsRequest, ScimListGroupsResponse, ScimListUsersRequest, ScimListUsersResponse,
         ScimMember, ScimService, ScimUpdateGroupRequest, ScimUpdateUserRequest, ScimUser,
     },
+    services::permission::PermissionBackend,
 };
 
 const BACKEND_KRATOS: &str = "kratos";
@@ -57,25 +60,6 @@ pub trait ScimKratos: Send + Sync + 'static {
     async fn delete_identity(&self, id: &str) -> Result<(), OryClientError>;
 }
 
-/// Async trait for the Keto operations used by the SCIM service.
-#[async_trait]
-pub trait ScimKeto: Send + Sync + 'static {
-    async fn create_relation_tuple(
-        &self,
-        namespace: &str,
-        object: &str,
-        relation: &str,
-        subject_id: &str,
-    ) -> Result<Value, OryClientError>;
-    async fn delete_relation_tuple(
-        &self,
-        namespace: &str,
-        object: &str,
-        relation: &str,
-        subject_id: &str,
-    ) -> Result<(), OryClientError>;
-}
-
 #[async_trait]
 impl ScimKratos for KratosClient {
     async fn create_identity(&self, payload: Value) -> Result<Value, OryClientError> {
@@ -95,35 +79,10 @@ impl ScimKratos for KratosClient {
     }
 }
 
-#[async_trait]
-impl ScimKeto for KetoClient {
-    async fn create_relation_tuple(
-        &self,
-        namespace: &str,
-        object: &str,
-        relation: &str,
-        subject_id: &str,
-    ) -> Result<Value, OryClientError> {
-        self.create_relation_tuple(namespace, object, relation, subject_id)
-            .await
-    }
-
-    async fn delete_relation_tuple(
-        &self,
-        namespace: &str,
-        object: &str,
-        relation: &str,
-        subject_id: &str,
-    ) -> Result<(), OryClientError> {
-        self.delete_relation_tuple(namespace, object, relation, subject_id)
-            .await
-    }
-}
-
 #[derive(Clone)]
 pub struct ScimServiceImpl {
     kratos: Arc<dyn ScimKratos>,
-    keto: Arc<dyn ScimKeto>,
+    backend: Arc<dyn PermissionBackend>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
     groups: Arc<dyn ScimGroupStore>,
@@ -132,14 +91,14 @@ pub struct ScimServiceImpl {
 impl ScimServiceImpl {
     pub fn new(
         kratos: Arc<KratosClient>,
-        keto: Arc<KetoClient>,
+        backend: Arc<dyn PermissionBackend>,
         mappings: IdMappingRepo,
         schemas: IdentitySchemaRepo,
         groups: ScimGroupRepo,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn ScimKratos>,
-            keto: keto as Arc<dyn ScimKeto>,
+            backend,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
             groups: Arc::new(groups) as Arc<dyn ScimGroupStore>,
@@ -151,14 +110,14 @@ impl ScimServiceImpl {
 impl ScimServiceImpl {
     fn new_for_test(
         kratos: Arc<dyn ScimKratos>,
-        keto: Arc<dyn ScimKeto>,
+        backend: Arc<dyn PermissionBackend>,
         mappings: Arc<dyn IdMappingStore>,
         schemas: Arc<dyn IdentitySchemaStore>,
         groups: Arc<dyn ScimGroupStore>,
     ) -> Self {
         Self {
             kratos,
-            keto,
+            backend,
             mappings,
             schemas,
             groups,
@@ -400,16 +359,24 @@ impl ScimService for ScimServiceImpl {
             .await?;
 
         // Replace memberships.
+        self.backend
+            .ensure_namespace(&tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .await?;
         let existing = self.groups.list_members(&req.id).await?;
         for user_id in &existing {
             self.groups
                 .remove_member(&tenant_id, &req.id, user_id)
                 .await?;
             let _ = self
-                .keto
-                .delete_relation_tuple(SCIM_GROUP_NAMESPACE, &req.id, SCIM_GROUP_RELATION, user_id)
-                .await
-                .map_err(map_ory_error);
+                .backend
+                .delete_relation_tuple(
+                    &tenant_id,
+                    SCIM_GROUP_NAMESPACE,
+                    &req.id,
+                    SCIM_GROUP_RELATION,
+                    user_id,
+                )
+                .await;
         }
         for member in &input.members {
             if member.r#type == "User" || member.r#type.is_empty() {
@@ -432,13 +399,21 @@ impl ScimService for ScimServiceImpl {
         require_scope(&ctx, SCOPE_SCIM_ADMIN)?;
         let req = request.to_owned_message();
 
+        self.backend
+            .ensure_namespace(&tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .await?;
         let members = self.groups.list_members(&req.id).await?;
         for user_id in members {
             let _ = self
-                .keto
-                .delete_relation_tuple(SCIM_GROUP_NAMESPACE, &req.id, SCIM_GROUP_RELATION, &user_id)
-                .await
-                .map_err(map_ory_error);
+                .backend
+                .delete_relation_tuple(
+                    &tenant_id,
+                    SCIM_GROUP_NAMESPACE,
+                    &req.id,
+                    SCIM_GROUP_RELATION,
+                    &user_id,
+                )
+                .await;
         }
 
         self.groups.delete(&tenant_id, &req.id).await?;
@@ -562,10 +537,18 @@ impl ScimServiceImpl {
             .get_ory_id(tenant_id, BACKEND_KRATOS, user_id)
             .await?;
         self.groups.add_member(tenant_id, group_id, user_id).await?;
-        self.keto
-            .create_relation_tuple(SCIM_GROUP_NAMESPACE, group_id, SCIM_GROUP_RELATION, user_id)
-            .await
-            .map_err(map_ory_error)?;
+        self.backend
+            .ensure_namespace(tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .await?;
+        self.backend
+            .create_relation_tuple(
+                tenant_id,
+                SCIM_GROUP_NAMESPACE,
+                group_id,
+                SCIM_GROUP_RELATION,
+                user_id,
+            )
+            .await?;
         Ok(())
     }
 }
@@ -798,7 +781,7 @@ mod tests {
     fn make_service() -> ScimServiceImpl {
         ScimServiceImpl::new_for_test(
             Arc::new(StubKratos::default()),
-            Arc::new(StubKeto::default()),
+            Arc::new(StubPermissionBackend::default()),
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::valid()),
             Arc::new(StubGroups::default()),
@@ -917,21 +900,36 @@ mod tests {
         }
     }
 
+    type StringQuintList = Arc<tokio::sync::Mutex<Vec<(String, String, String, String, String)>>>;
+
     #[derive(Clone, Default)]
-    struct StubKeto {
-        tuples: StringQuadList,
+    struct StubPermissionBackend {
+        tuples: StringQuintList,
     }
 
     #[async_trait]
-    impl ScimKeto for StubKeto {
+    impl PermissionBackend for StubPermissionBackend {
+        async fn check_permission(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _object: &str,
+            _relation: &str,
+            _subject_id: &str,
+        ) -> Result<bool, crate::services::permission::PermissionBackendError> {
+            Ok(false)
+        }
+
         async fn create_relation_tuple(
             &self,
+            tenant_id: &str,
             namespace: &str,
             object: &str,
             relation: &str,
             subject_id: &str,
-        ) -> Result<Value, OryClientError> {
+        ) -> Result<Value, crate::services::permission::PermissionBackendError> {
             self.tuples.lock().await.push((
+                tenant_id.to_string(),
                 namespace.to_string(),
                 object.to_string(),
                 relation.to_string(),
@@ -942,14 +940,52 @@ mod tests {
 
         async fn delete_relation_tuple(
             &self,
+            tenant_id: &str,
             namespace: &str,
             object: &str,
             relation: &str,
             subject_id: &str,
-        ) -> Result<(), OryClientError> {
+        ) -> Result<(), crate::services::permission::PermissionBackendError> {
             self.tuples.lock().await.retain(|t| {
-                !(t.0 == namespace && t.1 == object && t.2 == relation && t.3 == subject_id)
+                !(t.0 == tenant_id
+                    && t.1 == namespace
+                    && t.2 == object
+                    && t.3 == relation
+                    && t.4 == subject_id)
             });
+            Ok(())
+        }
+
+        async fn expand(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _object: &str,
+            _relation: &str,
+        ) -> Result<Value, crate::services::permission::PermissionBackendError> {
+            Ok(Value::Null)
+        }
+
+        async fn expand_objects(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _relation: &str,
+            _subject_id: Option<&str>,
+            _subject_set_namespace: Option<&str>,
+            _subject_set_object: Option<&str>,
+            _subject_set_relation: Option<&str>,
+            _max_depth: Option<i32>,
+        ) -> Result<Value, crate::services::permission::PermissionBackendError> {
+            Ok(Value::Null)
+        }
+
+        async fn ensure_namespace(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _relations: &[String],
+        ) -> Result<(), crate::services::permission::PermissionBackendError> {
             Ok(())
         }
     }
@@ -1416,11 +1452,11 @@ mod tests {
         let pool =
             sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").expect("lazy pool");
         let kratos = Arc::new(KratosClient::new("http://localhost:1").unwrap());
-        let keto = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap());
+        let backend: Arc<dyn PermissionBackend> = Arc::new(StubPermissionBackend::default());
         let mappings = IdMappingRepo::new(pool.clone());
         let schemas = IdentitySchemaRepo::new(pool.clone());
         let groups = ScimGroupRepo::new(pool);
-        let service = ScimServiceImpl::new(kratos, keto, mappings, schemas, groups);
+        let service = ScimServiceImpl::new(kratos, backend, mappings, schemas, groups);
         // Exercise Clone to ensure the struct fields are consistent.
         let _cloned = service.clone();
     }
@@ -1487,7 +1523,7 @@ mod tests {
     async fn create_user_invalid_traits_returns_invalid_argument() {
         let service = ScimServiceImpl::new_for_test(
             Arc::new(StubKratos::default()),
-            Arc::new(StubKeto::default()),
+            Arc::new(StubPermissionBackend::default()),
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::invalid()),
             Arc::new(StubGroups::default()),
@@ -1511,7 +1547,7 @@ mod tests {
                 status: 503,
                 message: "down".into(),
             }),
-            Arc::new(StubKeto::default()),
+            Arc::new(StubPermissionBackend::default()),
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::valid()),
             Arc::new(StubGroups::default()),
@@ -1997,19 +2033,20 @@ mod tests {
         assert!(client.delete_identity("id").await.is_err());
     }
 
+    #[cfg(feature = "keto")]
     #[tokio::test]
-    async fn keto_client_as_scim_keto_delegates() {
+    async fn keto_client_as_permission_backend_delegates() {
         let client = Arc::new(KetoClient::new("http://localhost:1", "http://localhost:1").unwrap())
-            as Arc<dyn ScimKeto>;
+            as Arc<dyn PermissionBackend>;
         assert!(
             client
-                .create_relation_tuple("ns", "obj", "rel", "subject")
+                .create_relation_tuple("tenant-1", "ns", "obj", "rel", "subject")
                 .await
                 .is_err()
         );
         assert!(
             client
-                .delete_relation_tuple("ns", "obj", "rel", "subject")
+                .delete_relation_tuple("tenant-1", "ns", "obj", "rel", "subject")
                 .await
                 .is_err()
         );
