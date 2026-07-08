@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0-rc.15"
+version = "2026.7.1"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-or-later"
@@ -28,6 +28,7 @@ buffa = { version = "0.7", features = ["json"] }
 buffa-types = { version = "0.7", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.8" }
+sso-openfga-client = { path = "crates/sso-openfga-client" }
 http = { version = "1.2" }
 http-body = { version = "1" }
 http-body-util = { version = "0.1" }

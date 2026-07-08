@@ -3,9 +3,39 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
 ## [Unreleased]
+
+## [2026.07.1] - 2026-07-08
+
+### Added
+
+- Optional OpenFGA permission backend, gated by the `openfga` Cargo feature (enabled
+  by default). When both `openfga` and `keto` are compiled, OpenFGA is preferred.
+- New internal `sso-openfga-client` crate for OpenFGA store, model, and tuple
+  management.
+- Tenant-owned OpenFGA stores and authorization models via `NamespaceMappingRepo`;
+  objects are not tenant-prefixed. Keto continues to use the existing
+  `{tenant_id}:{object}` prefix.
+- `PermissionBackend` trait abstracting `check_permission`, `create_relation_tuple`,
+  `delete_relation_tuple`, `expand`, `expand_objects`, and `ensure_namespace`.
+- Integration test parity for OpenFGA:
+  `tests/permission_service_openfga.rs` and `tests/scim_service_openfga.rs`.
+
+### Changed
+
+- `PermissionServiceImpl` and `ScimServiceImpl` now operate over `Arc<dyn PermissionBackend>`.
+- `permissions_backend` config selects the active backend at runtime.
+- The system bootstrap OAuth2 client now receives full administrative scopes for
+  every gateway service:
+  `tenant:read tenant:admin identity:read identity:admin application:read application:admin
+   scim:read scim:admin permission:read permission:admin`.
+
+### Fixed
+
+- Feature-gated the OpenFGA URL validation test so `cargo test` passes when the
+  crate is built with only the `keto` feature.
 
 ## [1.0.0-rc.15] - 2026-07-08
 
@@ -317,6 +347,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[2026.07.1]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v2026.07.1
+[1.0.0-rc.15]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc.15
 [1.0.0-rc.11]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc11
 [1.0.0-rc.10]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc10
 [1.0.0-rc.9]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc9
