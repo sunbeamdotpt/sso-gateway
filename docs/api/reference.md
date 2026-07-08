@@ -54,6 +54,20 @@ via Hydra and the tenant is resolved from the token subject.
 | `DeleteApplication` | Delete an OAuth2 client. |
 | `RotateSecret` | Rotate a client secret. |
 
+### `iam.v1.ClientCredentialService`
+
+Machine-to-machine OAuth2 clients restricted to the `client_credentials` grant.
+Protected by `application:read` / `application:admin`.
+
+| Method | Description |
+|---|---|
+| `CreateClientCredential` | Create a client credentials OAuth2 client. |
+| `GetClientCredential` | Get a client credentials OAuth2 client. |
+| `ListClientCredentials` | List client credentials OAuth2 clients. |
+| `UpdateClientCredential` | Update a client credentials OAuth2 client. |
+| `DeleteClientCredential` | Delete a client credentials OAuth2 client. |
+| `RotateClientCredentialSecret` | Rotate a client credentials client secret. |
+
 ### `iam.v1.PermissionService`
 
 | Method | Description |
