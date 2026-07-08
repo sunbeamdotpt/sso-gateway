@@ -15,12 +15,13 @@ use crate::{
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
     proto::iam::v1::{
-        ApplicationServiceExt, FederationServiceExt, IdentitySelfServiceExt, IdentityServiceExt,
-        OAuth2ConsentServiceExt, OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt,
-        TenantServiceExt,
+        ApplicationServiceExt, ClientCredentialServiceExt, FederationServiceExt,
+        IdentitySelfServiceExt, IdentityServiceExt, OAuth2ConsentServiceExt,
+        OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt, TenantServiceExt,
     },
     services::{
         application::ApplicationServiceImpl,
+        client_credential::ClientCredentialServiceImpl,
         federation::FederationServiceImpl,
         handlers::{
             callback::{CallbackState, router as callback_router},
@@ -218,6 +219,8 @@ pub async fn build_app_with_upstream(
     ));
     let application_service =
         Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let client_credential_service =
+        Arc::new(ClientCredentialServiceImpl::new(hydra.clone(), mappings.clone()));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
         mappings.clone(),
@@ -299,6 +302,7 @@ pub async fn build_app_with_upstream(
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
+    let connect_router: ConnectRouter = client_credential_service.register(connect_router);
     let connect_router: ConnectRouter = identity_service.register(connect_router);
     let connect_router: ConnectRouter = permission_service.register(connect_router);
     let connect_router: ConnectRouter = scim_service.register(connect_router);

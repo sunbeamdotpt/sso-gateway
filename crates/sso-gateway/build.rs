@@ -11,6 +11,7 @@ fn main() -> io::Result<()> {
             proto_dir.join("iam/v1/tenant.proto"),
             proto_dir.join("iam/v1/identity.proto"),
             proto_dir.join("iam/v1/application.proto"),
+            proto_dir.join("iam/v1/client_credential.proto"),
             proto_dir.join("iam/v1/permission.proto"),
             proto_dir.join("iam/v1/federation.proto"),
             proto_dir.join("iam/v1/scim.proto"),

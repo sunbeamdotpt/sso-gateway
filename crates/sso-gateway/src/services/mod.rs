@@ -1,4 +1,5 @@
 pub mod application;
+pub mod client_credential;
 pub mod federation;
 pub mod handlers;
 pub mod identity;
