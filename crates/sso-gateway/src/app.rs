@@ -49,7 +49,7 @@ use axum::{
 use connectrpc::Router as ConnectRouter;
 use gamlastan::crypto::SamlSigner;
 use gamlastan::crypto::keys::build_idp_keys_manager;
-use sso_ory_client::{HydraClient, KetoClient, KratosClient};
+use sso_ory_client::{HydraClient, KetoClient, KratosClient, error::OryClientError};
 use sunbeam_g2v::{
     error::ServiceResult,
     health::HealthRouter,
@@ -350,6 +350,11 @@ pub async fn build_app_with_upstream(
     Ok(app)
 }
 
+/// OAuth2 scopes assigned to the system bootstrap client. The bootstrap token
+/// needs tenant read/admin access to manage the gateway, plus application:admin
+/// so it can provision further OAuth2 clients.
+const BOOTSTRAP_CLIENT_SCOPE: &str = "tenant:read tenant:admin application:admin";
+
 async fn bootstrap_system_client(
     hydra: &HydraClient,
     mappings: &IdMappingRepo,
@@ -357,24 +362,56 @@ async fn bootstrap_system_client(
     client_id: &str,
     client_secret: &str,
 ) -> ServiceResult<()> {
+    let payload = serde_json::json!({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_types": ["client_credentials"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        "scope": BOOTSTRAP_CLIENT_SCOPE,
+    });
+
     match mappings.get_tenant_id_by_ory_id("hydra", client_id).await {
         Ok(Some(_)) => {
-            info!("system bootstrap OAuth2 client already mapped; skipping creation");
-            return Ok(());
+            // The mapping exists; make sure the upstream Hydra client carries
+            // the scopes required for bootstrapping. This lets deployments that
+            // created the client under an older release pick up new scopes
+            // without manual intervention.
+            match hydra.get_oauth2_client(client_id).await {
+                Ok(existing) => {
+                    let existing_scope = existing["scope"].as_str().unwrap_or("");
+                    if existing_scope == BOOTSTRAP_CLIENT_SCOPE {
+                        info!("system bootstrap OAuth2 client already configured");
+                        return Ok(());
+                    }
+                    info!("updating system bootstrap OAuth2 client scopes");
+                    let mut updated = existing;
+                    updated["scope"] =
+                        serde_json::Value::String(BOOTSTRAP_CLIENT_SCOPE.to_string());
+                    hydra
+                        .update_oauth2_client(client_id, updated)
+                        .await
+                        .map_err(|e| {
+                            sunbeam_g2v::error::ServiceError::Configuration(format!(
+                                "bootstrap client update: {e}"
+                            ))
+                        })?;
+                    return Ok(());
+                }
+                Err(OryClientError::Ory { status: 404, .. }) => {
+                    info!("bootstrap client mapping exists but Hydra client missing; recreating");
+                }
+                Err(e) => {
+                    return Err(sunbeam_g2v::error::ServiceError::Configuration(format!(
+                        "bootstrap client lookup: {e}"
+                    )));
+                }
+            }
         }
         Ok(None) => {}
         Err(e) => {
             return Err(sunbeam_g2v::error::ServiceError::Database(e.to_string()));
         }
     }
-
-    let payload = serde_json::json!({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_types": ["client_credentials"],
-        "token_endpoint_auth_method": "client_secret_basic",
-        "scope": "tenant:admin application:admin"
-    });
 
     hydra.create_oauth2_client(payload).await.map_err(|e| {
         sunbeam_g2v::error::ServiceError::Configuration(format!("bootstrap client: {e}"))
