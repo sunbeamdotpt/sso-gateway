@@ -20,6 +20,19 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 - `CreateApplication` and `/oauth2/register` now accept `http://` redirect URIs
   when the host is a loopback address (`localhost`, `127.0.0.1`, or `[::1]`)
   without requiring the `allow_http_redirect_uris` configuration flag.
+- `CreateApplication`, `CreateClientCredential`, and `/oauth2/register` now set
+  the Hydra `client_id` to the gateway public ULID so internal Hydra identifiers
+  never appear in OAuth2 protocol artifacts such as `id_token` `aud` claims.
+
+### Fixed
+
+- `identity_self_service_consent_service` integration test now seeds and uses
+  opaque public tokens for Kratos flow, recovery/verification token, error, and
+  Hydra consent/logout challenge identifiers.
+- `oauth2_service` integration test binds the gateway port before starting Hydra
+  so Hydra's self-issuer redirects remain on the gateway origin.
+- OIDC conformance test now uses an opaque ULID subject in the `id_token` and
+  `userinfo` sub claim.
 
 ## [2026.07.1] - 2026-07-08
 
