@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-const BACKEND_HYDRA: &str = "hydra";
+pub(crate) const BACKEND_HYDRA: &str = "hydra";
 
 /// Async trait abstracting the Hydra operations used by [`ApplicationServiceImpl`].
 #[async_trait]
@@ -291,7 +291,7 @@ fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), Servic
     Ok(())
 }
 
-fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), ServiceError> {
+pub fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), ServiceError> {
     for uri in uris {
         if uri.contains('*') {
             return Err(ServiceError::InvalidArgument(format!(
@@ -320,7 +320,7 @@ fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), Servi
     Ok(())
 }
 
-fn validate_token_endpoint_auth_method(method: &str) -> Result<(), ServiceError> {
+pub fn validate_token_endpoint_auth_method(method: &str) -> Result<(), ServiceError> {
     if method.is_empty() {
         return Ok(());
     }
