@@ -10,17 +10,29 @@ use sso_ory_client::{
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
+use crate::db::{
+    IdMappingRepo, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+    TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+    TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, TransientTokenStore,
+};
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     BrowserSession, CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
     CreateRegistrationFlowRequest, CreateSettingsFlowRequest, CreateVerificationFlowRequest,
     FlowError, GetFlowErrorRequest, GetFlowRequest, GetTenantCapabilitiesRequest,
-    GetTenantCapabilitiesResponse, IdentitySelfService, LogoutFlow, SelfServiceFlow,
-    SubmitFlowRequest, SubmitLogoutFlowRequest, SubmitRecoveryTokenRequest,
+    GetTenantCapabilitiesResponse, IdentitySelfService, LogoutFlow, OAuth2LoginRequest,
+    SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, SubmitRecoveryTokenRequest,
     SubmitRecoveryTokenResponse, SubmitVerificationTokenRequest, SubmitVerificationTokenResponse,
     TenantCapabilities, ToSessionRequest, WebAuthnJsResponse,
 };
 use buffa_types::google::protobuf::Empty;
+
+const BACKEND_KRATOS: &str = "kratos";
+const BACKEND_HYDRA: &str = "hydra";
+
+fn transient_expiry() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
 
 use super::identity_self_service_mapper::{
     ory_flow_error_to_proto, ory_flow_to_proto, ory_logout_flow_to_proto, ory_session_to_proto,
@@ -335,7 +347,8 @@ impl KratosSelfService for KratosClient {
         cookie: Option<&str>,
         csrf_token: Option<&str>,
     ) -> Result<sso_ory_client::kratos::KratosRedirectResponse, OryClientError> {
-        self.submit_recovery_token(token, flow, cookie, csrf_token).await
+        self.submit_recovery_token(token, flow, cookie, csrf_token)
+            .await
     }
 
     async fn submit_verification_token(
@@ -353,6 +366,8 @@ impl KratosSelfService for KratosClient {
 #[derive(Clone)]
 pub struct IdentitySelfServiceImpl {
     kratos: Arc<dyn KratosSelfService>,
+    transient: Arc<dyn TransientTokenStore>,
+    mappings: Arc<dyn IdMappingStore>,
     consent_enabled: bool,
     kratos_public_url: String,
     gateway_public_url: String,
@@ -361,12 +376,16 @@ pub struct IdentitySelfServiceImpl {
 impl IdentitySelfServiceImpl {
     pub fn new(
         kratos: Arc<KratosClient>,
+        transient: TransientTokenRepo,
+        mappings: IdMappingRepo,
         consent_enabled: bool,
         kratos_public_url: String,
         gateway_public_url: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn KratosSelfService>,
+            transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             consent_enabled,
             kratos_public_url,
             gateway_public_url,
@@ -462,6 +481,92 @@ impl IdentitySelfServiceImpl {
             );
         }
     }
+
+    async fn resolve_flow(
+        &self,
+        tenant_id: &str,
+        public_flow_id: &str,
+    ) -> Result<String, ServiceError> {
+        if public_flow_id.is_empty() {
+            return Err(ServiceError::InvalidArgument("flow id is required".into()));
+        }
+        self.transient
+            .get_ory_token(tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, public_flow_id)
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn public_flow(
+        &self,
+        tenant_id: &str,
+        ory_flow_id: &str,
+    ) -> Result<String, ServiceError> {
+        if ory_flow_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.transient
+            .create(
+                tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_FLOW,
+                ory_flow_id,
+                transient_expiry(),
+            )
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn map_flow_response(
+        &self,
+        tenant_id: &str,
+        flow: &mut SelfServiceFlow,
+    ) -> Result<(), ServiceError> {
+        flow.id = self.public_flow(tenant_id, &flow.id).await?;
+        if let Some(oauth2) = flow.oauth2_login_request.as_option_mut() {
+            self.map_oauth2_login_request(tenant_id, oauth2).await?;
+        }
+        Ok(())
+    }
+
+    async fn map_oauth2_login_request(
+        &self,
+        tenant_id: &str,
+        oauth2: &mut OAuth2LoginRequest,
+    ) -> Result<(), ServiceError> {
+        if !oauth2.challenge.is_empty() {
+            oauth2.challenge = self
+                .transient
+                .create(
+                    tenant_id,
+                    BACKEND_HYDRA,
+                    TOKEN_TYPE_LOGIN_CHALLENGE,
+                    &oauth2.challenge,
+                    transient_expiry(),
+                )
+                .await?;
+        }
+        if !oauth2.client_id.is_empty() {
+            oauth2.client_id = self
+                .mappings
+                .get_public_id(tenant_id, BACKEND_HYDRA, &oauth2.client_id)
+                .await?;
+        }
+        if !oauth2.subject.is_empty() {
+            oauth2.subject = self
+                .mappings
+                .get_public_id(tenant_id, BACKEND_KRATOS, &oauth2.subject)
+                .await?;
+        }
+        if let Some(client) = oauth2.client.as_option_mut()
+            && !client.client_id.is_empty()
+        {
+            client.client_id = self
+                .mappings
+                .get_public_id(tenant_id, BACKEND_HYDRA, &client.client_id)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn cookie_from_context(ctx: &RequestContext) -> Option<String> {
@@ -514,7 +619,36 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .map_err(map_ory_error)?;
 
         let mut proto = ory_session_to_proto(&session);
-        proto.tenant_id = tenant_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        proto.tenant_id = tenant_id.clone();
+        if !tenant_id.is_empty() {
+            let ory_session_id = session["id"].as_str().unwrap_or("");
+            if !ory_session_id.is_empty() {
+                proto.id = self
+                    .transient
+                    .create(
+                        &tenant_id,
+                        BACKEND_KRATOS,
+                        TOKEN_TYPE_SESSION,
+                        ory_session_id,
+                        transient_expiry(),
+                    )
+                    .await?;
+            }
+            let ory_identity_id = session
+                .get("identity")
+                .and_then(|i| i["id"].as_str())
+                .unwrap_or("");
+            if !ory_identity_id.is_empty() {
+                proto.identity_id = self
+                    .mappings
+                    .get_public_id(&tenant_id, BACKEND_KRATOS, ory_identity_id)
+                    .await?;
+                if let Some(identity) = proto.identity.as_option_mut() {
+                    identity.id = proto.identity_id.clone();
+                }
+            }
+        }
         Ok(Response::new(proto))
     }
 
@@ -526,12 +660,16 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .get_login_flow(&req.id, cookie.as_deref())
+            .get_login_flow(&ory_flow_id, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -545,12 +683,16 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .get_registration_flow(&req.id, cookie.as_deref())
+            .get_registration_flow(&ory_flow_id, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -564,12 +706,16 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .get_settings_flow(&req.id, cookie.as_deref())
+            .get_settings_flow(&ory_flow_id, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -583,12 +729,16 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .get_recovery_flow(&req.id, cookie.as_deref())
+            .get_recovery_flow(&ory_flow_id, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -602,12 +752,16 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .get_verification_flow(&req.id, cookie.as_deref())
+            .get_verification_flow(&ory_flow_id, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -621,13 +775,17 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .submit_login_flow(&req.id, cookie.as_deref(), body)
+            .submit_login_flow(&ory_flow_id, cookie.as_deref(), body)
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -641,13 +799,17 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .submit_registration_flow(&req.id, cookie.as_deref(), body)
+            .submit_registration_flow(&ory_flow_id, cookie.as_deref(), body)
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -661,13 +823,17 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .submit_settings_flow(&req.id, cookie.as_deref(), body)
+            .submit_settings_flow(&ory_flow_id, cookie.as_deref(), body)
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -681,13 +847,17 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .submit_recovery_flow(&req.id, cookie.as_deref(), body)
+            .submit_recovery_flow(&ory_flow_id, cookie.as_deref(), body)
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -701,13 +871,17 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
+        let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         let flow = self
             .kratos
-            .submit_verification_flow(&req.id, cookie.as_deref(), body)
+            .submit_verification_flow(&ory_flow_id, cookie.as_deref(), body)
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -721,34 +895,48 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
-        let mut query = Vec::<(&str, &str)>::new();
+        let tenant_id = tenant_from_context(&ctx);
+        let mut query_owned = Vec::<(&str, String)>::new();
         if !req.return_to.is_empty() {
-            query.push(("return_to", req.return_to.as_str()));
+            query_owned.push(("return_to", req.return_to));
         }
         if !req.aal.is_empty() {
-            query.push(("aal", req.aal.as_str()));
+            query_owned.push(("aal", req.aal));
         }
         if req.refresh {
-            query.push(("refresh", "true"));
+            query_owned.push(("refresh", "true".to_string()));
         }
         if !req.organization.is_empty() {
-            query.push(("organization", req.organization.as_str()));
+            query_owned.push(("organization", req.organization));
         }
         if !req.via.is_empty() {
-            query.push(("via", req.via.as_str()));
+            query_owned.push(("via", req.via));
         }
         if !req.login_challenge.is_empty() {
-            query.push(("login_challenge", req.login_challenge.as_str()));
+            let ory_challenge = self
+                .transient
+                .get_ory_token(
+                    &tenant_id,
+                    BACKEND_HYDRA,
+                    TOKEN_TYPE_LOGIN_CHALLENGE,
+                    &req.login_challenge,
+                )
+                .await?;
+            query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query.push(("identity_schema", req.identity_schema.as_str()));
+            query_owned.push(("identity_schema", req.identity_schema));
         }
+        let query_refs: Vec<(&str, &str)> =
+            query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let flow = self
             .kratos
-            .create_login_browser_flow(&query, cookie.as_deref())
+            .create_login_browser_flow(&query_refs, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -762,22 +950,36 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
-        let mut query = Vec::<(&str, &str)>::new();
+        let tenant_id = tenant_from_context(&ctx);
+        let mut query_owned = Vec::<(&str, String)>::new();
         if !req.return_to.is_empty() {
-            query.push(("return_to", req.return_to.as_str()));
+            query_owned.push(("return_to", req.return_to));
         }
         if !req.login_challenge.is_empty() {
-            query.push(("login_challenge", req.login_challenge.as_str()));
+            let ory_challenge = self
+                .transient
+                .get_ory_token(
+                    &tenant_id,
+                    BACKEND_HYDRA,
+                    TOKEN_TYPE_LOGIN_CHALLENGE,
+                    &req.login_challenge,
+                )
+                .await?;
+            query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query.push(("identity_schema", req.identity_schema.as_str()));
+            query_owned.push(("identity_schema", req.identity_schema));
         }
+        let query_refs: Vec<(&str, &str)> =
+            query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let flow = self
             .kratos
-            .create_registration_browser_flow(&query, cookie.as_deref())
+            .create_registration_browser_flow(&query_refs, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -791,6 +993,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let return_to = if req.return_to.is_empty() {
             None
         } else {
@@ -802,6 +1005,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -815,6 +1020,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let return_to = if req.return_to.is_empty() {
             None
         } else {
@@ -826,6 +1032,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -839,6 +1047,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<LogoutFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let return_to = if req.return_to.is_empty() {
             None
         } else {
@@ -855,6 +1064,18 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             &self.kratos_public_url,
             &self.gateway_public_url,
         );
+        if !response.body.logout_token.is_empty() {
+            response.body.logout_token = self
+                .transient
+                .create(
+                    &tenant_id,
+                    BACKEND_KRATOS,
+                    TOKEN_TYPE_LOGOUT_TOKEN,
+                    &response.body.logout_token,
+                    transient_expiry(),
+                )
+                .await?;
+        }
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -867,13 +1088,23 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<Empty> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let return_to = if req.return_to.is_empty() {
             None
         } else {
             Some(req.return_to.as_str())
         };
+        let ory_token = self
+            .transient
+            .get_ory_token(
+                &tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_LOGOUT_TOKEN,
+                &req.token,
+            )
+            .await?;
         self.kratos
-            .submit_logout_flow(&req.token, return_to, cookie.as_deref())
+            .submit_logout_flow(&ory_token, return_to, cookie.as_deref())
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(Empty::default()))
@@ -887,6 +1118,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     ) -> ServiceResult<SelfServiceFlow> {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         let return_to = if req.return_to.is_empty() {
             None
         } else {
@@ -898,6 +1130,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(&tenant_id, &mut response.body)
+            .await?;
         self.rewrite_flow_urls(&mut response.body);
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
@@ -912,17 +1146,31 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
         let csrf_token = csrf_token_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         if req.flow.is_empty() {
             return Err(ServiceError::InvalidArgument(
                 "flow is required to exchange a recovery token".into(),
             )
             .into());
         }
+        let ory_token = self
+            .transient
+            .get_ory_token(
+                &tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_RECOVERY_TOKEN,
+                &req.token,
+            )
+            .await?;
+        let ory_flow = self
+            .transient
+            .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &req.flow)
+            .await?;
         let redirect = self
             .kratos
             .submit_recovery_token(
-                &req.token,
-                &req.flow,
+                &ory_token,
+                &ory_flow,
                 cookie.as_deref(),
                 csrf_token.as_deref(),
             )
@@ -948,17 +1196,31 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
         let csrf_token = csrf_token_from_context(&ctx);
+        let tenant_id = tenant_from_context(&ctx);
         if req.flow.is_empty() {
             return Err(ServiceError::InvalidArgument(
                 "flow is required to exchange a verification token".into(),
             )
             .into());
         }
+        let ory_token = self
+            .transient
+            .get_ory_token(
+                &tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_VERIFICATION_TOKEN,
+                &req.token,
+            )
+            .await?;
+        let ory_flow = self
+            .transient
+            .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &req.flow)
+            .await?;
         let redirect = self
             .kratos
             .submit_verification_token(
-                &req.token,
-                &req.flow,
+                &ory_token,
+                &ory_flow,
                 cookie.as_deref(),
                 csrf_token.as_deref(),
             )
@@ -978,16 +1240,25 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
     #[instrument(skip(self, request))]
     async fn get_flow_error(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, GetFlowErrorRequest>,
     ) -> ServiceResult<FlowError> {
         let req = request.to_owned_message();
+        let tenant_id = tenant_from_context(&ctx);
+        let ory_error_id = self
+            .transient
+            .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &req.id)
+            .await?;
         let error = self
             .kratos
-            .get_flow_error(&req.id)
+            .get_flow_error(&ory_error_id)
             .await
             .map_err(map_ory_error)?;
-        Ok(Response::new(ory_flow_error_to_proto(&error)))
+        let mut proto = ory_flow_error_to_proto(&error);
+        if !proto.id.is_empty() {
+            proto.id = self.public_flow(&tenant_id, &proto.id).await?;
+        }
+        Ok(Response::new(proto))
     }
 
     #[instrument(skip(self))]
@@ -1036,6 +1307,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
             ServiceError::Internal("invalid upstream response".into())
         }
         OryClientError::MissingTenant => ServiceError::Unauthenticated("missing tenant".into()),
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
@@ -1053,6 +1325,11 @@ mod tests {
     };
     use sunbeam_g2v::error::ServiceError;
 
+    use crate::db::{
+        DbError, IdMappingRow, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+        TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRow, TransientTokenStore,
+    };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
         CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
@@ -1061,10 +1338,11 @@ mod tests {
         SelfServiceFlow, SubmitFlowRequest, SubmitLogoutFlowRequest, SubmitRecoveryTokenRequest,
         SubmitVerificationTokenRequest, ToSessionRequest,
     };
+    use ulid::Ulid;
 
     use super::{
-        IdentitySelfServiceImpl, KratosSelfService, cookie_from_context, csrf_token_from_context,
-        map_ory_error, tenant_from_context,
+        BACKEND_HYDRA, BACKEND_KRATOS, IdentitySelfServiceImpl, KratosSelfService,
+        cookie_from_context, csrf_token_from_context, map_ory_error, tenant_from_context,
     };
 
     fn request_context_with_cookie(cookie: &str) -> RequestContext {
@@ -1487,20 +1765,461 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubMappingStore {
+        rows: Mutex<Vec<IdMappingRow>>,
+    }
+
+    impl StubMappingStore {
+        fn with_mapping(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Self {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().unwrap().push(row);
+            Self {
+                rows: Mutex::new(std::mem::take(&mut *self.rows.lock().unwrap())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(row)
+        }
+
+        async fn get_ory_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id && r.backend == backend && r.public_id == public_id
+                })
+                .map(|r| r.ory_global_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id
+                        && r.backend == backend
+                        && r.ory_global_id == ory_global_id
+                })
+                .map(|r| r.public_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_id_by_ory_id(
+            &self,
+            _backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.ory_global_id == ory_global_id)
+                .map(|r| r.public_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows.iter().position(|r| {
+                r.tenant_id == tenant_id && r.backend == backend && r.public_id == public_id
+            });
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn list_public_ids(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.tenant_id == tenant_id && r.backend == backend)
+                .map(|r| r.public_id.clone())
+                .collect())
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct StubTransientTokenStore {
+        rows: Mutex<Vec<TransientTokenRow>>,
+    }
+
+    impl StubTransientTokenStore {
+        fn seed(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+            ory_token: &str,
+        ) {
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.to_string(),
+                ory_token: ory_token.to_string(),
+                expires_at: super::transient_expiry(),
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransientTokenStore for StubTransientTokenStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+            expires_at: time::OffsetDateTime,
+        ) -> Result<String, DbError> {
+            let rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter().find(|r| {
+                r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+            }) {
+                return Ok(row.public_token.clone());
+            }
+            drop(rows);
+            let public_token = Ulid::new().to_string();
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.clone(),
+                ory_token: ory_token.to_string(),
+                expires_at,
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+            Ok(public_token)
+        }
+
+        async fn get_ory_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| r.ory_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+                })
+                .map(|r| r.public_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(&self, _tenant_id: &str, public_token: &str) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows.iter().position(|r| r.public_token == public_token);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_ory_token_global(
+            &self,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<(String, String), DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| (r.tenant_id.clone(), r.ory_token.clone()))
+                .ok_or(DbError::MappingNotFound)
+        }
+    }
+
+    fn default_mapping_store() -> StubMappingStore {
+        StubMappingStore::default()
+            .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
+            .with_mapping("tenant-1", BACKEND_HYDRA, "pub-client-1", "client-1")
+    }
+
+    fn default_transient_store() -> StubTransientTokenStore {
+        let store = StubTransientTokenStore::default();
+        store.seed("", BACKEND_KRATOS, TOKEN_TYPE_FLOW, "flow-1", "flow-1");
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "registration-flow",
+            "registration-flow",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "settings-flow",
+            "settings-flow",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "recovery-flow",
+            "recovery-flow",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "recovery-flow-1",
+            "recovery-flow-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "verification-flow",
+            "verification-flow",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "verification-flow-1",
+            "verification-flow-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "pub-error-1",
+            "error-1",
+        );
+        store.seed("", BACKEND_KRATOS, TOKEN_TYPE_FLOW, "error-1", "error-1");
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_SESSION,
+            "session-1",
+            "session-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_LOGOUT_TOKEN,
+            "pub-logout-token",
+            "token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_LOGOUT_TOKEN,
+            "token-1",
+            "token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "pub-recovery-token-1",
+            "recovery-token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "recovery-token-1",
+            "recovery-token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "pub-recovery-token",
+            "recovery-token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "recovery-token",
+            "recovery-token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "token",
+            "token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "expired",
+            "expired",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "pub-verification-token-1",
+            "verification-token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "verification-token-1",
+            "verification-token-1",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "pub-verification-token",
+            "verification-token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "verification-token",
+            "verification-token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "token",
+            "token",
+        );
+        store.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "missing",
+            "missing",
+        );
+        store.seed(
+            "",
+            BACKEND_HYDRA,
+            TOKEN_TYPE_LOGIN_CHALLENGE,
+            "challenge-1",
+            "challenge-1",
+        );
+        store
+    }
+
     fn service(kratos: FakeKratos) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
         }
     }
 
-    #[test]
-    fn new_stores_kratos_client() {
+    #[tokio::test]
+    async fn new_stores_kratos_client() {
         let kratos = Arc::new(KratosClient::new("http://localhost:4434").unwrap());
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
         let svc = IdentitySelfServiceImpl::new(
             kratos.clone(),
+            crate::db::TransientTokenRepo::new(pool.clone()),
+            crate::db::IdMappingRepo::new(pool),
             true,
             "http://kratos.example.com".to_string(),
             "https://gateway.example.com".to_string(),
@@ -1637,6 +2356,7 @@ mod tests {
 
         let resp = svc.to_session(ctx, req).await.unwrap();
         assert_eq!(resp.body.id, "session-1");
+        assert_eq!(resp.body.identity_id, "pub-identity-1");
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
         assert_eq!(
             fake.calls.lock().unwrap()[0],
@@ -1824,7 +2544,7 @@ mod tests {
         });
 
         let resp = svc.create_logout_flow(ctx, req).await.unwrap();
-        assert_eq!(resp.body.logout_token, "token-1");
+        assert_eq!(resp.body.logout_token, "pub-logout-token");
         assert!(
             fake.calls.lock().unwrap()[0]
                 .starts_with("create_logout_flow(return_to=Some(\"http://return\"), cookie=Some(")
@@ -1899,12 +2619,12 @@ mod tests {
         let svc = service(fake.clone());
         let ctx = request_context_without_cookie();
         let req = service_request(GetFlowErrorRequest {
-            id: "error-1".to_string(),
+            id: "pub-error-1".to_string(),
             ..Default::default()
         });
 
         let resp = svc.get_flow_error(ctx, req).await.unwrap();
-        assert_eq!(resp.body.id, "error-1");
+        assert_eq!(resp.body.id, "pub-error-1");
         assert_eq!(fake.calls.lock().unwrap()[0], "get_flow_error(id=error-1)");
     }
 
@@ -2630,7 +3350,7 @@ mod tests {
         let req = service_request(CreateLogoutFlowRequest::default());
 
         let resp = svc.create_logout_flow(ctx, req).await.unwrap();
-        assert_eq!(resp.body.logout_token, "token-1");
+        assert_eq!(resp.body.logout_token, "pub-logout-token");
         let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 1);
     }

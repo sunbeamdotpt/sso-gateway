@@ -13,7 +13,11 @@ use ulid::Ulid;
 
 use crate::{
     auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_IDENTITY_READ, require_scope},
-    db::{IdMappingStore, IdentitySchemaRow, IdentitySchemaStore},
+    db::{
+        IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, TOKEN_TYPE_FLOW,
+        TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenStore,
+    },
     middleware::TenantId,
     proto::iam::v1::{
         CreateIdentityRequest, CreateIdentitySchemaRequest, CreateLoginFlowRequest,
@@ -28,6 +32,11 @@ use crate::{
 };
 
 const BACKEND_KRATOS: &str = "kratos";
+const BACKEND_HYDRA: &str = "hydra";
+
+fn transient_expiry() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
 
 /// Local async trait for the subset of Kratos operations used by identity
 /// service. Keeps the service implementation testable without a real Ory
@@ -158,6 +167,7 @@ pub struct IdentityServiceImpl {
     kratos: Arc<dyn IdentityKratos>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
+    transient: Arc<dyn TransientTokenStore>,
     ui_public_url: String,
 }
 
@@ -166,12 +176,14 @@ impl IdentityServiceImpl {
         kratos: Arc<KratosClient>,
         mappings: crate::db::IdMappingRepo,
         schemas: crate::db::IdentitySchemaRepo,
+        transient: crate::db::TransientTokenRepo,
         ui_public_url: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn IdentityKratos>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             ui_public_url,
         }
     }
@@ -448,34 +460,52 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
-        let mut query = Vec::<(&str, &str)>::new();
+        let mut query_owned = Vec::<(&str, String)>::new();
         if !req.return_to.is_empty() {
-            query.push(("return_to", req.return_to.as_str()));
+            query_owned.push(("return_to", req.return_to));
         }
         if !req.aal.is_empty() {
-            query.push(("aal", req.aal.as_str()));
+            query_owned.push(("aal", req.aal));
         }
         if req.refresh {
-            query.push(("refresh", "true"));
+            query_owned.push(("refresh", "true".to_string()));
         }
         if !req.organization.is_empty() {
-            query.push(("organization", req.organization.as_str()));
+            query_owned.push(("organization", req.organization));
         }
         if !req.via.is_empty() {
-            query.push(("via", req.via.as_str()));
+            query_owned.push(("via", req.via));
         }
         if !req.login_challenge.is_empty() {
-            query.push(("login_challenge", req.login_challenge.as_str()));
+            let ory_challenge = self
+                .transient
+                .get_ory_token(
+                    &tenant_id,
+                    BACKEND_HYDRA,
+                    TOKEN_TYPE_LOGIN_CHALLENGE,
+                    &req.login_challenge,
+                )
+                .await?;
+            query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query.push(("identity_schema", req.identity_schema.as_str()));
+            query_owned.push(("identity_schema", req.identity_schema));
         }
+        let query_refs: Vec<(&str, &str)> =
+            query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let flow = self
             .kratos
-            .create_login_flow(&query)
+            .create_login_flow(&query_refs)
             .await
             .map_err(map_ory_error)?;
-        Ok(Response::new(kratos_flow_to_flow(&flow, &tenant_id)))
+        let public_flow = self.public_flow(&tenant_id, &flow).await?;
+        let public_identity_id = self.public_identity_in_flow(&tenant_id, &flow).await?;
+        Ok(Response::new(kratos_flow_to_flow(
+            &flow,
+            &tenant_id,
+            &public_flow,
+            &public_identity_id,
+        )))
     }
 
     #[instrument(skip(self, request))]
@@ -487,22 +517,40 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
-        let mut query = Vec::<(&str, &str)>::new();
+        let mut query_owned = Vec::<(&str, String)>::new();
         if !req.return_to.is_empty() {
-            query.push(("return_to", req.return_to.as_str()));
+            query_owned.push(("return_to", req.return_to));
         }
         if !req.login_challenge.is_empty() {
-            query.push(("login_challenge", req.login_challenge.as_str()));
+            let ory_challenge = self
+                .transient
+                .get_ory_token(
+                    &tenant_id,
+                    BACKEND_HYDRA,
+                    TOKEN_TYPE_LOGIN_CHALLENGE,
+                    &req.login_challenge,
+                )
+                .await?;
+            query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query.push(("identity_schema", req.identity_schema.as_str()));
+            query_owned.push(("identity_schema", req.identity_schema));
         }
+        let query_refs: Vec<(&str, &str)> =
+            query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let flow = self
             .kratos
-            .create_registration_flow(&query)
+            .create_registration_flow(&query_refs)
             .await
             .map_err(map_ory_error)?;
-        Ok(Response::new(kratos_flow_to_flow(&flow, &tenant_id)))
+        let public_flow = self.public_flow(&tenant_id, &flow).await?;
+        let public_identity_id = self.public_identity_in_flow(&tenant_id, &flow).await?;
+        Ok(Response::new(kratos_flow_to_flow(
+            &flow,
+            &tenant_id,
+            &public_flow,
+            &public_identity_id,
+        )))
     }
 
     #[instrument(skip(self, request))]
@@ -514,9 +562,13 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
+        let ory_session_id = self
+            .transient
+            .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_SESSION, &req.id)
+            .await?;
         let session = self
             .kratos
-            .admin_get_session(&req.id)
+            .admin_get_session(&ory_session_id)
             .await
             .map_err(map_ory_error)?;
 
@@ -525,9 +577,10 @@ impl IdentityService for IdentityServiceImpl {
             .mappings
             .get_public_id(&tenant_id, BACKEND_KRATOS, identity_id)
             .await?;
+        let public_session_id = self.public_session(&tenant_id, &session).await?;
 
         Ok(Response::new(Session {
-            id: req.id,
+            id: public_session_id,
             identity_id: public_identity_id,
             tenant_id,
             active: session["active"].as_bool().unwrap_or(false),
@@ -560,14 +613,19 @@ impl IdentityService for IdentityServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
-        let items = sessions
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|s| kratos_session_to_session(s, &tenant_id, &req.identity_id))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut items = Vec::new();
+        if let Some(arr) = sessions.as_array() {
+            for s in arr {
+                let public_session_id = self.public_session(&tenant_id, s).await?;
+                items.push(Session {
+                    id: public_session_id,
+                    identity_id: req.identity_id.clone(),
+                    tenant_id: tenant_id.clone(),
+                    active: s["active"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                });
+            }
+        }
 
         Ok(Response::new(ListSessionsResponse {
             sessions: items,
@@ -584,10 +642,14 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
+        let ory_session_id = self
+            .transient
+            .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_SESSION, &req.id)
+            .await?;
 
         let session = self
             .kratos
-            .admin_get_session(&req.id)
+            .admin_get_session(&ory_session_id)
             .await
             .map_err(map_ory_error)?;
         let identity_id = session["identity_id"].as_str().unwrap_or("");
@@ -598,7 +660,7 @@ impl IdentityService for IdentityServiceImpl {
             .await?;
 
         self.kratos
-            .delete_session(&req.id)
+            .delete_session(&ory_session_id)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(Empty::default()))
@@ -647,25 +709,49 @@ impl IdentityService for IdentityServiceImpl {
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default();
 
-        let gateway_link = if flow.is_empty() {
+        let public_recovery_token = self
+            .transient
+            .create(
+                &tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_RECOVERY_TOKEN,
+                &recovery_token,
+                transient_expiry(),
+            )
+            .await?;
+        let public_flow = if flow.is_empty() {
+            String::new()
+        } else {
+            self.transient
+                .create(
+                    &tenant_id,
+                    BACKEND_KRATOS,
+                    TOKEN_TYPE_FLOW,
+                    &flow,
+                    transient_expiry(),
+                )
+                .await?
+        };
+
+        let gateway_link = if public_flow.is_empty() {
             format!(
                 "{}/recovery?token={}",
                 self.ui_public_url.trim_end_matches('/'),
-                urlencoding::encode(&recovery_token)
+                urlencoding::encode(&public_recovery_token)
             )
         } else {
             format!(
                 "{}/recovery?flow={}&token={}",
                 self.ui_public_url.trim_end_matches('/'),
-                urlencoding::encode(&flow),
-                urlencoding::encode(&recovery_token)
+                urlencoding::encode(&public_flow),
+                urlencoding::encode(&public_recovery_token)
             )
         };
 
         Ok(Response::new(RecoveryLink {
             recovery_link: gateway_link,
-            recovery_token: recovery_token.to_string(),
-            flow,
+            recovery_token: public_recovery_token,
+            flow: public_flow,
             expires_at: response.body["expires_at"]
                 .as_str()
                 .and_then(parse_timestamp)
@@ -712,7 +798,7 @@ impl IdentityService for IdentityServiceImpl {
         .ok_or_else(|| ServiceError::NotFound("verification message not found".into()))?;
 
         let body = message["body"].as_str().unwrap_or("");
-        let (link, flow) = extract_first_self_service_link(body)
+        let (raw_token, raw_flow) = extract_first_self_service_link(body)
             .and_then(|url| {
                 reqwest::Url::parse(&url).ok().map(|u| {
                     let token = u
@@ -725,26 +811,54 @@ impl IdentityService for IdentityServiceImpl {
                         .find(|(k, _)| k == "flow")
                         .map(|(_, v)| v.into_owned())
                         .unwrap_or_default();
-                    let link = if token.is_empty() {
-                        String::new()
-                    } else if flow.is_empty() {
-                        format!(
-                            "{}/verification?token={}",
-                            self.ui_public_url.trim_end_matches('/'),
-                            urlencoding::encode(&token)
-                        )
-                    } else {
-                        format!(
-                            "{}/verification?flow={}&token={}",
-                            self.ui_public_url.trim_end_matches('/'),
-                            urlencoding::encode(&flow),
-                            urlencoding::encode(&token)
-                        )
-                    };
-                    (link, flow)
+                    (token, flow)
                 })
             })
             .unwrap_or_default();
+
+        let public_token = if raw_token.is_empty() {
+            String::new()
+        } else {
+            self.transient
+                .create(
+                    &tenant_id,
+                    BACKEND_KRATOS,
+                    TOKEN_TYPE_VERIFICATION_TOKEN,
+                    &raw_token,
+                    transient_expiry(),
+                )
+                .await?
+        };
+        let public_flow = if raw_flow.is_empty() {
+            String::new()
+        } else {
+            self.transient
+                .create(
+                    &tenant_id,
+                    BACKEND_KRATOS,
+                    TOKEN_TYPE_FLOW,
+                    &raw_flow,
+                    transient_expiry(),
+                )
+                .await?
+        };
+
+        let link = if public_token.is_empty() {
+            String::new()
+        } else if public_flow.is_empty() {
+            format!(
+                "{}/verification?token={}",
+                self.ui_public_url.trim_end_matches('/'),
+                urlencoding::encode(&public_token)
+            )
+        } else {
+            format!(
+                "{}/verification?flow={}&token={}",
+                self.ui_public_url.trim_end_matches('/'),
+                urlencoding::encode(&public_flow),
+                urlencoding::encode(&public_token)
+            )
+        };
 
         Ok(Response::new(VerificationMessage {
             id: message["id"].as_str().unwrap_or("").to_string(),
@@ -759,7 +873,7 @@ impl IdentityService for IdentityServiceImpl {
                 .map(Into::into)
                 .unwrap_or_default(),
             link,
-            flow,
+            flow: public_flow,
             ..Default::default()
         }))
     }
@@ -783,6 +897,63 @@ impl IdentityServiceImpl {
             Err(_) => "default".to_string(),
         };
         Ok((ory_id, schema_id))
+    }
+
+    async fn public_flow(
+        &self,
+        tenant_id: &str,
+        flow: &serde_json::Value,
+    ) -> Result<String, ServiceError> {
+        let ory_flow_id = flow["id"].as_str().unwrap_or("");
+        if ory_flow_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.transient
+            .create(
+                tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_FLOW,
+                ory_flow_id,
+                transient_expiry(),
+            )
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn public_identity_in_flow(
+        &self,
+        tenant_id: &str,
+        flow: &serde_json::Value,
+    ) -> Result<String, ServiceError> {
+        let ory_identity_id = flow["identity"]["id"].as_str().unwrap_or("");
+        if ory_identity_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.mappings
+            .get_public_id(tenant_id, BACKEND_KRATOS, ory_identity_id)
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn public_session(
+        &self,
+        tenant_id: &str,
+        session: &serde_json::Value,
+    ) -> Result<String, ServiceError> {
+        let ory_session_id = session["id"].as_str().unwrap_or("");
+        if ory_session_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.transient
+            .create(
+                tenant_id,
+                BACKEND_KRATOS,
+                TOKEN_TYPE_SESSION,
+                ory_session_id,
+                transient_expiry(),
+            )
+            .await
+            .map_err(|e| e.into())
     }
 
     async fn resolve_schema(
@@ -931,6 +1102,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
@@ -1009,20 +1181,6 @@ fn kratos_to_identity(
     }
 }
 
-fn kratos_session_to_session(
-    session: &serde_json::Value,
-    tenant_id: &str,
-    public_identity_id: &str,
-) -> Session {
-    Session {
-        id: session["id"].as_str().unwrap_or("").to_string(),
-        identity_id: public_identity_id.to_string(),
-        tenant_id: tenant_id.to_string(),
-        active: session["active"].as_bool().unwrap_or(false),
-        ..Default::default()
-    }
-}
-
 fn schema_row_to_proto(row: IdentitySchemaRow) -> IdentitySchema {
     let schema_struct = serde_json::from_value::<ProtoStruct>(row.schema_json).unwrap_or_default();
     IdentitySchema {
@@ -1037,13 +1195,18 @@ fn schema_row_to_proto(row: IdentitySchemaRow) -> IdentitySchema {
     }
 }
 
-fn kratos_flow_to_flow(flow: &serde_json::Value, tenant_id: &str) -> Flow {
+fn kratos_flow_to_flow(
+    flow: &serde_json::Value,
+    tenant_id: &str,
+    public_flow_id: &str,
+    public_identity_id: &str,
+) -> Flow {
     let ui_struct = serde_json::from_value::<ProtoStruct>(flow["ui"].clone()).unwrap_or_default();
     Flow {
-        id: flow["id"].as_str().unwrap_or("").to_string(),
+        id: public_flow_id.to_string(),
         r#type: flow["type"].as_str().unwrap_or("").to_string(),
         tenant_id: tenant_id.to_string(),
-        identity_id: flow["identity"]["id"].as_str().unwrap_or("").to_string(),
+        identity_id: public_identity_id.to_string(),
         expires_at: flow["expires_at"]
             .as_str()
             .and_then(parse_timestamp)
@@ -1079,7 +1242,10 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::auth::AuthContext;
-    use crate::db::{DbError, IdMappingRepo, IdMappingRow, IdentitySchemaRepo};
+    use crate::db::{
+        DbError, IdMappingRepo, IdMappingRow, IdentitySchemaRepo, TransientTokenRepo,
+        TransientTokenRow, TransientTokenStore,
+    };
 
     macro_rules! svc_req {
         ($id:ident, $req:expr, $ty:ty) => {
@@ -1486,6 +1652,130 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct StubTransientTokenStore {
+        rows: std::sync::Mutex<Vec<TransientTokenRow>>,
+    }
+
+    impl StubTransientTokenStore {
+        fn seed(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+            ory_token: &str,
+        ) {
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.to_string(),
+                ory_token: ory_token.to_string(),
+                expires_at: transient_expiry(),
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+        }
+    }
+
+    #[async_trait]
+    impl TransientTokenStore for StubTransientTokenStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+            expires_at: time::OffsetDateTime,
+        ) -> Result<String, DbError> {
+            let rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter().find(|r| {
+                r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+            }) {
+                return Ok(row.public_token.clone());
+            }
+            drop(rows);
+            let public_token = Ulid::new().to_string();
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.clone(),
+                ory_token: ory_token.to_string(),
+                expires_at,
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+            Ok(public_token)
+        }
+
+        async fn get_ory_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| r.ory_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+                })
+                .map(|r| r.public_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(&self, _tenant_id: &str, public_token: &str) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows.iter().position(|r| r.public_token == public_token);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_ory_token_global(
+            &self,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<(String, String), DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| (r.tenant_id.clone(), r.ory_token.clone()))
+                .ok_or(DbError::MappingNotFound)
+        }
+    }
+
+    #[derive(Default)]
     struct StubSchemaStore {
         rows: Mutex<Vec<IdentitySchemaRow>>,
     }
@@ -1598,13 +1888,69 @@ mod tests {
         kratos: StubKratos,
         mappings: StubMappingStore,
         schemas: StubSchemaStore,
+        transient: StubTransientTokenStore,
     ) -> IdentityServiceImpl {
         IdentityServiceImpl {
             kratos: Arc::new(kratos),
             mappings: Arc::new(mappings),
             schemas: Arc::new(schemas),
+            transient: Arc::new(transient),
             ui_public_url: "https://ui.example.com".to_string(),
         }
+    }
+
+    fn default_transient_store() -> StubTransientTokenStore {
+        let store = StubTransientTokenStore::default();
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_SESSION,
+            "pub-sess-1",
+            "sess-1",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "flow-abc",
+            "flow-abc",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "flow-v25",
+            "flow-v25",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "pub-recovery-abc",
+            "abc",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_RECOVERY_TOKEN,
+            "pub-recovery-kratos-v25",
+            "kratos-v25-token",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_VERIFICATION_TOKEN,
+            "pub-token-v1",
+            "v1",
+        );
+        store.seed(
+            "tenant-1",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "pub-flow-v1",
+            "flow-v1",
+        );
+        store
     }
 
     #[test]
@@ -1685,10 +2031,16 @@ mod tests {
     }
 
     #[test]
-    fn kratos_session_to_session_extracts_fields() {
+    fn session_proto_extracts_fields() {
         let session = json!({"id": "sess-1", "active": true});
-        let s = kratos_session_to_session(&session, "tenant-1", "pub-1");
-        assert_eq!(s.id, "sess-1");
+        let s = Session {
+            id: "pub-sess-1".into(),
+            identity_id: "pub-1".into(),
+            tenant_id: "tenant-1".into(),
+            active: session["active"].as_bool().unwrap_or(false),
+            ..Default::default()
+        };
+        assert_eq!(s.id, "pub-sess-1");
         assert_eq!(s.identity_id, "pub-1");
         assert_eq!(s.tenant_id, "tenant-1");
         assert!(s.active);
@@ -1719,10 +2071,11 @@ mod tests {
             "expires_at": "2026-06-28T12:00:00Z",
             "ui": {"nodes": []}
         });
-        let f = kratos_flow_to_flow(&flow, "tenant-1");
-        assert_eq!(f.id, "flow-1");
+        let f = kratos_flow_to_flow(&flow, "tenant-1", "pub-flow-1", "pub-identity-1");
+        assert_eq!(f.id, "pub-flow-1");
         assert_eq!(f.r#type, "login");
         assert_eq!(f.tenant_id, "tenant-1");
+        assert_eq!(f.identity_id, "pub-identity-1");
     }
 
     #[test]
@@ -1809,6 +2162,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+            default_transient_store(),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1831,6 +2185,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+            default_transient_store(),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1853,6 +2208,7 @@ mod tests {
             }),
             StubMappingStore::default(),
             StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+            default_transient_store(),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -1875,6 +2231,7 @@ mod tests {
             ),
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetIdentityRequest {
             id: "pub-1".into(),
@@ -1895,6 +2252,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetIdentityRequest {
             id: "missing".into(),
@@ -1914,7 +2272,12 @@ mod tests {
             json!({"id": "ory-1", "schema_id": "default", "traits": {}}),
         );
         let mappings = StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1");
-        let svc = make_service(kratos, mappings, StubSchemaStore::default());
+        let svc = make_service(
+            kratos,
+            mappings,
+            StubSchemaStore::default(),
+            default_transient_store(),
+        );
         let req = ListIdentitiesRequest::default();
         svc_req!(svc_req, req, ListIdentitiesRequest);
         let resp = IdentityService::list_identities(&svc, read_ctx("tenant-1"), svc_req)
@@ -1935,6 +2298,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+            default_transient_store(),
         );
         let req = UpdateIdentityRequest {
             id: "pub-1".into(),
@@ -1955,7 +2319,12 @@ mod tests {
     async fn delete_identity_happy_path() {
         let kratos = StubKratos::with_identity("ory-1", json!({"id": "ory-1"}));
         let mappings = StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1");
-        let svc = make_service(kratos, mappings, StubSchemaStore::default());
+        let svc = make_service(
+            kratos,
+            mappings,
+            StubSchemaStore::default(),
+            default_transient_store(),
+        );
         let req = DeleteIdentityRequest {
             id: "pub-1".into(),
             ..Default::default()
@@ -1972,6 +2341,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let tenant_id = "tenant-1";
 
@@ -2054,6 +2424,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = CreateLoginFlowRequest {
             return_to: "https://app.example.com/callback".into(),
@@ -2074,6 +2445,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = CreateRegistrationFlowRequest {
             return_to: "https://app.example.com/callback".into(),
@@ -2098,9 +2470,10 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetSessionRequest {
-            id: "sess-1".into(),
+            id: "pub-sess-1".into(),
             ..Default::default()
         };
         svc_req!(svc_req, req, GetSessionRequest);
@@ -2108,7 +2481,7 @@ mod tests {
             .await
             .unwrap()
             .body;
-        assert_eq!(resp.id, "sess-1");
+        assert_eq!(resp.id, "pub-sess-1");
         assert_eq!(resp.identity_id, "pub-1");
         assert!(resp.active);
     }
@@ -2119,6 +2492,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = ListSessionsRequest::default();
         svc_req!(svc_req, req, ListSessionsRequest);
@@ -2140,6 +2514,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = ListSessionsRequest {
             identity_id: "pub-1".into(),
@@ -2151,7 +2526,7 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(resp.sessions.len(), 1);
-        assert_eq!(resp.sessions[0].id, "sess-1");
+        assert_eq!(resp.sessions[0].id, "pub-sess-1");
     }
 
     #[tokio::test]
@@ -2165,9 +2540,10 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = DeleteSessionRequest {
-            id: "sess-1".into(),
+            id: "pub-sess-1".into(),
             ..Default::default()
         };
         svc_req!(svc_req, req, DeleteSessionRequest);
@@ -2190,6 +2566,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = CreateRecoveryLinkRequest {
             identity_id: "pub-1".into(),
@@ -2203,9 +2580,9 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://ui.example.com/recovery?flow=flow-abc&token=abc"
+            "https://ui.example.com/recovery?flow=flow-abc&token=pub-recovery-abc"
         );
-        assert_eq!(resp.recovery_token, "abc");
+        assert_eq!(resp.recovery_token, "pub-recovery-abc");
         assert_eq!(resp.flow, "flow-abc");
         assert!(resp.expires_at.is_set());
     }
@@ -2223,6 +2600,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = CreateRecoveryLinkRequest {
             identity_id: "pub-1".into(),
@@ -2236,9 +2614,9 @@ mod tests {
             .body;
         assert_eq!(
             resp.recovery_link,
-            "https://ui.example.com/recovery?flow=flow-v25&token=kratos-v25-token"
+            "https://ui.example.com/recovery?flow=flow-v25&token=pub-recovery-kratos-v25"
         );
-        assert_eq!(resp.recovery_token, "kratos-v25-token");
+        assert_eq!(resp.recovery_token, "pub-recovery-kratos-v25");
         assert_eq!(resp.flow, "flow-v25");
         assert!(resp.expires_at.is_set());
     }
@@ -2261,6 +2639,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetVerificationMessageRequest {
             identity_id: "pub-1".into(),
@@ -2274,9 +2653,9 @@ mod tests {
         assert_eq!(resp.id, "msg-1");
         assert_eq!(
             resp.link,
-            "https://ui.example.com/verification?flow=flow-v1&token=v1"
+            "https://ui.example.com/verification?flow=pub-flow-v1&token=pub-token-v1"
         );
-        assert_eq!(resp.flow, "flow-v1");
+        assert_eq!(resp.flow, "pub-flow-v1");
     }
 
     #[test]
@@ -2304,6 +2683,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = ListIdentitiesRequest::default();
         svc_req!(svc_req, req, ListIdentitiesRequest);
@@ -2321,7 +2701,8 @@ mod tests {
         let service = IdentityServiceImpl::new(
             kratos.clone(),
             IdMappingRepo::new(pool.clone()),
-            IdentitySchemaRepo::new(pool),
+            IdentitySchemaRepo::new(pool.clone()),
+            TransientTokenRepo::new(pool),
             "https://ui.example.com".to_string(),
         );
         let _cloned = service.clone();
@@ -2333,6 +2714,7 @@ mod tests {
             kratos: Arc::new(StubKratos::default()),
             mappings: Arc::new(StubMappingStore::default()),
             schemas: Arc::new(StubSchemaStore::default()),
+            transient: Arc::new(StubTransientTokenStore::default()),
             ui_public_url: "https://ui.example.com".to_string(),
         };
         let _cloned = svc.clone();
@@ -2367,6 +2749,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::with_row(schema_row("tenant-1", "default", email_schema(), true)),
+            default_transient_store(),
         );
         let req = CreateIdentityRequest {
             schema_id: "default".into(),
@@ -2390,6 +2773,7 @@ mod tests {
             ),
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetIdentityRequest {
             id: "pub-1".into(),
@@ -2411,6 +2795,7 @@ mod tests {
             ),
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetIdentityRequest {
             id: "pub-1".into(),
@@ -2430,6 +2815,7 @@ mod tests {
             StubKratos::default(),
             StubMappingStore::default(),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = DeleteSessionRequest {
             id: "sess-1".into(),
@@ -2453,6 +2839,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-2", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = DeleteSessionRequest {
             id: "sess-1".into(),
@@ -2476,6 +2863,7 @@ mod tests {
             kratos,
             StubMappingStore::with_mapping("tenant-2", BACKEND_KRATOS, "pub-1", "ory-1"),
             StubSchemaStore::default(),
+            default_transient_store(),
         );
         let req = GetSessionRequest {
             id: "sess-1".into(),

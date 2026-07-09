@@ -5,8 +5,8 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, TenantRepo, bootstrap_system_tenant,
-        create_pool,
+        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, TenantRepo, TransientTokenRepo,
+        bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{IdentityServiceExt, TenantServiceExt},
@@ -92,6 +92,7 @@ async fn identity_service_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas,
+        TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
     ));
 

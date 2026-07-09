@@ -6,7 +6,11 @@ use axum::{
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
+    db::{
+        IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
+        TOKEN_TYPE_LOGOUT_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, bootstrap_system_tenant, create_pool,
+    },
     middleware::auth_middleware,
     proto::iam::v1::{IdentitySelfServiceExt, OAuth2ConsentServiceExt},
     services::{
@@ -20,9 +24,31 @@ use sunbeam_g2v::{
     router::ServiceRouter,
     server::{axum::bind_random_port, builder::ServerBuilder},
 };
+use time::{Duration, OffsetDateTime};
 
 mod support;
 
+/// Seed a transient token mapping so integration tests can present opaque
+/// public tokens at the API boundary while the mock backends continue to use
+/// their fixed Ory identifiers.
+async fn seed_token(
+    transient: &TransientTokenRepo,
+    tenant_id: &str,
+    backend: &str,
+    token_type: &str,
+    ory_token: &str,
+) -> String {
+    transient
+        .create(
+            tenant_id,
+            backend,
+            token_type,
+            ory_token,
+            OffsetDateTime::now_utc() + Duration::seconds(3600),
+        )
+        .await
+        .expect("transient token should be seeded")
+}
 fn kratos_app() -> Router {
     Router::new()
         .route("/sessions/whoami", get(kratos_whoami))
@@ -169,8 +195,14 @@ async fn kratos_get_flow_error(
 async fn kratos_submit_recovery_token(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
-) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<serde_json::Value>), axum::http::StatusCode>
-{
+) -> Result<
+    (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        Json<serde_json::Value>,
+    ),
+    axum::http::StatusCode,
+> {
     let token = params.get("token").cloned().unwrap_or_default();
     let flow = params.get("flow").cloned().unwrap_or_default();
     if token != "valid-recovery-token" || flow != "recovery-flow-id" {
@@ -197,14 +229,24 @@ async fn kratos_submit_recovery_token(
             .parse()
             .unwrap(),
     );
-    Ok((axum::http::StatusCode::SEE_OTHER, resp_headers, Json(json!({}))))
+    Ok((
+        axum::http::StatusCode::SEE_OTHER,
+        resp_headers,
+        Json(json!({})),
+    ))
 }
 
 async fn kratos_submit_verification_token(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
-) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Json<serde_json::Value>), axum::http::StatusCode>
-{
+) -> Result<
+    (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        Json<serde_json::Value>,
+    ),
+    axum::http::StatusCode,
+> {
     let token = params.get("token").cloned().unwrap_or_default();
     let flow = params.get("flow").cloned().unwrap_or_default();
     if token != "valid-verification-token" || flow != "verification-flow-id" {
@@ -227,7 +269,11 @@ async fn kratos_submit_verification_token(
             .parse()
             .unwrap(),
     );
-    Ok((axum::http::StatusCode::SEE_OTHER, resp_headers, Json(json!({}))))
+    Ok((
+        axum::http::StatusCode::SEE_OTHER,
+        resp_headers,
+        Json(json!({})),
+    ))
 }
 
 async fn kratos_webauthn_js() -> &'static str {
@@ -342,15 +388,108 @@ async fn self_service_and_consent_round_trip() {
         .create(&system_tenant_ulid, "kratos", "public-1", "identity-1")
         .await
         .expect("mapping should be created");
+    mappings
+        .create(&system_tenant_ulid, "hydra", "public-client-1", "client-1")
+        .await
+        .expect("client mapping should be created");
+    mappings
+        .create(
+            &system_tenant_ulid,
+            "kratos",
+            "public-subject-1",
+            "subject-1",
+        )
+        .await
+        .expect("subject mapping should be created");
     support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
+
+    let transient = TransientTokenRepo::new(pool.clone());
+    let pub_flow = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_FLOW,
+        "flow-1",
+    )
+    .await;
+    let pub_recovery_flow = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_FLOW,
+        "recovery-flow-id",
+    )
+    .await;
+    let pub_verification_flow = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_FLOW,
+        "verification-flow-id",
+    )
+    .await;
+    let pub_error = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_FLOW,
+        "error-1",
+    )
+    .await;
+    let pub_consent = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "hydra",
+        TOKEN_TYPE_CONSENT_CHALLENGE,
+        "challenge-1",
+    )
+    .await;
+    let pub_logout_challenge = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "hydra",
+        TOKEN_TYPE_LOGOUT_CHALLENGE,
+        "logout-1",
+    )
+    .await;
+    let pub_logout_token = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_LOGOUT_TOKEN,
+        "token-1",
+    )
+    .await;
+    let pub_recovery_token = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_RECOVERY_TOKEN,
+        "valid-recovery-token",
+    )
+    .await;
+    let pub_verification_token = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_VERIFICATION_TOKEN,
+        "valid-verification-token",
+    )
+    .await;
 
     let self_service = Arc::new(IdentitySelfServiceImpl::new(
         kratos.clone(),
+        TransientTokenRepo::new(pool.clone()),
+        mappings.clone(),
         true,
         kratos_url.clone(),
         "http://gateway.test".to_string(),
     ));
-    let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
+    let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
+        hydra.clone(),
+        TransientTokenRepo::new(pool.clone()),
+        mappings.clone(),
+    ));
 
     let connect_router: ConnectRouter = self_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = consent_service.register(connect_router);
@@ -414,7 +553,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1" }))
+        .json(&json!({ "id": &pub_flow }))
         .send()
         .await
         .expect("get_login_flow request should succeed");
@@ -437,7 +576,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1", "body": { "identifier": "a" } }))
+        .json(&json!({ "id": &pub_flow, "body": { "identifier": "a" } }))
         .send()
         .await
         .expect("submit_login_flow request should succeed");
@@ -539,7 +678,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1" }))
+        .json(&json!({ "id": &pub_flow }))
         .send()
         .await
         .expect("get_registration_flow request should succeed");
@@ -557,7 +696,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1", "body": { "traits": { "email": "a@b.com" } } }))
+        .json(&json!({ "id": &pub_flow, "body": { "traits": { "email": "a@b.com" } } }))
         .send()
         .await
         .expect("submit_registration_flow request should succeed");
@@ -573,7 +712,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1" }))
+        .json(&json!({ "id": &pub_flow }))
         .send()
         .await
         .expect("get_settings_flow request should succeed");
@@ -591,7 +730,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1", "body": { "traits": {} } }))
+        .json(&json!({ "id": &pub_flow, "body": { "traits": {} } }))
         .send()
         .await
         .expect("submit_settings_flow request should succeed");
@@ -607,7 +746,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1" }))
+        .json(&json!({ "id": &pub_flow }))
         .send()
         .await
         .expect("get_recovery_flow request should succeed");
@@ -625,7 +764,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1", "body": { "email": "a@b.com" } }))
+        .json(&json!({ "id": &pub_flow, "body": { "email": "a@b.com" } }))
         .send()
         .await
         .expect("submit_recovery_flow request should succeed");
@@ -643,7 +782,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1" }))
+        .json(&json!({ "id": &pub_flow }))
         .send()
         .await
         .expect("get_verification_flow request should succeed");
@@ -661,7 +800,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": "flow-1", "body": { "code": "123456" } }))
+        .json(&json!({ "id": &pub_flow, "body": { "code": "123456" } }))
         .send()
         .await
         .expect("submit_verification_flow request should succeed");
@@ -698,7 +837,7 @@ async fn self_service_and_consent_round_trip() {
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
         .header("x-csrf-token", "csrf-1")
-        .json(&json!({ "token": "valid-recovery-token", "flow": "recovery-flow-id" }))
+        .json(&json!({ "token": &pub_recovery_token, "flow": &pub_recovery_flow }))
         .send()
         .await
         .expect("submit_recovery_token request should succeed");
@@ -731,7 +870,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "token": "valid-verification-token", "flow": "verification-flow-id" }))
+        .json(&json!({ "token": &pub_verification_token, "flow": &pub_verification_flow }))
         .send()
         .await
         .expect("submit_verification_token request should succeed");
@@ -786,7 +925,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "token": "token-1" }))
+        .json(&json!({ "token": &pub_logout_token }))
         .send()
         .await
         .expect("submit_logout_flow request should succeed");
@@ -801,7 +940,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!("{base}/iam.v1.IdentitySelfService/GetFlowError"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "id": "error-1" }))
+        .json(&json!({ "id": &pub_error }))
         .send()
         .await
         .expect("get_flow_error request should succeed");
@@ -835,7 +974,7 @@ async fn self_service_and_consent_round_trip() {
         ))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "challenge-1" }))
+        .json(&json!({ "challenge": &pub_consent }))
         .send()
         .await
         .expect("get_consent_request request should succeed");
@@ -850,7 +989,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!("{base}/iam.v1.OAuth2ConsentService/AcceptConsent"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "challenge-1", "grantScope": ["openid"] }))
+        .json(&json!({ "challenge": &pub_consent, "grantScope": ["openid"] }))
         .send()
         .await
         .expect("accept_consent request should succeed");
@@ -865,7 +1004,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!("{base}/iam.v1.OAuth2ConsentService/RejectConsent"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "challenge-1", "error": "access_denied" }))
+        .json(&json!({ "challenge": &pub_consent, "error": "access_denied" }))
         .send()
         .await
         .expect("reject_consent request should succeed");
@@ -882,7 +1021,7 @@ async fn self_service_and_consent_round_trip() {
         ))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "logout-1" }))
+        .json(&json!({ "challenge": &pub_logout_challenge }))
         .send()
         .await
         .expect("get_logout_request request should succeed");
@@ -897,7 +1036,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!("{base}/iam.v1.OAuth2ConsentService/AcceptLogout"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "logout-1" }))
+        .json(&json!({ "challenge": &pub_logout_challenge }))
         .send()
         .await
         .expect("accept_logout request should succeed");
@@ -912,7 +1051,7 @@ async fn self_service_and_consent_round_trip() {
         .post(format!("{base}/iam.v1.OAuth2ConsentService/RejectLogout"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .json(&json!({ "challenge": "logout-1", "error": "invalid_request" }))
+        .json(&json!({ "challenge": &pub_logout_challenge, "error": "invalid_request" }))
         .send()
         .await
         .expect("reject_logout request should succeed");
