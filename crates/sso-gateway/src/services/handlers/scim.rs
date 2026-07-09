@@ -538,6 +538,14 @@ mod tests {
             unimplemented!()
         }
 
+        async fn get_public_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            Ok("pub-sub-1".into())
+        }
+
         async fn delete(
             &self,
             _tenant_id: &str,

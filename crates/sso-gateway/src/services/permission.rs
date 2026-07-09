@@ -13,7 +13,10 @@ use tracing::instrument;
 
 use crate::{
     auth::{AuthContext, SCOPE_PERMISSION_ADMIN, SCOPE_PERMISSION_READ, require_scope},
-    db::{PermissionTupleRepo, PermissionTupleRow, PermissionTupleStore},
+    db::{
+        IdMappingRepo, IdMappingStore, PermissionTupleRepo, PermissionTupleRow,
+        PermissionTupleStore,
+    },
     middleware::TenantId,
     proto::iam::v1::{
         CheckPermissionRequest, CheckPermissionResponse, CreateRelationTupleRequest,
@@ -56,6 +59,7 @@ impl From<OryClientError> for PermissionBackendError {
             OryClientError::MissingTenant => {
                 Self::Configuration("missing tenant context".to_string())
             }
+            OryClientError::Redirect { .. } => Self::Unavailable("unexpected redirect".into()),
         }
     }
 }
@@ -199,7 +203,12 @@ impl PermissionBackend for KetoClient {
         subject_id: &str,
     ) -> Result<bool, PermissionBackendError> {
         Ok(self
-            .check_permission(namespace, &tenant_object(tenant_id, object), relation, subject_id)
+            .check_permission(
+                namespace,
+                &tenant_object(tenant_id, object),
+                relation,
+                subject_id,
+            )
             .await?)
     }
 
@@ -212,7 +221,12 @@ impl PermissionBackend for KetoClient {
         subject_id: &str,
     ) -> Result<Value, PermissionBackendError> {
         Ok(self
-            .create_relation_tuple(namespace, &tenant_object(tenant_id, object), relation, subject_id)
+            .create_relation_tuple(
+                namespace,
+                &tenant_object(tenant_id, object),
+                relation,
+                subject_id,
+            )
             .await?)
     }
 
@@ -225,7 +239,12 @@ impl PermissionBackend for KetoClient {
         subject_id: &str,
     ) -> Result<(), PermissionBackendError> {
         Ok(self
-            .delete_relation_tuple(namespace, &tenant_object(tenant_id, object), relation, subject_id)
+            .delete_relation_tuple(
+                namespace,
+                &tenant_object(tenant_id, object),
+                relation,
+                subject_id,
+            )
             .await?)
     }
 
@@ -236,7 +255,9 @@ impl PermissionBackend for KetoClient {
         object: &str,
         relation: &str,
     ) -> Result<Value, PermissionBackendError> {
-        Ok(self.expand(namespace, &tenant_object(tenant_id, object), relation).await?)
+        Ok(self
+            .expand(namespace, &tenant_object(tenant_id, object), relation)
+            .await?)
     }
 
     async fn expand_objects(
@@ -311,7 +332,9 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         namespace: &str,
     ) -> Result<Option<NamespaceMapping>, PermissionBackendError> {
         let lock = self.mappings.lock().unwrap();
-        Ok(lock.get(&(tenant_id.to_string(), namespace.to_string())).cloned())
+        Ok(lock
+            .get(&(tenant_id.to_string(), namespace.to_string()))
+            .cloned())
     }
 
     async fn set(
@@ -321,10 +344,7 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         mapping: NamespaceMapping,
     ) -> Result<(), PermissionBackendError> {
         let mut lock = self.mappings.lock().unwrap();
-        lock.insert(
-            (tenant_id.to_string(), namespace.to_string()),
-            mapping,
-        );
+        lock.insert((tenant_id.to_string(), namespace.to_string()), mapping);
         Ok(())
     }
 }
@@ -500,14 +520,16 @@ impl PermissionBackend for OpenFgaPermissionBackend {
                 &typed,
             )
             .await?;
-        Ok(serde_json::json!({ "relation_tuples": objects.iter().map(|o| {
+        Ok(
+            serde_json::json!({ "relation_tuples": objects.iter().map(|o| {
             serde_json::json!({
                 "namespace": namespace,
                 "object": o,
                 "relation": relation,
                 "subject_id": user,
             })
-        }).collect::<Vec<_>>() }))
+        }).collect::<Vec<_>>() }),
+        )
     }
 
     async fn ensure_namespace(
@@ -531,10 +553,7 @@ impl PermissionBackend for OpenFgaPermissionBackend {
             .set(
                 tenant_id,
                 namespace,
-                NamespaceMapping {
-                    store_id,
-                    model_id,
-                },
+                NamespaceMapping { store_id, model_id },
             )
             .await?;
         Ok(())
@@ -545,13 +564,19 @@ impl PermissionBackend for OpenFgaPermissionBackend {
 pub struct PermissionServiceImpl {
     backend: Arc<dyn PermissionBackend>,
     tuples: Arc<dyn PermissionTupleStore>,
+    mappings: Arc<dyn IdMappingStore>,
 }
 
 impl PermissionServiceImpl {
-    pub fn new(backend: Arc<dyn PermissionBackend>, tuples: PermissionTupleRepo) -> Self {
+    pub fn new(
+        backend: Arc<dyn PermissionBackend>,
+        tuples: PermissionTupleRepo,
+        mappings: IdMappingRepo,
+    ) -> Self {
         Self {
             backend,
             tuples: Arc::new(tuples) as Arc<dyn PermissionTupleStore>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
         }
     }
 }
@@ -657,7 +682,8 @@ impl PermissionService for PermissionServiceImpl {
             .expand(&tenant_id, &req.namespace, &req.object, &req.relation)
             .await?;
 
-        let tree = serde_json::to_string(&expanded).unwrap_or_default();
+        let sanitized = sanitize_expand_tree(&expanded, &tenant_id, &self.mappings).await?;
+        let tree = serde_json::to_string(&sanitized).unwrap_or_default();
         Ok(Response::new(ExpandPermissionsResponse {
             tree,
             ..Default::default()
@@ -688,19 +714,21 @@ impl PermissionService for PermissionServiceImpl {
             )
             .await?;
 
-        let objects = expanded
+        let sanitized = sanitize_expand_tree(&expanded, &tenant_id, &self.mappings).await?;
+
+        let objects = sanitized
             .get("relation_tuples")
             .and_then(|v| v.as_array())
             .map(|tuples| {
                 tuples
                     .iter()
                     .filter_map(|tuple| tuple.get("object").and_then(|o| o.as_str()))
-                    .filter_map(|object| strip_tenant_object_prefix(&tenant_id, object))
+                    .map(|object| object.to_string())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
-        let tree = serde_json::to_string(&expanded).unwrap_or_default();
+        let tree = serde_json::to_string(&sanitized).unwrap_or_default();
         Ok(Response::new(ExpandObjectsResponse {
             objects,
             tree,
@@ -742,9 +770,102 @@ fn tenant_object(tenant_id: &str, object: &str) -> String {
 
 fn strip_tenant_object_prefix(tenant_id: &str, object: &str) -> Option<String> {
     let prefix = format!("{tenant_id}:");
-    object
-        .strip_prefix(&prefix)
-        .map(|rest| rest.to_string())
+    object.strip_prefix(&prefix).map(|rest| rest.to_string())
+}
+
+/// Recursively rewrite an expand/tree response so that no tenant-prefixed
+/// internal object identifiers or backend subject identifiers are exposed.
+fn sanitize_expand_tree<'a>(
+    value: &'a serde_json::Value,
+    tenant_id: &'a str,
+    mappings: &'a Arc<dyn IdMappingStore>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, ServiceError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    if k == "object" {
+                        out.insert(k.clone(), sanitize_object_value(v, tenant_id)?);
+                    } else if k == "subject_id" {
+                        out.insert(
+                            k.clone(),
+                            sanitize_subject_id(v, tenant_id, mappings).await?,
+                        );
+                    } else {
+                        out.insert(
+                            k.clone(),
+                            sanitize_expand_tree(v, tenant_id, mappings).await?,
+                        );
+                    }
+                }
+                Ok(serde_json::Value::Object(out))
+            }
+            serde_json::Value::Array(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    out.push(sanitize_expand_tree(v, tenant_id, mappings).await?);
+                }
+                Ok(serde_json::Value::Array(out))
+            }
+            other => Ok(other.clone()),
+        }
+    })
+}
+
+fn sanitize_object_value(
+    value: &serde_json::Value,
+    tenant_id: &str,
+) -> Result<serde_json::Value, ServiceError> {
+    match value.as_str() {
+        Some(s) => Ok(strip_tenant_object_prefix(tenant_id, s)
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|| serde_json::Value::String(s.to_string()))),
+        None => Ok(value.clone()),
+    }
+}
+
+async fn sanitize_subject_id(
+    value: &serde_json::Value,
+    tenant_id: &str,
+    mappings: &Arc<dyn IdMappingStore>,
+) -> Result<serde_json::Value, ServiceError> {
+    let Some(subject) = value.as_str() else {
+        return Ok(value.clone());
+    };
+
+    // Subject sets are encoded as "namespace:object#relation" by Keto.
+    // Strip the tenant prefix from the object portion if present.
+    if subject.contains('#') {
+        return Ok(serde_json::Value::String(strip_subject_set_prefix(
+            subject, tenant_id,
+        )));
+    }
+
+    // Try to map a backend identity or client identifier to the gateway public
+    // id. If no mapping exists, the value is already a public id or a
+    // non-sensitive backend identifier; pass it through unchanged.
+    if let Ok(public_id) = mappings.get_public_id(tenant_id, "kratos", subject).await {
+        return Ok(serde_json::Value::String(public_id));
+    }
+    if let Ok(public_id) = mappings.get_public_id(tenant_id, "hydra", subject).await {
+        return Ok(serde_json::Value::String(public_id));
+    }
+    Ok(serde_json::Value::String(subject.to_string()))
+}
+
+fn strip_subject_set_prefix(subject: &str, tenant_id: &str) -> String {
+    // Keto subject set format: "namespace:object#relation" where the object
+    // may be "tenant_id:gateway_object_id".
+    let prefix = format!("{tenant_id}:");
+    if let Some((left, relation)) = subject.split_once('#') {
+        let stripped = left.strip_prefix(&prefix).unwrap_or(left);
+        format!("{stripped}#{relation}")
+    } else {
+        subject.to_string()
+    }
 }
 
 fn namespace_filter(namespace: &str) -> Option<&str> {
@@ -780,11 +901,7 @@ fn subject_id_filter(subject_id: &str) -> Option<&str> {
 }
 
 fn subject_set_filter(value: &str) -> Option<&str> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn max_depth_filter(max_depth: i32) -> Option<i32> {
@@ -835,6 +952,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
@@ -857,7 +975,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::db::DbError;
+    use crate::db::{DbError, IdMappingRow};
 
     fn tenant_ctx() -> RequestContext {
         scoped_ctx(&[SCOPE_PERMISSION_READ])
@@ -1063,19 +1181,16 @@ mod tests {
             subject_set_relation: Option<&str>,
             max_depth: Option<i32>,
         ) -> Result<Value, PermissionBackendError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(BackendCall::ExpandObjects {
-                    tenant_id: tenant_id.into(),
-                    namespace: namespace.into(),
-                    relation: relation.into(),
-                    subject_id: subject_id.map(Into::into),
-                    subject_set_namespace: subject_set_namespace.map(Into::into),
-                    subject_set_object: subject_set_object.map(Into::into),
-                    subject_set_relation: subject_set_relation.map(Into::into),
-                    max_depth,
-                });
+            self.calls.lock().unwrap().push(BackendCall::ExpandObjects {
+                tenant_id: tenant_id.into(),
+                namespace: namespace.into(),
+                relation: relation.into(),
+                subject_id: subject_id.map(Into::into),
+                subject_set_namespace: subject_set_namespace.map(Into::into),
+                subject_set_object: subject_set_object.map(Into::into),
+                subject_set_relation: subject_set_relation.map(Into::into),
+                max_depth,
+            });
             self.expand_objects_result.clone().map_err(Into::into)
         }
 
@@ -1200,6 +1315,93 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    #[allow(clippy::type_complexity)]
+    struct FakeMappingStore {
+        mappings: Arc<Mutex<Vec<(String, String, String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for FakeMappingStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            self.mappings.lock().unwrap().push((
+                tenant_id.to_string(),
+                backend.to_string(),
+                public_id.to_string(),
+                ory_global_id.to_string(),
+            ));
+            Ok(IdMappingRow {
+                id: "id".into(),
+                tenant_id: tenant_id.into(),
+                backend: backend.into(),
+                public_id: public_id.into(),
+                ory_global_id: ory_global_id.into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+        }
+
+        async fn get_ory_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<String, DbError> {
+            self.mappings
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(t, b, p, _)| t == tenant_id && b == backend && p == public_id)
+                .map(|(_, _, _, o)| o.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            self.mappings
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(t, b, _, o)| t == tenant_id && b == backend && o == ory_global_id)
+                .map(|(_, _, p, _)| p.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            Ok(None)
+        }
+    }
+
     fn service_with(
         backend: FakePermissionBackend,
         tuples: FakeTupleStore,
@@ -1207,6 +1409,7 @@ mod tests {
         PermissionServiceImpl {
             backend: Arc::new(backend) as Arc<dyn PermissionBackend>,
             tuples: Arc::new(tuples) as Arc<dyn PermissionTupleStore>,
+            mappings: Arc::new(FakeMappingStore::default()) as Arc<dyn IdMappingStore>,
         }
     }
 
@@ -1742,8 +1945,7 @@ mod tests {
             max_depth: 3,
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
+        let owned = crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         let resp = service.expand_objects(tenant_ctx(), req).await.unwrap();
@@ -1823,8 +2025,7 @@ mod tests {
             max_depth: 0,
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
+        let owned = crate::proto::iam::v1::ExpandObjectsRequestOwnedView::from_owned(&req).unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
 
         service.expand_objects(tenant_ctx(), req).await.unwrap();
@@ -1947,6 +2148,65 @@ mod tests {
     fn strip_tenant_object_prefix_returns_none_for_mismatch() {
         assert_eq!(strip_tenant_object_prefix("tenant-1", "other:doc"), None);
         assert_eq!(strip_tenant_object_prefix("tenant-1", "doc"), None);
+    }
+
+    #[tokio::test]
+    async fn sanitize_expand_tree_strips_tenant_prefix_and_maps_subjects() {
+        let mappings = Arc::new(FakeMappingStore::default()) as Arc<dyn IdMappingStore>;
+        mappings
+            .create("tenant-1", "kratos", "pub-alice", "ory-alice")
+            .await
+            .unwrap();
+        let tree = serde_json::json!({
+            "type": "expand",
+            "tuple": {
+                "namespace": "files",
+                "object": "tenant-1:doc-1",
+                "relation": "owner",
+                "subject_id": "ory-alice"
+            }
+        });
+        let sanitized = sanitize_expand_tree(&tree, "tenant-1", &mappings)
+            .await
+            .unwrap();
+        assert_eq!(sanitized["tuple"]["object"], "doc-1");
+        assert_eq!(sanitized["tuple"]["subject_id"], "pub-alice");
+    }
+
+    #[tokio::test]
+    async fn sanitize_expand_tree_maps_hydra_subject_ids() {
+        let mappings = Arc::new(FakeMappingStore::default()) as Arc<dyn IdMappingStore>;
+        mappings
+            .create("tenant-1", "hydra", "pub-client", "ory-client")
+            .await
+            .unwrap();
+        let tree = serde_json::json!({
+            "relation_tuples": [
+                { "namespace": "apps", "object": "tenant-1:app-1", "relation": "user", "subject_id": "ory-client" }
+            ]
+        });
+        let sanitized = sanitize_expand_tree(&tree, "tenant-1", &mappings)
+            .await
+            .unwrap();
+        assert_eq!(sanitized["relation_tuples"][0]["subject_id"], "pub-client");
+    }
+
+    #[tokio::test]
+    async fn sanitize_expand_tree_strips_subject_set_prefix() {
+        let mappings = Arc::new(FakeMappingStore::default()) as Arc<dyn IdMappingStore>;
+        let tree = serde_json::json!({
+            "tuple": {
+                "subject_set": {
+                    "namespace": "groups",
+                    "object": "tenant-1:group-1",
+                    "relation": "member"
+                }
+            }
+        });
+        let sanitized = sanitize_expand_tree(&tree, "tenant-1", &mappings)
+            .await
+            .unwrap();
+        assert_eq!(sanitized["tuple"]["subject_set"]["object"], "group-1");
     }
 
     #[test]
@@ -2295,9 +2555,7 @@ mod tests {
             let model = models
                 .iter()
                 .find(|m| {
-                    m.get("authorization_model_id")
-                        .and_then(|v| v.as_str())
-                        == Some(&model_id)
+                    m.get("authorization_model_id").and_then(|v| v.as_str()) == Some(&model_id)
                 })
                 .cloned()
                 .unwrap_or_default();
@@ -2339,17 +2597,12 @@ mod tests {
             let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
             let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
             let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
-            let allowed = state
-                .tuples
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|t| {
-                    t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
-                        && t.get("user").and_then(|v| v.as_str()) == Some(user)
-                        && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
-                        && t.get("object").and_then(|v| v.as_str()) == Some(object)
-                });
+            let allowed = state.tuples.lock().unwrap().iter().any(|t| {
+                t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
+                    && t.get("user").and_then(|v| v.as_str()) == Some(user)
+                    && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
+                    && t.get("object").and_then(|v| v.as_str()) == Some(object)
+            });
             Json(json!({ "allowed": allowed }))
         }
 
@@ -2384,7 +2637,9 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let state = FakeOpenFgaState::default();
             let handle = tokio::spawn(async move {
-                axum::serve(listener, fake_openfga_app(state)).await.unwrap();
+                axum::serve(listener, fake_openfga_app(state))
+                    .await
+                    .unwrap();
             });
             (handle, format!("http://{addr}"))
         }
@@ -2431,13 +2686,7 @@ mod tests {
             );
 
             backend
-                .create_relation_tuple(
-                    "tenant-1",
-                    "document",
-                    "doc-1",
-                    "reader",
-                    "user:alice",
-                )
+                .create_relation_tuple("tenant-1", "document", "doc-1", "reader", "user:alice")
                 .await
                 .unwrap();
 
@@ -2466,13 +2715,7 @@ mod tests {
             assert_eq!(tuples.unwrap().len(), 1);
 
             backend
-                .delete_relation_tuple(
-                    "tenant-1",
-                    "document",
-                    "doc-1",
-                    "reader",
-                    "user:alice",
-                )
+                .delete_relation_tuple("tenant-1", "document", "doc-1", "reader", "user:alice")
                 .await
                 .unwrap();
 
@@ -2496,7 +2739,10 @@ mod tests {
                 .check_permission("tenant-1", "document", "doc-1", "reader", "user:alice")
                 .await
                 .unwrap_err();
-            assert!(matches!(err, PermissionBackendError::NamespaceNotConfigured(_)));
+            assert!(matches!(
+                err,
+                PermissionBackendError::NamespaceNotConfigured(_)
+            ));
         }
     }
 }

@@ -1017,6 +1017,7 @@ fn map_ory_error(err: sso_ory_client::error::OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 

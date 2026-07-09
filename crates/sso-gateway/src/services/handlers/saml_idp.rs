@@ -409,7 +409,7 @@ async fn sso(
         sp_entity_id: sp_client.entity_id.clone(),
         acs_url: sp_client.acs_url.clone(),
         assertion_lifetime_seconds: 300,
-        session_index: Some(identity_id.to_string()),
+        session_index: Some(name_id_value.clone()),
         session_not_on_or_after: None,
         authn_context_class_ref: Some(authn_context_class_ref),
         client_address: None,

@@ -8,17 +8,19 @@ use serde_json::json;
 use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, IdentitySchemaRepo, ScimGroupRepo, TenantRepo,
-        bootstrap_system_tenant, create_pool,
+        TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt},
+    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
+    services::handlers::scim::{ScimState, router as scim_router},
+    services::permission::{
+        MemoryNamespaceMappingRepo, OpenFgaPermissionBackend, PermissionBackend,
+    },
     services::{
         application::ApplicationServiceImpl, identity::IdentityServiceImpl, scim::ScimServiceImpl,
         tenant::TenantServiceImpl,
     },
-    services::handlers::oauth2::{Oauth2State, router as oauth2_router},
-    services::handlers::scim::{ScimState, router as scim_router},
-    services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend, PermissionBackend},
     session_token::SessionTokenSigner,
 };
 use sso_openfga_client::OpenFgaClient;
@@ -40,8 +42,9 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
         support::start_hydra().await.expect("hydra should start");
     let (_kratos, kratos_admin_url, _kratos_public_url) =
         support::start_kratos().await.expect("kratos should start");
-    let (_openfga, openfga_url) =
-        support::start_openfga().await.expect("openfga should start");
+    let (_openfga, openfga_url) = support::start_openfga()
+        .await
+        .expect("openfga should start");
 
     let pool = create_pool(&database_url, false)
         .await
@@ -78,6 +81,7 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
     ));
     let scim_service = Arc::new(ScimServiceImpl::new(
@@ -348,7 +352,13 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
     // Verify the group membership is reflected in OpenFGA. SCIM requests in this
     // test run under the system tenant resolved from the test token subject.
     let allowed = backend
-        .check_permission(&system_tenant_ulid, "scim_group", group_id, "member", user_id)
+        .check_permission(
+            &system_tenant_ulid,
+            "scim_group",
+            group_id,
+            "member",
+            user_id,
+        )
         .await
         .expect("check should succeed");
     assert!(allowed, "user should be a member of the group in openfga");

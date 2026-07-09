@@ -52,7 +52,11 @@ async fn permission_service_round_trip() {
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let permission_service = Arc::new(PermissionServiceImpl::new(keto, tuples));
+    let permission_service = Arc::new(PermissionServiceImpl::new(
+        keto,
+        tuples,
+        IdMappingRepo::new(pool.clone()),
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = permission_service.register(connect_router);

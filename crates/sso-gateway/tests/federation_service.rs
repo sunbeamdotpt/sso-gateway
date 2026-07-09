@@ -8,7 +8,8 @@ use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, IdentitySchemaRepo, LoginStateRepo, SamlIdentityMappingRepo,
         SamlIdpKeyRepo, SamlProviderRepo, SamlReplayCache, SamlReplayCacheTrait, SamlRequestRepo,
-        TenantConnectionRepo, TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
+        TenantConnectionRepo, TenantDomainRepo, TenantRepo, TransientTokenRepo,
+        bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{FederationServiceExt, IdentityServiceExt, TenantServiceExt},
@@ -184,7 +185,7 @@ async fn federation_saml_login_round_trip() {
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool.clone());
     let replay_cache: Arc<dyn SamlReplayCacheTrait> = Arc::new(InMemoryReplayCache::new());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
@@ -195,6 +196,7 @@ async fn federation_saml_login_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(
@@ -451,7 +453,7 @@ async fn federation_saml_signed_login_is_idempotent() {
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool.clone());
     let replay_cache: Arc<dyn SamlReplayCacheTrait> = Arc::new(InMemoryReplayCache::new());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
@@ -462,6 +464,7 @@ async fn federation_saml_signed_login_is_idempotent() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(

@@ -9,9 +9,9 @@ use buffa_types::google::protobuf::Struct as ProtoStruct;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use http::HeaderMap;
 use serde_json::{Value, json};
-use sso_ory_client::{error::OryClientError, kratos::KratosClient};
 #[cfg(all(feature = "keto", test))]
 use sso_ory_client::keto::KetoClient;
+use sso_ory_client::{error::OryClientError, kratos::KratosClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
@@ -360,7 +360,11 @@ impl ScimService for ScimServiceImpl {
 
         // Replace memberships.
         self.backend
-            .ensure_namespace(&tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .ensure_namespace(
+                &tenant_id,
+                SCIM_GROUP_NAMESPACE,
+                &[SCIM_GROUP_RELATION.into()],
+            )
             .await?;
         let existing = self.groups.list_members(&req.id).await?;
         for user_id in &existing {
@@ -400,7 +404,11 @@ impl ScimService for ScimServiceImpl {
         let req = request.to_owned_message();
 
         self.backend
-            .ensure_namespace(&tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .ensure_namespace(
+                &tenant_id,
+                SCIM_GROUP_NAMESPACE,
+                &[SCIM_GROUP_RELATION.into()],
+            )
             .await?;
         let members = self.groups.list_members(&req.id).await?;
         for user_id in members {
@@ -538,7 +546,11 @@ impl ScimServiceImpl {
             .await?;
         self.groups.add_member(tenant_id, group_id, user_id).await?;
         self.backend
-            .ensure_namespace(tenant_id, SCIM_GROUP_NAMESPACE, &[SCIM_GROUP_RELATION.into()])
+            .ensure_namespace(
+                tenant_id,
+                SCIM_GROUP_NAMESPACE,
+                &[SCIM_GROUP_RELATION.into()],
+            )
             .await?;
         self.backend
             .create_relation_tuple(
@@ -763,6 +775,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 

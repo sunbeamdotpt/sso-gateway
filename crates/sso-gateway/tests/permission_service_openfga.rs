@@ -36,8 +36,9 @@ async fn permission_service_openfga_round_trip() {
     let (_pg, database_url) = support::start_postgres()
         .await
         .expect("postgres should start");
-    let (_openfga, openfga_url) =
-        support::start_openfga().await.expect("openfga should start");
+    let (_openfga, openfga_url) = support::start_openfga()
+        .await
+        .expect("openfga should start");
 
     let pool = create_pool(&database_url, false)
         .await
@@ -49,16 +50,18 @@ async fn permission_service_openfga_round_trip() {
         .expect("system tenant should bootstrap");
     support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
 
-    let openfga = Arc::new(
-        OpenFgaPermissionBackend::new(
-            OpenFgaClient::new(&openfga_url).expect("openfga client should build"),
-            Arc::new(MemoryNamespaceMappingRepo::default()),
-        ),
-    );
+    let openfga = Arc::new(OpenFgaPermissionBackend::new(
+        OpenFgaClient::new(&openfga_url).expect("openfga client should build"),
+        Arc::new(MemoryNamespaceMappingRepo::default()),
+    ));
 
     // Pre-provision the namespace so the service can write tuples.
     openfga
-        .ensure_namespace(&system_tenant_ulid, "document", &["reader".into(), "owner".into()])
+        .ensure_namespace(
+            &system_tenant_ulid,
+            "document",
+            &["reader".into(), "owner".into()],
+        )
         .await
         .expect("namespace should be ensured");
 
@@ -69,7 +72,11 @@ async fn permission_service_openfga_round_trip() {
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let permission_service = Arc::new(PermissionServiceImpl::new(openfga, tuples));
+    let permission_service = Arc::new(PermissionServiceImpl::new(
+        openfga,
+        tuples,
+        IdMappingRepo::new(pool.clone()),
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = permission_service.register(connect_router);
@@ -129,7 +136,12 @@ async fn permission_service_openfga_round_trip() {
         .send()
         .await
         .expect("request should send");
-    assert_eq!(resp.status(), 200, "create tuple failed: {:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "create tuple failed: {:?}",
+        resp.text().await
+    );
 
     let url = format!("{base}/iam.v1.PermissionService/CheckPermission");
     let resp = client
