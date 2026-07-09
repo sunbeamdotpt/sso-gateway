@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    extract::{Extension, Form, Path, Query, State},
+    extract::{Extension, Form, Json, Path, Query, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,14 +13,16 @@ use axum::{
 use serde_json::json;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use tracing::{instrument, warn};
+use ulid::Ulid;
 
 use crate::auth::{
     AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN, hash_token,
     resolve_tenant_from_subject,
 };
 use crate::db::{IdMappingRepo, IdMappingStore, TokenIntrospectionCache};
-
-const BACKEND_HYDRA: &str = "hydra";
+use crate::services::application::{
+    BACKEND_HYDRA, validate_redirect_uris, validate_token_endpoint_auth_method,
+};
 
 /// Async trait for the Hydra operations used by the public OAuth2/OIDC handlers.
 #[async_trait]
@@ -43,6 +45,10 @@ pub trait HydraOperations: Send + Sync + 'static {
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError>;
+    async fn create_oauth2_client(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError>;
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError>;
     fn public_url(&self) -> &reqwest::Url;
 }
@@ -91,6 +97,13 @@ impl HydraOperations for HydraClient {
         self.revoke(form).await
     }
 
+    async fn create_oauth2_client(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.create_oauth2_client(payload).await
+    }
+
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
         self.get_json(url).await
     }
@@ -136,6 +149,8 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/oauth2/token", post(token))
         .route("/oauth2/device/{*path}", post(device))
         .route("/oauth2/userinfo", get(userinfo))
+        .route("/userinfo", get(userinfo))
+        .route("/oauth2/register", post(register))
         .route("/oauth2/introspect", post(introspect))
         .route("/oauth2/revoke", post(revoke))
         .with_state(state)
@@ -295,6 +310,108 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
         Ok(value) => json_response(value),
         Err(err) => map_ory_error(err),
     }
+}
+
+async fn register(
+    State(state): State<Arc<Oauth2State>>,
+    Extension(auth): Extension<AuthContext>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !auth.scopes.iter().any(|s| s == SCOPE_APPLICATION_ADMIN) {
+        return forbidden();
+    }
+
+    let redirect_uris = json_string_array(&body["redirect_uris"]);
+    let grant_types = json_string_array(&body["grant_types"]);
+    let response_types = json_string_array(&body["response_types"]);
+    let scope = body["scope"]
+        .as_str()
+        .map(|s| s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let token_endpoint_auth_method = body["token_endpoint_auth_method"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if let Err(err) = validate_redirect_uris(&redirect_uris, false) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "invalid_request", "error_description": err.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(err) = validate_token_endpoint_auth_method(&token_endpoint_auth_method) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "invalid_request", "error_description": err.to_string()})),
+        )
+            .into_response();
+    }
+
+    let client_name = body["client_name"].as_str().unwrap_or("").to_string();
+    let payload = json!({
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "grant_types": if grant_types.is_empty() { vec!["authorization_code".to_string()] } else { grant_types.clone() },
+        "response_types": if response_types.is_empty() { vec!["code".to_string()] } else { response_types.clone() },
+        "scope": scope.join(" "),
+        "token_endpoint_auth_method": token_endpoint_auth_method,
+    });
+
+    let created = match state.hydra.create_oauth2_client(payload).await {
+        Ok(value) => value,
+        Err(err) => return map_ory_error(err),
+    };
+
+    let ory_id = match created["client_id"].as_str() {
+        Some(id) => id,
+        None => return internal_error(),
+    };
+    let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
+    let public_id = Ulid::new().to_string();
+
+    match state
+        .mappings
+        .create(&auth.tenant_id, BACKEND_HYDRA, &public_id, ory_id)
+        .await
+    {
+        Ok(_) => {}
+        Err(err) => {
+            warn!(
+                tenant_id = %auth.tenant_id,
+                ory_id = %ory_id,
+                "failed to store client mapping: {}",
+                err
+            );
+            return internal_error();
+        }
+    }
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let response = json!({
+        "client_id": public_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": now,
+        "client_secret_expires_at": 0,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "grant_types": grant_types,
+        "response_types": response_types,
+        "scope": scope.join(" "),
+        "token_endpoint_auth_method": token_endpoint_auth_method,
+    });
+    json_response(response)
+}
+
+fn json_string_array(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn revoke(
@@ -514,6 +631,13 @@ mod tests {
             unimplemented!("stub revoke not configured")
         }
 
+        async fn create_oauth2_client(
+            &self,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!("stub create_oauth2_client not configured")
+        }
+
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub get_json not configured")
         }
@@ -592,6 +716,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockTokenCache {
         removed: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_remove: Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl MockTokenCache {
+        fn with_remove_error() -> Self {
+            Self {
+                removed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_remove: Arc::new(std::sync::Mutex::new(true)),
+            }
+        }
     }
 
     #[async_trait]
@@ -617,7 +751,11 @@ mod tests {
 
         async fn remove(&self, token_hash: &str) -> Result<(), crate::db::DbError> {
             self.removed.lock().unwrap().push(token_hash.to_string());
-            Ok(())
+            if *self.fail_remove.lock().unwrap() {
+                Err(crate::db::DbError::ConnectionNotFound)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -898,6 +1036,16 @@ mod tests {
             Ok(())
         }
 
+        async fn create_oauth2_client(
+            &self,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(json!({
+                "client_id": "ory-client-1",
+                "client_secret": "ory-secret-1",
+            }))
+        }
+
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
         }
@@ -967,6 +1115,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    fn basic_auth_header(client_id: &str, secret: &str) -> HeaderValue {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{client_id}:{secret}"),
+        );
+        HeaderValue::from_str(&format!("Basic {encoded}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_succeeds_with_basic_auth() {
+        let state = Arc::new(ok_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("client-1", "secret"));
+        let form = HashMap::new();
+        let resp = token(State(state), headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn device_succeeds_with_basic_auth() {
+        let state = Arc::new(ok_state(Some("tenant-1".to_string())));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("client-1", "secret"));
+        let form = HashMap::new();
+        let resp = device(
+            State(state),
+            headers,
+            Path("auth".to_string()),
+            Form(form),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn userinfo_succeeds_with_token() {
         let state = Arc::new(ok_state(None));
@@ -996,6 +1181,18 @@ mod tests {
     #[tokio::test]
     async fn revoke_clears_token_cache_when_configured() {
         let cache = Arc::new(MockTokenCache::default());
+        let state = Arc::new(ok_state(None).with_token_cache(cache.clone()));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = revoke(State(state), Form(form)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let removed = cache.removed.lock().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], hash_token("token-1"));
+    }
+
+    #[tokio::test]
+    async fn revoke_succeeds_when_cache_remove_fails() {
+        let cache = Arc::new(MockTokenCache::with_remove_error());
         let state = Arc::new(ok_state(None).with_token_cache(cache.clone()));
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
         let resp = revoke(State(state), Form(form)).await.into_response();
@@ -1100,6 +1297,13 @@ mod tests {
             Err(hydra_err())
         }
 
+        async fn create_oauth2_client(
+            &self,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
@@ -1195,6 +1399,12 @@ mod tests {
         assert!(client.revoke(vec![]).await.is_err());
         assert!(
             client
+                .create_oauth2_client(json!({"client_name": "test"}))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
                 .get_json(reqwest::Url::parse("http://localhost:1").unwrap())
                 .await
                 .is_err()
@@ -1212,6 +1422,23 @@ mod tests {
         let _ = store.get_public_id("t", "hydra", "ory").await;
         let _ = store.delete("t", "hydra", "pub").await;
         let _ = store.list_public_ids("t", "hydra").await;
+    }
+
+    #[tokio::test]
+    async fn introspect_returns_forbidden_without_admin_scope() {
+        let state = Arc::new(ok_state(None));
+        let auth = AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            scopes: vec!["openid".into()],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        };
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), Extension(auth), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1286,6 +1513,360 @@ mod tests {
         assert!(value.get("tenant_id").is_none());
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingMappingStore {
+        #[allow(clippy::type_complexity)]
+        created: Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl IdMappingStore for RecordingMappingStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
+            self.created.lock().unwrap().push((
+                tenant_id.to_string(),
+                backend.to_string(),
+                public_id.to_string(),
+                ory_global_id.to_string(),
+            ));
+            Ok(crate::db::IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            Ok(None)
+        }
+    }
+
+    fn register_state() -> Arc<Oauth2State> {
+        Arc::new(Oauth2State {
+            hydra: Arc::new(AlwaysOkHydra {
+                response: json!({"status": "ok"}),
+            }),
+            mappings: Arc::new(RecordingMappingStore::default()),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        })
+    }
+
+    fn register_auth(scopes: Vec<String>) -> AuthContext {
+        AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            scopes,
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn register_returns_forbidden_without_application_admin_scope() {
+        let state = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(State(state), Extension(register_auth(vec!["tenant:read".into()])), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn register_returns_bad_request_for_invalid_redirect_uri() {
+        let state = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["not-a-url"],
+        });
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_str = body_to_string(resp).await;
+        assert!(body_str.contains("invalid_request"));
+    }
+
+    #[tokio::test]
+    async fn register_creates_client_and_mapping() {
+        let state = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid profile",
+            "token_endpoint_auth_method": "client_secret_basic",
+        });
+        let resp = register(
+            State(state.clone()),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert!(value["client_id"].as_str().unwrap().starts_with("01"));
+        assert_eq!(value["client_secret"], "ory-secret-1");
+        assert_eq!(value["client_secret_expires_at"], 0);
+        assert_eq!(value["scope"], "openid profile");
+    }
+
+    #[tokio::test]
+    async fn register_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(AlwaysErrHydra),
+            mappings: Arc::new(RecordingMappingStore::default()),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn register_returns_bad_request_for_invalid_token_endpoint_auth_method() {
+        let state = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "invalid_method",
+        });
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_str = body_to_string(resp).await;
+        assert!(body_str.contains("invalid_request"));
+    }
+
+    #[derive(Clone, Default)]
+    struct MissingClientIdHydra;
+
+    #[async_trait]
+    impl HydraOperations for MissingClientIdHydra {
+        async fn authorize(
+            &self,
+            _query: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        async fn token(
+            &self,
+            _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        async fn device(
+            &self,
+            _path: &str,
+            _form: Vec<(String, String)>,
+            _client_credentials: Option<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        async fn userinfo(&self, _token: &str) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        async fn introspect_token(
+            &self,
+            _token: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
+            unimplemented!()
+        }
+        async fn create_oauth2_client(
+            &self,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(json!({"client_secret": "secret"}))
+        }
+        async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
+        fn public_url(&self) -> &reqwest::Url {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn register_returns_internal_error_when_hydra_response_missing_client_id() {
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(MissingClientIdHydra),
+            mappings: Arc::new(RecordingMappingStore::default()),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingCreateMappingStore;
+
+    #[async_trait]
+    impl IdMappingStore for FailingCreateMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
+            Err(crate::db::DbError::ConnectionNotFound)
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn register_returns_internal_error_when_mapping_fails() {
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(AlwaysOkHydra {
+                response: json!({"status": "ok"}),
+            }),
+            mappings: Arc::new(FailingCreateMappingStore),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn jwks_returns_bad_gateway_when_url_join_fails() {
         struct BadUrlHydra;
@@ -1322,6 +1903,12 @@ mod tests {
                 unimplemented!()
             }
             async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
+                unimplemented!()
+            }
+            async fn create_oauth2_client(
+                &self,
+                _payload: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }
             async fn get_json(

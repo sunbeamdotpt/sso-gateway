@@ -88,7 +88,7 @@ pub struct TenantId(pub String);
 fn is_public_path(path: &str) -> bool {
     match path {
         "/.well-known/openid-configuration" | "/.well-known/jwks.json" => true,
-        "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" => true,
+        "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" | "/userinfo" => true,
         "/saml/metadata" | "/saml/acs" | "/saml/sso" => true,
         "/callbacks/oidc" | "/callbacks/oauth2" => true,
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
@@ -440,6 +440,7 @@ mod tests {
         assert!(is_public_path("/oauth2/revoke"));
         assert!(!is_public_path("/oauth2/introspect"));
         assert!(is_public_path("/oauth2/userinfo"));
+        assert!(is_public_path("/userinfo"));
         assert!(is_public_path("/saml/metadata"));
         assert!(is_public_path("/saml/acs"));
         assert!(is_public_path("/saml/sso"));
