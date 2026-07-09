@@ -7,7 +7,7 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
-## [2026.07.2] - 2026-07-09
+## [2026.07.3] - 2026-07-09
 
 ### Added
 
@@ -33,6 +33,10 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   so Hydra's self-issuer redirects remain on the gateway origin.
 - OIDC conformance test now uses an opaque ULID subject in the `id_token` and
   `userinfo` sub claim.
+
+## [2026.07.2] - 2026-07-09
+
+Superseded by `2026.07.3`; no artifacts were published for this version.
 
 ## [2026.07.1] - 2026-07-08
 
