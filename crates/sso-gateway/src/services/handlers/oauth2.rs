@@ -318,10 +318,19 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
         None => return unauthorized(),
     };
 
-    match state.hydra.userinfo(token).await {
-        Ok(value) => json_response(value),
-        Err(err) => map_ory_error(err),
+    let mut value = match state.hydra.userinfo(token).await {
+        Ok(value) => value,
+        Err(err) => return map_ory_error(err),
+    };
+
+    if let Some(obj) = value.as_object_mut()
+        && let Some(sub) = obj.get("sub").and_then(|v| v.as_str())
+        && let Some(public_id) = translate_ory_id_to_public_id(&state, sub).await
+    {
+        obj.insert("sub".to_string(), json!(public_id));
     }
+
+    json_response(value)
 }
 
 async fn register(
@@ -481,14 +490,23 @@ async fn introspect(
     }
 
     let subject = match value.get("sub").and_then(|v| v.as_str()) {
-        Some(sub) => sub,
+        Some(sub) => sub.to_string(),
         None => return json_response(value),
     };
 
-    match resolve_tenant_from_subject(state.mappings.as_ref(), subject).await {
+    match resolve_tenant_from_subject(state.mappings.as_ref(), &subject).await {
         Ok(tenant_id) => {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("tenant_id".to_string(), json!(tenant_id));
+                if let Some(public_id) = translate_ory_id_to_public_id(&state, &subject).await {
+                    obj.insert("sub".to_string(), json!(public_id));
+                }
+                if let Some(client_id) = obj.get("client_id").and_then(|v| v.as_str())
+                    && let Some(public_id) =
+                        translate_ory_id_to_public_id(&state, client_id).await
+                {
+                    obj.insert("client_id".to_string(), json!(public_id));
+                }
             }
             json_response(value)
         }
@@ -528,6 +546,18 @@ async fn resolve_public_client(
                 _ => Box::new(internal_error()),
             }
         })
+}
+
+async fn translate_ory_id_to_public_id(
+    state: &Oauth2State,
+    ory_id: &str,
+) -> Option<String> {
+    for backend in [BACKEND_HYDRA, "kratos"] {
+        if let Ok(public_id) = state.mappings.get_public_id_by_ory_id(backend, ory_id).await {
+            return Some(public_id);
+        }
+    }
+    None
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -664,6 +694,7 @@ mod tests {
         #[allow(clippy::type_complexity)]
         tenant_by_ory_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
         ory_by_public_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
+        public_id_by_ory_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
     }
 
     impl StubMappingStore {
@@ -671,6 +702,15 @@ mod tests {
             Self {
                 tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(result))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        fn with_public_id_by_ory_id(result: Result<Option<String>, crate::db::DbError>) -> Self {
+            Self {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(result))),
             }
         }
     }
@@ -716,6 +756,19 @@ mod tests {
             _ory_global_id: &str,
         ) -> Result<String, crate::db::DbError> {
             Err(crate::db::DbError::ConnectionNotFound)
+        }
+
+        async fn get_public_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            let guard = self.public_id_by_ory_id.lock().unwrap();
+            match guard.as_ref().expect("stub not configured") {
+                Ok(Some(id)) => Ok(id.clone()),
+                Ok(None) => Err(crate::db::DbError::MappingNotFound),
+                Err(_) => Err(crate::db::DbError::ConnectionNotFound),
+            }
         }
 
         async fn delete(
@@ -803,6 +856,9 @@ mod tests {
                 tenant_by_ory_id: Arc::new(std::sync::Mutex::new(tenant_result)),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
                     "hydra-client-id-1".to_string(),
+                ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
                 ))))),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
@@ -1198,6 +1254,9 @@ mod tests {
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
                     "hydra-client-id-1".to_string(),
                 ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
@@ -1301,6 +1360,9 @@ mod tests {
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
                     "hydra-client-id-1".to_string(),
                 ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
@@ -1387,6 +1449,33 @@ mod tests {
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
         let resp = userinfo(State(state), headers).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn userinfo_translates_sub_to_public_id() {
+        let hydra = Arc::new(AlwaysOkHydra {
+            response: json!({"sub": "kratos-identity-1", "email": "a@example.com"}),
+        });
+        let state = Arc::new(Oauth2State {
+            hydra,
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
+        let resp = userinfo(State(state), headers).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["sub"], "gateway-public-1");
+        assert_eq!(value["email"], "a@example.com");
     }
 
     #[tokio::test]
@@ -1550,6 +1639,9 @@ mod tests {
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
                     "hydra-client-id-1".to_string(),
                 ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
@@ -1648,11 +1740,13 @@ mod tests {
         let store = StubMappingStore {
             tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
             ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(None)))),
+            public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(None)))),
         };
         let _ = store.create("t", "hydra", "pub", "ory").await;
         let _ = store.get_ory_id("t", "hydra", "pub").await;
         let _ = store.get_ory_id_by_public_id("hydra", "pub").await;
         let _ = store.get_public_id("t", "hydra", "ory").await;
+        let _ = store.get_public_id_by_ory_id("hydra", "ory").await;
         let _ = store.delete("t", "hydra", "pub").await;
         let _ = store.list_public_ids("t", "hydra").await;
     }
@@ -1690,6 +1784,9 @@ mod tests {
                     "tenant-1".to_string(),
                 ))))),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
@@ -1710,6 +1807,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["active"], true);
         assert_eq!(value["tenant_id"], "tenant-1");
+        assert_eq!(value["sub"], "gateway-public-1");
     }
 
     #[tokio::test]
@@ -1726,6 +1824,7 @@ mod tests {
             mappings: Arc::new(StubMappingStore {
                 tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(None)))),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
@@ -1746,6 +1845,50 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["active"], false);
         assert!(value.get("tenant_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn introspect_translates_client_id_to_public_id() {
+        let hydra = Arc::new(AlwaysOkHydra {
+            response: json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+        });
+        let state = Arc::new(Oauth2State {
+            hydra,
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "tenant-1".to_string(),
+                ))))),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        });
+        let auth = AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            scopes: vec![SCOPE_TENANT_ADMIN.into()],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        };
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), Extension(auth), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["active"], true);
+        assert_eq!(value["sub"], "gateway-public-1");
+        assert_eq!(value["client_id"], "gateway-public-1");
+        assert_eq!(value["tenant_id"], "tenant-1");
     }
 
     #[derive(Clone, Default)]
@@ -2162,6 +2305,7 @@ mod tests {
             mappings: Arc::new(StubMappingStore {
                 tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,

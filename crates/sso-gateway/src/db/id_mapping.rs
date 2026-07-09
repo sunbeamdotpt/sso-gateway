@@ -48,6 +48,16 @@ pub trait IdMappingStore: Send + Sync + 'static {
         ory_global_id: &str,
     ) -> Result<String, DbError>;
 
+    /// Resolve a backend Ory global id to the gateway public id.
+    async fn get_public_id_by_ory_id(
+        &self,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<String, DbError> {
+        let _ = (backend, ory_global_id);
+        Err(DbError::MappingNotFound)
+    }
+
     async fn delete(&self, tenant_id: &str, backend: &str, public_id: &str) -> Result<(), DbError>;
 
     async fn list_public_ids(&self, tenant_id: &str, backend: &str)
@@ -123,6 +133,22 @@ impl PgIdMappingStore {
              WHERE tenant_id = $1 AND backend = $2 AND ory_global_id = $3",
         )
         .bind(tenant_id)
+        .bind(backend)
+        .bind(ory_global_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        id.ok_or(DbError::MappingNotFound)
+    }
+
+    pub async fn get_public_id_by_ory_id(
+        &self,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<String, DbError> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT public_id FROM id_mappings \
+             WHERE backend = $1 AND ory_global_id = $2 LIMIT 1",
+        )
         .bind(backend)
         .bind(ory_global_id)
         .fetch_optional(&self.pool)
@@ -236,6 +262,14 @@ impl IdMappingStore for PgIdMappingStore {
         ory_global_id: &str,
     ) -> Result<String, DbError> {
         self.get_public_id(tenant_id, backend, ory_global_id).await
+    }
+
+    async fn get_public_id_by_ory_id(
+        &self,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<String, DbError> {
+        self.get_public_id_by_ory_id(backend, ory_global_id).await
     }
 
     async fn delete(&self, tenant_id: &str, backend: &str, public_id: &str) -> Result<(), DbError> {
