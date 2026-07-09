@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::jwks::ReqwestJwksService;
+use crate::services::permission::PermissionBackend;
+#[cfg(feature = "openfga")]
+use crate::services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend};
 use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
@@ -10,7 +13,7 @@ use crate::{
         DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionTupleRepo,
         PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
         SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
-        TenantDomainRepo, TenantRepo, bootstrap_system_tenant, create_pool,
+        TenantDomainRepo, TenantRepo, TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
@@ -50,14 +53,11 @@ use axum::{
 use connectrpc::Router as ConnectRouter;
 use gamlastan::crypto::SamlSigner;
 use gamlastan::crypto::keys::build_idp_keys_manager;
-use sso_ory_client::{HydraClient, KratosClient, error::OryClientError};
-#[cfg(feature = "keto")]
-use sso_ory_client::KetoClient;
 #[cfg(feature = "openfga")]
 use sso_openfga_client::OpenFgaClient;
-use crate::services::permission::PermissionBackend;
-#[cfg(feature = "openfga")]
-use crate::services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend};
+#[cfg(feature = "keto")]
+use sso_ory_client::KetoClient;
+use sso_ory_client::{HydraClient, KratosClient, error::OryClientError};
 use sunbeam_g2v::{
     error::ServiceResult,
     health::HealthRouter,
@@ -172,6 +172,7 @@ pub async fn build_app_with_upstream(
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
+    let transient = TransientTokenRepo::new(pool.clone());
 
     // Keep trait-object handles for the public callback handlers; the concrete
     // repos are moved into FederationServiceImpl below.
@@ -250,15 +251,22 @@ pub async fn build_app_with_upstream(
     ));
     let application_service =
         Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
-    let client_credential_service =
-        Arc::new(ClientCredentialServiceImpl::new(hydra.clone(), mappings.clone()));
+    let client_credential_service = Arc::new(ClientCredentialServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+    ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        transient.clone(),
         config.ui_public_url.clone(),
     ));
-    let permission_service = Arc::new(PermissionServiceImpl::new(backend.clone(), tuples));
+    let permission_service = Arc::new(PermissionServiceImpl::new(
+        backend.clone(),
+        tuples,
+        mappings.clone(),
+    ));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),
         backend,
@@ -270,12 +278,21 @@ pub async fn build_app_with_upstream(
     let consent_enabled = !config.hydra_admin_url.is_empty();
     let self_service = Arc::new(IdentitySelfServiceImpl::new(
         kratos.clone(),
+        transient.clone(),
+        mappings.clone(),
         consent_enabled,
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),
     ));
-    let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(hydra.clone()));
-    let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(hydra.clone()));
+    let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
+        hydra.clone(),
+        transient.clone(),
+        mappings.clone(),
+    ));
+    let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+    ));
 
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),
@@ -389,8 +406,7 @@ pub async fn build_app_with_upstream(
 /// receives full administrative access to every gateway service so it can
 /// provision tenants, identities, applications, SCIM resources, and permission
 /// tuples without requiring a second client.
-const BOOTSTRAP_CLIENT_SCOPE: &str =
-    "tenant:read tenant:admin identity:read identity:admin application:read application:admin \
+const BOOTSTRAP_CLIENT_SCOPE: &str = "tenant:read tenant:admin identity:read identity:admin application:read application:admin \
      scim:read scim:admin permission:read permission:admin";
 
 async fn bootstrap_system_client(

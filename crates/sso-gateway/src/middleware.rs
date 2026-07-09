@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{
-    AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_tenant_from_subject,
+    AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_public_subject,
+    resolve_tenant_from_subject,
 };
 use crate::db::{IdMappingStore, SessionStore};
 use crate::session_token::SessionTokenSigner;
@@ -88,7 +89,9 @@ pub struct TenantId(pub String);
 fn is_public_path(path: &str) -> bool {
     match path {
         "/.well-known/openid-configuration" | "/.well-known/jwks.json" => true,
-        "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" | "/userinfo" => true,
+        "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" | "/userinfo" => {
+            true
+        }
         "/saml/metadata" | "/saml/acs" | "/saml/sso" => true,
         "/callbacks/oidc" | "/callbacks/oauth2" => true,
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
@@ -222,9 +225,21 @@ async fn authenticate_bearer_token(
             }
         })?;
 
+    let public_subject = resolve_public_subject(mappings, &subject)
+        .await
+        .map_err(|err| {
+            tracing::debug!(%err, "failed to resolve public subject");
+            match err {
+                crate::auth::AuthError::UnknownSubject => {
+                    Box::new(auth_error(StatusCode::UNAUTHORIZED))
+                }
+                _ => Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR)),
+            }
+        })?;
+
     Ok(build_auth_context(
         tenant_id,
-        subject,
+        public_subject,
         introspection.scope,
         introspection.authentication_methods,
         token,
@@ -377,6 +392,14 @@ mod tests {
             _ory_global_id: &str,
         ) -> Result<String, crate::db::DbError> {
             unimplemented!()
+        }
+
+        async fn get_public_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            Ok("pub-sub-1".into())
         }
 
         async fn delete(

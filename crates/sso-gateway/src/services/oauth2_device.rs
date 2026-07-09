@@ -8,10 +8,21 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
 use crate::auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN};
+use crate::db::{DbError, IdMappingRepo, IdMappingStore};
+use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     DeviceAuthorizationRequest, DeviceAuthorizationResponse, DeviceTokenRequest,
     DeviceTokenResponse, OAuth2DeviceService,
 };
+
+const BACKEND_HYDRA: &str = "hydra";
+
+fn map_db_error(err: DbError) -> ServiceError {
+    match err {
+        DbError::MappingNotFound => ServiceError::NotFound("mapping not found".into()),
+        _ => ServiceError::Database(err.to_string()),
+    }
+}
 
 /// Hydra operations used by the OAuth2 device service.
 #[async_trait]
@@ -37,12 +48,14 @@ impl DeviceHydra for HydraClient {
 #[derive(Clone)]
 pub struct OAuth2DeviceServiceImpl {
     hydra: Arc<dyn DeviceHydra>,
+    mappings: Arc<dyn IdMappingStore>,
 }
 
 impl OAuth2DeviceServiceImpl {
-    pub fn new(hydra: Arc<HydraClient>) -> Self {
+    pub fn new(hydra: Arc<HydraClient>, mappings: IdMappingRepo) -> Self {
         Self {
             hydra: hydra as Arc<dyn DeviceHydra>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
         }
     }
 }
@@ -71,6 +84,29 @@ fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceError> 
     Ok(())
 }
 
+fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
+    ctx.extensions()
+        .get::<TenantId>()
+        .map(|t| t.0.clone())
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
+}
+
+impl OAuth2DeviceServiceImpl {
+    async fn ory_client_id(
+        &self,
+        tenant_id: &str,
+        public_client_id: &str,
+    ) -> Result<String, ServiceError> {
+        if public_client_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.mappings
+            .get_ory_id(tenant_id, BACKEND_HYDRA, public_client_id)
+            .await
+            .map_err(map_db_error)
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
     #[instrument(skip(self, request))]
@@ -80,8 +116,10 @@ impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
         request: ServiceRequest<'_, DeviceAuthorizationRequest>,
     ) -> ServiceResult<DeviceAuthorizationResponse> {
         require_device_admin(&ctx)?;
+        let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let mut form = vec![("client_id", req.client_id)];
+        let ory_client_id = self.ory_client_id(&tenant_id, &req.client_id).await?;
+        let mut form = vec![("client_id", ory_client_id)];
         if !req.scope.is_empty() {
             form.push(("scope", req.scope.join(" ")));
         }
@@ -103,13 +141,15 @@ impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
         request: ServiceRequest<'_, DeviceTokenRequest>,
     ) -> ServiceResult<DeviceTokenResponse> {
         require_device_admin(&ctx)?;
+        let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
+        let ory_client_id = self.ory_client_id(&tenant_id, &req.client_id).await?;
         let form = vec![
             (
                 "grant_type".to_string(),
                 "urn:ietf:params:oauth:grant-type:device_code".to_string(),
             ),
-            ("client_id".to_string(), req.client_id),
+            ("client_id".to_string(), ory_client_id),
             ("device_code".to_string(), req.device_code),
         ];
         let value = self
@@ -176,6 +216,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
             ServiceError::Internal("invalid upstream response".into())
         }
         OryClientError::MissingTenant => ServiceError::Unauthenticated("missing tenant".into()),
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
@@ -190,8 +231,11 @@ mod tests {
     use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
+    use ulid::Ulid;
 
     use crate::auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN};
+    use crate::db::{DbError, IdMappingRow, IdMappingStore};
+    use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
         DeviceAuthorizationRequest, DeviceTokenRequest, OAuth2DeviceService,
     };
@@ -218,6 +262,7 @@ mod tests {
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),
         });
+        ctx.extensions_mut().insert(TenantId("tenant-1".into()));
         ctx
     }
 
@@ -255,9 +300,111 @@ mod tests {
         }
     }
 
+    #[derive(Default, Clone)]
+    struct StubMappingStore {
+        rows: Arc<Mutex<Vec<IdMappingRow>>>,
+    }
+
+    impl StubMappingStore {
+        fn with_mapping(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Self {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().unwrap().push(row);
+            Self {
+                rows: Arc::new(Mutex::new(std::mem::take(&mut *self.rows.lock().unwrap()))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<IdMappingRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id && r.backend == backend && r.public_id == public_id
+                })
+                .map(|r| r.ory_global_id.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, DbError> {
+            Ok(None)
+        }
+    }
+
+    fn default_mapping_store() -> StubMappingStore {
+        StubMappingStore::default().with_mapping(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            "pub-client-1",
+            "client-1",
+        )
+    }
+
     fn service(hydra: FakeHydra) -> OAuth2DeviceServiceImpl {
         OAuth2DeviceServiceImpl {
             hydra: Arc::new(hydra),
+            mappings: Arc::new(default_mapping_store()),
         }
     }
 
@@ -276,7 +423,7 @@ mod tests {
         };
         let svc = service(fake.clone());
         let req = service_request(DeviceAuthorizationRequest {
-            client_id: "client-1".to_string(),
+            client_id: "pub-client-1".to_string(),
             scope: vec!["openid".to_string(), "profile".to_string()],
             ..Default::default()
         });
@@ -292,7 +439,7 @@ mod tests {
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
         let call = &fake.calls.lock().unwrap()[0];
         assert!(call.contains("path=auth"));
-        assert!(call.contains("client_id"));
+        assert!(call.contains(r#"("client_id", "client-1")"#));
         assert!(call.contains("scope"));
     }
 
@@ -341,7 +488,7 @@ mod tests {
         };
         let svc = service(fake.clone());
         let req = service_request(DeviceTokenRequest {
-            client_id: "client-1".to_string(),
+            client_id: "pub-client-1".to_string(),
             device_code: "device-1".to_string(),
             ..Default::default()
         });
@@ -360,6 +507,7 @@ mod tests {
         let call = &fake.calls.lock().unwrap()[0];
         assert!(call.contains("path=token"));
         assert!(call.contains("grant_type"));
+        assert!(call.contains(r#"("client_id", "client-1")"#));
     }
 
     #[tokio::test]

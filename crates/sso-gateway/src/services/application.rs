@@ -100,7 +100,8 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         validate_redirect_uris(&req.redirect_uris, self.allow_http_redirect_uris)?;
         validate_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
 
-        let payload = build_hydra_payload(&req);
+        let public_id = Ulid::new().to_string();
+        let payload = build_hydra_payload(&req, &public_id);
         let created = self
             .hydra
             .create_oauth2_client(payload)
@@ -112,7 +113,6 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_id".into()))?;
         let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
 
-        let public_id = Ulid::new().to_string();
         self.mappings
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
             .await?;
@@ -256,14 +256,13 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
-        let client_id = rotated["client_id"].as_str().unwrap_or(&ory_id).to_string();
         let client_secret = rotated["client_secret"]
             .as_str()
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_secret".into()))?
             .to_string();
 
         Ok(Response::new(ApplicationSecret {
-            client_id,
+            client_id: req.id,
             client_secret,
             ..Default::default()
         }))
@@ -363,11 +362,13 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
-fn build_hydra_payload(req: &CreateApplicationRequest) -> serde_json::Value {
+fn build_hydra_payload(req: &CreateApplicationRequest, client_id: &str) -> serde_json::Value {
     serde_json::json!({
+        "client_id": client_id,
         "client_name": req.name,
         "redirect_uris": req.redirect_uris,
         "grant_types": req.grant_types,
@@ -1041,7 +1042,7 @@ mod tests {
             .unwrap()
             .body;
 
-        assert_eq!(resp.client_id, "ory-123");
+        assert_eq!(resp.client_id, "pub-1");
         assert_eq!(resp.client_secret, "rotated-secret");
     }
 
@@ -1086,7 +1087,8 @@ mod tests {
             token_endpoint_auth_method: "none".into(),
             ..Default::default()
         };
-        let payload = build_hydra_payload(&req);
+        let payload = build_hydra_payload(&req, "pub-1");
+        assert_eq!(payload["client_id"], "pub-1");
         assert_eq!(payload["client_name"], "app");
         assert_eq!(payload["scope"], "openid profile");
     }
@@ -1535,17 +1537,13 @@ mod tests {
 
     #[test]
     fn validate_redirect_uris_allows_http_localhost_without_flag() {
-        assert!(
-            validate_redirect_uris(&["http://localhost:3000/callback".into()], false,).is_ok()
-        );
+        assert!(validate_redirect_uris(&["http://localhost:3000/callback".into()], false,).is_ok());
         assert!(validate_redirect_uris(&["http://localhost/callback".into()], false,).is_ok());
     }
 
     #[test]
     fn validate_redirect_uris_allows_http_loopback_without_flag() {
-        assert!(
-            validate_redirect_uris(&["http://127.0.0.1:3000/callback".into()], false,).is_ok()
-        );
+        assert!(validate_redirect_uris(&["http://127.0.0.1:3000/callback".into()], false,).is_ok());
         assert!(validate_redirect_uris(&["http://[::1]/callback".into()], false,).is_ok());
     }
 

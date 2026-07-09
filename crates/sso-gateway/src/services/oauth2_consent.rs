@@ -9,6 +9,11 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
 use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
+use crate::db::{
+    DbError, IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE,
+    TOKEN_TYPE_LOGOUT_CHALLENGE, TransientTokenRepo, TransientTokenStore,
+};
+use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     AcceptConsentRequest, AcceptLogoutRequest, ConsentRequest, ConsentResponse,
     GetChallengeRequest, LogoutRequest, LogoutResponse, OAuth2ConsentService, RejectConsentRequest,
@@ -20,6 +25,20 @@ use super::oauth2_consent_mapper::{
     ory_consent_response_to_proto, ory_logout_request_to_proto, ory_logout_response_to_proto,
     reject_consent_request_to_json, reject_logout_request_to_json,
 };
+
+const BACKEND_HYDRA: &str = "hydra";
+const BACKEND_KRATOS: &str = "kratos";
+
+fn challenge_expiry() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
+
+fn map_db_error(err: DbError) -> ServiceError {
+    match err {
+        DbError::MappingNotFound => ServiceError::NotFound("mapping not found".into()),
+        _ => ServiceError::Database(err.to_string()),
+    }
+}
 
 /// Hydra operations used by the OAuth2 consent service.
 #[async_trait]
@@ -94,14 +113,29 @@ impl ConsentHydra for HydraClient {
 #[derive(Clone)]
 pub struct OAuth2ConsentServiceImpl {
     hydra: Arc<dyn ConsentHydra>,
+    transient: Arc<dyn TransientTokenStore>,
+    mappings: Arc<dyn IdMappingStore>,
 }
 
 impl OAuth2ConsentServiceImpl {
-    pub fn new(hydra: Arc<HydraClient>) -> Self {
+    pub fn new(
+        hydra: Arc<HydraClient>,
+        transient: TransientTokenRepo,
+        mappings: IdMappingRepo,
+    ) -> Self {
         Self {
             hydra: hydra as Arc<dyn ConsentHydra>,
+            transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
+            mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
         }
     }
+}
+
+fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
+    ctx.extensions()
+        .get::<TenantId>()
+        .map(|t| t.0.clone())
+        .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
 }
 
 fn require_consent_admin(ctx: &RequestContext) -> Result<(), ServiceError> {
@@ -128,6 +162,117 @@ fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceError> 
     Ok(())
 }
 
+impl OAuth2ConsentServiceImpl {
+    async fn ory_challenge(
+        &self,
+        tenant_id: &str,
+        public_challenge: &str,
+        token_type: &str,
+    ) -> Result<String, ServiceError> {
+        self.transient
+            .get_ory_token(tenant_id, BACKEND_HYDRA, token_type, public_challenge)
+            .await
+            .map_err(map_db_error)
+    }
+
+    async fn public_challenge(
+        &self,
+        tenant_id: &str,
+        ory_challenge: &str,
+        token_type: &str,
+    ) -> Result<String, ServiceError> {
+        match self
+            .transient
+            .get_public_token(tenant_id, BACKEND_HYDRA, token_type, ory_challenge)
+            .await
+        {
+            Ok(public) => Ok(public),
+            Err(DbError::MappingNotFound) => self
+                .transient
+                .create(
+                    tenant_id,
+                    BACKEND_HYDRA,
+                    token_type,
+                    ory_challenge,
+                    challenge_expiry(),
+                )
+                .await
+                .map_err(map_db_error),
+            Err(e) => Err(map_db_error(e)),
+        }
+    }
+
+    async fn resolve_logout_challenge(
+        &self,
+        public_challenge: &str,
+    ) -> Result<(String, String), ServiceError> {
+        self.transient
+            .get_ory_token_global(BACKEND_HYDRA, TOKEN_TYPE_LOGOUT_CHALLENGE, public_challenge)
+            .await
+            .map_err(map_db_error)
+    }
+
+    async fn public_client_id(
+        &self,
+        tenant_id: &str,
+        ory_client_id: &str,
+    ) -> Result<String, ServiceError> {
+        if ory_client_id.is_empty() {
+            return Ok(String::new());
+        }
+        self.mappings
+            .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
+            .await
+            .map_err(map_db_error)
+    }
+
+    async fn public_subject(
+        &self,
+        tenant_id: &str,
+        ory_subject: &str,
+    ) -> Result<String, ServiceError> {
+        if ory_subject.is_empty() {
+            return Ok(String::new());
+        }
+        self.mappings
+            .get_public_id(tenant_id, BACKEND_KRATOS, ory_subject)
+            .await
+            .map_err(map_db_error)
+    }
+
+    async fn map_consent_request(
+        &self,
+        tenant_id: &str,
+        mut consent: ConsentRequest,
+    ) -> Result<ConsentRequest, ServiceError> {
+        consent.challenge = self
+            .public_challenge(tenant_id, &consent.challenge, TOKEN_TYPE_CONSENT_CHALLENGE)
+            .await?;
+        consent.client_id = self.public_client_id(tenant_id, &consent.client_id).await?;
+        consent.subject = self.public_subject(tenant_id, &consent.subject).await?;
+        if let Some(client) = consent.client.as_option_mut() {
+            client.client_id = self.public_client_id(tenant_id, &client.client_id).await?;
+        }
+        Ok(consent)
+    }
+
+    async fn map_logout_request(
+        &self,
+        tenant_id: &str,
+        mut logout: LogoutRequest,
+    ) -> Result<LogoutRequest, ServiceError> {
+        logout.challenge = self
+            .public_challenge(tenant_id, &logout.challenge, TOKEN_TYPE_LOGOUT_CHALLENGE)
+            .await?;
+        logout.client_id = self.public_client_id(tenant_id, &logout.client_id).await?;
+        logout.subject = self.public_subject(tenant_id, &logout.subject).await?;
+        if let Some(client) = logout.client.as_option_mut() {
+            client.client_id = self.public_client_id(tenant_id, &client.client_id).await?;
+        }
+        Ok(logout)
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
@@ -137,13 +282,21 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, GetChallengeRequest>,
     ) -> ServiceResult<ConsentRequest> {
         require_consent_admin(&ctx)?;
+        let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
+        let ory_challenge = self
+            .ory_challenge(&tenant_id, &req.challenge, TOKEN_TYPE_CONSENT_CHALLENGE)
+            .await?;
+
         let value = self
             .hydra
-            .get_consent_request(&req.challenge)
+            .get_consent_request(&ory_challenge)
             .await
             .map_err(map_ory_error)?;
-        Ok(Response::new(ory_consent_request_to_proto(&value)))
+        let consent = ory_consent_request_to_proto(&value);
+        Ok(Response::new(
+            self.map_consent_request(&tenant_id, consent).await?,
+        ))
     }
 
     #[instrument(skip(self, request))]
@@ -153,14 +306,17 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, AcceptConsentRequest>,
     ) -> ServiceResult<ConsentResponse> {
         require_consent_admin(&ctx)?;
+        let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let challenge = req.challenge.clone();
+        let ory_challenge = self
+            .ory_challenge(&tenant_id, &req.challenge, TOKEN_TYPE_CONSENT_CHALLENGE)
+            .await?;
 
         // Fetch the consent request first to enforce that the challenge exists,
         // has not been handled yet, and to obtain the requested scopes/subject.
         let consent_value = self
             .hydra
-            .get_consent_request(&challenge)
+            .get_consent_request(&ory_challenge)
             .await
             .map_err(map_ory_error)?;
         let consent = ory_consent_request_to_proto(&consent_value);
@@ -177,7 +333,8 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
             ServiceError::Unauthenticated("missing authentication context".into())
         })?;
         let is_tenant_admin = auth.scopes.iter().any(|s| s == SCOPE_TENANT_ADMIN);
-        if auth.subject != consent.subject && !is_tenant_admin {
+        let public_subject = self.public_subject(&tenant_id, &consent.subject).await?;
+        if auth.subject != public_subject && !is_tenant_admin {
             return Err(ServiceError::PermissionDenied(
                 "cannot accept consent for another subject".into(),
             )
@@ -187,7 +344,7 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         let body = accept_consent_request_to_json(&req);
         let value = self
             .hydra
-            .accept_consent_request(&challenge, body)
+            .accept_consent_request(&ory_challenge, body)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_consent_response_to_proto(&value)))
@@ -200,12 +357,15 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, RejectConsentRequest>,
     ) -> ServiceResult<ConsentResponse> {
         require_consent_admin(&ctx)?;
+        let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let challenge = req.challenge.clone();
+        let ory_challenge = self
+            .ory_challenge(&tenant_id, &req.challenge, TOKEN_TYPE_CONSENT_CHALLENGE)
+            .await?;
         let body = reject_consent_request_to_json(&req);
         let value = self
             .hydra
-            .reject_consent_request(&challenge, body)
+            .reject_consent_request(&ory_challenge, body)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_consent_response_to_proto(&value)))
@@ -218,12 +378,16 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, GetChallengeRequest>,
     ) -> ServiceResult<LogoutRequest> {
         let req = request.to_owned_message();
+        let (tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
         let value = self
             .hydra
-            .get_logout_request(&req.challenge)
+            .get_logout_request(&ory_challenge)
             .await
             .map_err(map_ory_error)?;
-        Ok(Response::new(ory_logout_request_to_proto(&value)))
+        let logout = ory_logout_request_to_proto(&value);
+        Ok(Response::new(
+            self.map_logout_request(&tenant_id, logout).await?,
+        ))
     }
 
     #[instrument(skip(self, request))]
@@ -233,11 +397,11 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, AcceptLogoutRequest>,
     ) -> ServiceResult<LogoutResponse> {
         let req = request.to_owned_message();
-        let challenge = req.challenge.clone();
+        let (_tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
         let body = accept_logout_request_to_json(&req);
         let value = self
             .hydra
-            .accept_logout_request(&challenge, body)
+            .accept_logout_request(&ory_challenge, body)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_logout_response_to_proto(&value)))
@@ -250,11 +414,11 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         request: ServiceRequest<'_, RejectLogoutRequest>,
     ) -> ServiceResult<LogoutResponse> {
         let req = request.to_owned_message();
-        let challenge = req.challenge.clone();
+        let (_tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
         let body = reject_logout_request_to_json(&req);
         let value = self
             .hydra
-            .reject_logout_request(&challenge, body)
+            .reject_logout_request(&ory_challenge, body)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(ory_logout_response_to_proto(&value)))
@@ -280,6 +444,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
             ServiceError::Internal("invalid upstream response".into())
         }
         OryClientError::MissingTenant => ServiceError::Unauthenticated("missing tenant".into()),
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
@@ -296,8 +461,14 @@ mod tests {
     use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient};
     use sunbeam_g2v::error::ServiceError;
+    use ulid::Ulid;
 
     use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
+    use crate::db::{
+        IdMappingRow, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE,
+        TransientTokenRepo, TransientTokenRow, TransientTokenStore,
+    };
+    use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
         AcceptConsentRequest, AcceptLogoutRequest, GetChallengeRequest, OAuth2ConsentService,
         RejectConsentRequest, RejectLogoutRequest,
@@ -406,8 +577,298 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubTransientTokenStore {
+        rows: Mutex<Vec<TransientTokenRow>>,
+    }
+
+    impl StubTransientTokenStore {
+        fn seed(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+            ory_token: &str,
+        ) {
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.to_string(),
+                ory_token: ory_token.to_string(),
+                expires_at: super::challenge_expiry(),
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransientTokenStore for StubTransientTokenStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+            expires_at: time::OffsetDateTime,
+        ) -> Result<String, crate::db::DbError> {
+            let rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter().find(|r| {
+                r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+            }) {
+                return Ok(row.public_token.clone());
+            }
+            drop(rows);
+            let public_token = Ulid::new().to_string();
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.clone(),
+                ory_token: ory_token.to_string(),
+                expires_at,
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+            Ok(public_token)
+        }
+
+        async fn get_ory_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<String, crate::db::DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| r.ory_token.clone())
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+
+        async fn get_public_token(
+            &self,
+            _tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+        ) -> Result<String, crate::db::DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend && r.token_type == token_type && r.ory_token == ory_token
+                })
+                .map(|r| r.public_token.clone())
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            public_token: &str,
+        ) -> Result<(), crate::db::DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows.iter().position(|r| r.public_token == public_token);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+
+        async fn get_ory_token_global(
+            &self,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<(String, String), crate::db::DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| (r.tenant_id.clone(), r.ory_token.clone()))
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+    }
+
+    #[derive(Default)]
+    struct StubMappingStore {
+        rows: Mutex<Vec<IdMappingRow>>,
+    }
+
+    impl StubMappingStore {
+        fn with_mapping(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
+        ) -> Self {
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().unwrap().push(row);
+            Self {
+                rows: Mutex::new(std::mem::take(&mut *self.rows.lock().unwrap())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdMappingStore for StubMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<IdMappingRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id
+                        && r.backend == backend
+                        && r.ory_global_id == ory_global_id
+                })
+                .map(|r| r.public_id.clone())
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+
+        async fn delete(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            Ok(None)
+        }
+    }
+
+    fn default_transient_store() -> StubTransientTokenStore {
+        let store = StubTransientTokenStore::default();
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_CONSENT_CHALLENGE,
+            "pub-consent-1",
+            "consent-challenge-1",
+        );
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_CONSENT_CHALLENGE,
+            "pub-consent-2",
+            "consent-challenge-2",
+        );
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_CONSENT_CHALLENGE,
+            "pub-consent-3",
+            "consent-challenge-3",
+        );
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_LOGOUT_CHALLENGE,
+            "pub-logout-1",
+            "logout-challenge-1",
+        );
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_LOGOUT_CHALLENGE,
+            "pub-logout-2",
+            "logout-challenge-2",
+        );
+        store.seed(
+            "tenant-1",
+            super::BACKEND_HYDRA,
+            TOKEN_TYPE_LOGOUT_CHALLENGE,
+            "pub-logout-3",
+            "logout-challenge-3",
+        );
+        store
+    }
+
+    fn default_mapping_store() -> StubMappingStore {
+        StubMappingStore::default()
+            .with_mapping("tenant-1", super::BACKEND_HYDRA, "pub-client-1", "client-1")
+            .with_mapping(
+                "tenant-1",
+                super::BACKEND_KRATOS,
+                "subject-1",
+                "ory-subject-1",
+            )
+            .with_mapping(
+                "tenant-1",
+                super::BACKEND_KRATOS,
+                "other-subject",
+                "ory-other-subject",
+            )
+    }
+
     fn service(hydra: Arc<dyn ConsentHydra>) -> OAuth2ConsentServiceImpl {
-        OAuth2ConsentServiceImpl { hydra }
+        OAuth2ConsentServiceImpl {
+            hydra,
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+        }
     }
 
     fn request_context() -> RequestContext {
@@ -423,6 +884,7 @@ mod tests {
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),
         });
+        ctx.extensions_mut().insert(TenantId("tenant-1".into()));
         ctx
     }
 
@@ -489,10 +951,15 @@ mod tests {
         assert!(matches!(missing, ServiceError::Unauthenticated(_)));
     }
 
-    #[test]
-    fn oauth2_consent_service_impl_new_stores_hydra() {
+    #[tokio::test]
+    async fn oauth2_consent_service_impl_new_stores_hydra() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
         let hydra = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap());
-        let service = OAuth2ConsentServiceImpl::new(hydra);
+        let service = OAuth2ConsentServiceImpl::new(
+            hydra,
+            TransientTokenRepo::new(pool.clone()),
+            crate::db::IdMappingRepo::new(pool),
+        );
         let _cloned = service.clone();
     }
 
@@ -502,14 +969,14 @@ mod tests {
         mock.queue(Ok(serde_json::json!({
             "challenge": "consent-challenge-1",
             "client": { "client_id": "client-1", "client_name": "App" },
-            "subject": "subject-1",
+            "subject": "ory-subject-1",
             "skip": false,
         })));
         let svc = service(mock.clone());
         svc_req!(
             req,
             GetChallengeRequest {
-                challenge: "consent-challenge-1".into(),
+                challenge: "pub-consent-1".into(),
                 ..Default::default()
             },
             GetChallengeRequest
@@ -519,8 +986,8 @@ mod tests {
             .await
             .unwrap()
             .body;
-        assert_eq!(resp.challenge, "consent-challenge-1");
-        assert_eq!(resp.client_id, "client-1");
+        assert_eq!(resp.challenge, "pub-consent-1");
+        assert_eq!(resp.client_id, "pub-client-1");
         assert_eq!(resp.subject, "subject-1");
         assert!(!resp.skip);
         assert!(
@@ -535,7 +1002,7 @@ mod tests {
         svc_req!(
             req,
             GetChallengeRequest {
-                challenge: "consent-challenge-1".into(),
+                challenge: "pub-consent-1".into(),
                 ..Default::default()
             },
             GetChallengeRequest
@@ -558,7 +1025,7 @@ mod tests {
         svc_req!(
             req,
             GetChallengeRequest {
-                challenge: "missing".into(),
+                challenge: "pub-consent-1".into(),
                 ..Default::default()
             },
             GetChallengeRequest
@@ -576,7 +1043,7 @@ mod tests {
         mock.queue(Ok(serde_json::json!({
             "challenge": "consent-challenge-2",
             "client": { "client_id": "client-1" },
-            "subject": "subject-1",
+            "subject": "ory-subject-1",
             "requested_scope": ["openid"],
         })));
         mock.queue(Ok(serde_json::json!({
@@ -586,7 +1053,7 @@ mod tests {
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "consent-challenge-2".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into()],
                 remember: true,
                 ..Default::default()
@@ -617,7 +1084,7 @@ mod tests {
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "bad-challenge".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into()],
                 ..Default::default()
             },
@@ -636,14 +1103,14 @@ mod tests {
         mock.queue(Ok(serde_json::json!({
             "challenge": "consent-challenge-2",
             "client": { "client_id": "client-1" },
-            "subject": "subject-1",
+            "subject": "ory-subject-1",
             "requested_scope": ["openid"],
         })));
         let svc = service(mock.clone());
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "consent-challenge-2".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into(), "admin".into()],
                 ..Default::default()
             },
@@ -662,7 +1129,7 @@ mod tests {
         mock.queue(Ok(serde_json::json!({
             "challenge": "consent-challenge-2",
             "client": { "client_id": "client-1" },
-            "subject": "other-subject",
+            "subject": "ory-other-subject",
             "requested_scope": ["openid"],
         })));
         mock.queue(Ok(serde_json::json!({
@@ -672,7 +1139,7 @@ mod tests {
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "consent-challenge-2".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into()],
                 ..Default::default()
             },
@@ -696,14 +1163,14 @@ mod tests {
         mock.queue(Ok(serde_json::json!({
             "challenge": "consent-challenge-2",
             "client": { "client_id": "client-1" },
-            "subject": "other-subject",
+            "subject": "ory-other-subject",
             "requested_scope": ["openid"],
         })));
         let svc = service(mock.clone());
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "consent-challenge-2".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into()],
                 ..Default::default()
             },
@@ -723,7 +1190,7 @@ mod tests {
         svc_req!(
             req,
             AcceptConsentRequest {
-                challenge: "consent-challenge-2".into(),
+                challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into()],
                 ..Default::default()
             },
@@ -746,7 +1213,7 @@ mod tests {
         svc_req!(
             req,
             RejectConsentRequest {
-                challenge: "consent-challenge-3".into(),
+                challenge: "pub-consent-3".into(),
                 error: "access_denied".into(),
                 ..Default::default()
             },
@@ -772,7 +1239,7 @@ mod tests {
         svc_req!(
             req,
             RejectConsentRequest {
-                challenge: "consent-challenge-3".into(),
+                challenge: "pub-consent-3".into(),
                 error: "access_denied".into(),
                 ..Default::default()
             },
@@ -796,7 +1263,7 @@ mod tests {
         svc_req!(
             req,
             RejectConsentRequest {
-                challenge: "forbidden-challenge".into(),
+                challenge: "pub-consent-3".into(),
                 error: "access_denied".into(),
                 ..Default::default()
             },
@@ -814,7 +1281,7 @@ mod tests {
         let mock = Arc::new(MockConsentHydra::default());
         mock.queue(Ok(serde_json::json!({
             "challenge": "logout-challenge-1",
-            "subject": "subject-1",
+            "subject": "ory-subject-1",
             "client": { "client_id": "client-1" },
             "request_url": "https://example.com/logout",
             "post_logout_redirect_uri": "https://example.com/after-logout",
@@ -823,7 +1290,7 @@ mod tests {
         svc_req!(
             req,
             GetChallengeRequest {
-                challenge: "logout-challenge-1".into(),
+                challenge: "pub-logout-1".into(),
                 ..Default::default()
             },
             GetChallengeRequest
@@ -833,9 +1300,9 @@ mod tests {
             .await
             .unwrap()
             .body;
-        assert_eq!(resp.challenge, "logout-challenge-1");
+        assert_eq!(resp.challenge, "pub-logout-1");
         assert_eq!(resp.subject, "subject-1");
-        assert_eq!(resp.client_id, "client-1");
+        assert_eq!(resp.client_id, "pub-client-1");
         assert_eq!(resp.request_url, "https://example.com/logout");
         assert_eq!(
             resp.post_logout_redirect_uri,
@@ -857,7 +1324,7 @@ mod tests {
         svc_req!(
             req,
             GetChallengeRequest {
-                challenge: "missing-logout".into(),
+                challenge: "pub-logout-1".into(),
                 ..Default::default()
             },
             GetChallengeRequest
@@ -879,7 +1346,7 @@ mod tests {
         svc_req!(
             req,
             AcceptLogoutRequest {
-                challenge: "logout-challenge-2".into(),
+                challenge: "pub-logout-2".into(),
                 ..Default::default()
             },
             AcceptLogoutRequest
@@ -907,7 +1374,7 @@ mod tests {
         svc_req!(
             req,
             AcceptLogoutRequest {
-                challenge: "network-error".into(),
+                challenge: "pub-logout-2".into(),
                 ..Default::default()
             },
             AcceptLogoutRequest
@@ -926,7 +1393,7 @@ mod tests {
         svc_req!(
             req,
             RejectLogoutRequest {
-                challenge: "logout-challenge-3".into(),
+                challenge: "pub-logout-3".into(),
                 error: "invalid_request".into(),
                 ..Default::default()
             },
@@ -955,7 +1422,7 @@ mod tests {
         svc_req!(
             req,
             RejectLogoutRequest {
-                challenge: "bad-response".into(),
+                challenge: "pub-logout-3".into(),
                 error: "invalid_request".into(),
                 ..Default::default()
             },

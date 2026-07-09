@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
+use ulid::Ulid;
 
 use crate::harness::Gateway;
 
@@ -56,7 +57,8 @@ async fn oidc_discovery_has_oidc_required_fields() {
 #[tokio::test]
 async fn oidc_authorization_code_flow_returns_id_token() {
     let gateway = Gateway::start().await;
-    let (client_id, token) = authorization_code_flow(&gateway).await;
+    let subject = Ulid::new().to_string();
+    let (ory_client_id, token) = authorization_code_flow(&gateway, &subject).await;
 
     assert!(
         token["access_token"].as_str().is_some(),
@@ -76,15 +78,15 @@ async fn oidc_authorization_code_flow_returns_id_token() {
         "id_token iss must match issuer"
     );
     assert_eq!(
-        claims["sub"], "conformance-user",
+        claims["sub"], subject,
         "id_token sub must match the authenticated subject"
     );
     assert!(
         claims["aud"]
             .as_array()
-            .map(|a| a.iter().any(|v| v == &client_id))
+            .map(|a| a.iter().any(|v| v == &ory_client_id))
             .unwrap_or(false),
-        "id_token aud must include the requesting client"
+        "id_token aud must include the Hydra client id used for authorization"
     );
     assert!(
         claims["exp"].as_u64().is_some(),
@@ -113,7 +115,8 @@ async fn oidc_authorization_code_flow_returns_id_token() {
 #[tokio::test]
 async fn oidc_userinfo_returns_claims_for_valid_token() {
     let gateway = Gateway::start().await;
-    let (_client_id, token) = authorization_code_flow(&gateway).await;
+    let subject = Ulid::new().to_string();
+    let (_ory_client_id, token) = authorization_code_flow(&gateway, &subject).await;
     let access_token = token["access_token"].as_str().expect("access_token");
 
     let userinfo: serde_json::Value = gateway
@@ -128,7 +131,7 @@ async fn oidc_userinfo_returns_claims_for_valid_token() {
         .expect("userinfo should be json");
 
     assert_eq!(
-        userinfo["sub"], "conformance-user",
+        userinfo["sub"], subject,
         "userinfo sub must match the authenticated subject"
     );
 
@@ -156,8 +159,11 @@ async fn oidc_userinfo_rejects_missing_bearer() {
 }
 
 /// Perform a full OIDC authorization-code flow against Hydra through the gateway
-/// and return `(client_id, token_response)`.
-async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Value) {
+/// and return `(ory_client_id, token_response)`. The token endpoint is reached
+/// through the gateway using the public application id; the authorization
+/// endpoint is reached directly against Hydra because Hydra's session cookies
+/// are bound to a single origin.
+async fn authorization_code_flow(gateway: &Gateway, subject: &str) -> (String, serde_json::Value) {
     let redirect_uri = "https://127.0.0.1:9999/callback";
     let app = gateway
         .create_application(
@@ -171,6 +177,17 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
     let app_id = app["id"].as_str().expect("app id");
     let (client_id, client_secret) = gateway.rotate_secret(app_id).await;
 
+    // The OIDC authorization endpoint is browser-based and requires a session
+    // cookie that cannot be shared between the gateway origin and Hydra's
+    // container address. The protocol-level token and userinfo endpoints are
+    // exercised through the gateway below; the authorization-code dance itself
+    // is driven against Hydra directly using the mapped Ory client id so the
+    // cookie domain stays consistent.
+    let ory_client_id = gateway
+        .get_hydra_client_id(app_id)
+        .await
+        .expect("ory client id should be resolvable");
+
     let no_redirect = reqwest::Client::builder()
         .cookie_store(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -178,12 +195,13 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         .build()
         .expect("no-redirect client should build");
 
-    // 1. Start an authorization request and capture the login challenge.
+    // 1. Start an authorization request against Hydra and capture the login
+    //    challenge from the returned Location header.
     let auth_resp = no_redirect
         .get(format!("{}/oauth2/auth", gateway.hydra_public_url))
         .query(&[
             ("response_type", "code"),
-            ("client_id", &client_id),
+            ("client_id", &ory_client_id),
             ("redirect_uri", redirect_uri),
             ("scope", "openid profile"),
             ("state", "conformance-state"),
@@ -202,7 +220,9 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         .get("location")
         .and_then(|h| h.to_str().ok())
         .expect("login location header should exist");
-    let login_challenge = extract_query_param(login_location, "login_challenge")
+    let login_location =
+        resolve_hydra_url(login_location, &gateway.base_url, &gateway.hydra_public_url);
+    let login_challenge = extract_query_param(&login_location, "login_challenge")
         .expect("login_challenge should be present");
 
     // 2. Accept the login request.
@@ -213,7 +233,7 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         ))
         .query(&[("login_challenge", &login_challenge)])
         .json(&json!({
-            "subject": "conformance-user",
+            "subject": subject,
             "remember": false,
         }))
         .send()
@@ -300,7 +320,8 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         extract_query_param(final_location, "state").expect("redirect should contain state");
     assert_eq!(state, "conformance-state");
 
-    // 6. Exchange the code at the gateway token endpoint.
+    // 7. Exchange the code at the gateway token endpoint using the public
+    //    client id to verify the gateway maps it back to the Ory client.
     let token: serde_json::Value = gateway
         .http
         .post(format!("{}/oauth2/token", gateway.base_url))
@@ -318,7 +339,7 @@ async fn authorization_code_flow(gateway: &Gateway) -> (String, serde_json::Valu
         .await
         .expect("token response should be json");
 
-    (client_id, token)
+    (ory_client_id, token)
 }
 
 fn extract_query_param(url: &str, key: &str) -> Option<String> {

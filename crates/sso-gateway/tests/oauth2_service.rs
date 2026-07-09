@@ -25,8 +25,15 @@ async fn oauth2_public_endpoints_round_trip() {
     let (_pg, database_url) = support::start_postgres()
         .await
         .expect("postgres should start");
-    let (_hydra, hydra_admin_url, hydra_public_url) =
-        support::start_hydra().await.expect("hydra should start");
+
+    let (listener, addr) = bind_random_port("127.0.0.1")
+        .await
+        .expect("random port should bind");
+    let base = format!("http://{addr}");
+
+    let (_hydra, hydra_admin_url, hydra_public_url) = support::start_hydra_with_issuer(&base)
+        .await
+        .expect("hydra should start");
 
     let pool = create_pool(&database_url, false)
         .await
@@ -54,11 +61,6 @@ async fn oauth2_public_endpoints_round_trip() {
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
-
-    let (listener, addr) = bind_random_port("127.0.0.1")
-        .await
-        .expect("random port should bind");
-    let base = format!("http://{addr}");
 
     let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
 
@@ -261,8 +263,15 @@ async fn oauth2_missing_client_id_is_rejected() {
     let (_pg, database_url) = support::start_postgres()
         .await
         .expect("postgres should start");
-    let (_hydra, hydra_admin_url, hydra_public_url) =
-        support::start_hydra().await.expect("hydra should start");
+
+    let (listener, addr) = bind_random_port("127.0.0.1")
+        .await
+        .expect("random port should bind");
+    let base = format!("http://{addr}");
+
+    let (_hydra, hydra_admin_url, hydra_public_url) = support::start_hydra_with_issuer(&base)
+        .await
+        .expect("hydra should start");
 
     let pool = create_pool(&database_url, false)
         .await
@@ -290,11 +299,6 @@ async fn oauth2_missing_client_id_is_rejected() {
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
-
-    let (listener, addr) = bind_random_port("127.0.0.1")
-        .await
-        .expect("random port should bind");
-    let base = format!("http://{addr}");
 
     let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
 

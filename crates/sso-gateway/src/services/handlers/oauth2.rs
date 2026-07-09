@@ -216,17 +216,37 @@ async fn authorize(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let client_id = params.get("client_id").cloned().unwrap_or_default();
-    let ory_id = match resolve_public_client(&state, &client_id).await {
+    let ory_id = match resolve_public_client_for_authorize(&state, &client_id).await {
         Ok(id) => id,
         Err(err) => return *err,
     };
 
     let query = params
         .into_iter()
-        .map(|(k, v)| if k == "client_id" { (k, ory_id.clone()) } else { (k, v) })
+        .map(|(k, v)| {
+            if k == "client_id" {
+                (k, ory_id.clone())
+            } else {
+                (k, v)
+            }
+        })
         .collect::<Vec<_>>();
     match state.hydra.authorize(query).await {
         Ok(value) => json_response(value),
+        Err(OryClientError::Redirect { location }) => {
+            if location.is_empty() {
+                return internal_error();
+            }
+            match axum::http::HeaderValue::try_from(location) {
+                Ok(location) => (
+                    StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, location)],
+                    Body::empty(),
+                )
+                    .into_response(),
+                Err(_) => internal_error(),
+            }
+        }
         Err(err) => map_ory_error(err),
     }
 }
@@ -347,7 +367,11 @@ async fn register(
     let response_types = json_string_array(&body["response_types"]);
     let scope = body["scope"]
         .as_str()
-        .map(|s| s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let token_endpoint_auth_method = body["token_endpoint_auth_method"]
         .as_str()
@@ -370,7 +394,9 @@ async fn register(
     }
 
     let client_name = body["client_name"].as_str().unwrap_or("").to_string();
+    let public_id = Ulid::new().to_string();
     let payload = json!({
+        "client_id": public_id,
         "client_name": client_name,
         "redirect_uris": redirect_uris,
         "grant_types": if grant_types.is_empty() { vec!["authorization_code".to_string()] } else { grant_types.clone() },
@@ -389,7 +415,6 @@ async fn register(
         None => return internal_error(),
     };
     let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
-    let public_id = Ulid::new().to_string();
 
     match state
         .mappings
@@ -400,7 +425,7 @@ async fn register(
         Err(err) => {
             warn!(
                 tenant_id = %auth.tenant_id,
-                ory_id = %ory_id,
+                public_id = %public_id,
                 "failed to store client mapping: {}",
                 err
             );
@@ -437,9 +462,39 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 
 async fn revoke(
     State(state): State<Arc<Oauth2State>>,
-    Form(form): Form<HashMap<String, String>>,
+    headers: HeaderMap,
+    Form(mut form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let token = form.get("token").cloned();
+
+    let client_credentials = if let Some((id, secret)) = basic_auth_credentials(&headers) {
+        form.remove("client_id");
+        form.remove("client_secret");
+        Some((id, secret))
+    } else {
+        None
+    };
+
+    let client_id = client_credentials
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .or_else(|| form.get("client_id").cloned())
+        .unwrap_or_default();
+    if !client_id.is_empty() {
+        match resolve_public_client(&state, &client_id).await {
+            Ok(ory_id) => {
+                let hydra_credentials =
+                    client_credentials.map(|(_, secret)| (ory_id.clone(), secret));
+                form.insert("client_id".to_string(), ory_id);
+                if let Some((id, secret)) = hydra_credentials {
+                    form.insert("client_secret".to_string(), secret);
+                    let _ = id;
+                }
+            }
+            Err(err) => return *err,
+        }
+    }
+
     let form_vec = form.into_iter().collect::<Vec<_>>();
 
     match state.hydra.revoke(form_vec).await {
@@ -502,8 +557,7 @@ async fn introspect(
                     obj.insert("sub".to_string(), json!(public_id));
                 }
                 if let Some(client_id) = obj.get("client_id").and_then(|v| v.as_str())
-                    && let Some(public_id) =
-                        translate_ory_id_to_public_id(&state, client_id).await
+                    && let Some(public_id) = translate_ory_id_to_public_id(&state, client_id).await
                 {
                     obj.insert("client_id".to_string(), json!(public_id));
                 }
@@ -548,12 +602,39 @@ async fn resolve_public_client(
         })
 }
 
-async fn translate_ory_id_to_public_id(
+/// Resolve a gateway public client id to the Ory id. If the value is already an
+/// Ory id (e.g. because Hydra generated it in a redirect URL) pass it through
+/// unchanged. This is only appropriate for the public OAuth2 authorization
+/// endpoint where Hydra itself produces the client_id query parameter.
+async fn resolve_public_client_for_authorize(
     state: &Oauth2State,
-    ory_id: &str,
-) -> Option<String> {
+    client_id: &str,
+) -> Result<String, Box<Response>> {
+    if client_id.is_empty() {
+        return Err(Box::new(bad_request("missing client_id")));
+    }
+
+    match state
+        .mappings
+        .get_ory_id_by_public_id(BACKEND_HYDRA, client_id)
+        .await
+    {
+        Ok(ory_id) => Ok(ory_id),
+        Err(crate::db::DbError::MappingNotFound) => Ok(client_id.to_string()),
+        Err(e) => {
+            warn!("failed to resolve public client {}: {}", client_id, e);
+            Err(Box::new(internal_error()))
+        }
+    }
+}
+
+async fn translate_ory_id_to_public_id(state: &Oauth2State, ory_id: &str) -> Option<String> {
     for backend in [BACKEND_HYDRA, "kratos"] {
-        if let Ok(public_id) = state.mappings.get_public_id_by_ory_id(backend, ory_id).await {
+        if let Ok(public_id) = state
+            .mappings
+            .get_public_id_by_ory_id(backend, ory_id)
+            .await
+        {
             return Some(public_id);
         }
     }
@@ -618,6 +699,7 @@ fn map_ory_error(err: OryClientError) -> Response<Body> {
             StatusCode::INTERNAL_SERVER_ERROR
         }
         OryClientError::MissingTenant => StatusCode::UNAUTHORIZED,
+        OryClientError::Redirect { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     warn!(?err, "ory backend error");
     let body = json!({"error": "server_error"});
@@ -690,11 +772,12 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    #[allow(clippy::type_complexity)]
     struct StubMappingStore {
-        #[allow(clippy::type_complexity)]
         tenant_by_ory_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
         ory_by_public_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
-        public_id_by_ory_id: Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
+        public_id_by_ory_id:
+            Arc<std::sync::Mutex<Option<Result<Option<String>, crate::db::DbError>>>>,
     }
 
     impl StubMappingStore {
@@ -703,14 +786,6 @@ mod tests {
                 tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
                 ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(result))),
                 public_id_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
-            }
-        }
-
-        fn with_public_id_by_ory_id(result: Result<Option<String>, crate::db::DbError>) -> Self {
-            Self {
-                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
-                ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
-                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(result))),
             }
         }
     }
@@ -866,9 +941,7 @@ mod tests {
         }
     }
 
-    fn resolve_state(
-        ory_result: Result<Option<String>, crate::db::DbError>,
-    ) -> Oauth2State {
+    fn resolve_state(ory_result: Result<Option<String>, crate::db::DbError>) -> Oauth2State {
         Oauth2State {
             hydra: Arc::new(StubHydra),
             mappings: Arc::new(StubMappingStore::with_ory_by_public_id(ory_result)),
@@ -1077,9 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_public_client_maps_db_error_to_internal() {
         let state = resolve_state(Err(crate::db::DbError::ConnectionNotFound));
-        let err = resolve_public_client(&state, "client-1")
-            .await
-            .unwrap_err();
+        let err = resolve_public_client(&state, "client-1").await.unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -1162,15 +1233,13 @@ mod tests {
 
     /// Hydra stub that records the normalized request passed to it.
     #[derive(Clone, Default)]
+    #[allow(clippy::type_complexity)]
     struct RecordingHydra {
         response: serde_json::Value,
         authorize_calls: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
-        token_calls: Arc<
-            std::sync::Mutex<Vec<(Vec<(String, String)>, Option<(String, String)>)>>,
-        >,
-        device_calls: Arc<
-            std::sync::Mutex<Vec<(String, Vec<(String, String)>, Option<(String, String)>)>>,
-        >,
+        token_calls: Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Option<(String, String)>)>>>,
+        device_calls:
+            Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>, Option<(String, String)>)>>>,
     }
 
     #[async_trait]
@@ -1201,11 +1270,10 @@ mod tests {
             form: Vec<(String, String)>,
             client_credentials: Option<(String, String)>,
         ) -> Result<serde_json::Value, OryClientError> {
-            self.device_calls.lock().unwrap().push((
-                path.to_string(),
-                form,
-                client_credentials,
-            ));
+            self.device_calls
+                .lock()
+                .unwrap()
+                .push((path.to_string(), form, client_credentials));
             Ok(self.response.clone())
         }
 
@@ -1335,14 +1403,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("client-1", "secret"));
         let form = HashMap::new();
-        let resp = device(
-            State(state),
-            headers,
-            Path("auth".to_string()),
-            Form(form),
-        )
-        .await
-        .into_response();
+        let resp = device(State(state), headers, Path("auth".to_string()), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1378,7 +1441,10 @@ mod tests {
         let calls = hydra.authorize_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].iter().find(|(k, _)| k == "client_id").map(|(_, v)| v),
+            calls[0]
+                .iter()
+                .find(|(k, _)| k == "client_id")
+                .map(|(_, v)| v),
             Some(&"hydra-client-id-1".to_string())
         );
     }
@@ -1406,9 +1472,14 @@ mod tests {
     async fn token_replaces_basic_auth_client_id_with_ory_id() {
         let (state, hydra) = recording_state();
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
         let form = HashMap::new();
-        let _ = token(State(state), headers, Form(form)).await.into_response();
+        let _ = token(State(state), headers, Form(form))
+            .await
+            .into_response();
         let calls = hydra.token_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let (_, creds) = &calls[0];
@@ -1491,7 +1562,9 @@ mod tests {
     async fn revoke_succeeds() {
         let state = Arc::new(ok_state(None));
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = revoke(State(state), Form(form)).await.into_response();
+        let resp = revoke(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1500,7 +1573,9 @@ mod tests {
         let cache = Arc::new(MockTokenCache::default());
         let state = Arc::new(ok_state(None).with_token_cache(cache.clone()));
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = revoke(State(state), Form(form)).await.into_response();
+        let resp = revoke(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let removed = cache.removed.lock().unwrap();
         assert_eq!(removed.len(), 1);
@@ -1512,7 +1587,9 @@ mod tests {
         let cache = Arc::new(MockTokenCache::with_remove_error());
         let state = Arc::new(ok_state(None).with_token_cache(cache.clone()));
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = revoke(State(state), Form(form)).await.into_response();
+        let resp = revoke(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let removed = cache.removed.lock().unwrap();
         assert_eq!(removed.len(), 1);
@@ -1707,7 +1784,9 @@ mod tests {
     async fn revoke_returns_bad_gateway_on_hydra_error() {
         let state = Arc::new(err_state(None));
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = revoke(State(state), Form(form)).await.into_response();
+        let resp = revoke(State(state), HeaderMap::new(), Form(form))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1994,9 +2073,13 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), Extension(register_auth(vec!["tenant:read".into()])), Json(body))
-            .await
-            .into_response();
+        let resp = register(
+            State(state),
+            Extension(register_auth(vec!["tenant:read".into()])),
+            Json(body),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 

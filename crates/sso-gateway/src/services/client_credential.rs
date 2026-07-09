@@ -19,8 +19,8 @@ use crate::{
     middleware::TenantId,
     proto::iam::v1::{
         ClientCredential, ClientCredentialSecret, ClientCredentialService,
-        CreateClientCredentialRequest, DeleteClientCredentialRequest,
-        GetClientCredentialRequest, ListClientCredentialsRequest, ListClientCredentialsResponse,
+        CreateClientCredentialRequest, DeleteClientCredentialRequest, GetClientCredentialRequest,
+        ListClientCredentialsRequest, ListClientCredentialsResponse,
         RotateClientCredentialSecretRequest, UpdateClientCredentialRequest,
     },
 };
@@ -33,11 +33,8 @@ const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 pub trait ClientCredentialHydra: Send + Sync + 'static {
     async fn create_oauth2_client(&self, payload: Value) -> Result<Value, OryClientError>;
     async fn get_oauth2_client(&self, id: &str) -> Result<Value, OryClientError>;
-    async fn update_oauth2_client(
-        &self,
-        id: &str,
-        payload: Value,
-    ) -> Result<Value, OryClientError>;
+    async fn update_oauth2_client(&self, id: &str, payload: Value)
+    -> Result<Value, OryClientError>;
     async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError>;
     async fn rotate_client_secret(&self, id: &str) -> Result<Value, OryClientError>;
 }
@@ -100,7 +97,8 @@ impl ClientCredentialService for ClientCredentialServiceImpl {
         let token_endpoint_auth_method =
             validate_or_default_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
 
-        let payload = build_hydra_payload(&req, &token_endpoint_auth_method);
+        let public_id = Ulid::new().to_string();
+        let payload = build_hydra_payload(&req, &token_endpoint_auth_method, &public_id);
         let created = self
             .hydra
             .create_oauth2_client(payload)
@@ -112,7 +110,6 @@ impl ClientCredentialService for ClientCredentialServiceImpl {
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_id".into()))?;
         let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
 
-        let public_id = Ulid::new().to_string();
         self.mappings
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
             .await?;
@@ -167,11 +164,8 @@ impl ClientCredentialService for ClientCredentialServiceImpl {
                 .await
             {
                 Ok(ory_id) => match self.hydra.get_oauth2_client(&ory_id).await {
-                    Ok(client) => credentials.push(hydra_to_client_credential(
-                        &client,
-                        &tenant_id,
-                        &public_id,
-                    )),
+                    Ok(client) => credentials
+                        .push(hydra_to_client_credential(&client, &tenant_id, &public_id)),
                     Err(err) => debug!(%public_id, "failed to fetch hydra client: {}", err),
                 },
                 Err(err) => debug!(%public_id, "mapping lookup failed: {}", err),
@@ -260,14 +254,13 @@ impl ClientCredentialService for ClientCredentialServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
-        let client_id = rotated["client_id"].as_str().unwrap_or(&ory_id).to_string();
         let client_secret = rotated["client_secret"]
             .as_str()
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_secret".into()))?
             .to_string();
 
         Ok(Response::new(ClientCredentialSecret {
-            client_id,
+            client_id: req.id,
             client_secret,
             ..Default::default()
         }))
@@ -356,11 +349,17 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
         OryClientError::MissingTenant => {
             ServiceError::Unauthenticated("missing tenant context".into())
         }
+        OryClientError::Redirect { .. } => ServiceError::Internal("unexpected redirect".into()),
     }
 }
 
-fn build_hydra_payload(req: &CreateClientCredentialRequest, method: &str) -> serde_json::Value {
+fn build_hydra_payload(
+    req: &CreateClientCredentialRequest,
+    method: &str,
+    client_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
+        "client_id": client_id,
         "client_name": req.name,
         "grant_types": [GRANT_TYPE_CLIENT_CREDENTIALS],
         "scope": req.scope.join(" "),
@@ -680,7 +679,7 @@ mod tests {
             .create_client_credential(admin_context("t1"), r)
             .await
             .unwrap_err();
-            assert!(err.to_string().contains("unknown scope"));
+        assert!(err.to_string().contains("unknown scope"));
     }
 
     #[tokio::test]
@@ -903,7 +902,7 @@ mod tests {
             .unwrap()
             .body;
 
-        assert_eq!(resp.client_id, "ory-123");
+        assert_eq!(resp.client_id, "pub-1");
         assert_eq!(resp.client_secret, "new-secret");
     }
 
@@ -929,6 +928,8 @@ mod tests {
             .get_client_credential(tenant_context("t1"), r)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not found") || err.to_string().contains("MappingNotFound"));
+        assert!(
+            err.to_string().contains("not found") || err.to_string().contains("MappingNotFound")
+        );
     }
 }

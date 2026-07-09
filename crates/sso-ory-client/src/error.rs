@@ -14,6 +14,11 @@ pub enum OryClientError {
     #[error("ory returned error: {status} {message}")]
     Ory { status: u16, message: String },
 
+    /// Hydra's authorization endpoint responded with an HTTP redirect.
+    /// The gateway should proxy this location to the browser.
+    #[error("ory returned redirect: {location}")]
+    Redirect { location: String },
+
     #[error("missing tenant context")]
     MissingTenant,
 

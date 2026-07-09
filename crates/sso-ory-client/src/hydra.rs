@@ -20,6 +20,9 @@ impl HydraClient {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .connect_timeout(std::time::Duration::from_secs(5))
+                // Hydra's authorization endpoint returns HTTP redirects that the
+                // gateway must proxy to the caller. Never follow them internally.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             admin_url: parse_base_url(admin_url)?,
             public_url: parse_base_url(public_url)?,
@@ -312,6 +315,17 @@ impl HydraClient {
             .send()
             .await
             .map_err(OryClientError::Http)?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .map(String::from)
+                .unwrap_or_default();
+            return Err(OryClientError::Redirect { location });
+        }
+
         handle_response(response).await
     }
 

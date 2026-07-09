@@ -406,6 +406,19 @@ impl Gateway {
 
         (key_id, private_key_pem, certificate_pem)
     }
+
+    /// Resolve the Ory Hydra client id for a gateway application. This is only
+    /// used internally by conformance tests to drive the browser-oriented OIDC
+    /// authorization flow against Hydra directly; the gateway's public API
+    /// never exposes this value.
+    pub async fn get_hydra_client_id(&self, app_id: &str) -> Result<String, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT ory_global_id FROM id_mappings WHERE backend = 'hydra' AND public_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&self.pool)
+        .await
+    }
 }
 
 async fn fetch_bootstrap_token(

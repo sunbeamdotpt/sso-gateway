@@ -26,6 +26,9 @@ pub const SCOPE_APPLICATION_ADMIN: &str = "application:admin";
 pub const SCOPE_APPLICATION_READ: &str = "application:read";
 
 /// Authentication context attached to a request after successful token introspection.
+///
+/// `subject` is the gateway public identifier (never the raw Hydra client ID or
+/// Kratos identity ID). Callers and audit logs should only see this value.
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub tenant_id: String,
@@ -248,7 +251,26 @@ pub async fn resolve_tenant_from_subject(
             Ok(Some(tenant_id)) => return Ok(tenant_id),
             Ok(None) => continue,
             Err(e) => {
-                warn!("failed to resolve tenant for subject {}: {}", subject, e);
+                warn!("failed to resolve tenant for subject: {}", e);
+                return Err(AuthError::Database(e));
+            }
+        }
+    }
+    Err(AuthError::UnknownSubject)
+}
+
+/// Translate an Ory backend subject (Hydra client ID or Kratos identity ID)
+/// into the gateway public identifier stored in id_mappings.
+pub async fn resolve_public_subject(
+    mappings: &dyn IdMappingStore,
+    ory_subject: &str,
+) -> Result<String, AuthError> {
+    for backend in ["hydra", "kratos"] {
+        match mappings.get_public_id_by_ory_id(backend, ory_subject).await {
+            Ok(public_id) => return Ok(public_id),
+            Err(DbError::MappingNotFound) => continue,
+            Err(e) => {
+                warn!("failed to resolve public subject: {}", e);
                 return Err(AuthError::Database(e));
             }
         }
