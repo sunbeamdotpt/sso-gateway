@@ -27,6 +27,7 @@ mod scim_group;
 mod session_store;
 mod tenant;
 mod token_cache;
+mod transient_token;
 
 pub use connection::{
     ConnectionType, PgTenantConnectionStore, TenantConnectionRow, TenantConnectionStore,
@@ -59,6 +60,12 @@ pub use scim_group::{PgScimGroupStore, ScimGroupRow, ScimGroupStore};
 pub use session_store::{PgSessionStore, SessionStore};
 pub use tenant::{PgTenantStore, TenantRow, TenantStore};
 pub use token_cache::{PgTokenIntrospectionCache, TokenIntrospectionCache, TokenIntrospectionRow};
+pub use transient_token::{
+    PgTransientTokenStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
+    TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+    TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+    TransientTokenRow, TransientTokenStore,
+};
 
 // Backward-compatible concrete repo aliases.
 pub use connection::PgTenantConnectionStore as TenantConnectionRepo;
@@ -76,3 +83,4 @@ pub use saml_request::PgSamlRequestStore as SamlRequestRepo;
 pub use saml_sp_client::PgSamlSpClientStore as SamlSpClientRepo;
 pub use scim_group::PgScimGroupStore as ScimGroupRepo;
 pub use tenant::PgTenantStore as TenantRepo;
+pub use transient_token::PgTransientTokenStore as TransientTokenRepo;
