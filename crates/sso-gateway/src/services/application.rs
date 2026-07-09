@@ -291,6 +291,17 @@ fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), Servic
     Ok(())
 }
 
+fn is_loopback_host(parsed: &reqwest::Url) -> bool {
+    parsed
+        .host()
+        .map(|host| match host {
+            url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+        })
+        .unwrap_or(false)
+}
+
 pub fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), ServiceError> {
     for uri in uris {
         if uri.contains('*') {
@@ -304,7 +315,7 @@ pub fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), S
         let scheme = parsed.scheme();
         match scheme {
             "https" => {}
-            "http" if allow_http => {}
+            "http" if allow_http || is_loopback_host(&parsed) => {}
             "javascript" | "data" => {
                 return Err(ServiceError::InvalidArgument(format!(
                     "redirect_uri uses forbidden scheme: {scheme}"
@@ -1520,6 +1531,22 @@ mod tests {
     #[test]
     fn validate_redirect_uris_allows_http_when_allowed() {
         assert!(validate_redirect_uris(&["http://example.com/callback".into()], true,).is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_uris_allows_http_localhost_without_flag() {
+        assert!(
+            validate_redirect_uris(&["http://localhost:3000/callback".into()], false,).is_ok()
+        );
+        assert!(validate_redirect_uris(&["http://localhost/callback".into()], false,).is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_uris_allows_http_loopback_without_flag() {
+        assert!(
+            validate_redirect_uris(&["http://127.0.0.1:3000/callback".into()], false,).is_ok()
+        );
+        assert!(validate_redirect_uris(&["http://[::1]/callback".into()], false,).is_ok());
     }
 
     #[test]
