@@ -292,12 +292,12 @@ impl Config {
             }
         }
 
-        let keto_read_url = std::env::var("KETO_READ_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4467".to_string());
-        let openfga_url = std::env::var("OPENFGA_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
+        let keto_read_url =
+            std::env::var("KETO_READ_URL").unwrap_or_else(|_| "http://127.0.0.1:4466".to_string());
+        let keto_write_url =
+            std::env::var("KETO_WRITE_URL").unwrap_or_else(|_| "http://127.0.0.1:4467".to_string());
+        let openfga_url =
+            std::env::var("OPENFGA_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
 
         Ok(Self {
             bind_addr: std::env::var("BIND_ADDR")
@@ -533,9 +533,15 @@ mod tests {
         assert_eq!(config.kratos_admin_url, "http://127.0.0.1:4434");
         assert_eq!(config.kratos_public_url, "http://127.0.0.1:4433");
         #[cfg(feature = "openfga")]
-        assert!(matches!(config.permissions_backend, PermissionsBackend::OpenFga));
+        assert!(matches!(
+            config.permissions_backend,
+            PermissionsBackend::OpenFga
+        ));
         #[cfg(all(not(feature = "openfga"), feature = "keto"))]
-        assert!(matches!(config.permissions_backend, PermissionsBackend::Keto));
+        assert!(matches!(
+            config.permissions_backend,
+            PermissionsBackend::Keto
+        ));
         assert_eq!(config.keto_read_url, "http://127.0.0.1:4466");
         assert_eq!(config.keto_write_url, "http://127.0.0.1:4467");
         assert_eq!(config.openfga_url, "http://127.0.0.1:8081");
@@ -591,7 +597,10 @@ mod tests {
         drop(_guard);
         assert_eq!(config.system_tenant_ulid, ulid);
         assert_eq!(config.bind_addr, "0.0.0.0:3000".parse().unwrap());
-        assert!(matches!(config.permissions_backend, PermissionsBackend::OpenFga));
+        assert!(matches!(
+            config.permissions_backend,
+            PermissionsBackend::OpenFga
+        ));
         assert_eq!(config.hydra_admin_url, "http://hydra:4445");
         assert_eq!(config.openfga_url, "http://openfga:8081");
         assert_eq!(config.public_base_url, "https://gateway.example.com");
@@ -636,7 +645,10 @@ mod tests {
 
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
-        assert!(matches!(config.permissions_backend, PermissionsBackend::Keto));
+        assert!(matches!(
+            config.permissions_backend,
+            PermissionsBackend::Keto
+        ));
     }
 
     #[test]

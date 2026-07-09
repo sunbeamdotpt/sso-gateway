@@ -273,9 +273,7 @@ pub async fn start_openfga()
     let container = retry_start("openfga", || async move {
         GenericImage::new("openfga/openfga", "v1.8.3")
             .with_exposed_port(ContainerPort::Tcp(HTTP_PORT))
-            .with_wait_for(WaitFor::message_on_either_std(
-                "starting openfga service",
-            ))
+            .with_wait_for(WaitFor::message_on_either_std("starting openfga service"))
             .with_mapped_port(0, HTTP_PORT.tcp())
             .with_cmd(["run"])
             .with_startup_timeout(Duration::from_secs(120))

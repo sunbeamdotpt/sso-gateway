@@ -151,9 +151,9 @@ impl OpenFgaClient {
         store_id: &str,
         model_id: &str,
     ) -> Result<Value, OpenFgaClientError> {
-        let url = self
-            .base_url
-            .join(&format!("stores/{store_id}/authorization-models/{model_id}"))?;
+        let url = self.base_url.join(&format!(
+            "stores/{store_id}/authorization-models/{model_id}"
+        ))?;
         debug!(%url, %store_id, %model_id, "getting openfga authorization model");
         let response = self
             .client
@@ -339,7 +339,8 @@ pub enum WriteTupleOp {
 }
 
 fn parse_base_url(url: &str) -> Result<Url, OpenFgaClientError> {
-    let mut url = Url::parse(url).map_err(|e| OpenFgaClientError::InvalidResponse(e.to_string()))?;
+    let mut url =
+        Url::parse(url).map_err(|e| OpenFgaClientError::InvalidResponse(e.to_string()))?;
     if !url.path().ends_with('/')
         && let Ok(mut path) = url.path_segments_mut()
     {
@@ -442,7 +443,10 @@ mod tests {
         Json(json!({ "stores": stores }))
     }
 
-    async fn get_store(State(state): State<FakeState>, Path(store_id): Path<String>) -> Json<Value> {
+    async fn get_store(
+        State(state): State<FakeState>,
+        Path(store_id): Path<String>,
+    ) -> Json<Value> {
         let stores = state.stores.lock().unwrap();
         let store = stores
             .iter()
@@ -489,11 +493,7 @@ mod tests {
         let models = state.models.lock().unwrap();
         let model = models
             .iter()
-            .find(|m| {
-                m.get("authorization_model_id")
-                    .and_then(|v| v.as_str())
-                    == Some(&model_id)
-            })
+            .find(|m| m.get("authorization_model_id").and_then(|v| v.as_str()) == Some(&model_id))
             .cloned()
             .unwrap_or_default();
         Json(model)
@@ -534,17 +534,12 @@ mod tests {
         let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
         let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
         let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
-        let allowed = state
-            .tuples
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|t| {
-                t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
-                    && t.get("user").and_then(|v| v.as_str()) == Some(user)
-                    && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
-                    && t.get("object").and_then(|v| v.as_str()) == Some(object)
-            });
+        let allowed = state.tuples.lock().unwrap().iter().any(|t| {
+            t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
+                && t.get("user").and_then(|v| v.as_str()) == Some(user)
+                && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
+                && t.get("object").and_then(|v| v.as_str()) == Some(object)
+        });
         Json(json!({ "allowed": allowed }))
     }
 
@@ -623,7 +618,14 @@ mod tests {
         assert_eq!(model["authorization_model_id"], model_id);
 
         let allowed = client
-            .check(&store_id, &model_id, "document", "doc-1", "reader", "user:alice")
+            .check(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                "user:alice",
+            )
             .await
             .unwrap();
         assert!(!allowed);
@@ -642,7 +644,14 @@ mod tests {
             .unwrap();
 
         let allowed = client
-            .check(&store_id, &model_id, "document", "doc-1", "reader", "user:alice")
+            .check(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                "user:alice",
+            )
             .await
             .unwrap();
         assert!(allowed);
@@ -667,7 +676,14 @@ mod tests {
             .unwrap();
 
         let allowed = client
-            .check(&store_id, &model_id, "document", "doc-1", "reader", "user:alice")
+            .check(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                "user:alice",
+            )
             .await
             .unwrap();
         assert!(!allowed);
@@ -708,6 +724,9 @@ mod tests {
 
         let client = OpenFgaClient::new(&format!("http://{addr}")).unwrap();
         let err = client.create_store("x").await.unwrap_err();
-        assert!(matches!(err, OpenFgaClientError::OpenFga { status: 400, .. }));
+        assert!(matches!(
+            err,
+            OpenFgaClientError::OpenFga { status: 400, .. }
+        ));
     }
 }

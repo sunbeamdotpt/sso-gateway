@@ -278,7 +278,10 @@ mod tests {
             .get("subject_set.namespace")
             .cloned()
             .unwrap_or_default();
-        let subject_set_object = params.get("subject_set.object").cloned().unwrap_or_default();
+        let subject_set_object = params
+            .get("subject_set.object")
+            .cloned()
+            .unwrap_or_default();
         let subject_set_relation = params
             .get("subject_set.relation")
             .cloned()

@@ -7,9 +7,7 @@ use sso_gateway::{
     db::{IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::{ClientCredentialServiceExt, TenantServiceExt},
-    services::{
-        client_credential::ClientCredentialServiceImpl, tenant::TenantServiceImpl,
-    },
+    services::{client_credential::ClientCredentialServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
 use sso_ory_client::{HydraClient, KratosClient};
@@ -122,9 +120,14 @@ async fn client_credential_service_round_trip() {
         .json()
         .await
         .expect("client credential should be json");
-    let credential_id = credential["id"].as_str().expect("credential id should exist");
+    let credential_id = credential["id"]
+        .as_str()
+        .expect("credential id should exist");
     assert_eq!(credential["name"], "test-credential");
-    assert_eq!(credential["scope"], json![["tenant:read", "application:read"]]);
+    assert_eq!(
+        credential["scope"],
+        json![["tenant:read", "application:read"]]
+    );
     assert_eq!(credential["tokenEndpointAuthMethod"], "client_secret_basic");
     assert!(!credential["clientSecret"].as_str().unwrap_or("").is_empty());
 
@@ -140,7 +143,10 @@ async fn client_credential_service_round_trip() {
         .await
         .expect("get client credential request should succeed");
 
-    assert!(get_resp.status().is_success(), "get client credential failed");
+    assert!(
+        get_resp.status().is_success(),
+        "get client credential failed"
+    );
     let fetched: serde_json::Value = get_resp
         .json()
         .await
@@ -189,7 +195,10 @@ async fn client_credential_service_round_trip() {
         .await
         .expect("list client credentials request should succeed");
 
-    assert!(list_resp.status().is_success(), "list client credentials failed");
+    assert!(
+        list_resp.status().is_success(),
+        "list client credentials failed"
+    );
     let listed: serde_json::Value = list_resp
         .json()
         .await
