@@ -7,6 +7,20 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.2] - 2026-07-09
+
+### Added
+
+- `/oauth2/register` endpoint for dynamic OAuth2 client registration, protected by
+  `application:admin` and backed by Hydra with gateway-level ID mapping.
+- `/userinfo` public endpoint alias in addition to `/oauth2/userinfo`.
+
+### Changed
+
+- `CreateApplication` and `/oauth2/register` now accept `http://` redirect URIs
+  when the host is a loopback address (`localhost`, `127.0.0.1`, or `[::1]`)
+  without requiring the `allow_http_redirect_uris` configuration flag.
+
 ## [2026.07.1] - 2026-07-08
 
 ### Added
@@ -347,6 +361,7 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 - `rsa 0.9.x` is affected by `RUSTSEC-2023-0071` (Marvin Attack). No patched
   version is available upstream; risk is documented in `docs/security.md`.
 
+[2026.07.2]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v2026.07.2
 [2026.07.1]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v2026.07.1
 [1.0.0-rc.15]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc.15
 [1.0.0-rc.11]: https://github.com/sunbeamdotpt/sso-gateway/releases/tag/v1.0.0-rc11
