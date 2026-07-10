@@ -286,6 +286,7 @@ pub async fn build_app_with_upstream(
         transient.clone(),
         mappings.clone(),
         schemas.clone(),
+        memberships.clone(),
         consent_enabled,
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),

@@ -12,10 +12,11 @@ use tracing::instrument;
 
 use crate::db::{
     DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
-    TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
-    TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
-    TransientTokenRepo, TransientTokenStore,
+    TenantMembershipRepo, TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+    TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+    TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, TransientTokenStore,
 };
+use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     BrowserSession, CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
@@ -405,6 +406,7 @@ pub struct IdentitySelfServiceImpl {
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
+    memberships: Arc<dyn TenantMembershipStore>,
     consent_enabled: bool,
     kratos_public_url: String,
     gateway_public_url: String,
@@ -418,6 +420,7 @@ impl IdentitySelfServiceImpl {
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
         schemas: IdentitySchemaRepo,
+        memberships: TenantMembershipRepo,
         consent_enabled: bool,
         kratos_public_url: String,
         gateway_public_url: String,
@@ -428,6 +431,7 @@ impl IdentitySelfServiceImpl {
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
             consent_enabled,
             kratos_public_url,
             gateway_public_url,
@@ -615,6 +619,113 @@ impl IdentitySelfServiceImpl {
                 .mappings
                 .get_public_id(tenant_id, BACKEND_HYDRA, &client.client_id)
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Intercept a settings-flow profile update so the gateway stays the trait owner.
+    ///
+    /// Profile (traits) submissions are normalized, validated against the membership's
+    /// schema, merged into the membership, and reduced to `{email}` before reaching
+    /// Kratos. Email is immutable. Non-profile methods (password, oidc, webauthn, …)
+    /// carry no `traits` object and pass through untouched — credentials stay in Kratos.
+    async fn intercept_settings_profile(
+        &self,
+        tenant_id: &str,
+        cookie: Option<&str>,
+        body: &mut serde_json::Value,
+    ) -> Result<(), ServiceError> {
+        let submitted = match body.get("traits").and_then(|t| t.as_object()) {
+            Some(obj) => serde_json::Value::Object(obj.clone()),
+            None => return Ok(()),
+        };
+
+        let session = self
+            .kratos
+            .to_session(cookie, None)
+            .await
+            .map_err(map_ory_error)?;
+        let ory_identity_id = session
+            .get("identity")
+            .and_then(|i| i["id"].as_str())
+            .unwrap_or("");
+        if ory_identity_id.is_empty() {
+            return Err(ServiceError::Unauthenticated(
+                "settings flow has no authenticated identity".into(),
+            ));
+        }
+        let public_id = self
+            .mappings
+            .get_public_id(tenant_id, BACKEND_KRATOS, ory_identity_id)
+            .await?;
+
+        let membership = match self.memberships.get(tenant_id, &public_id).await {
+            Ok(membership) => membership,
+            Err(DbError::MembershipNotFound) => {
+                // Pre-migration identity: backfill a membership from the session under the
+                // tenant's default gateway schema so this write becomes authoritative.
+                let schema = self.schemas.get_default(tenant_id).await?;
+                let email = session
+                    .get("identity")
+                    .and_then(|i| i["traits"]["email"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.memberships
+                    .upsert(
+                        tenant_id,
+                        &public_id,
+                        &schema.schema_id,
+                        schema.version,
+                        serde_json::json!({ "email": email }),
+                    )
+                    .await?
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let schema = self
+            .schemas
+            .get_by_schema_id(tenant_id, &membership.schema_id)
+            .await?;
+
+        let mut submitted = submitted;
+        normalize_traits(&mut submitted);
+        validate_traits(&schema.schema_json, &submitted)?;
+        let new_email = extract_email(&submitted)?;
+
+        let current_email = membership
+            .traits
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !current_email.is_empty() && new_email != current_email {
+            return Err(ServiceError::InvalidArgument("email is immutable".into()));
+        }
+
+        // The gateway is authoritative for traits: overlay the submitted fields onto the
+        // stored membership traits, then pin the email to its immutable value.
+        let mut merged = membership.traits.clone();
+        if let (Some(m), Some(s)) = (merged.as_object_mut(), submitted.as_object()) {
+            for (key, value) in s.iter() {
+                m.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(m) = merged.as_object_mut() {
+            m.insert("email".to_string(), serde_json::json!(current_email.clone()));
+        }
+        self.memberships
+            .upsert(
+                tenant_id,
+                &public_id,
+                &membership.schema_id,
+                membership.schema_version,
+                merged,
+            )
+            .await?;
+
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("traits".to_string(), serde_json::json!({ "email": current_email }));
         }
         Ok(())
     }
@@ -875,8 +986,10 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let req = request.to_owned_message();
         let cookie = cookie_from_context(&ctx);
         let tenant_id = tenant_from_context(&ctx);
-        let body = proto_struct_to_json(req.body.as_option());
+        let mut body = proto_struct_to_json(req.body.as_option());
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
+        self.intercept_settings_profile(&tenant_id, cookie.as_deref(), &mut body)
+            .await?;
         let flow = self
             .kratos
             .submit_settings_flow(&ory_flow_id, cookie.as_deref(), body)
@@ -1372,9 +1485,9 @@ mod tests {
 
     use crate::db::{
         DbError, IdMappingRow, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore,
-        TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
-        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
-        TransientTokenRow, TransientTokenStore,
+        TenantMembershipRow, TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+        TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRow, TransientTokenStore,
     };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
@@ -2280,10 +2393,19 @@ mod tests {
 
         async fn get_by_schema_id(
             &self,
-            _tenant_id: &str,
-            _schema_id: &str,
+            tenant_id: &str,
+            schema_id: &str,
         ) -> Result<IdentitySchemaRow, DbError> {
-            unimplemented!()
+            Ok(IdentitySchemaRow {
+                id: "schema-1".into(),
+                tenant_id: tenant_id.to_string(),
+                schema_id: schema_id.to_string(),
+                schema_json: json!({}),
+                version: 1,
+                is_default: true,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })
         }
 
         async fn list(&self, _tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
@@ -2333,12 +2455,93 @@ mod tests {
         StubSchemaStore::default()
     }
 
+    type MembershipUpsertCall = (String, String, String, i64, serde_json::Value);
+
+    #[derive(Clone, Default)]
+    struct StubMembershipStore {
+        get_result: Arc<Mutex<Option<Result<TenantMembershipRow, DbError>>>>,
+        upsert_calls: Arc<Mutex<Vec<MembershipUpsertCall>>>,
+    }
+
+    impl StubMembershipStore {
+        fn with_membership(row: TenantMembershipRow) -> Self {
+            Self {
+                get_result: Arc::new(Mutex::new(Some(Ok(row)))),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TenantMembershipStore for StubMembershipStore {
+        async fn upsert(
+            &self,
+            tenant_id: &str,
+            identity_id: &str,
+            schema_id: &str,
+            schema_version: i64,
+            traits: serde_json::Value,
+        ) -> Result<TenantMembershipRow, DbError> {
+            self.upsert_calls.lock().unwrap().push((
+                tenant_id.to_string(),
+                identity_id.to_string(),
+                schema_id.to_string(),
+                schema_version,
+                traits.clone(),
+            ));
+            let now = time::OffsetDateTime::now_utc();
+            Ok(TenantMembershipRow {
+                tenant_id: tenant_id.to_string(),
+                identity_id: identity_id.to_string(),
+                schema_id: schema_id.to_string(),
+                schema_version,
+                traits,
+                state: "active".into(),
+                created_at: now,
+                updated_at: now,
+            })
+        }
+
+        async fn get(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            self.get_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(DbError::MembershipNotFound))
+        }
+
+        async fn set_state(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _state: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<Vec<TenantMembershipRow>, DbError> {
+            unimplemented!()
+        }
+    }
+
+    fn default_membership_store() -> StubMembershipStore {
+        StubMembershipStore::default()
+    }
+
     fn service(kratos: FakeKratos) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),
+            memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
@@ -2354,7 +2557,8 @@ mod tests {
             kratos.clone(),
             crate::db::TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool.clone()),
-            crate::db::IdentitySchemaRepo::new(pool),
+            crate::db::IdentitySchemaRepo::new(pool.clone()),
+            crate::db::TenantMembershipRepo::new(pool),
             true,
             "http://kratos.example.com".to_string(),
             "https://gateway.example.com".to_string(),
@@ -2416,6 +2620,7 @@ mod tests {
                 created_at: time::OffsetDateTime::now_utc(),
                 updated_at: time::OffsetDateTime::now_utc(),
             })),
+            memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
@@ -2437,6 +2642,7 @@ mod tests {
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(StubSchemaStore::with_default_error(DbError::SchemaNotFound)),
+            memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
@@ -3392,6 +3598,167 @@ mod tests {
                 .unwrap_err()
                 .code,
             ErrorCode::PermissionDenied
+        );
+    }
+
+    fn proto_struct(value: serde_json::Value) -> buffa_types::google::protobuf::Struct {
+        serde_json::from_value(value).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn submit_settings_profile_merges_traits_and_sends_base_to_kratos() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "identity": { "id": "identity-1", "traits": { "email": "alice@example.com" } }
+            }))))),
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let memberships = Arc::new(StubMembershipStore::with_membership(TenantMembershipRow {
+            tenant_id: "tenant-1".into(),
+            identity_id: "pub-identity-1".into(),
+            schema_id: "default".into(),
+            schema_version: 2,
+            traits: json!({"email": "alice@example.com", "name": {"first": "Alice"}}),
+            state: "active".into(),
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }));
+        let svc = IdentitySelfServiceImpl {
+            kratos: Arc::new(fake.clone()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+            schemas: Arc::new(default_schema_store()),
+            memberships: memberships.clone(),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
+        };
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(SubmitFlowRequest {
+            id: "settings-flow".to_string(),
+            body: Some(proto_struct(json!({
+                "method": "profile",
+                "traits": { "email": "alice@example.com", "name": { "first": "Alice", "last": "Smith" } }
+            })))
+            .into(),
+            ..Default::default()
+        });
+
+        svc.submit_settings_flow(ctx, req).await.unwrap();
+
+        // Membership is merged with the submitted traits; email stays pinned.
+        let calls = memberships.upsert_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "tenant-1");
+        assert_eq!(calls[0].1, "pub-identity-1");
+        assert_eq!(calls[0].2, "default");
+        assert_eq!(calls[0].3, 2);
+        assert_eq!(calls[0].4["email"], "alice@example.com");
+        assert_eq!(calls[0].4["name"], json!({"first": "Alice", "last": "Smith"}));
+
+        // Kratos only ever receives the base identity traits.
+        let recorded = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.starts_with("submit_settings_flow("))
+            .cloned()
+            .unwrap();
+        assert!(recorded.contains("\"traits\":{\"email\":\"alice@example.com\"}"));
+        assert!(!recorded.contains("\"name\""));
+    }
+
+    #[tokio::test]
+    async fn submit_settings_profile_rejects_email_change() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "identity": { "id": "identity-1", "traits": { "email": "alice@example.com" } }
+            }))))),
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = IdentitySelfServiceImpl {
+            kratos: Arc::new(fake.clone()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+            schemas: Arc::new(default_schema_store()),
+            memberships: Arc::new(StubMembershipStore::with_membership(TenantMembershipRow {
+                tenant_id: "tenant-1".into(),
+                identity_id: "pub-identity-1".into(),
+                schema_id: "default".into(),
+                schema_version: 1,
+                traits: json!({"email": "alice@example.com"}),
+                state: "active".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
+        };
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(SubmitFlowRequest {
+            id: "settings-flow".to_string(),
+            body: Some(proto_struct(json!({
+                "method": "profile",
+                "traits": { "email": "new@example.com" }
+            })))
+            .into(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_settings_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        // Kratos submit must never have been called once the email change is rejected.
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("submit_settings_flow("))
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_settings_non_profile_passes_through_without_membership() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        // No session configured: if the intercept ran, to_session would fail. A password
+        // update carries no `traits`, so it must pass straight to Kratos untouched.
+        let svc = service(fake.clone());
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(SubmitFlowRequest {
+            id: "settings-flow".to_string(),
+            body: Some(proto_struct(json!({ "method": "password", "password": "hunter2" }))).into(),
+            ..Default::default()
+        });
+
+        svc.submit_settings_flow(ctx, req).await.unwrap();
+        let recorded = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.starts_with("submit_settings_flow("))
+            .cloned()
+            .unwrap();
+        assert!(recorded.contains("\"password\":\"hunter2\""));
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("to_session("))
         );
     }
 
