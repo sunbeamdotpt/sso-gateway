@@ -26,6 +26,7 @@ mod saml_sp_client;
 mod scim_group;
 mod session_store;
 mod tenant;
+mod tenant_membership;
 mod token_cache;
 mod transient_token;
 
@@ -59,6 +60,9 @@ pub use saml_sp_client::{PgSamlSpClientStore, SamlSpClientRow, SamlSpClientStore
 pub use scim_group::{PgScimGroupStore, ScimGroupRow, ScimGroupStore};
 pub use session_store::{PgSessionStore, SessionStore};
 pub use tenant::{PgTenantStore, TenantRow, TenantStore};
+pub use tenant_membership::{
+    PgTenantMembershipStore, TenantMembershipRow, TenantMembershipStore,
+};
 pub use token_cache::{PgTokenIntrospectionCache, TokenIntrospectionCache, TokenIntrospectionRow};
 pub use transient_token::{
     PgTransientTokenStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
@@ -83,4 +87,5 @@ pub use saml_request::PgSamlRequestStore as SamlRequestRepo;
 pub use saml_sp_client::PgSamlSpClientStore as SamlSpClientRepo;
 pub use scim_group::PgScimGroupStore as ScimGroupRepo;
 pub use tenant::PgTenantStore as TenantRepo;
+pub use tenant_membership::PgTenantMembershipStore as TenantMembershipRepo;
 pub use transient_token::PgTransientTokenStore as TransientTokenRepo;

@@ -10,6 +10,7 @@ pub struct IdentitySchemaRow {
     pub tenant_id: String,
     pub schema_id: String,
     pub schema_json: serde_json::Value,
+    pub version: i64,
     pub is_default: bool,
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
@@ -74,7 +75,7 @@ impl PgIdentitySchemaStore {
             "INSERT INTO tenant_identity_schemas \
              (id, tenant_id, schema_id, schema_json, is_default) \
              VALUES ($1, $2, $3, $4, $5) \
-             RETURNING id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at",
+             RETURNING id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at",
         )
         .bind(&id)
         .bind(tenant_id)
@@ -92,7 +93,7 @@ impl PgIdentitySchemaStore {
         schema_id: &str,
     ) -> Result<IdentitySchemaRow, DbError> {
         let row = sqlx::query_as::<_, IdentitySchemaRow>(
-            "SELECT id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at \
+            "SELECT id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at \
              FROM tenant_identity_schemas \
              WHERE tenant_id = $1 AND schema_id = $2",
         )
@@ -105,7 +106,7 @@ impl PgIdentitySchemaStore {
 
     pub async fn list(&self, tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
         let rows = sqlx::query_as::<_, IdentitySchemaRow>(
-            "SELECT id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at \
+            "SELECT id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at \
              FROM tenant_identity_schemas \
              WHERE tenant_id = $1 ORDER BY created_at DESC",
         )
@@ -141,9 +142,9 @@ impl PgIdentitySchemaStore {
         }
         let row = sqlx::query_as::<_, IdentitySchemaRow>(
             "UPDATE tenant_identity_schemas \
-             SET schema_json = $1, is_default = $2, updated_at = NOW() \
+             SET schema_json = $1, is_default = $2, version = version + 1, updated_at = NOW() \
              WHERE tenant_id = $3 AND schema_id = $4 \
-             RETURNING id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at",
+             RETURNING id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at",
         )
         .bind(sqlx::types::Json(schema_json))
         .bind(is_default)
@@ -164,7 +165,7 @@ impl PgIdentitySchemaStore {
             "UPDATE tenant_identity_schemas \
              SET is_default = TRUE, updated_at = NOW() \
              WHERE tenant_id = $1 AND schema_id = $2 \
-             RETURNING id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at",
+             RETURNING id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at",
         )
         .bind(tenant_id)
         .bind(schema_id)
@@ -175,7 +176,7 @@ impl PgIdentitySchemaStore {
 
     pub async fn get_default(&self, tenant_id: &str) -> Result<IdentitySchemaRow, DbError> {
         let row = sqlx::query_as::<_, IdentitySchemaRow>(
-            "SELECT id, tenant_id, schema_id, schema_json, is_default, created_at, updated_at \
+            "SELECT id, tenant_id, schema_id, schema_json, version, is_default, created_at, updated_at \
              FROM tenant_identity_schemas \
              WHERE tenant_id = $1 AND is_default = TRUE \
              ORDER BY created_at DESC LIMIT 1",
@@ -259,6 +260,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for IdentitySchemaRow {
             schema_json: row
                 .try_get::<sqlx::types::Json<serde_json::Value>, _>("schema_json")?
                 .0,
+            version: row.try_get("version")?,
             is_default: row.try_get("is_default")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -294,6 +296,7 @@ mod tests {
             tenant_id: "tenant".to_string(),
             schema_id: "schema".to_string(),
             schema_json: serde_json::json!({"k": "v"}),
+            version: 1,
             is_default: true,
             created_at: now,
             updated_at: now,
@@ -317,6 +320,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.schema_id, schema_id);
         assert!(!created.is_default);
+        assert_eq!(created.version, 1);
 
         let found = store.get_by_schema_id(&tenant, &schema_id).await.unwrap();
         assert_eq!(found.id, created.id);
@@ -329,6 +333,7 @@ mod tests {
             .await
             .unwrap();
         assert!(updated.is_default);
+        assert_eq!(updated.version, created.version + 1);
 
         let default = store.get_default(&tenant).await.unwrap();
         assert_eq!(default.schema_id, schema_id);

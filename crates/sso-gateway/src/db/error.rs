@@ -18,6 +18,9 @@ pub enum DbError {
     #[error("identity schema not found")]
     SchemaNotFound,
 
+    #[error("tenant membership not found")]
+    MembershipNotFound,
+
     #[error("permission tuple not found")]
     TupleNotFound,
 
@@ -78,6 +81,9 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             DbError::TenantNotFound => Self::NotFound("tenant not found".to_string()),
             DbError::MappingNotFound => Self::NotFound("id mapping not found".to_string()),
             DbError::SchemaNotFound => Self::NotFound("identity schema not found".to_string()),
+            DbError::MembershipNotFound => {
+                Self::NotFound("tenant membership not found".to_string())
+            }
             DbError::TupleNotFound => Self::NotFound("permission tuple not found".to_string()),
             DbError::SamlProviderNotFound => Self::NotFound("saml provider not found".to_string()),
             DbError::SamlRequestNotFound => Self::NotFound("saml request not found".to_string()),
@@ -151,6 +157,10 @@ mod tests {
             (
                 DbError::SchemaNotFound,
                 ServiceError::NotFound("identity schema not found".into()),
+            ),
+            (
+                DbError::MembershipNotFound,
+                ServiceError::NotFound("tenant membership not found".into()),
             ),
             (
                 DbError::TupleNotFound,

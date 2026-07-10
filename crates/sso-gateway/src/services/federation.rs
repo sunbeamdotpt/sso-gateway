@@ -1132,6 +1132,7 @@ mod tests {
             tenant_id: "tenant-1".into(),
             schema_id: "default".into(),
             schema_json: json!({}),
+            version: 1,
             is_default: true,
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),

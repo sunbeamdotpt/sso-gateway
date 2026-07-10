@@ -1124,6 +1124,7 @@ mod tests {
                 tenant_id: tenant_id.to_string(),
                 schema_id: "default".to_string(),
                 schema_json: self.schema_json.clone(),
+                version: 1,
                 is_default: true,
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
                 updated_at: time::OffsetDateTime::UNIX_EPOCH,
