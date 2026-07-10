@@ -525,10 +525,23 @@ impl IdentitySelfServiceImpl {
         if public_flow_id.is_empty() {
             return Err(ServiceError::InvalidArgument("flow id is required".into()));
         }
-        self.transient
+        match self
+            .transient
             .get_ory_token(tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, public_flow_id)
             .await
-            .map_err(|e| e.into())
+        {
+            Ok(ory_flow_id) => Ok(ory_flow_id),
+            // The standard Ory browser flow can hand Kratos's raw flow id straight
+            // to the UI without the gateway ever minting a public token for it —
+            // for example a Kratos-initiated redirect back to the login UI, or a
+            // refresh flow that pre-dates the ULID migration. In that case there is
+            // no mapping to resolve. Forward the raw value unchanged: Kratos issued
+            // and cryptographically validates the flow id, and the browser already
+            // holds it in the URL, so passing it through leaks nothing. This mirrors
+            // `resolve_login_challenge`.
+            Err(DbError::MappingNotFound) => Ok(public_flow_id.to_string()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn public_flow(
@@ -2489,6 +2502,53 @@ mod tests {
 
         let err = svc.submit_login_flow(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    // Regression: a flow id that Kratos delivered straight to the browser (a raw
+    // Kratos UUID, never minted by the gateway) must be forwarded to Kratos
+    // unchanged rather than rejected with `not_found`. Otherwise a refresh or
+    // Kratos-initiated login flow cannot be submitted and the UI loops.
+    #[tokio::test]
+    async fn submit_login_flow_passes_through_raw_kratos_flow_id() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: "b2c3a9db-5129-4156-8f2c-6ad045965953".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(
+            fake.calls.lock().unwrap()[0].starts_with(
+                "submit_login_flow(id=b2c3a9db-5129-4156-8f2c-6ad045965953, cookie=Some("
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn get_login_flow_passes_through_raw_kratos_flow_id() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(GetFlowRequest {
+            id: "b2c3a9db-5129-4156-8f2c-6ad045965953".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.get_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            "get_login_flow(id=b2c3a9db-5129-4156-8f2c-6ad045965953, cookie=Some(\"session=abc\"))"
+        );
     }
 
     #[tokio::test]
