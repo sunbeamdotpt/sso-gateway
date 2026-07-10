@@ -11,7 +11,7 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
 use crate::db::{
-    IdMappingRepo, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+    DbError, IdMappingRepo, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
     TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
     TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, TransientTokenStore,
 };
@@ -32,6 +32,41 @@ const BACKEND_HYDRA: &str = "hydra";
 
 fn transient_expiry() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
+
+/// Resolve a login challenge supplied by the caller to the Hydra challenge that
+/// Kratos expects.
+///
+/// The gateway mints its own opaque login challenges (see
+/// `map_oauth2_login_request`) so that Hydra identifiers never leave the
+/// gateway in protocol artifacts. When the caller presents such a gateway
+/// challenge, the transient token store resolves it back to the Hydra
+/// challenge.
+///
+/// However, the standard Ory login flow also delivers Hydra's raw challenge to
+/// the login UI via the `login_challenge` query parameter of Hydra's redirect.
+/// In that case the value is already the Hydra challenge and there is no
+/// mapping to resolve. Kratos accepts the raw value unchanged, so on a lookup
+/// miss we pass it through rather than failing with `not_found`. Kratos still
+/// cryptographically validates the challenge, so passthrough is safe.
+async fn resolve_login_challenge(
+    transient: &dyn TransientTokenStore,
+    tenant_id: &str,
+    login_challenge: &str,
+) -> Result<String, ServiceError> {
+    match transient
+        .get_ory_token(
+            tenant_id,
+            BACKEND_HYDRA,
+            TOKEN_TYPE_LOGIN_CHALLENGE,
+            login_challenge,
+        )
+        .await
+    {
+        Ok(ory_challenge) => Ok(ory_challenge),
+        Err(DbError::MappingNotFound) => Ok(login_challenge.to_string()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 use super::identity_self_service_mapper::{
@@ -913,15 +948,12 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("via", req.via));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = self
-                .transient
-                .get_ory_token(
-                    &tenant_id,
-                    BACKEND_HYDRA,
-                    TOKEN_TYPE_LOGIN_CHALLENGE,
-                    &req.login_challenge,
-                )
-                .await?;
+            let ory_challenge = resolve_login_challenge(
+                self.transient.as_ref(),
+                &tenant_id,
+                &req.login_challenge,
+            )
+            .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -956,15 +988,12 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("return_to", req.return_to));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = self
-                .transient
-                .get_ory_token(
-                    &tenant_id,
-                    BACKEND_HYDRA,
-                    TOKEN_TYPE_LOGIN_CHALLENGE,
-                    &req.login_challenge,
-                )
-                .await?;
+            let ory_challenge = resolve_login_challenge(
+                self.transient.as_ref(),
+                &tenant_id,
+                &req.login_challenge,
+            )
+            .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -2511,6 +2540,48 @@ mod tests {
         assert!(call.contains("(\"via\", \"email\")"));
         assert!(call.contains("(\"login_challenge\", \"challenge-1\")"));
         assert!(call.contains("(\"identity_schema\", \"default\")"));
+    }
+
+    // Regression: the standard Ory login flow delivers Hydra's raw challenge to
+    // the login UI via the redirect query string. The gateway has no mapping for
+    // that value, so it must forward it to Kratos unchanged instead of failing
+    // with `not_found` (which previously trapped the browser in a redirect loop).
+    #[tokio::test]
+    async fn create_login_flow_passes_through_raw_hydra_challenge() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "raw-hydra-challenge-not-in-store".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        let call = &fake.calls.lock().unwrap()[0];
+        assert!(call.starts_with("create_login_browser_flow(query=["));
+        assert!(call.contains("(\"login_challenge\", \"raw-hydra-challenge-not-in-store\")"));
+    }
+
+    #[tokio::test]
+    async fn create_registration_flow_passes_through_raw_hydra_challenge() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(CreateRegistrationFlowRequest {
+            login_challenge: "raw-hydra-challenge-not-in-store".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_registration_flow(ctx, req).await.unwrap();
+        let call = &fake.calls.lock().unwrap()[0];
+        assert!(call.starts_with("create_registration_browser_flow(query=["));
+        assert!(call.contains("(\"login_challenge\", \"raw-hydra-challenge-not-in-store\")"));
     }
 
     #[tokio::test]
