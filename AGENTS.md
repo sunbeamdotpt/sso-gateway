@@ -12,7 +12,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - **Error handling**: Custom errors use `thiserror`. `anyhow` is not used in gateway code. Convert everything into `sunbeam_g2v::error::ServiceError` at service boundaries.
 - **Identifiers**: All gateway-level identifiers are ULIDs (`ulid` crate). Do **not** use UUIDs for primary keys.
 - **Tenancy**: Protected endpoints require an `Authorization: Bearer <token>` header. The shared auth middleware introspects the token via Hydra and resolves the tenant from the token subject. The system tenant ULID is configured via `SYSTEM_TENANT_ULID`; a system bootstrap OAuth2 client is created on startup.
-- **Schemas**: Per-tenant identity schemas are managed through a registry API backed by `tenant_identity_schemas`.
+- **Identity model (gateway-owned traits)**: Kratos persists only the minimal base identity — `{email}` plus credentials — bound to the base schema id set via `KRATOS_DEFAULT_SCHEMA_ID` (dev `default`, prod `employee`). The gateway owns the full trait set and the per-tenant schema binding. Reads assemble the caller-facing identity from `tenant_memberships`; writes validate against the tenant's versioned schema in `tenant_identity_schemas` and persist only the base email to Kratos. Email is the Kratos identifier, so it is normalized (lowercase + trim) and immutable. A single base identity may belong to many tenants via `tenant_memberships` (invites/SCIM add membership); superset schemas may add traits and enable extra methods (SAML/SCIM/OIDC) that Kratos never sees.
 - **Audit**: Request audit records are emitted as structured logs to the standard log stream by `audit_middleware`, tagged with `sso_gateway::audit`.
 - **SAML**: The gateway is both a SAML Service Provider (`/saml/metadata`, `/saml/acs`) and a SAML Identity Provider (`/saml/sso`). IdP signing keys are stored in `saml_idp_keys`; SP client configuration is stored in `saml_sp_clients`.
 - **Latest versions**: Use the latest compatible versions of crates. Do not pin versions unless required to resolve a known incompatibility.
@@ -33,6 +33,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - Integration tests use `testcontainers-rs` via the local `sunbeam-test` crate at `../test`.
 - Tests expect a Docker-compatible runtime at `DOCKER_HOST` (e.g., `lima-docker` / `socktainer` on macOS). `testcontainers-rs` does not honor the Docker CLI context, so set `DOCKER_HOST` explicitly to the active context's socket rather than assuming `/var/run/docker.sock`.
 - Containers are reached via published ports because lima rootless Docker lacks bridge reachability; `container_bridge_ip` from `sunbeam-test` is not used.
+- Integration tests run against Ory Kratos v25.4 to match production; the image tag is pinned in `crates/sso-gateway/tests/support/mod.rs`.
 - Add tests alongside code (`#[cfg(test)]`) and in `crates/*/tests/` for integration scenarios.
 
 ### Useful commands
@@ -64,7 +65,7 @@ buf breaking --against "https://github.com/sunbeamdotpt/sso-gateway.git#branch=m
 The gateway never exposes Ory paths or IDs to callers. Internally:
 
 - Hydra OAuth2 clients are mapped via `id_mappings`.
-- Kratos identities are mapped via `id_mappings`; tenant ID is also stored in identity traits.
+- Kratos identities are mapped via `id_mappings` and hold only the base `{email}` trait; tenant membership and every other trait live in the gateway (`tenant_memberships`), never in Kratos.
 - Keto namespaces and object IDs are prefixed with the tenant slug.
 
 ## Documentation
