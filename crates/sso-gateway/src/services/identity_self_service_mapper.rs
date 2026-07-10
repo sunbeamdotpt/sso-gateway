@@ -232,25 +232,55 @@ pub fn ory_ui_text_to_proto(value: &Value) -> UiText {
 /// `json_value_to_string` would render it as the literal text
 /// `["alice@example.com","alice@example.com"]`, which the browser then submits
 /// verbatim. No identity matches that string, so the password check fails and
-/// the login silently loops. Collapse an array whose elements all reduce to the
-/// same string down to that one string. A genuinely multi-valued array (more
-/// than one distinct string) is left in its JSON form so we never silently drop
-/// a value the caller may need.
+/// the login silently loops.
+///
+/// The array can reach us in two shapes:
+///   * as a real JSON array (`value.as_array()`), or
+///   * as a string that is itself the JSON encoding of such an array
+///     (`value.as_str() == Some("[\"a\",\"a\"]")`), which is how Kratos
+///     delivers the node value when the stored identifier is a stringified list.
+///
+/// Both must collapse to one string, and critically they must collapse on every
+/// render: a failed submit re-renders the form with the same value, so if we
+/// ever emit the array the browser multiplies the field and the next attempt
+/// carries one more copy — the array grows by one element per failed attempt.
+/// Collapsing to a scalar on every render breaks that cycle.
+///
+/// A genuinely multi-valued array (more than one distinct string) is left in
+/// its JSON form so we never silently drop a value the caller may need.
 fn input_value_to_string(value: &Value) -> String {
-    if let Some(arr) = value.as_array() {
-        let mut distinct: Vec<&str> = Vec::new();
-        for item in arr {
-            if let Some(s) = item.as_str()
-                && !distinct.contains(&s)
-            {
-                distinct.push(s);
-            }
-        }
-        if distinct.len() == 1 {
-            return distinct[0].to_string();
-        }
+    if let Some(collapsed) = collapse_identical_string_array(value) {
+        return collapsed;
     }
     json_value_to_string(value)
+}
+
+/// Collapse an array of strings that all reduce to one value down to that value.
+/// Also handles a node value that is itself a string encoding of such an array.
+/// Returns `None` for non-collapsible values so genuinely multi-valued arrays
+/// are never silently merged.
+fn collapse_identical_string_array(value: &Value) -> Option<String> {
+    if let Some(arr) = value.as_array() {
+        return collapse_str_array(arr);
+    }
+    if let Some(s) = value.as_str()
+        && s.starts_with('[')
+        && let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s)
+    {
+        return collapse_str_array(&arr);
+    }
+    None
+}
+
+fn collapse_str_array(arr: &[Value]) -> Option<String> {
+    let mut distinct: Vec<&str> = Vec::new();
+    for item in arr {
+        let s = item.as_str()?;
+        if !distinct.contains(&s) {
+            distinct.push(s);
+        }
+    }
+    (distinct.len() == 1).then(|| distinct[0].to_string())
 }
 
 pub fn ory_ui_node_input_attributes_to_proto(value: &Value) -> UiNodeInputAttributes {
@@ -885,6 +915,65 @@ mod tests {
         });
         let proto = ory_ui_node_input_attributes_to_proto(&value);
         assert_eq!(proto.value, "alice@example.com");
+    }
+
+    // Kratos delivers the refresh-flow identifier node value as a *string* that
+    // is itself the JSON encoding of the duplicated array — the array-only
+    // collapse (value.as_array()) misses it and the form renders the literal
+    // `[...]` text. This is the exact shape reported in production.
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_collapses_string_encoded_identifier_array() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": "[\"sienna@sunbeam.pt\",\"sienna@sunbeam.pt\"]",
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, "sienna@sunbeam.pt");
+    }
+
+    // A failed submit re-renders the form with the same value. If we ever emit
+    // the array, the browser multiplies the field and the next attempt carries
+    // one more copy — the array grows by one element per attempt. Collapsing
+    // the string-encoded array to a scalar on every render breaks that cycle:
+    // feeding the collapsed result back in must stay a scalar, never re-array.
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_string_encoded_array_does_not_grow_on_rerender() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": "[\"sienna@sunbeam.pt\",\"sienna@sunbeam.pt\"]",
+            "node_type": "input"
+        });
+        let first = ory_ui_node_input_attributes_to_proto(&value).value;
+        assert_eq!(first, "sienna@sunbeam.pt");
+
+        // Simulate the next render: the collapsed scalar is what the browser
+        // submits back, so it arrives as a plain string — never an array.
+        let rerendered = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": first,
+            "node_type": "input"
+        });
+        let second = ory_ui_node_input_attributes_to_proto(&rerendered).value;
+        assert_eq!(second, "sienna@sunbeam.pt");
+        assert!(!second.starts_with('['));
+    }
+
+    // A string that looks like an array but holds distinct values is genuinely
+    // multi-valued and must not be silently merged.
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_keeps_distinct_string_encoded_array_as_json() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": "[\"alice@example.com\",\"bob@example.com\"]",
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, r#"["alice@example.com","bob@example.com"]"#);
     }
 
     #[test]
