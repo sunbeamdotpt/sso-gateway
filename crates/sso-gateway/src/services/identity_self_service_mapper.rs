@@ -222,11 +222,42 @@ pub fn ory_ui_text_to_proto(value: &Value) -> UiText {
     }
 }
 
+/// Coerce an Ory UI input node's `value` into the single string an HTML form
+/// control submits.
+///
+/// Kratos input node values are scalars in the normal case, but a refresh
+/// (re-authentication) flow prefills the `identifier` node from the identity's
+/// credential identifier. If that identifier was ever stored as a JSON array
+/// (e.g. `["alice@example.com", "alice@example.com"]`), the generic
+/// `json_value_to_string` would render it as the literal text
+/// `["alice@example.com","alice@example.com"]`, which the browser then submits
+/// verbatim. No identity matches that string, so the password check fails and
+/// the login silently loops. Collapse an array whose elements all reduce to the
+/// same string down to that one string. A genuinely multi-valued array (more
+/// than one distinct string) is left in its JSON form so we never silently drop
+/// a value the caller may need.
+fn input_value_to_string(value: &Value) -> String {
+    if let Some(arr) = value.as_array() {
+        let mut distinct: Vec<&str> = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str()
+                && !distinct.contains(&s)
+            {
+                distinct.push(s);
+            }
+        }
+        if distinct.len() == 1 {
+            return distinct[0].to_string();
+        }
+    }
+    json_value_to_string(value)
+}
+
 pub fn ory_ui_node_input_attributes_to_proto(value: &Value) -> UiNodeInputAttributes {
     UiNodeInputAttributes {
         name: json_str(value, "name"),
         r#type: json_str(value, "type"),
-        value: json_value_to_string(value.get("value").unwrap_or(&Value::Null)),
+        value: input_value_to_string(value.get("value").unwrap_or(&Value::Null)),
         required: json_bool(value, "required"),
         disabled: json_bool(value, "disabled"),
         autocomplete: json_str(value, "autocomplete"),
@@ -802,6 +833,58 @@ mod tests {
         assert_eq!(proto.maxlength, 256);
         assert_eq!(proto.minlength, 3);
         assert_eq!(proto.placeholder, "email@example.com");
+    }
+
+    // Regression: a refresh flow whose identifier Kratos prefilled as a JSON
+    // array of the same email must collapse to a single scalar. Otherwise the
+    // browser submits the literal `[...]` string and the password check never
+    // matches an identity.
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_collapses_duplicated_identifier_array() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": ["sienna@sunbeam.pt", "sienna@sunbeam.pt"],
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, "sienna@sunbeam.pt");
+    }
+
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_collapses_single_element_array() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": ["alice@example.com"],
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, "alice@example.com");
+    }
+
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_keeps_distinct_array_as_json() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": ["alice@example.com", "bob@example.com"],
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, r#"["alice@example.com","bob@example.com"]"#);
+    }
+
+    #[test]
+    fn ory_ui_node_input_attributes_to_proto_keeps_scalar_value() {
+        let value = json!({
+            "name": "identifier",
+            "type": "text",
+            "value": "alice@example.com",
+            "node_type": "input"
+        });
+        let proto = ory_ui_node_input_attributes_to_proto(&value);
+        assert_eq!(proto.value, "alice@example.com");
     }
 
     #[test]
