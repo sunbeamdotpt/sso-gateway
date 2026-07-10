@@ -110,13 +110,18 @@ async fn proxy_request(
 
     let status = StatusCode::from_u16(upstream_response.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
+    // Preserve every upstream header value, including repeated header names.
+    // `HeaderMap::insert` overwrites earlier values for the same name, which
+    // silently drops all but the last `Set-Cookie` (e.g. losing the Kratos
+    // session or CSRF cookie). `append` keeps every value so the browser
+    // receives the full set.
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream_response.headers().iter() {
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
         if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-            response_headers.insert(name, value);
+            response_headers.append(name.clone(), value);
         }
     }
 
@@ -265,5 +270,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn proxy_request_preserves_multiple_set_cookie_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_origin = format!("http://{addr}");
+        let app = axum::Router::new().route(
+            "/.well-known/ory/webauthn.js",
+            get(|| async {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.append(
+                    axum::http::header::SET_COOKIE,
+                    "ory_kratos_session=abc; Path=/; HttpOnly"
+                        .parse()
+                        .unwrap(),
+                );
+                headers.append(
+                    axum::http::header::SET_COOKIE,
+                    "csrf_token=def; Path=/; HttpOnly".parse().unwrap(),
+                );
+                (headers, "ok")
+            }),
+        );
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = test_state(upstream_origin.clone());
+        let upstream_url =
+            build_upstream_url(&upstream_origin, ".well-known/ory/webauthn.js").unwrap();
+        let request = Request::get("/.well-known/ory/webauthn.js")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_request(state, request, upstream_url).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies: Vec<_> = response.headers().get_all("set-cookie").iter().collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "both upstream Set-Cookie headers must be forwarded"
+        );
+        assert!(cookies
+            .iter()
+            .any(|c| c.to_str().unwrap().starts_with("ory_kratos_session=")));
+        assert!(cookies
+            .iter()
+            .any(|c| c.to_str().unwrap().starts_with("csrf_token=")));
+    }
+
+    #[tokio::test]
+    async fn proxy_request_forwards_incoming_cookie_to_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_origin = format!("http://{addr}");
+        let app = axum::Router::new().route(
+            "/.well-known/ory/webauthn.js",
+            get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get_all("cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }),
+        );
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = test_state(upstream_origin.clone());
+        let upstream_url =
+            build_upstream_url(&upstream_origin, ".well-known/ory/webauthn.js").unwrap();
+        let request = Request::get("/.well-known/ory/webauthn.js")
+            .header("cookie", "ory_kratos_session=abc; csrf_token=def")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_request(state, request, upstream_url).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let echoed = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            echoed.contains("ory_kratos_session=abc"),
+            "session cookie was not forwarded upstream: {echoed}"
+        );
+        assert!(
+            echoed.contains("csrf_token=def"),
+            "csrf cookie was not forwarded upstream: {echoed}"
+        );
     }
 }
