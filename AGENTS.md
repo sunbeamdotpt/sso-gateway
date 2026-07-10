@@ -31,18 +31,23 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 
 - Target >90% unit and integration test coverage.
 - Integration tests use `testcontainers-rs` via the local `sunbeam-test` crate at `../test`.
-- Tests expect a Docker-compatible runtime at `DOCKER_HOST` (e.g., `lima-docker` / `socktainer` on macOS).
+- Tests expect a Docker-compatible runtime at `DOCKER_HOST` (e.g., `lima-docker` / `socktainer` on macOS). `testcontainers-rs` does not honor the Docker CLI context, so set `DOCKER_HOST` explicitly to the active context's socket rather than assuming `/var/run/docker.sock`.
 - Containers are reached via published ports because lima rootless Docker lacks bridge reachability; `container_bridge_ip` from `sunbeam-test` is not used.
 - Add tests alongside code (`#[cfg(test)]`) and in `crates/*/tests/` for integration scenarios.
 
 ### Useful commands
 
 ```bash
+# testcontainers-rs does not read the Docker CLI context, so DOCKER_HOST must be
+# set explicitly. Point it at your active context's socket (lima/socktainer on
+# macOS, /var/run/docker.sock on most Linux hosts):
+export DOCKER_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+
 # Gateway tests (containers required)
-DOCKER_HOST=unix:///var/run/docker.sock cargo test -p sso-gateway --all-targets --all-features
+cargo test -p sso-gateway --all-targets --all-features
 
 # Ory client tests (containers required)
-DOCKER_HOST=unix:///var/run/docker.sock cargo test -p sso-ory-client --all-targets --all-features
+cargo test -p sso-ory-client --all-targets --all-features
 
 # Linting
 cargo clippy -p sso-gateway --all-targets --all-features -- -D warnings
