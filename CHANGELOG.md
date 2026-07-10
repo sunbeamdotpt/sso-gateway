@@ -7,6 +7,26 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.6] - 2026-07-10
+
+### Fixed
+
+- Reverted the raw Kratos flow id passthrough added in 2026.07.5 for
+  `GetLoginFlow` / `SubmitLoginFlow`. Accepting an unminted Kratos flow id made
+  Ory's internal identifier a valid gateway input — a backend fingerprint that
+  the gateway's opaqueness contract forbids. An unknown flow id now correctly
+  returns `not_found`; the login UI re-initializes the flow on that response
+  (see sso-ui). The `login_challenge` passthrough from 2026.07.4 is unchanged —
+  that value is part of the OIDC spec and is not an Ory-internal identifier.
+- The self-service UI mapper now also collapses an `identifier` input node whose
+  value Kratos delivers as a *string* encoding of a same-email array
+  (`"[\"alice@example.com\",\"alice@example.com\"]"`). The 2026.07.5 collapse
+  only matched a real JSON array (`value.as_array()`), so the string-encoded
+  form slipped through, rendered as the literal `[...]` text, and — because a
+  failed submit re-renders the form with the same value — grew by one copy on
+  every attempt. Collapsing to a scalar on every render breaks the cycle.
+  Genuinely multi-valued arrays are still left unchanged.
+
 ## [2026.07.5] - 2026-07-10
 
 ### Fixed
