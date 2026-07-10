@@ -88,5 +88,6 @@ Store `DATABASE_URL` and `SYSTEM_TENANT_ULID` in a Kubernetes secret.
 - [ ] Restrict Ory admin endpoints to the gateway via mTLS or network policies.
 - [ ] Enable structured logging and tracing.
 - [ ] Run the gateway behind a load balancer with TLS termination.
+- [ ] Point Kratos `identity.default_schema_id` and the gateway `KRATOS_DEFAULT_SCHEMA_ID` at the same base schema id (dev `default`, prod `employee`). The base schema should require only `traits.email`; tenant traits stay in the gateway.
 - [ ] Monitor `/health/ready` and `/health/alive` endpoints.
 - [ ] Back up Postgres and rotate SAML signing keys regularly.

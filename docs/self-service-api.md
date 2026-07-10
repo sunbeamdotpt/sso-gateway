@@ -83,9 +83,9 @@ parameters the browser UI needs:
 - `organization` — organization context.
 - `via` — delivery strategy for registration/verification.
 - `login_challenge` — Hydra login challenge when the flow was triggered by OAuth2.
-- `identity_schema` — schema to use for the flow.
+- `identity_schema` — gateway tenant schema to render and splice for the flow. This is not forwarded to Kratos; Kratos always uses the base schema from `KRATOS_DEFAULT_SCHEMA_ID`.
 
-These parameters are forwarded to Kratos as query string arguments.
+The remaining parameters are forwarded to Kratos as query string arguments.
 
 ### Flow getters
 

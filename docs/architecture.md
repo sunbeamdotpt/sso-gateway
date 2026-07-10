@@ -27,8 +27,24 @@ Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) s
 | Backend | Isolation mechanism |
 |---|---|
 | Hydra | OAuth2 client IDs are mapped through `id_mappings`; tenant is also verified from `client_id`. |
-| Kratos | Identities are mapped through `id_mappings`; tenant ID is stored in identity traits. |
+| Kratos | Base identity only: Kratos holds `{email}` plus credentials/sessions under the base schema id from `KRATOS_DEFAULT_SCHEMA_ID`. The gateway owns tenant traits and membership. |
 | Keto | Namespaces and object IDs are prefixed with the tenant slug. |
+
+## Identity model and the default Kratos schema
+
+Kratos is the authentication store, not the profile store. Configure Kratos with one
+base identity schema and point both Kratos and the gateway at the same schema id:
+
+- Kratos `identity.default_schema_id` and `identity.schemas[].id` must equal the
+  gateway `KRATOS_DEFAULT_SCHEMA_ID` value (dev `default`, prod `employee`).
+- The base schema should require only `traits.email` as a string email, mark that
+  field as the password identifier and the recovery/verification email, and carry no
+  tenant traits. Treat this schema as minimal, stable, and review-gated.
+- The gateway persists only `{email}` to Kratos. All other traits are validated
+  against the tenant's pinned gateway schema (`tenant_identity_schemas`) and stored
+  in `tenant_memberships`.
+- Reads return the gateway schema id and the assembled caller-facing traits, never
+  the Kratos base schema id. Email is normalized (lowercase + trim) and immutable.
 
 ## Federation and home-realm discovery
 

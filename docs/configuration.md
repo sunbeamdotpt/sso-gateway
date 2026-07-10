@@ -31,6 +31,7 @@ All configuration is read from environment variables.
 | `HYDRA_PUBLIC_URL` | `http://127.0.0.1:4444` | Ory Hydra public endpoint. |
 | `KRATOS_ADMIN_URL` | `http://127.0.0.1:4434` | Ory Kratos admin endpoint. |
 | `KRATOS_PUBLIC_URL` | `http://127.0.0.1:4433` | Ory Kratos public endpoint. |
+| `KRATOS_DEFAULT_SCHEMA_ID` | `default` | Kratos base identity schema id used for all Kratos identity reads/writes. Must match Kratos `identity.default_schema_id`; use `employee` in production. |
 | `KETO_READ_URL` | `http://127.0.0.1:4466` | Ory Keto read endpoint. |
 | `KETO_WRITE_URL` | `http://127.0.0.1:4467` | Ory Keto write endpoint. |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8080` | Public URL used in discovery, SAML metadata, and session cookie issuer. |
@@ -59,6 +60,22 @@ All configuration is read from environment variables.
 | `DATABASE_STATEMENT_TIMEOUT_SECONDS` | `30` | Postgres statement timeout. |
 | `PUBLIC_RATE_LIMIT_REQUESTS` | `100` | Maximum number of requests allowed per public IP in the rate-limit window. |
 | `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Duration of the rate-limit window in seconds. |
+
+## Default identity schema
+
+Kratos must expose one base identity schema at the id configured in
+`KRATOS_DEFAULT_SCHEMA_ID`. It should be the smallest schema that lets Kratos do
+its job: require `traits.email` as an email string and annotate that field as the
+password identifier and the recovery/verification email. Do not add tenant fields
+(`tenant_id`, names, or other profile data) to this schema.
+
+The gateway owns the tenant trait set. It validates traits against the tenant's
+pinned schema in `tenant_identity_schemas`, stores them in `tenant_memberships`,
+and assembles the caller-facing identity on reads. Tenant schemas may be supersets
+that enable SAML, SCIM, or OIDC, but Kratos never sees those schemas; it only ever
+receives `{email}` plus credentials. A mismatch between `KRATOS_DEFAULT_SCHEMA_ID`
+and Kratos `identity.default_schema_id` (for example `system-tenant` vs `employee`)
+causes identity creation to fail.
 
 ## Notes
 
