@@ -13,7 +13,11 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
 
-use crate::db::{DbError, IdMappingStore, IdentitySchemaStore, SamlIdentityMappingStore};
+use crate::db::{
+    DbError, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, SamlIdentityMappingStore,
+    TenantMembershipStore,
+};
+use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 
 const BACKEND_KRATOS: &str = "kratos";
 
@@ -177,7 +181,9 @@ pub struct KratosIdentityProvisioner {
     kratos: Arc<dyn ProvisionerKratos>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
+    memberships: Arc<dyn TenantMembershipStore>,
     saml_mappings: Option<Arc<dyn SamlIdentityMappingStore>>,
+    kratos_default_schema_id: String,
 }
 
 impl KratosIdentityProvisioner {
@@ -185,12 +191,16 @@ impl KratosIdentityProvisioner {
         kratos: Arc<KratosClient>,
         mappings: Arc<dyn IdMappingStore>,
         schemas: Arc<dyn IdentitySchemaStore>,
+        memberships: crate::db::TenantMembershipRepo,
+        kratos_default_schema_id: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn ProvisionerKratos>,
             mappings,
             schemas,
+            memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
             saml_mappings: None,
+            kratos_default_schema_id,
         }
     }
 
@@ -217,10 +227,11 @@ impl KratosIdentityProvisioner {
     async fn find_or_create_by_email(
         &self,
         tenant_id: &str,
-        schema_id: &str,
-        email: &str,
-        name: Option<&serde_json::Value>,
+        schema: &IdentitySchemaRow,
+        traits: serde_json::Value,
     ) -> Result<ProvisionedIdentity, ProvisionError> {
+        let email =
+            extract_email(&traits).map_err(|e| ProvisionError::InvalidResponse(e.to_string()))?;
         let scoped_identifier = format!("{tenant_id}:{email}");
         let existing = self
             .kratos
@@ -253,13 +264,11 @@ impl KratosIdentityProvisioner {
                 };
                 (ory_id, public_id)
             } else {
+                // Kratos stores only the base identity ({email}); the gateway owns the
+                // full trait document via the membership upserted below.
                 let payload = json!({
-                    "schema_id": schema_id,
-                    "traits": {
-                        "email": email,
-                        "tenant_id": tenant_id,
-                        "name": normalize_name_claim(name),
-                    },
+                    "schema_id": self.kratos_default_schema_id,
+                    "traits": { "email": &email },
                 });
                 let created = self
                     .kratos
@@ -282,12 +291,42 @@ impl KratosIdentityProvisioner {
                 (ory_id, public_id)
             };
 
+        self.ensure_membership(tenant_id, &public_id, schema, &traits)
+            .await?;
+
         Ok(ProvisionedIdentity {
             tenant_id: tenant_id.to_string(),
             public_id,
             ory_id,
-            email: email.to_string(),
+            email,
         })
+    }
+
+    /// Seed a membership on first sight so reads become gateway-authoritative, without
+    /// clobbering richer traits an earlier admin/SCIM/SAML-JIT write may have stored.
+    async fn ensure_membership(
+        &self,
+        tenant_id: &str,
+        public_id: &str,
+        schema: &IdentitySchemaRow,
+        traits: &serde_json::Value,
+    ) -> Result<(), ProvisionError> {
+        match self.memberships.get(tenant_id, public_id).await {
+            Ok(_) => Ok(()),
+            Err(DbError::MembershipNotFound) => {
+                self.memberships
+                    .upsert(
+                        tenant_id,
+                        public_id,
+                        &schema.schema_id,
+                        schema.version,
+                        traits.clone(),
+                    )
+                    .await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -304,7 +343,7 @@ impl IdentityProvisioner for KratosIdentityProvisioner {
             .as_str()
             .ok_or(ProvisionError::MissingEmail)?;
 
-        let _schema = self
+        let schema = self
             .schemas
             .get_by_schema_id(tenant_id, schema_id)
             .await
@@ -312,7 +351,15 @@ impl IdentityProvisioner for KratosIdentityProvisioner {
 
         Self::require_email_verified(claims)?;
 
-        self.find_or_create_by_email(tenant_id, schema_id, email, claims.get("name"))
+        let mut traits = json!({
+            "email": email,
+            "name": normalize_name_claim(claims.get("name")),
+        });
+        normalize_traits(&mut traits);
+        validate_traits(&schema.schema_json, &traits)
+            .map_err(|e| ProvisionError::InvalidResponse(e.to_string()))?;
+
+        self.find_or_create_by_email(tenant_id, &schema, traits)
             .await
     }
 
@@ -327,7 +374,7 @@ impl IdentityProvisioner for KratosIdentityProvisioner {
         email_verified: bool,
         trusted_provider: bool,
     ) -> Result<ProvisionedIdentity, ProvisionError> {
-        let _schema = self
+        let schema = self
             .schemas
             .get_by_schema_id(tenant_id, schema_id)
             .await
@@ -356,8 +403,16 @@ impl IdentityProvisioner for KratosIdentityProvisioner {
             return Err(ProvisionError::EmailNotVerified);
         }
 
+        let mut traits = json!({
+            "email": email,
+            "name": normalize_name_claim(Some(&json!(name_id))),
+        });
+        normalize_traits(&mut traits);
+        validate_traits(&schema.schema_json, &traits)
+            .map_err(|e| ProvisionError::InvalidResponse(e.to_string()))?;
+
         let identity = self
-            .find_or_create_by_email(tenant_id, schema_id, email, Some(&json!(name_id)))
+            .find_or_create_by_email(tenant_id, &schema, traits)
             .await?;
 
         // Record the provider-specific mapping for future logins.
@@ -390,7 +445,9 @@ mod tests {
     use sso_ory_client::error::OryClientError;
 
     use super::*;
-    use crate::db::{IdMappingRow, IdentitySchemaRow, SamlIdentityMappingRow};
+    use crate::db::{
+        IdMappingRow, IdentitySchemaRow, SamlIdentityMappingRow, TenantMembershipRow,
+    };
 
     #[derive(Clone, Default)]
     struct StubKratos {
@@ -591,6 +648,73 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct StubMembershipStore {
+        get_result: Arc<Mutex<Option<Result<TenantMembershipRow, DbError>>>>,
+        upsert_calls: Arc<Mutex<Vec<UpsertCall>>>,
+    }
+
+    type UpsertCall = (String, String, String, i64, serde_json::Value);
+
+    #[async_trait]
+    impl TenantMembershipStore for StubMembershipStore {
+        async fn upsert(
+            &self,
+            tenant_id: &str,
+            identity_id: &str,
+            schema_id: &str,
+            schema_version: i64,
+            traits: serde_json::Value,
+        ) -> Result<TenantMembershipRow, DbError> {
+            self.upsert_calls.lock().unwrap().push((
+                tenant_id.to_string(),
+                identity_id.to_string(),
+                schema_id.to_string(),
+                schema_version,
+                traits.clone(),
+            ));
+            let now = time::OffsetDateTime::now_utc();
+            Ok(TenantMembershipRow {
+                tenant_id: tenant_id.to_string(),
+                identity_id: identity_id.to_string(),
+                schema_id: schema_id.to_string(),
+                schema_version,
+                traits,
+                state: "active".into(),
+                created_at: now,
+                updated_at: now,
+            })
+        }
+
+        async fn get(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            self.get_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(DbError::MembershipNotFound))
+        }
+
+        async fn set_state(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _state: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: &str,
+        ) -> Result<Vec<TenantMembershipRow>, DbError> {
+            unimplemented!()
+        }
+    }
+
     fn provisioner(
         kratos: Arc<dyn ProvisionerKratos>,
         mappings: Arc<dyn IdMappingStore>,
@@ -600,7 +724,9 @@ mod tests {
             kratos,
             mappings,
             schemas,
+            memberships: Arc::new(StubMembershipStore::default()),
             saml_mappings: None,
+            kratos_default_schema_id: "default".into(),
         }
     }
 
@@ -614,7 +740,25 @@ mod tests {
             kratos,
             mappings,
             schemas,
+            memberships: Arc::new(StubMembershipStore::default()),
             saml_mappings: Some(saml_mappings),
+            kratos_default_schema_id: "default".into(),
+        }
+    }
+
+    fn provisioner_with_memberships(
+        kratos: Arc<dyn ProvisionerKratos>,
+        mappings: Arc<dyn IdMappingStore>,
+        schemas: Arc<dyn IdentitySchemaStore>,
+        memberships: Arc<StubMembershipStore>,
+    ) -> KratosIdentityProvisioner {
+        KratosIdentityProvisioner {
+            kratos,
+            mappings,
+            schemas,
+            memberships,
+            saml_mappings: None,
+            kratos_default_schema_id: "default".into(),
         }
     }
 
@@ -723,8 +867,8 @@ mod tests {
                 &self,
                 payload: serde_json::Value,
             ) -> Result<serde_json::Value, OryClientError> {
-                let tenant_id = payload["traits"]["tenant_id"].as_str().unwrap_or("unknown");
-                Ok(json!({ "id": format!("ory-created-{tenant_id}") }))
+                let email = payload["traits"]["email"].as_str().unwrap_or("unknown");
+                Ok(json!({ "id": format!("ory-created-{email}") }))
             }
         }
 
@@ -740,7 +884,7 @@ mod tests {
                 tenant_id: "tenant-b".into(),
                 backend: BACKEND_KRATOS.into(),
                 public_id: "public-b".into(),
-                ory_global_id: "ory-created-tenant-b".into(),
+                ory_global_id: "ory-created-alice@example.com".into(),
                 created_at: time::OffsetDateTime::now_utc(),
             })))),
         });
@@ -829,7 +973,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(b.ory_id, "ory-created-tenant-b");
+        assert_eq!(b.ory_id, "ory-created-alice@example.com");
         assert_eq!(b.public_id, "public-b");
         assert_ne!(a.public_id, b.public_id);
     }
@@ -925,6 +1069,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.ory_id, "ory-3");
+    }
+
+    #[tokio::test]
+    async fn provision_writes_base_only_to_kratos_and_full_traits_to_membership() {
+        #[derive(Clone, Default)]
+        struct CapturingKratos {
+            create_payload: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+
+        #[async_trait]
+        impl ProvisionerKratos for CapturingKratos {
+            async fn list_identities_by_identifier(
+                &self,
+                _tenant_id: &str,
+                _identifier: &str,
+            ) -> Result<serde_json::Value, OryClientError> {
+                Ok(json!([]))
+            }
+
+            async fn create_identity(
+                &self,
+                payload: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                *self.create_payload.lock().unwrap() = Some(payload);
+                Ok(json!({"id": "ory-new"}))
+            }
+        }
+
+        let create_payload: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let kratos = Arc::new(CapturingKratos {
+            create_payload: create_payload.clone(),
+        });
+        let mappings = Arc::new(StubMappingStore {
+            get_public_id_result: Arc::new(Mutex::new(None)),
+            create_result: Arc::new(Mutex::new(Some(Ok(IdMappingRow {
+                id: "id-1".into(),
+                tenant_id: "tenant-1".into(),
+                backend: BACKEND_KRATOS.into(),
+                public_id: "public-1".into(),
+                ory_global_id: "ory-new".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })))),
+        });
+        let schemas = Arc::new(StubSchemaStore {
+            get_by_schema_id_result: Arc::new(Mutex::new(Some(Ok(IdentitySchemaRow {
+                id: "schema-1".into(),
+                tenant_id: "tenant-1".into(),
+                schema_id: "employee".into(),
+                schema_json: json!({
+                    "type": "object",
+                    "properties": {
+                        "email": { "type": "string" },
+                        "name": { "type": "object" }
+                    }
+                }),
+                version: 7,
+                is_default: true,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })))),
+        });
+        let memberships = Arc::new(StubMembershipStore::default());
+        let p = provisioner_with_memberships(kratos, mappings, schemas, memberships.clone());
+        let result = p
+            .provision(
+                "tenant-1",
+                "employee",
+                &json!({"email": "Alice@Example.com", "email_verified": true, "name": "Alice Smith"}),
+            )
+            .await
+            .unwrap();
+        // Email is normalized before it reaches either store.
+        assert_eq!(result.email, "alice@example.com");
+
+        // Kratos only ever sees the base identity under the Kratos default schema id.
+        let payload = create_payload.lock().unwrap().clone().unwrap();
+        assert_eq!(payload["schema_id"], "default");
+        assert_eq!(payload["traits"], json!({"email": "alice@example.com"}));
+
+        // The membership holds the gateway schema binding and the full trait document.
+        let calls = memberships.upsert_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "tenant-1");
+        assert_eq!(calls[0].1, "public-1");
+        assert_eq!(calls[0].2, "employee");
+        assert_eq!(calls[0].3, 7);
+        assert_eq!(calls[0].4["email"], "alice@example.com");
+        assert_eq!(calls[0].4["name"], json!({"first": "Alice", "last": "Smith"}));
     }
 
     #[tokio::test]

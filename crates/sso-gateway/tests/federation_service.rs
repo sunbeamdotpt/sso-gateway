@@ -222,6 +222,8 @@ async fn federation_saml_login_round_trip() {
         false,
         false,
         replay_cache,
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        "default".to_string(),
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
@@ -490,6 +492,8 @@ async fn federation_saml_signed_login_is_idempotent() {
         true,
         false,
         replay_cache,
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        "default".to_string(),
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
@@ -727,7 +731,7 @@ async fn federation_saml_metadata_endpoint() {
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
-    let replay_cache = Arc::new(SamlReplayCache::new(pool));
+    let replay_cache = Arc::new(SamlReplayCache::new(pool.clone()));
 
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos,
@@ -748,6 +752,8 @@ async fn federation_saml_metadata_endpoint() {
         true,
         false,
         replay_cache,
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        "default".to_string(),
     ));
 
     let saml_state = Arc::new(SamlState::new(federation_service));

@@ -34,7 +34,7 @@ use crate::db::{
     LoginStateRepo, LoginStateStore, SamlIdentityMappingRepo, SamlIdentityMappingStore,
     SamlIdpKeyRepo, SamlIdpKeyStore, SamlProviderRepo, SamlProviderRow, SamlProviderStore,
     SamlReplayCacheTrait, SamlRequestRepo, SamlRequestStore, TenantConnectionRepo,
-    TenantConnectionStore, TenantDomainRepo, TenantDomainStore,
+    TenantConnectionStore, TenantDomainRepo, TenantDomainStore, TenantMembershipRepo,
 };
 use crate::hrd::Hrd;
 use crate::identity_provisioner::{
@@ -152,6 +152,8 @@ impl FederationServiceImpl {
         require_signed_assertions: bool,
         require_signed_responses: bool,
         replay_cache: Arc<dyn SamlReplayCacheTrait>,
+        memberships: TenantMembershipRepo,
+        kratos_default_schema_id: String,
     ) -> Self {
         let providers: Arc<dyn SamlProviderStore> = Arc::new(providers);
         let connections: Arc<dyn TenantConnectionStore> = Arc::new(connections);
@@ -159,10 +161,16 @@ impl FederationServiceImpl {
         let mappings: Arc<dyn IdMappingStore> = Arc::new(mappings);
         let schemas: Arc<dyn IdentitySchemaStore> = Arc::new(schemas);
         let identity_provisioner: Arc<dyn IdentityProvisioner> = Arc::new(
-            KratosIdentityProvisioner::new(kratos.clone(), mappings.clone(), schemas.clone())
-                .with_saml_mappings(
-                    Arc::new(federation_mappings.clone()) as Arc<dyn SamlIdentityMappingStore>
-                ),
+            KratosIdentityProvisioner::new(
+                kratos.clone(),
+                mappings.clone(),
+                schemas.clone(),
+                memberships,
+                kratos_default_schema_id,
+            )
+            .with_saml_mappings(
+                Arc::new(federation_mappings.clone()) as Arc<dyn SamlIdentityMappingStore>
+            ),
         );
         let hrd = Hrd::new(
             connections.clone(),
@@ -1970,7 +1978,7 @@ mod tests {
             SamlIdpKeyRepo::new(pool.clone()),
             TenantConnectionRepo::new(pool.clone()),
             TenantDomainRepo::new(pool.clone()),
-            LoginStateRepo::new(pool),
+            LoginStateRepo::new(pool.clone()),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -1979,6 +1987,8 @@ mod tests {
             true,
             false,
             Arc::new(InMemoryReplayCache::new()),
+            TenantMembershipRepo::new(pool.clone()),
+            "default".to_string(),
         );
         let provider = SamlProviderRow {
             id: "p1".into(),
@@ -2034,7 +2044,7 @@ mod tests {
             SamlIdpKeyRepo::new(pool.clone()),
             TenantConnectionRepo::new(pool.clone()),
             TenantDomainRepo::new(pool.clone()),
-            LoginStateRepo::new(pool),
+            LoginStateRepo::new(pool.clone()),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -2043,6 +2053,8 @@ mod tests {
             true,
             false,
             Arc::new(InMemoryReplayCache::new()),
+            TenantMembershipRepo::new(pool.clone()),
+            "default".to_string(),
         );
         let provider = SamlProviderRow {
             id: "p1".into(),
@@ -2090,7 +2102,7 @@ mod tests {
             SamlIdpKeyRepo::new(pool.clone()),
             TenantConnectionRepo::new(pool.clone()),
             TenantDomainRepo::new(pool.clone()),
-            LoginStateRepo::new(pool),
+            LoginStateRepo::new(pool.clone()),
             "http://hydra".into(),
             "http://gateway".into(),
             None,
@@ -2099,6 +2111,8 @@ mod tests {
             true,
             false,
             Arc::new(InMemoryReplayCache::new()),
+            TenantMembershipRepo::new(pool.clone()),
+            "default".to_string(),
         );
         let _cloned = service.clone();
     }

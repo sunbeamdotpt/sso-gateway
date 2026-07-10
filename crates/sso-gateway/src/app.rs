@@ -187,6 +187,8 @@ pub async fn build_app_with_upstream(
             kratos.clone(),
             callback_mappings,
             callback_schemas,
+            memberships.clone(),
+            config.kratos_default_schema_id.clone(),
         ));
     let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> = upstream_oauth
         .unwrap_or_else(|| {
@@ -316,6 +318,8 @@ pub async fn build_app_with_upstream(
         config.saml_require_signed_assertions,
         config.saml_require_signed_responses,
         replay_cache,
+        memberships.clone(),
+        config.kratos_default_schema_id.clone(),
     ));
 
     let oauth_state = Arc::new(Oauth2State::new(
