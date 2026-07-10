@@ -7,6 +7,26 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.5] - 2026-07-10
+
+### Fixed
+
+- `GetLoginFlow` and `SubmitLoginFlow` now forward Kratos's raw flow id to
+  Kratos when no gateway-minted public token exists. The standard Ory browser
+  flow can hand the raw flow id straight to the login UI (a Kratos-initiated
+  redirect, or a flow that pre-dates the ULID migration), in which case there
+  is no mapping to resolve. The gateway previously returned `not_found`,
+  trapping the browser in a redirect loop. Kratos issued and cryptographically
+  validates the flow id, and the browser already holds it in the URL, so
+  passthrough is safe and leaks nothing.
+- The self-service UI mapper now collapses an `identifier` input node whose
+  value Kratos prefilled as a JSON array of the same email (e.g.
+  `["alice@example.com","alice@example.com"]`) down to the single email. The
+  generic coercion previously rendered the array as the literal text
+  `[...]`, which the browser submitted verbatim; no identity matched it, so
+  the password check rejected and the login looped. Genuinely multi-valued
+  arrays are left unchanged.
+
 ## [2026.07.4] - 2026-07-09
 
 ### Fixed
