@@ -7,6 +7,18 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.4] - 2026-07-09
+
+### Fixed
+
+- `CreateLoginFlow` and `CreateRegistrationFlow` (both `IdentitySelfService` and
+  the legacy `Identity` service) now forward Hydra's raw login challenge to
+  Kratos when no gateway-minted mapping exists. Previously these RPCs returned
+  `not_found` for the standard Ory login flow, where Hydra delivers the raw
+  challenge to the login UI via the redirect query string, trapping the browser
+  in a redirect loop. Kratos cryptographically validates the challenge either
+  way, so passthrough is safe.
+
 ## [2026.07.3] - 2026-07-09
 
 ### Added
