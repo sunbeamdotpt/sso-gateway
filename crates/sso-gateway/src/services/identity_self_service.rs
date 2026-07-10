@@ -11,9 +11,10 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 
 use crate::db::{
-    DbError, IdMappingRepo, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
-    TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
-    TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, TransientTokenStore,
+    DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
+    TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+    TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+    TransientTokenRepo, TransientTokenStore,
 };
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
@@ -403,27 +404,34 @@ pub struct IdentitySelfServiceImpl {
     kratos: Arc<dyn KratosSelfService>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
+    schemas: Arc<dyn IdentitySchemaStore>,
     consent_enabled: bool,
     kratos_public_url: String,
     gateway_public_url: String,
+    kratos_default_schema_id: String,
 }
 
 impl IdentitySelfServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kratos: Arc<KratosClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
+        schemas: IdentitySchemaRepo,
         consent_enabled: bool,
         kratos_public_url: String,
         gateway_public_url: String,
+        kratos_default_schema_id: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn KratosSelfService>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
             consent_enabled,
             kratos_public_url,
             gateway_public_url,
+            kratos_default_schema_id,
         }
     }
 
@@ -557,6 +565,14 @@ impl IdentitySelfServiceImpl {
         flow: &mut SelfServiceFlow,
     ) -> Result<(), ServiceError> {
         flow.id = self.public_flow(tenant_id, &flow.id).await?;
+        // Kratos echoes its own (base) schema id on settings flows. Surface the
+        // tenant's gateway schema instead, and never leak the Kratos id.
+        if !flow.identity_schema_id.is_empty() {
+            flow.identity_schema_id = match self.schemas.get_default(tenant_id).await {
+                Ok(schema) => schema.schema_id,
+                Err(_) => String::new(),
+            };
+        }
         if let Some(oauth2) = flow.oauth2_login_request.as_option_mut() {
             self.map_oauth2_login_request(tenant_id, oauth2).await?;
         }
@@ -957,7 +973,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query_owned.push(("identity_schema", req.identity_schema));
+            query_owned.push(("identity_schema", self.kratos_default_schema_id.clone()));
         }
         let query_refs: Vec<(&str, &str)> =
             query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -997,7 +1013,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
-            query_owned.push(("identity_schema", req.identity_schema));
+            query_owned.push(("identity_schema", self.kratos_default_schema_id.clone()));
         }
         let query_refs: Vec<(&str, &str)> =
             query_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1355,9 +1371,10 @@ mod tests {
     use sunbeam_g2v::error::ServiceError;
 
     use crate::db::{
-        DbError, IdMappingRow, IdMappingStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
-        TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
-        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRow, TransientTokenStore,
+        DbError, IdMappingRow, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore,
+        TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+        TransientTokenRow, TransientTokenStore,
     };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
@@ -2230,14 +2247,102 @@ mod tests {
         store
     }
 
+    #[derive(Clone, Default)]
+    struct StubSchemaStore {
+        get_default_result: Arc<Mutex<Option<Result<IdentitySchemaRow, DbError>>>>,
+    }
+
+    impl StubSchemaStore {
+        fn with_default(row: IdentitySchemaRow) -> Self {
+            Self {
+                get_default_result: Arc::new(Mutex::new(Some(Ok(row)))),
+            }
+        }
+
+        fn with_default_error(err: DbError) -> Self {
+            Self {
+                get_default_result: Arc::new(Mutex::new(Some(Err(err)))),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdentitySchemaStore for StubSchemaStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+            _schema_json: serde_json::Value,
+            _is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_by_schema_id(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn list(&self, _tenant_id: &str) -> Result<Vec<IdentitySchemaRow>, DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _tenant_id: &str, _schema_id: &str) -> Result<(), DbError> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+            _schema_json: serde_json::Value,
+            _is_default: bool,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn set_default(
+            &self,
+            _tenant_id: &str,
+            _schema_id: &str,
+        ) -> Result<IdentitySchemaRow, DbError> {
+            unimplemented!()
+        }
+
+        async fn get_default(&self, tenant_id: &str) -> Result<IdentitySchemaRow, DbError> {
+            match self.get_default_result.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(IdentitySchemaRow {
+                    id: "schema-1".into(),
+                    tenant_id: tenant_id.to_string(),
+                    schema_id: "default".into(),
+                    schema_json: json!({}),
+                    version: 1,
+                    is_default: true,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    updated_at: time::OffsetDateTime::now_utc(),
+                }),
+            }
+        }
+    }
+
+    fn default_schema_store() -> StubSchemaStore {
+        StubSchemaStore::default()
+    }
+
     fn service(kratos: FakeKratos) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            schemas: Arc::new(default_schema_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
         }
     }
 
@@ -2248,10 +2353,12 @@ mod tests {
         let svc = IdentitySelfServiceImpl::new(
             kratos.clone(),
             crate::db::TransientTokenRepo::new(pool.clone()),
-            crate::db::IdMappingRepo::new(pool),
+            crate::db::IdMappingRepo::new(pool.clone()),
+            crate::db::IdentitySchemaRepo::new(pool),
             true,
             "http://kratos.example.com".to_string(),
             "https://gateway.example.com".to_string(),
+            "default".to_string(),
         );
         // Field is now a trait object; just verify the service was created.
         assert_eq!(Arc::strong_count(&kratos), 2);
@@ -2291,6 +2398,58 @@ mod tests {
             flow.ui.as_option().unwrap().action,
             "https://gateway.example.com/self-service/login?flow=1"
         );
+    }
+
+    #[tokio::test]
+    async fn map_flow_response_surfaces_gateway_schema_and_hides_kratos_schema() {
+        let svc = IdentitySelfServiceImpl {
+            kratos: Arc::new(FakeKratos::default()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+            schemas: Arc::new(StubSchemaStore::with_default(IdentitySchemaRow {
+                id: "schema-1".into(),
+                tenant_id: "tenant-1".into(),
+                schema_id: "gateway-default".into(),
+                schema_json: json!({}),
+                version: 3,
+                is_default: true,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            })),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "kratos-base".to_string(),
+        };
+        let mut flow = SelfServiceFlow {
+            id: "flow-1".into(),
+            identity_schema_id: "kratos-base".into(),
+            ..Default::default()
+        };
+        svc.map_flow_response("tenant-1", &mut flow).await.unwrap();
+        assert_eq!(flow.identity_schema_id, "gateway-default");
+    }
+
+    #[tokio::test]
+    async fn map_flow_response_clears_schema_when_no_gateway_default() {
+        let svc = IdentitySelfServiceImpl {
+            kratos: Arc::new(FakeKratos::default()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+            schemas: Arc::new(StubSchemaStore::with_default_error(DbError::SchemaNotFound)),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "kratos-base".to_string(),
+        };
+        let mut flow = SelfServiceFlow {
+            id: "flow-1".into(),
+            identity_schema_id: "kratos-base".into(),
+            ..Default::default()
+        };
+        svc.map_flow_response("tenant-1", &mut flow).await.unwrap();
+        // The Kratos schema id must never be surfaced, even if no gateway default exists.
+        assert!(flow.identity_schema_id.is_empty());
     }
 
     #[test]
@@ -2573,7 +2732,7 @@ mod tests {
             organization: "org-1".to_string(),
             via: "email".to_string(),
             login_challenge: "challenge-1".to_string(),
-            identity_schema: "default".to_string(),
+            identity_schema: "employee".to_string(),
             ..Default::default()
         });
 
@@ -2586,7 +2745,10 @@ mod tests {
         assert!(call.contains("(\"organization\", \"org-1\")"));
         assert!(call.contains("(\"via\", \"email\")"));
         assert!(call.contains("(\"login_challenge\", \"challenge-1\")"));
+        // The gateway schema id ("employee") is translated to the Kratos base
+        // schema id before it ever reaches Kratos.
         assert!(call.contains("(\"identity_schema\", \"default\")"));
+        assert!(!call.contains("employee"));
     }
 
     // Regression: the standard Ory login flow delivers Hydra's raw challenge to

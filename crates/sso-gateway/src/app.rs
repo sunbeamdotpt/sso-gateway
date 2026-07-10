@@ -285,9 +285,11 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         transient.clone(),
         mappings.clone(),
+        schemas.clone(),
         consent_enabled,
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),
+        config.kratos_default_schema_id.clone(),
     ));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),

@@ -481,9 +481,11 @@ async fn self_service_and_consent_round_trip() {
         kratos.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
         true,
         kratos_url.clone(),
         "http://gateway.test".to_string(),
+        "default".to_string(),
     ));
     let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),
