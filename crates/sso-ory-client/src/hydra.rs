@@ -323,7 +323,17 @@ impl HydraClient {
                 .and_then(|h| h.to_str().ok())
                 .map(String::from)
                 .unwrap_or_default();
-            return Err(OryClientError::Redirect { location });
+            let set_cookies = response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|h| h.to_str().ok())
+                .map(String::from)
+                .collect();
+            return Err(OryClientError::Redirect {
+                location,
+                set_cookies,
+            });
         }
 
         handle_response(response).await
@@ -1144,6 +1154,53 @@ mod tests {
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client.get_login_request("challenge-1").await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn authorize_preserves_set_cookie_headers_on_redirect() {
+        async fn redirect_with_cookies() -> (axum::http::StatusCode, axum::http::HeaderMap) {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::LOCATION,
+                "https://gateway.example.com/login?login_challenge=abc"
+                    .parse()
+                    .unwrap(),
+            );
+            headers.append(
+                axum::http::header::SET_COOKIE,
+                "oauth2_authentication_csrf=a; Path=/; HttpOnly"
+                    .parse()
+                    .unwrap(),
+            );
+            headers.append(
+                axum::http::header::SET_COOKIE,
+                "ory_hydra_continuity=b; Path=/; HttpOnly".parse().unwrap(),
+            );
+            (axum::http::StatusCode::FOUND, headers)
+        }
+
+        let app = Router::new().route("/oauth2/auth", get(redirect_with_cookies));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.authorize(Vec::new()).await.unwrap_err();
+        match err {
+            OryClientError::Redirect {
+                location,
+                set_cookies,
+            } => {
+                assert!(location.contains("login_challenge=abc"));
+                assert_eq!(set_cookies.len(), 2);
+                assert!(set_cookies
+                    .iter()
+                    .any(|c| c.starts_with("oauth2_authentication_csrf=")));
+            }
+            other => panic!("expected redirect, got {other:?}"),
+        }
     }
 
     #[tokio::test]

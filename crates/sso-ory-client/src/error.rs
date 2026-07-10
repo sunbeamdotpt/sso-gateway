@@ -15,9 +15,14 @@ pub enum OryClientError {
     Ory { status: u16, message: String },
 
     /// Hydra's authorization endpoint responded with an HTTP redirect.
-    /// The gateway should proxy this location to the browser.
+    /// The gateway should proxy this location, and any `Set-Cookie` headers
+    /// Hydra emitted (notably the `oauth2_authentication_csrf` cookie required
+    /// to complete the subsequent authorize request), to the browser.
     #[error("ory returned redirect: {location}")]
-    Redirect { location: String },
+    Redirect {
+        location: String,
+        set_cookies: Vec<String>,
+    },
 
     #[error("missing tenant context")]
     MissingTenant,

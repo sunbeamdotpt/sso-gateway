@@ -233,19 +233,24 @@ async fn authorize(
         .collect::<Vec<_>>();
     match state.hydra.authorize(query).await {
         Ok(value) => json_response(value),
-        Err(OryClientError::Redirect { location }) => {
+        Err(OryClientError::Redirect {
+            location,
+            set_cookies,
+        }) => {
             if location.is_empty() {
                 return internal_error();
             }
-            match axum::http::HeaderValue::try_from(location) {
-                Ok(location) => (
-                    StatusCode::FOUND,
-                    [(axum::http::header::LOCATION, location)],
-                    Body::empty(),
-                )
-                    .into_response(),
-                Err(_) => internal_error(),
+            let Ok(location) = axum::http::HeaderValue::try_from(location) else {
+                return internal_error();
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::LOCATION, location);
+            for cookie in set_cookies {
+                if let Ok(value) = axum::http::HeaderValue::try_from(cookie) {
+                    headers.append(axum::http::header::SET_COOKIE, value);
+                }
             }
+            (StatusCode::FOUND, headers, Body::empty()).into_response()
         }
         Err(err) => map_ory_error(err),
     }
@@ -1344,6 +1349,122 @@ mod tests {
         let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
         let resp = authorize(State(state), Query(params)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Hydra stub that redirects `authorize` carrying a set of cookies, used to
+    /// verify the handler forwards Hydra's `Set-Cookie` headers (notably the
+    /// `oauth2_authentication_csrf` cookie) to the browser.
+    #[derive(Clone, Default)]
+    struct RedirectHydra {
+        location: String,
+        set_cookies: Vec<String>,
+        inner: AlwaysOkHydra,
+    }
+
+    #[async_trait]
+    impl HydraOperations for RedirectHydra {
+        async fn authorize(
+            &self,
+            _query: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(OryClientError::Redirect {
+                location: self.location.clone(),
+                set_cookies: self.set_cookies.clone(),
+            })
+        }
+
+        async fn token(
+            &self,
+            form: Vec<(String, String)>,
+            client_credentials: Option<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.inner.token(form, client_credentials).await
+        }
+
+        async fn device(
+            &self,
+            path: &str,
+            form: Vec<(String, String)>,
+            client_credentials: Option<(String, String)>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.inner.device(path, form, client_credentials).await
+        }
+
+        async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError> {
+            self.inner.userinfo(token).await
+        }
+
+        async fn introspect_token(
+            &self,
+            token: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.inner.introspect_token(token).await
+        }
+
+        async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError> {
+            self.inner.revoke(form).await
+        }
+
+        async fn create_oauth2_client(
+            &self,
+            payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.inner.create_oauth2_client(payload).await
+        }
+
+        async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
+            self.inner.get_json(url).await
+        }
+
+        fn public_url(&self) -> &reqwest::Url {
+            self.inner.public_url()
+        }
+    }
+
+    fn redirect_state(location: String, set_cookies: Vec<String>) -> Oauth2State {
+        Oauth2State {
+            hydra: Arc::new(RedirectHydra {
+                location,
+                set_cookies,
+                inner: AlwaysOkHydra {
+                    response: json!({"status": "ok"}),
+                },
+            }),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "tenant-1".to_string(),
+                ))))),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "hydra-client-id-1".to_string(),
+                ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_forwards_set_cookie_on_redirect() {
+        let state = Arc::new(redirect_state(
+            "https://gateway.example.com/login?login_challenge=abc".to_string(),
+            vec![
+                "oauth2_authentication_csrf=a; Path=/; HttpOnly".to_string(),
+                "ory_hydra_continuity=b; Path=/; HttpOnly".to_string(),
+            ],
+        ));
+        let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
+        let resp = authorize(State(state), Query(params)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert!(resp.headers().get(axum::http::header::LOCATION).is_some());
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .collect();
+        assert_eq!(cookies.len(), 2);
     }
 
     #[tokio::test]
