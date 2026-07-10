@@ -92,8 +92,10 @@ async fn identity_service_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas,
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
+        "default".to_string(),
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());

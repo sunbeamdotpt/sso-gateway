@@ -14,9 +14,10 @@ use ulid::Ulid;
 use crate::{
     auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_IDENTITY_READ, require_scope},
     db::{
-        DbError, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, TOKEN_TYPE_FLOW,
-        TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
-        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenStore,
+        DbError, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, TenantMembershipRow,
+        TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+        TransientTokenStore,
     },
     middleware::TenantId,
     proto::iam::v1::{
@@ -194,8 +195,10 @@ pub struct IdentityServiceImpl {
     kratos: Arc<dyn IdentityKratos>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
+    memberships: Arc<dyn TenantMembershipStore>,
     transient: Arc<dyn TransientTokenStore>,
     ui_public_url: String,
+    kratos_default_schema_id: String,
 }
 
 impl IdentityServiceImpl {
@@ -203,15 +206,19 @@ impl IdentityServiceImpl {
         kratos: Arc<KratosClient>,
         mappings: crate::db::IdMappingRepo,
         schemas: crate::db::IdentitySchemaRepo,
+        memberships: crate::db::TenantMembershipRepo,
         transient: crate::db::TransientTokenRepo,
         ui_public_url: String,
+        kratos_default_schema_id: String,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn IdentityKratos>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
+            memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             ui_public_url,
+            kratos_default_schema_id,
         }
     }
 }
@@ -229,14 +236,17 @@ impl IdentityService for IdentityServiceImpl {
         let req = request.to_owned_message();
 
         let schema = self.resolve_schema(&tenant_id, &req.schema_id).await?;
-        let traits_json = req
+        let mut traits_json = req
             .traits
             .as_option()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .unwrap_or_else(|| serde_json::json!({}));
+        normalize_traits(&mut traits_json);
         validate_traits(&schema.schema_json, &traits_json)?;
+        let email = extract_email(&traits_json)?;
 
-        let payload = build_kratos_identity_payload(&schema.schema_id, traits_json, &req.password);
+        let payload =
+            build_kratos_identity_payload(&self.kratos_default_schema_id, &email, &req.password);
         let created = self
             .kratos
             .create_identity(payload)
@@ -251,11 +261,29 @@ impl IdentityService for IdentityServiceImpl {
             .create(&tenant_id, BACKEND_KRATOS, &public_id, ory_id)
             .await?;
 
-        Ok(Response::new(kratos_to_identity(
-            &created,
+        // The gateway owns the full trait document and the schema binding; Kratos holds
+        // only {email}. If the membership write fails, roll back the Kratos identity so
+        // the two stores stay converged.
+        if let Err(err) = self
+            .memberships
+            .upsert(
+                &tenant_id,
+                &public_id,
+                &schema.schema_id,
+                schema.version,
+                traits_json.clone(),
+            )
+            .await
+        {
+            let _ = self.kratos.delete_identity(ory_id).await;
+            return Err(err.into());
+        }
+
+        Ok(Response::new(identity_from_traits(
             &tenant_id,
             &public_id,
             &schema.schema_id,
+            &traits_json,
         )))
     }
 
@@ -268,16 +296,12 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope_any(&ctx, &[SCOPE_IDENTITY_READ, SCOPE_IDENTITY_ADMIN])?;
         let req = request.to_owned_message();
-        let (ory_id, schema_id) = self.resolve_identity(&tenant_id, &req.id).await?;
-
-        let identity = self
-            .kratos
-            .get_identity(&ory_id)
-            .await
-            .map_err(map_ory_error)?;
-
-        Ok(Response::new(kratos_to_identity(
-            &identity, &tenant_id, &req.id, &schema_id,
+        let (_ory_id, membership) = self.resolve_identity(&tenant_id, &req.id).await?;
+        Ok(Response::new(identity_from_traits(
+            &tenant_id,
+            &req.id,
+            &membership.schema_id,
+            &membership.traits,
         )))
     }
 
@@ -297,13 +321,13 @@ impl IdentityService for IdentityServiceImpl {
         let mut identities = Vec::with_capacity(public_ids.len());
         for public_id in public_ids {
             match self.resolve_identity(&tenant_id, &public_id).await {
-                Ok((ory_id, schema_id)) => match self.kratos.get_identity(&ory_id).await {
-                    Ok(identity) => identities.push(kratos_to_identity(
-                        &identity, &tenant_id, &public_id, &schema_id,
-                    )),
-                    Err(err) => debug!(%public_id, "failed to fetch kratos identity: {}", err),
-                },
-                Err(err) => debug!(%public_id, "mapping lookup failed: {}", err),
+                Ok((_ory_id, membership)) => identities.push(identity_from_traits(
+                    &tenant_id,
+                    &public_id,
+                    &membership.schema_id,
+                    &membership.traits,
+                )),
+                Err(err) => debug!(%public_id, "identity resolution failed: {}", err),
             }
         }
 
@@ -322,34 +346,58 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
-        let (ory_id, current_schema_id) = self.resolve_identity(&tenant_id, &req.id).await?;
+        let (ory_id, current) = self.resolve_identity(&tenant_id, &req.id).await?;
 
         let schema_id = if req.schema_id.is_empty() {
-            current_schema_id
+            current.schema_id.clone()
         } else {
             req.schema_id
         };
         let schema = self.resolve_schema(&tenant_id, &schema_id).await?;
 
-        let traits_json = req
+        let mut traits_json = req
             .traits
             .as_option()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .unwrap_or_else(|| serde_json::json!({}));
+        normalize_traits(&mut traits_json);
         validate_traits(&schema.schema_json, &traits_json)?;
+        let email = extract_email(&traits_json)?;
 
-        let payload = build_kratos_identity_payload(&schema.schema_id, traits_json, "");
-        let updated = self
-            .kratos
+        // Email is the Kratos identifier and is immutable.
+        let current_email = current
+            .traits
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !current_email.is_empty() && email != current_email {
+            return Err(ServiceError::InvalidArgument("email is immutable".into()).into());
+        }
+
+        // Traits-only Kratos update of {email}; Kratos preserves the omitted credentials
+        // block (verified against v25.4 by an integration test).
+        let payload = build_kratos_identity_payload(&self.kratos_default_schema_id, &email, "");
+        self.kratos
             .update_identity(&ory_id, payload)
             .await
             .map_err(map_ory_error)?;
 
-        Ok(Response::new(kratos_to_identity(
-            &updated,
+        let membership = self
+            .memberships
+            .upsert(
+                &tenant_id,
+                &req.id,
+                &schema.schema_id,
+                schema.version,
+                traits_json.clone(),
+            )
+            .await?;
+
+        Ok(Response::new(identity_from_traits(
             &tenant_id,
             &req.id,
-            &schema.schema_id,
+            &membership.schema_id,
+            &traits_json,
         )))
     }
 
@@ -392,6 +440,7 @@ impl IdentityService for IdentityServiceImpl {
             .as_option()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .unwrap_or_else(|| serde_json::json!({}));
+        require_email_string_schema(&schema_json)?;
         let row = self
             .schemas
             .create(&tenant_id, &req.schema_id, schema_json, req.is_default)
@@ -445,6 +494,7 @@ impl IdentityService for IdentityServiceImpl {
             .as_option()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .unwrap_or_else(|| serde_json::json!({}));
+        require_email_string_schema(&schema_json)?;
         let row = self
             .schemas
             .update(&tenant_id, &req.schema_id, schema_json, req.is_default)
@@ -905,19 +955,38 @@ impl IdentityServiceImpl {
         &self,
         tenant_id: &str,
         public_id: &str,
-    ) -> Result<(String, String), ServiceError> {
+    ) -> Result<(String, TenantMembershipRow), ServiceError> {
         let ory_id = self
             .mappings
             .get_ory_id(tenant_id, BACKEND_KRATOS, public_id)
             .await?;
-        let schema_id = match self.kratos.get_identity(&ory_id).await {
-            Ok(identity) => identity["schema_id"]
-                .as_str()
-                .unwrap_or("default")
-                .to_string(),
-            Err(_) => "default".to_string(),
-        };
-        Ok((ory_id, schema_id))
+        match self.memberships.get(tenant_id, public_id).await {
+            Ok(membership) => Ok((ory_id, membership)),
+            Err(DbError::MembershipNotFound) => {
+                // Pre-migration identity: backfill a membership from the current Kratos
+                // state so reads become gateway-authoritative from here on.
+                let identity = self
+                    .kratos
+                    .get_identity(&ory_id)
+                    .await
+                    .map_err(map_ory_error)?;
+                let schema_id = identity["schema_id"]
+                    .as_str()
+                    .unwrap_or("default")
+                    .to_string();
+                let traits = if identity["traits"].is_object() {
+                    identity["traits"].clone()
+                } else {
+                    serde_json::json!({})
+                };
+                let membership = self
+                    .memberships
+                    .upsert(tenant_id, public_id, &schema_id, 1, traits)
+                    .await?;
+                Ok((ory_id, membership))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn public_flow(
@@ -999,17 +1068,63 @@ impl IdentityServiceImpl {
 const MAX_SCHEMA_SIZE_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 10;
 
+pub(crate) fn traits_subschema(schema_json: &serde_json::Value) -> &serde_json::Value {
+    schema_json
+        .get("properties")
+        .and_then(|p| p.get("traits"))
+        .unwrap_or(schema_json)
+}
+
+/// Lowercase + trim `traits.email` so the Kratos identifier, the validated value, and
+/// the gateway-stored traits all agree on a single canonical form. No-op when traits is
+/// not an object or has no string email.
+pub(crate) fn normalize_traits(traits: &mut serde_json::Value) {
+    if let Some(email) = traits.get("email").and_then(|v| v.as_str()) {
+        let normalized = email.trim().to_ascii_lowercase();
+        if normalized != email {
+            traits["email"] = serde_json::Value::String(normalized);
+        }
+    }
+}
+
+pub(crate) fn extract_email(traits: &serde_json::Value) -> Result<String, ServiceError> {
+    traits
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ServiceError::InvalidArgument("traits.email is required".into()))
+}
+
+/// Superset rule: every tenant schema must declare `traits.email` as a string so the
+/// gateway can always project the base Kratos identity `{ email }` from it.
+pub(crate) fn require_email_string_schema(
+    schema_json: &serde_json::Value,
+) -> Result<(), ServiceError> {
+    let traits_schema = traits_subschema(schema_json);
+    let email_ty = traits_schema
+        .get("properties")
+        .and_then(|p| p.get("email"))
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str());
+    match email_ty {
+        Some("string") => Ok(()),
+        _ => Err(ServiceError::InvalidArgument(
+            "identity schema must declare traits.email as a string".into(),
+        )),
+    }
+}
+
 pub(crate) fn validate_traits(
     schema_json: &serde_json::Value,
     traits: &serde_json::Value,
 ) -> Result<(), ServiceError> {
     // Tenant schemas may be stored either as the full Kratos identity schema
     // (which wraps traits under `properties.traits`) or directly as the traits
-    // schema. Prefer the traits subschema when it exists.
-    let traits_schema = schema_json
-        .get("properties")
-        .and_then(|p| p.get("traits"))
-        .unwrap_or(schema_json);
+    // schema. Prefer the traits subschema when it exists. Callers are expected to
+    // run `normalize_traits` first so the value validated here is the value they
+    // persist and forward.
+    let traits_schema = traits_subschema(schema_json);
 
     validate_schema_size(traits_schema)?;
     validate_schema_depth(traits_schema, 0)?;
@@ -1156,37 +1271,32 @@ fn extract_first_self_service_link(body: &str) -> Option<String> {
 }
 
 fn build_kratos_identity_payload(
-    schema_id: &str,
-    traits: serde_json::Value,
+    base_schema_id: &str,
+    email: &str,
     password: &str,
 ) -> serde_json::Value {
-    if password.is_empty() {
-        serde_json::json!({
-            "schema_id": schema_id,
-            "traits": traits,
-        })
-    } else {
-        serde_json::json!({
-            "schema_id": schema_id,
-            "traits": traits,
-            "credentials": {
-                "password": {
-                    "config": {
-                        "password": password,
-                    },
-                },
-            },
-        })
+    // Kratos only ever stores the base identity: the email (its password identifier,
+    // recovery/verification target) plus optional credentials. The full trait document
+    // lives in the gateway membership, never here.
+    let mut payload = serde_json::json!({
+        "schema_id": base_schema_id,
+        "traits": { "email": email },
+    });
+    if !password.is_empty() {
+        payload["credentials"] = serde_json::json!({
+            "password": { "config": { "password": password } },
+        });
     }
+    payload
 }
 
-fn kratos_to_identity(
-    identity: &serde_json::Value,
+fn identity_from_traits(
     tenant_id: &str,
     public_id: &str,
     schema_id: &str,
+    traits: &serde_json::Value,
 ) -> Identity {
-    let traits_struct = match serde_json::from_value::<ProtoStruct>(identity["traits"].clone()) {
+    let traits_struct = match serde_json::from_value::<ProtoStruct>(traits.clone()) {
         Ok(s) => Some(s),
         Err(err) => {
             tracing::warn!("failed to decode identity traits: {}", err);
@@ -1380,6 +1490,13 @@ mod tests {
                 error: Mutex::new(Some(err)),
                 ..Default::default()
             }
+        }
+
+        async fn add_identity(&self, id: &str, identity: serde_json::Value) {
+            self.identities
+                .lock()
+                .await
+                .insert(id.to_string(), identity);
         }
     }
 
@@ -1906,6 +2023,91 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubMembershipStore {
+        rows: Mutex<Vec<TenantMembershipRow>>,
+    }
+
+    #[async_trait]
+    impl TenantMembershipStore for StubMembershipStore {
+        async fn upsert(
+            &self,
+            tenant_id: &str,
+            identity_id: &str,
+            schema_id: &str,
+            schema_version: i64,
+            traits: serde_json::Value,
+        ) -> Result<TenantMembershipRow, DbError> {
+            let mut rows = self.rows.lock().await;
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|r| r.tenant_id == tenant_id && r.identity_id == identity_id)
+            {
+                row.schema_id = schema_id.to_string();
+                row.schema_version = schema_version;
+                row.traits = traits;
+                row.updated_at = time::OffsetDateTime::now_utc();
+                return Ok(row.clone());
+            }
+            let row = TenantMembershipRow {
+                tenant_id: tenant_id.to_string(),
+                identity_id: identity_id.to_string(),
+                schema_id: schema_id.to_string(),
+                schema_version,
+                traits,
+                state: "active".to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            };
+            rows.push(row.clone());
+            Ok(row)
+        }
+
+        async fn get(
+            &self,
+            tenant_id: &str,
+            identity_id: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            self.rows
+                .lock()
+                .await
+                .iter()
+                .find(|r| r.tenant_id == tenant_id && r.identity_id == identity_id)
+                .cloned()
+                .ok_or(DbError::MembershipNotFound)
+        }
+
+        async fn set_state(
+            &self,
+            tenant_id: &str,
+            identity_id: &str,
+            state: &str,
+        ) -> Result<TenantMembershipRow, DbError> {
+            let mut rows = self.rows.lock().await;
+            let row = rows
+                .iter_mut()
+                .find(|r| r.tenant_id == tenant_id && r.identity_id == identity_id)
+                .ok_or(DbError::MembershipNotFound)?;
+            row.state = state.to_string();
+            row.updated_at = time::OffsetDateTime::now_utc();
+            Ok(row.clone())
+        }
+
+        async fn list_by_tenant(
+            &self,
+            tenant_id: &str,
+        ) -> Result<Vec<TenantMembershipRow>, DbError> {
+            Ok(self
+                .rows
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.tenant_id == tenant_id)
+                .cloned()
+                .collect())
+        }
+    }
+
     fn make_service(
         kratos: StubKratos,
         mappings: StubMappingStore,
@@ -1916,8 +2118,10 @@ mod tests {
             kratos: Arc::new(kratos),
             mappings: Arc::new(mappings),
             schemas: Arc::new(schemas),
+            memberships: Arc::new(StubMembershipStore::default()),
             transient: Arc::new(transient),
             ui_public_url: "https://ui.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
         }
     }
 
@@ -2015,8 +2219,7 @@ mod tests {
 
     #[test]
     fn build_kratos_identity_payload_includes_password_when_set() {
-        let payload =
-            build_kratos_identity_payload("default", json!({"email": "a@b.com"}), "secret");
+        let payload = build_kratos_identity_payload("default", "a@b.com", "secret");
         assert_eq!(payload["schema_id"], "default");
         assert_eq!(payload["traits"]["email"], "a@b.com");
         assert_eq!(
@@ -2027,17 +2230,14 @@ mod tests {
 
     #[test]
     fn build_kratos_identity_payload_omits_password_when_empty() {
-        let payload = build_kratos_identity_payload("default", json!({"email": "a@b.com"}), "");
+        let payload = build_kratos_identity_payload("default", "a@b.com", "");
         assert!(payload["credentials"].is_null());
     }
 
     #[test]
-    fn kratos_to_identity_handles_valid_traits() {
-        let identity = json!({
-            "id": "ory-1",
-            "traits": {"email": "a@b.com", "userName": "alice"}
-        });
-        let app = kratos_to_identity(&identity, "tenant-1", "pub-1", "default");
+    fn identity_from_traits_handles_valid_traits() {
+        let traits = json!({"email": "a@b.com", "userName": "alice"});
+        let app = identity_from_traits("tenant-1", "pub-1", "default", &traits);
         assert_eq!(app.id, "pub-1");
         assert_eq!(app.tenant_id, "tenant-1");
         assert_eq!(app.schema_id, "default");
@@ -2045,9 +2245,9 @@ mod tests {
     }
 
     #[test]
-    fn kratos_to_identity_handles_invalid_traits() {
-        let identity = json!({"id": "ory-1", "traits": "not-an-object"});
-        let app = kratos_to_identity(&identity, "tenant-1", "pub-1", "default");
+    fn identity_from_traits_handles_invalid_traits() {
+        let traits = json!("not-an-object");
+        let app = identity_from_traits("tenant-1", "pub-1", "default", &traits);
         assert_eq!(app.id, "pub-1");
         assert!(app.traits.fields.is_empty());
     }
@@ -2111,6 +2311,77 @@ mod tests {
         let invalid_schema = json!({"type": "totally-invalid-type"});
         let traits = json!({"email": "alice@example.com"});
         assert!(validate_traits(&invalid_schema, &traits).is_err());
+    }
+
+    #[test]
+    fn normalize_traits_lowercases_and_trims_email() {
+        let mut traits = json!({"email": "  Alice@Example.COM  ", "name": {"first": "Alice"}});
+        normalize_traits(&mut traits);
+        assert_eq!(traits["email"], "alice@example.com");
+        // Other fields are untouched.
+        assert_eq!(traits["name"]["first"], "Alice");
+    }
+
+    #[test]
+    fn normalize_traits_is_noop_without_string_email() {
+        let mut non_object = json!(["not", "an", "object"]);
+        normalize_traits(&mut non_object);
+        assert_eq!(non_object, json!(["not", "an", "object"]));
+
+        let mut no_email = json!({"name": "alice"});
+        normalize_traits(&mut no_email);
+        assert_eq!(no_email, json!({"name": "alice"}));
+    }
+
+    #[test]
+    fn extract_email_returns_value_and_errors_when_missing() {
+        assert_eq!(
+            extract_email(&json!({"email": "a@b.com"})).unwrap(),
+            "a@b.com"
+        );
+        assert!(extract_email(&json!({})).is_err());
+        assert!(extract_email(&json!({"email": ""})).is_err());
+        assert!(extract_email(&json!({"email": 42})).is_err());
+    }
+
+    #[test]
+    fn require_email_string_schema_accepts_full_kratos_and_direct_traits_schemas() {
+        let full_kratos = json!({
+            "type": "object",
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "email": { "type": "string" } }
+                }
+            }
+        });
+        assert!(require_email_string_schema(&full_kratos).is_ok());
+
+        let direct_traits = json!({
+            "type": "object",
+            "properties": { "email": { "type": "string" } }
+        });
+        assert!(require_email_string_schema(&direct_traits).is_ok());
+    }
+
+    #[test]
+    fn require_email_string_schema_rejects_missing_or_non_string_email() {
+        let missing_email = json!({
+            "type": "object",
+            "properties": { "traits": { "type": "object", "properties": {} } }
+        });
+        assert!(require_email_string_schema(&missing_email).is_err());
+
+        let non_string_email = json!({
+            "type": "object",
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "email": { "type": "number" } }
+                }
+            }
+        });
+        assert!(require_email_string_schema(&non_string_email).is_err());
     }
 
     #[tokio::test]
@@ -2326,7 +2597,7 @@ mod tests {
         let req = UpdateIdentityRequest {
             id: "pub-1".into(),
             schema_id: "default".into(),
-            traits: Some(proto_struct(json!({"email": "new@example.com"}))).into(),
+            traits: Some(proto_struct(json!({"email": "old@example.com"}))).into(),
             ..Default::default()
         };
         svc_req!(svc_req, req, UpdateIdentityRequest);
@@ -2371,7 +2642,7 @@ mod tests {
         // create
         let create_req = CreateIdentitySchemaRequest {
             schema_id: "custom".into(),
-            schema_json: Some(proto_struct(json!({"type": "object"}))).into(),
+            schema_json: Some(proto_struct(json!({"type": "object", "properties": {"traits": {"type": "object", "properties": {"email": {"type": "string"}}}}}))).into(),
             is_default: false,
             ..Default::default()
         };
@@ -2406,7 +2677,7 @@ mod tests {
         // update
         let update_req = UpdateIdentitySchemaRequest {
             schema_id: "custom".into(),
-            schema_json: Some(proto_struct(json!({"type": "array"}))).into(),
+            schema_json: Some(proto_struct(json!({"type": "object", "title": "v2", "properties": {"traits": {"type": "object", "properties": {"email": {"type": "string"}}}}}))).into(),
             is_default: true,
             ..Default::default()
         };
@@ -2628,6 +2899,12 @@ mod tests {
             }),
             headers: http::HeaderMap::new(),
         });
+        kratos
+            .add_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@example.com"}}),
+            )
+            .await;
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
@@ -2662,6 +2939,12 @@ mod tests {
             }),
             headers: http::HeaderMap::new(),
         });
+        kratos
+            .add_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@example.com"}}),
+            )
+            .await;
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
@@ -2701,6 +2984,12 @@ mod tests {
                 "template_type": "verification",
             }
         ]));
+        kratos
+            .add_identity(
+                "ory-1",
+                json!({"id": "ory-1", "schema_id": "default", "traits": {"email": "a@example.com"}}),
+            )
+            .await;
         let svc = make_service(
             kratos,
             StubMappingStore::with_mapping("tenant-1", BACKEND_KRATOS, "pub-1", "ory-1"),
@@ -2768,8 +3057,10 @@ mod tests {
             kratos.clone(),
             IdMappingRepo::new(pool.clone()),
             IdentitySchemaRepo::new(pool.clone()),
+            crate::db::TenantMembershipRepo::new(pool.clone()),
             TransientTokenRepo::new(pool),
             "https://ui.example.com".to_string(),
+            "default".to_string(),
         );
         let _cloned = service.clone();
     }
@@ -2780,8 +3071,10 @@ mod tests {
             kratos: Arc::new(StubKratos::default()),
             mappings: Arc::new(StubMappingStore::default()),
             schemas: Arc::new(StubSchemaStore::default()),
+            memberships: Arc::new(StubMembershipStore::default()),
             transient: Arc::new(StubTransientTokenStore::default()),
             ui_public_url: "https://ui.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
         };
         let _cloned = svc.clone();
     }

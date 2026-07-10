@@ -13,7 +13,7 @@ use crate::{
         DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionTupleRepo,
         PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
         SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
-        TenantDomainRepo, TenantRepo, TransientTokenRepo, bootstrap_system_tenant, create_pool,
+        TenantDomainRepo, TenantMembershipRepo, TenantRepo, TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
@@ -173,6 +173,7 @@ pub async fn build_app_with_upstream(
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
     let transient = TransientTokenRepo::new(pool.clone());
+    let memberships = TenantMembershipRepo::new(pool.clone());
 
     // Keep trait-object handles for the public callback handlers; the concrete
     // repos are moved into FederationServiceImpl below.
@@ -259,8 +260,10 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        memberships.clone(),
         transient.clone(),
         config.ui_public_url.clone(),
+        config.kratos_default_schema_id.clone(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(
         backend.clone(),

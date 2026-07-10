@@ -196,8 +196,10 @@ async fn federation_saml_login_round_trip() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
+        "default".to_string(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),
@@ -464,8 +466,10 @@ async fn federation_saml_signed_login_is_idempotent() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
+        "default".to_string(),
     ));
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),

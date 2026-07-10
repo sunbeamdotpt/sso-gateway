@@ -81,8 +81,10 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
         kratos.clone(),
         mappings.clone(),
         schemas.clone(),
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         TransientTokenRepo::new(pool.clone()),
         "http://ui.test".to_string(),
+        "default".to_string(),
     ));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),
