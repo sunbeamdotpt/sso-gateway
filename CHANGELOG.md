@@ -7,6 +7,55 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.8] - 2026-07-10
+
+### Changed
+
+- The identity model is now gateway-owned. Kratos persists only the minimal base
+  identity (`{email}` plus credentials) under the base schema id set via
+  `KRATOS_DEFAULT_SCHEMA_ID` (dev `default`, prod `employee`). The gateway owns
+  the full trait set, the per-tenant schema binding, and tenant membership
+  (`tenant_memberships`). Reads assemble the caller-facing identity from
+  membership; writes validate against the tenant's versioned schema and persist
+  only the base email to Kratos. Email is normalized (lowercase + trim) and is
+  immutable. A single base identity may belong to many tenants, and superset
+  schemas may add traits and enable extra methods (SAML/SCIM/OIDC) that Kratos
+  never sees. Federation, SCIM, self-service, and settings flows all route
+  through this model.
+- Identity schemas are now versioned (`tenant_identity_schemas.version`).
+
+### Fixed
+
+- The public self-service proxy copied upstream response headers with
+  `HeaderMap::insert`, which overwrites earlier values for the same name and
+  dropped all but the last `Set-Cookie`. It now appends every value so repeated
+  headers — notably multiple Kratos cookies — reach the browser. This is the
+  same defect class as the 2026.07.7 `/oauth2/auth` CSRF-cookie drop.
+
+### Tests
+
+- Added a divergent end-to-end test against a real Kratos v25.4 proving Kratos
+  holds only the base `{email}` while the gateway owns the full traits and
+  schema binding. Bumped the Kratos test image from v1.3.0 to v25.4.0 to match
+  production.
+
+## [2026.07.7] - 2026-07-10
+
+### Added
+
+- `KRATOS_DEFAULT_SCHEMA_ID` and the minimal base identity schema, laying the
+  groundwork for gateway-owned traits.
+
+### Fixed
+
+- The `/oauth2/auth` proxy now forwards Hydra's `Set-Cookie` headers (notably
+  `oauth2_authentication_csrf`) on its redirect, so the post-login authorize no
+  longer fails with "No CSRF value available in the session cookie."
+
+### Documentation
+
+- Captured the phase-2 multi-tenant membership design.
+
 ## [2026.07.6] - 2026-07-10
 
 ### Fixed
