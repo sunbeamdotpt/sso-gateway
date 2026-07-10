@@ -145,7 +145,8 @@ async fn federation_saml_login_round_trip() {
                                     "verification": { "via": "email" }
                                 }
                             },
-                            "tenant_id": { "type": "string" }
+                            "tenant_id": { "type": "string" },
+                            "name": { "type": "object", "properties": { "first": { "type": "string" }, "last": { "type": "string" } } }
                         },
                         "required": ["email"],
                         "additionalProperties": false
@@ -402,7 +403,8 @@ async fn federation_saml_signed_login_is_idempotent() {
                                     "verification": { "via": "email" }
                                 }
                             },
-                            "tenant_id": { "type": "string" }
+                            "tenant_id": { "type": "string" },
+                            "name": { "type": "object", "properties": { "first": { "type": "string" }, "last": { "type": "string" } } }
                         },
                         "required": ["email"],
                         "additionalProperties": false

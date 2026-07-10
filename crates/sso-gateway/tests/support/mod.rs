@@ -304,7 +304,7 @@ pub async fn start_kratos()
     let container = retry_start("kratos", || {
         let config_bytes = config_bytes.clone();
         async move {
-            GenericImage::new("oryd/kratos", "v1.3.0")
+            GenericImage::new("oryd/kratos", "v25.4.0")
                 .with_exposed_port(ContainerPort::Tcp(PUBLIC_PORT))
                 .with_exposed_port(ContainerPort::Tcp(ADMIN_PORT))
                 .with_wait_for(WaitFor::message_on_either_std(

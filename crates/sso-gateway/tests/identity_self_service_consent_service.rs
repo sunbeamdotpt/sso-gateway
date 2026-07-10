@@ -733,7 +733,7 @@ async fn self_service_and_consent_round_trip() {
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
         .header("cookie", "ory_kratos_session=abc")
-        .json(&json!({ "id": &pub_flow, "body": { "traits": {} } }))
+        .json(&json!({ "id": &pub_flow, "body": { "method": "password", "password": "hunter2hunter2" } }))
         .send()
         .await
         .expect("submit_settings_flow request should succeed");
