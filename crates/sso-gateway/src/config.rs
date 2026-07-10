@@ -11,6 +11,7 @@ pub struct Config {
     pub hydra_public_url: String,
     pub kratos_admin_url: String,
     pub kratos_public_url: String,
+    pub kratos_default_schema_id: String,
     pub permissions_backend: PermissionsBackend,
     pub keto_read_url: String,
     pub keto_write_url: String,
@@ -54,6 +55,7 @@ impl std::fmt::Debug for Config {
             .field("hydra_public_url", &self.hydra_public_url)
             .field("kratos_admin_url", &self.kratos_admin_url)
             .field("kratos_public_url", &self.kratos_public_url)
+            .field("kratos_default_schema_id", &self.kratos_default_schema_id)
             .field("permissions_backend", &self.permissions_backend)
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
@@ -313,6 +315,8 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:4434".to_string()),
             kratos_public_url: std::env::var("KRATOS_PUBLIC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:4433".to_string()),
+            kratos_default_schema_id: std::env::var("KRATOS_DEFAULT_SCHEMA_ID")
+                .unwrap_or_else(|_| "default".to_string()),
             permissions_backend,
             keto_read_url,
             keto_write_url,
@@ -478,6 +482,7 @@ mod tests {
         clear_env("HYDRA_PUBLIC_URL");
         clear_env("KRATOS_ADMIN_URL");
         clear_env("KRATOS_PUBLIC_URL");
+        clear_env("KRATOS_DEFAULT_SCHEMA_ID");
         clear_env("KETO_READ_URL");
         clear_env("KETO_WRITE_URL");
         clear_env("OPENFGA_URL");
@@ -532,6 +537,7 @@ mod tests {
         assert_eq!(config.hydra_public_url, "http://127.0.0.1:4444");
         assert_eq!(config.kratos_admin_url, "http://127.0.0.1:4434");
         assert_eq!(config.kratos_public_url, "http://127.0.0.1:4433");
+        assert_eq!(config.kratos_default_schema_id, "default");
         #[cfg(feature = "openfga")]
         assert!(matches!(
             config.permissions_backend,
@@ -559,6 +565,26 @@ mod tests {
             config.allowed_return_to_hosts,
             vec!["example.com".to_string()]
         );
+    }
+
+    #[test]
+    fn config_kratos_default_schema_id_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("KRATOS_DEFAULT_SCHEMA_ID", "employee");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert_eq!(config.kratos_default_schema_id, "employee");
     }
 
     #[cfg(feature = "openfga")]

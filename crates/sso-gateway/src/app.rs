@@ -562,6 +562,7 @@ mod tests {
             hydra_public_url: "http://127.0.0.1:4444".to_string(),
             kratos_admin_url: "http://127.0.0.1:4434".to_string(),
             kratos_public_url: "http://127.0.0.1:4433".to_string(),
+            kratos_default_schema_id: "default".to_string(),
             permissions_backend: crate::config::default_permissions_backend(),
             keto_read_url: "http://127.0.0.1:4466".to_string(),
             keto_write_url: "http://127.0.0.1:4467".to_string(),

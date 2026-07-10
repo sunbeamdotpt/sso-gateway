@@ -73,6 +73,7 @@ impl Gateway {
             hydra_public_url: hydra_public_url.clone(),
             kratos_admin_url: kratos_admin_url.clone(),
             kratos_public_url: kratos_public_url.clone(),
+            kratos_default_schema_id: "default".to_string(),
             permissions_backend: sso_gateway::config::PermissionsBackend::Keto,
             keto_read_url,
             keto_write_url,
