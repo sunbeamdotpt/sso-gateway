@@ -7,6 +7,8 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.11] - 2026-07-14
+
 ### Fixed
 
 - `GetConsentRequest`, `AcceptConsent`, `RejectConsent`, and the logout trio
