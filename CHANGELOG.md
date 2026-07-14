@@ -7,6 +7,8 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.10] - 2026-07-14
+
 ### Fixed
 
 - The `/oauth2/auth` proxy forwarded Hydra's `Set-Cookie` headers to the
