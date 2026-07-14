@@ -151,19 +151,26 @@ pub enum AuthOutcome {
 
 /// Extract the gateway session cookie value, if present.
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let (name, value) = cookie.trim().split_once('=')?;
-                if name == SESSION_COOKIE_NAME {
-                    Some(value.to_string())
-                } else {
-                    None
-                }
-            })
-        })
+    // HTTP/2 clients may split cookies across multiple Cookie header fields
+    // (RFC 7540 §8.1.2.5); receivers are required to reassemble them with
+    // "; " before parsing.
+    let joined = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        return None;
+    }
+    joined.split(';').find_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        if name == SESSION_COOKIE_NAME {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 async fn authenticate_session_cookie(
@@ -525,6 +532,34 @@ mod tests {
         let response = router
             .oneshot(
                 Request::get("/protected")
+                    .header("Cookie", format!("__Host-sso_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// HTTP/2 clients may split cookies across multiple Cookie header fields
+    /// (RFC 7540 §8.1.2.5); the session cookie must be found no matter which
+    /// field carries it.
+    #[tokio::test]
+    async fn session_cookie_found_across_split_cookie_headers() {
+        let signer = SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        );
+        let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            Arc::new(StubMappingStore(Mutex::new(None))),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/protected")
+                    .header("Cookie", "oauth2_authentication_csrf=csrf-value")
                     .header("Cookie", format!("__Host-sso_session={token}"))
                     .body(Body::empty())
                     .unwrap(),

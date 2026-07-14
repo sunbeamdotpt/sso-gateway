@@ -220,11 +220,20 @@ async fn authorize(
 ) -> impl IntoResponse {
     // Hydra's CSRF/continuity cookies must reach Hydra on the post-login and
     // post-consent authorize round-trips, or Hydra rejects the request with
-    // "No CSRF value available in the session cookie".
-    let cookie = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // "No CSRF value available in the session cookie". HTTP/2 clients may
+    // split cookies across multiple Cookie header fields (RFC 7540 §8.1.2.5),
+    // so reassemble them with "; " before forwarding.
+    let joined = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let cookie = if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    };
     let client_id = params.get("client_id").cloned().unwrap_or_default();
     let ory_id = match resolve_public_client_for_authorize(&state, &client_id).await {
         Ok(id) => id,
@@ -1524,6 +1533,34 @@ mod tests {
         let cookies = hydra.authorize_cookies.lock().unwrap();
         assert_eq!(cookies.len(), 1);
         assert_eq!(cookies[0], None);
+    }
+
+    /// Regression: HTTP/2 clients may split cookies across multiple Cookie
+    /// header fields (RFC 7540 §8.1.2.5); all fields must reach Hydra,
+    /// reassembled with "; ", or a cookie in a later field (e.g. the freshly
+    /// minted consent CSRF cookie) is silently dropped.
+    #[tokio::test]
+    async fn authorize_joins_split_cookie_headers() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("client_id".to_string(), "gateway-client-1".to_string())]);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("ory_hydra_login_csrf=login-csrf"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("oauth2_authentication_csrf=consent-csrf"),
+        );
+        let _ = authorize(State(state), headers, Query(params))
+            .await
+            .into_response();
+        let cookies = hydra.authorize_cookies.lock().unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0].as_deref(),
+            Some("ory_hydra_login_csrf=login-csrf; oauth2_authentication_csrf=consent-csrf")
+        );
     }
 
     #[tokio::test]

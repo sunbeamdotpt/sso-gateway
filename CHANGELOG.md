@@ -7,6 +7,17 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTP/2 clients may split cookies across multiple `Cookie` header fields
+  (RFC 7540 §8.1.2.5), but two request paths read only the first field. The
+  `/oauth2/auth` proxy now reassembles all fields with `"; "` before
+  forwarding to Hydra — previously a CSRF cookie landing in a later field was
+  silently dropped, reproducing "No CSRF value available in the session
+  cookie" on Chromium-based browsers. The auth middleware's
+  `session_cookie()` got the same treatment; a split gateway session cookie
+  no longer fails authentication.
+
 ## [2026.07.11] - 2026-07-14
 
 ### Fixed
