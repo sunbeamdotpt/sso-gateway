@@ -300,21 +300,30 @@ impl HydraClient {
     }
 
     /// Proxy an authorization request to Hydra's public `/oauth2/auth` endpoint.
+    ///
+    /// `cookie` is the browser's incoming `Cookie` header, forwarded verbatim so
+    /// Hydra can find its CSRF/continuity cookies on the post-login and
+    /// post-consent authorize round-trips.
     #[instrument(skip(self))]
-    pub async fn authorize(&self, query: Vec<(String, String)>) -> Result<Value, OryClientError> {
+    pub async fn authorize(
+        &self,
+        query: Vec<(String, String)>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
         let url = self
             .public_url
             .join("oauth2/auth")
             .map_err(OryClientError::Url)?;
         debug!(%url, "proxying authorize request");
-        let response = self
+        let mut request = self
             .client
             .get(url)
             .query(&query)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .map_err(OryClientError::Http)?;
+            .header("accept", "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
 
         if response.status().is_redirection() {
             let location = response
@@ -997,10 +1006,13 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = HydraClient::new(&url, &url).unwrap();
         let resp = client
-            .authorize(vec![
-                ("redirect_uri".to_string(), "http://return".to_string()),
-                ("state".to_string(), "state-1".to_string()),
-            ])
+            .authorize(
+                vec![
+                    ("redirect_uri".to_string(), "http://return".to_string()),
+                    ("state".to_string(), "state-1".to_string()),
+                ],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(resp["redirect_to"], "http://return");
@@ -1187,7 +1199,7 @@ mod tests {
         });
         let client =
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
-        let err = client.authorize(Vec::new()).await.unwrap_err();
+        let err = client.authorize(Vec::new(), None).await.unwrap_err();
         match err {
             OryClientError::Redirect {
                 location,
@@ -1215,8 +1227,54 @@ mod tests {
         });
         let client =
             HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
-        let err = client.authorize(vec![]).await.unwrap_err();
+        let err = client.authorize(vec![], None).await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    /// Echo server returning the incoming `Cookie` header so tests can assert
+    /// whether the client forwarded it.
+    async fn echo_cookie(headers: axum::http::HeaderMap) -> Json<Value> {
+        let cookie = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        Json(json!({ "cookie": cookie }))
+    }
+
+    async fn start_cookie_echo_server() -> (tokio::task::JoinHandle<()>, String) {
+        let app = Router::new().route("/oauth2/auth", get(echo_cookie));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (handle, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn authorize_forwards_cookie_header_to_hydra() {
+        let (_handle, url) = start_cookie_echo_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client
+            .authorize(
+                vec![],
+                Some("oauth2_authentication_csrf=csrf-value; ory_hydra_continuity=cont"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["cookie"],
+            "oauth2_authentication_csrf=csrf-value; ory_hydra_continuity=cont"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_omits_cookie_header_when_absent() {
+        let (_handle, url) = start_cookie_echo_server().await;
+        let client = HydraClient::new(&url, &url).unwrap();
+        let resp = client.authorize(vec![], None).await.unwrap();
+        assert_eq!(resp["cookie"], "");
     }
 
     #[tokio::test]

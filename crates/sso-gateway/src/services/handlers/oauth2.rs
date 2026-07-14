@@ -30,6 +30,7 @@ pub trait HydraOperations: Send + Sync + 'static {
     async fn authorize(
         &self,
         query: Vec<(String, String)>,
+        cookie: Option<&str>,
     ) -> Result<serde_json::Value, OryClientError>;
     async fn token(
         &self,
@@ -58,8 +59,9 @@ impl HydraOperations for HydraClient {
     async fn authorize(
         &self,
         query: Vec<(String, String)>,
+        cookie: Option<&str>,
     ) -> Result<serde_json::Value, OryClientError> {
-        self.authorize(query).await
+        self.authorize(query, cookie).await
     }
 
     async fn token(
@@ -213,8 +215,16 @@ async fn jwks(State(state): State<Arc<Oauth2State>>) -> impl IntoResponse {
 
 async fn authorize(
     State(state): State<Arc<Oauth2State>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // Hydra's CSRF/continuity cookies must reach Hydra on the post-login and
+    // post-consent authorize round-trips, or Hydra rejects the request with
+    // "No CSRF value available in the session cookie".
+    let cookie = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let client_id = params.get("client_id").cloned().unwrap_or_default();
     let ory_id = match resolve_public_client_for_authorize(&state, &client_id).await {
         Ok(id) => id,
@@ -231,7 +241,7 @@ async fn authorize(
             }
         })
         .collect::<Vec<_>>();
-    match state.hydra.authorize(query).await {
+    match state.hydra.authorize(query, cookie.as_deref()).await {
         Ok(value) => json_response(value),
         Err(OryClientError::Redirect {
             location,
@@ -724,6 +734,7 @@ mod tests {
         async fn authorize(
             &self,
             _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub authorize not configured")
         }
@@ -1163,7 +1174,9 @@ mod tests {
     async fn authorize_returns_bad_request_when_client_id_missing() {
         let state = Arc::new(test_state(None));
         let params = HashMap::new();
-        let resp = authorize(State(state), Query(params)).await.into_response();
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_to_string(resp).await;
         assert!(body.contains("missing client_id"));
@@ -1180,6 +1193,7 @@ mod tests {
         async fn authorize(
             &self,
             _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
         }
@@ -1242,6 +1256,7 @@ mod tests {
     struct RecordingHydra {
         response: serde_json::Value,
         authorize_calls: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+        authorize_cookies: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         token_calls: Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Option<(String, String)>)>>>,
         device_calls:
             Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>, Option<(String, String)>)>>>,
@@ -1252,8 +1267,13 @@ mod tests {
         async fn authorize(
             &self,
             query: Vec<(String, String)>,
+            cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             self.authorize_calls.lock().unwrap().push(query);
+            self.authorize_cookies
+                .lock()
+                .unwrap()
+                .push(cookie.map(str::to_owned));
             Ok(self.response.clone())
         }
 
@@ -1347,7 +1367,9 @@ mod tests {
     async fn authorize_succeeds_for_valid_client() {
         let state = Arc::new(ok_state(Some("tenant-1".to_string())));
         let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = authorize(State(state), Query(params)).await.into_response();
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1366,6 +1388,7 @@ mod tests {
         async fn authorize(
             &self,
             _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             Err(OryClientError::Redirect {
                 location: self.location.clone(),
@@ -1453,7 +1476,9 @@ mod tests {
             ],
         ));
         let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = authorize(State(state), Query(params)).await.into_response();
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert!(resp.headers().get(axum::http::header::LOCATION).is_some());
         let cookies: Vec<_> = resp
@@ -1462,6 +1487,43 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(cookies.len(), 2);
+    }
+
+    /// Regression test: the browser's `Cookie` header must be forwarded to
+    /// Hydra on `/oauth2/auth`, or Hydra rejects the post-login authorize with
+    /// "No CSRF value available in the session cookie".
+    #[tokio::test]
+    async fn authorize_forwards_browser_cookie_to_hydra() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("client_id".to_string(), "gateway-client-1".to_string())]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static(
+                "oauth2_authentication_csrf=csrf-value; ory_hydra_continuity=cont",
+            ),
+        );
+        let _ = authorize(State(state), headers, Query(params))
+            .await
+            .into_response();
+        let cookies = hydra.authorize_cookies.lock().unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0].as_deref(),
+            Some("oauth2_authentication_csrf=csrf-value; ory_hydra_continuity=cont")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_passes_no_cookie_when_browser_sent_none() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("client_id".to_string(), "gateway-client-1".to_string())]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let cookies = hydra.authorize_cookies.lock().unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0], None);
     }
 
     #[tokio::test]
@@ -1555,7 +1617,9 @@ mod tests {
     async fn authorize_replaces_client_id_with_ory_id() {
         let (state, hydra) = recording_state();
         let params = HashMap::from([("client_id".to_string(), "gateway-client-1".to_string())]);
-        let _ = authorize(State(state), Query(params)).await.into_response();
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
         let calls = hydra.authorize_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -1773,6 +1837,7 @@ mod tests {
         async fn authorize(
             &self,
             _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
@@ -1854,7 +1919,9 @@ mod tests {
     async fn authorize_returns_bad_gateway_on_hydra_error() {
         let state = Arc::new(err_state(Some("tenant-1".to_string())));
         let params = HashMap::from([("client_id".to_string(), "client-1".to_string())]);
-        let resp = authorize(State(state), Query(params)).await.into_response();
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1912,7 +1979,7 @@ mod tests {
     async fn hydra_client_as_hydra_operations_delegates() {
         let client = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap())
             as Arc<dyn HydraOperations>;
-        assert!(client.authorize(vec![]).await.is_err());
+        assert!(client.authorize(vec![], None).await.is_err());
         assert!(client.token(vec![], None).await.is_err());
         assert!(client.device("auth", vec![], None).await.is_err());
         assert!(client.userinfo("token").await.is_err());
@@ -2297,6 +2364,7 @@ mod tests {
         async fn authorize(
             &self,
             _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!()
         }
@@ -2454,6 +2522,7 @@ mod tests {
             async fn authorize(
                 &self,
                 _query: Vec<(String, String)>,
+                _cookie: Option<&str>,
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }

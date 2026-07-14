@@ -7,6 +7,17 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Fixed
+
+- The `/oauth2/auth` proxy forwarded Hydra's `Set-Cookie` headers to the
+  browser but dropped the browser's `Cookie` header on the way back to Hydra,
+  so Hydra's CSRF check never saw `oauth2_authentication_csrf` and rejected
+  every post-login and post-consent authorize with `request_forbidden: No CSRF
+  value available in the session cookie`. The handler now forwards the
+  incoming `Cookie` header verbatim, and `HydraClient::authorize` accepts an
+  optional cookie to send upstream. This is the request-direction mirror of
+  the 2026.07.7/2026.07.8 `Set-Cookie` fixes.
+
 ## [2026.07.9] - 2026-07-14
 
 ### Fixed
