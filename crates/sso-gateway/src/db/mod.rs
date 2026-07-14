@@ -60,9 +60,7 @@ pub use saml_sp_client::{PgSamlSpClientStore, SamlSpClientRow, SamlSpClientStore
 pub use scim_group::{PgScimGroupStore, ScimGroupRow, ScimGroupStore};
 pub use session_store::{PgSessionStore, SessionStore};
 pub use tenant::{PgTenantStore, TenantRow, TenantStore};
-pub use tenant_membership::{
-    PgTenantMembershipStore, TenantMembershipRow, TenantMembershipStore,
-};
+pub use tenant_membership::{PgTenantMembershipStore, TenantMembershipRow, TenantMembershipStore};
 pub use token_cache::{PgTokenIntrospectionCache, TokenIntrospectionCache, TokenIntrospectionRow};
 pub use transient_token::{
     PgTransientTokenStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,

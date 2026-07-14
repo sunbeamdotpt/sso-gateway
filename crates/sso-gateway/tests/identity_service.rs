@@ -611,7 +611,10 @@ async fn identity_service_gateway_owned_traits_diverge_from_kratos() {
         create_resp.text().await.unwrap_or_default()
     );
     let created: serde_json::Value = create_resp.json().await.expect("identity should be json");
-    let public_id = created["id"].as_str().expect("identity id should exist").to_string();
+    let public_id = created["id"]
+        .as_str()
+        .expect("identity id should exist")
+        .to_string();
     assert_eq!(created["schemaId"], "employee");
 
     // (a) Gateway view: full traits + the gateway schema binding are intact.
@@ -652,8 +655,10 @@ async fn identity_service_gateway_owned_traits_diverge_from_kratos() {
         "kratos admin read failed: {}",
         kratos_resp.text().await.unwrap_or_default()
     );
-    let kratos_identity: serde_json::Value =
-        kratos_resp.json().await.expect("kratos identity should be json");
+    let kratos_identity: serde_json::Value = kratos_resp
+        .json()
+        .await
+        .expect("kratos identity should be json");
     assert_eq!(
         kratos_identity["schema_id"], "default",
         "kratos must be bound to the base schema id"

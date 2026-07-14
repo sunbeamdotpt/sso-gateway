@@ -1394,10 +1394,7 @@ mod tests {
             self.inner.userinfo(token).await
         }
 
-        async fn introspect_token(
-            &self,
-            token: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError> {
             self.inner.introspect_token(token).await
         }
 

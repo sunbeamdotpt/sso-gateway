@@ -14,9 +14,9 @@ use ulid::Ulid;
 use crate::{
     auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_IDENTITY_READ, require_scope},
     db::{
-        DbError, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, TenantMembershipRow,
-        TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
-        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+        DbError, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore, TOKEN_TYPE_FLOW,
+        TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TenantMembershipRow, TenantMembershipStore,
         TransientTokenStore,
     },
     middleware::TenantId,
@@ -554,12 +554,9 @@ impl IdentityService for IdentityServiceImpl {
             query_owned.push(("via", req.via));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = resolve_login_challenge(
-                self.transient.as_ref(),
-                &tenant_id,
-                &req.login_challenge,
-            )
-            .await?;
+            let ory_challenge =
+                resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
+                    .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -596,12 +593,9 @@ impl IdentityService for IdentityServiceImpl {
             query_owned.push(("return_to", req.return_to));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = resolve_login_challenge(
-                self.transient.as_ref(),
-                &tenant_id,
-                &req.login_challenge,
-            )
-            .await?;
+            let ory_challenge =
+                resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
+                    .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {

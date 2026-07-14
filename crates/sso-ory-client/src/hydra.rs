@@ -1195,9 +1195,11 @@ mod tests {
             } => {
                 assert!(location.contains("login_challenge=abc"));
                 assert_eq!(set_cookies.len(), 2);
-                assert!(set_cookies
-                    .iter()
-                    .any(|c| c.starts_with("oauth2_authentication_csrf=")));
+                assert!(
+                    set_cookies
+                        .iter()
+                        .any(|c| c.starts_with("oauth2_authentication_csrf="))
+                );
             }
             other => panic!("expected redirect, got {other:?}"),
         }

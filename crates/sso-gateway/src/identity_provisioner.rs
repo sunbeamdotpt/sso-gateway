@@ -445,9 +445,7 @@ mod tests {
     use sso_ory_client::error::OryClientError;
 
     use super::*;
-    use crate::db::{
-        IdMappingRow, IdentitySchemaRow, SamlIdentityMappingRow, TenantMembershipRow,
-    };
+    use crate::db::{IdMappingRow, IdentitySchemaRow, SamlIdentityMappingRow, TenantMembershipRow};
 
     #[derive(Clone, Default)]
     struct StubKratos {
@@ -913,7 +911,7 @@ mod tests {
                     tenant_id: "tenant-a".into(),
                     schema_id: "default".into(),
                     schema_json: json!({}),
-                version: 1,
+                    version: 1,
                     is_default: true,
                     created_at: time::OffsetDateTime::now_utc(),
                     updated_at: time::OffsetDateTime::now_utc(),
@@ -1156,7 +1154,10 @@ mod tests {
         assert_eq!(calls[0].2, "employee");
         assert_eq!(calls[0].3, 7);
         assert_eq!(calls[0].4["email"], "alice@example.com");
-        assert_eq!(calls[0].4["name"], json!({"first": "Alice", "last": "Smith"}));
+        assert_eq!(
+            calls[0].4["name"],
+            json!({"first": "Alice", "last": "Smith"})
+        );
     }
 
     #[tokio::test]

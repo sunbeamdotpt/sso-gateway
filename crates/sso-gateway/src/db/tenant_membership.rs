@@ -27,7 +27,7 @@ pub trait TenantMembershipStore: Send + Sync + 'static {
     ) -> Result<TenantMembershipRow, DbError>;
 
     async fn get(&self, tenant_id: &str, identity_id: &str)
-        -> Result<TenantMembershipRow, DbError>;
+    -> Result<TenantMembershipRow, DbError>;
 
     async fn set_state(
         &self,
@@ -242,7 +242,8 @@ mod tests {
         assert_eq!(created.state, "active");
         assert_eq!(created.traits["email"], "person@example.com");
 
-        let updated_traits = serde_json::json!({"email": "person@example.com", "name": {"first": "Grace"}});
+        let updated_traits =
+            serde_json::json!({"email": "person@example.com", "name": {"first": "Grace"}});
         let updated = store
             .upsert(&tenant, &identity, "employee", 2, updated_traits.clone())
             .await
@@ -265,7 +266,10 @@ mod tests {
             .upsert(&tenant, &identity, "employee", 1, traits())
             .await
             .unwrap();
-        let disabled = store.set_state(&tenant, &identity, "disabled").await.unwrap();
+        let disabled = store
+            .set_state(&tenant, &identity, "disabled")
+            .await
+            .unwrap();
         assert_eq!(disabled.state, "disabled");
 
         // A subsequent upsert must not reactivate a disabled membership.

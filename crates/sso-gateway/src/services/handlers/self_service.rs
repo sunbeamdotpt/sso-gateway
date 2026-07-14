@@ -283,9 +283,7 @@ mod tests {
                 let mut headers = axum::http::HeaderMap::new();
                 headers.append(
                     axum::http::header::SET_COOKIE,
-                    "ory_kratos_session=abc; Path=/; HttpOnly"
-                        .parse()
-                        .unwrap(),
+                    "ory_kratos_session=abc; Path=/; HttpOnly".parse().unwrap(),
                 );
                 headers.append(
                     axum::http::header::SET_COOKIE,
@@ -313,12 +311,16 @@ mod tests {
             2,
             "both upstream Set-Cookie headers must be forwarded"
         );
-        assert!(cookies
-            .iter()
-            .any(|c| c.to_str().unwrap().starts_with("ory_kratos_session=")));
-        assert!(cookies
-            .iter()
-            .any(|c| c.to_str().unwrap().starts_with("csrf_token=")));
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("ory_kratos_session="))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("csrf_token="))
+        );
     }
 
     #[tokio::test]
