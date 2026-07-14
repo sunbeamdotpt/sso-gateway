@@ -7,6 +7,8 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.12] - 2026-07-14
+
 ### Fixed
 
 - HTTP/2 clients may split cookies across multiple `Cookie` header fields
