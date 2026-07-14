@@ -7,6 +7,18 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Fixed
+
+- `GetConsentRequest`, `AcceptConsent`, `RejectConsent`, and the logout trio
+  (`GetLogoutRequest` / `AcceptLogout` / `RejectLogout`) no longer fail with
+  `not_found: mapping not found` when handed Hydra's raw challenge. Hydra's
+  post-login redirect delivers the raw `consent_challenge` (and the logout
+  redirect the raw `logout_challenge`) to the consent/logout app, so on a
+  mapping lookup miss the value is passed through unchanged — Hydra still
+  validates the challenge cryptographically. This mirrors the existing
+  `login_challenge` passthrough; logout passthrough resolves the tenant from
+  the caller's request context.
+
 ## [2026.07.10] - 2026-07-14
 
 ### Fixed

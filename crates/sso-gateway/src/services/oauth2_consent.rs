@@ -138,6 +138,16 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
         .ok_or_else(|| ServiceError::Unauthenticated("missing tenant".into()))
 }
 
+/// Tenant from the request context, defaulting to empty when the caller is
+/// unauthenticated. Used only as the fallback tenant for raw-challenge
+/// passthrough; mapped challenges resolve their tenant from the mapping row.
+fn tenant_from_ctx(ctx: &RequestContext) -> String {
+    ctx.extensions()
+        .get::<TenantId>()
+        .map(|t| t.0.clone())
+        .unwrap_or_default()
+}
+
 fn require_consent_admin(ctx: &RequestContext) -> Result<(), ServiceError> {
     if require_scope(ctx, SCOPE_TENANT_ADMIN).is_ok()
         || require_scope(ctx, SCOPE_IDENTITY_ADMIN).is_ok()
@@ -169,10 +179,20 @@ impl OAuth2ConsentServiceImpl {
         public_challenge: &str,
         token_type: &str,
     ) -> Result<String, ServiceError> {
-        self.transient
+        match self
+            .transient
             .get_ory_token(tenant_id, BACKEND_HYDRA, token_type, public_challenge)
             .await
-            .map_err(map_db_error)
+        {
+            Ok(ory_challenge) => Ok(ory_challenge),
+            // Hydra's post-login redirect delivers the raw Hydra challenge to
+            // the consent app in the consent_challenge query parameter, so
+            // there is no mapping to resolve. Hydra still cryptographically
+            // validates the challenge, so passthrough is safe (mirrors
+            // resolve_login_challenge in identity_self_service).
+            Err(DbError::MappingNotFound) => Ok(public_challenge.to_string()),
+            Err(err) => Err(map_db_error(err)),
+        }
     }
 
     async fn public_challenge(
@@ -204,12 +224,26 @@ impl OAuth2ConsentServiceImpl {
 
     async fn resolve_logout_challenge(
         &self,
+        fallback_tenant_id: &str,
         public_challenge: &str,
     ) -> Result<(String, String), ServiceError> {
-        self.transient
+        match self
+            .transient
             .get_ory_token_global(BACKEND_HYDRA, TOKEN_TYPE_LOGOUT_CHALLENGE, public_challenge)
             .await
-            .map_err(map_db_error)
+        {
+            Ok(resolved) => Ok(resolved),
+            // Hydra's redirect to the logout app carries the raw Hydra logout
+            // challenge in the logout_challenge query parameter, so there is
+            // no mapping to resolve. Hydra still cryptographically validates
+            // the challenge, so passthrough is safe (mirrors
+            // resolve_login_challenge); the tenant falls back to the caller's
+            // tenant from the request context.
+            Err(DbError::MappingNotFound) => {
+                Ok((fallback_tenant_id.to_string(), public_challenge.to_string()))
+            }
+            Err(err) => Err(map_db_error(err)),
+        }
     }
 
     async fn public_client_id(
@@ -374,11 +408,13 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn get_logout_request(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, GetChallengeRequest>,
     ) -> ServiceResult<LogoutRequest> {
         let req = request.to_owned_message();
-        let (tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
+        let (tenant_id, ory_challenge) = self
+            .resolve_logout_challenge(&tenant_from_ctx(&ctx), &req.challenge)
+            .await?;
         let value = self
             .hydra
             .get_logout_request(&ory_challenge)
@@ -393,11 +429,13 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn accept_logout(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, AcceptLogoutRequest>,
     ) -> ServiceResult<LogoutResponse> {
         let req = request.to_owned_message();
-        let (_tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
+        let (_tenant_id, ory_challenge) = self
+            .resolve_logout_challenge(&tenant_from_ctx(&ctx), &req.challenge)
+            .await?;
         let body = accept_logout_request_to_json(&req);
         let value = self
             .hydra
@@ -410,11 +448,13 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     #[instrument(skip(self, request))]
     async fn reject_logout(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, RejectLogoutRequest>,
     ) -> ServiceResult<LogoutResponse> {
         let req = request.to_owned_message();
-        let (_tenant_id, ory_challenge) = self.resolve_logout_challenge(&req.challenge).await?;
+        let (_tenant_id, ory_challenge) = self
+            .resolve_logout_challenge(&tenant_from_ctx(&ctx), &req.challenge)
+            .await?;
         let body = reject_logout_request_to_json(&req);
         let value = self
             .hydra
@@ -1430,6 +1470,172 @@ mod tests {
         );
         let err = svc.reject_logout(request_context(), req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// Regression: Hydra's post-login redirect delivers the raw Hydra
+    /// consent_challenge to the consent app, so a lookup miss must pass the
+    /// value through instead of failing with not_found (mirrors the
+    /// login_challenge passthrough).
+    #[tokio::test]
+    async fn get_consent_request_passes_through_raw_hydra_challenge() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "raw-consent-challenge",
+            "client": { "client_id": "client-1", "client_name": "App" },
+            "subject": "ory-subject-1",
+            "skip": false,
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "raw-consent-challenge".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_consent_request(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        // The raw challenge reaches Hydra verbatim...
+        assert!(
+            matches!(mock.take_calls().as_slice(), [Call::GetConsent(c)] if c == "raw-consent-challenge")
+        );
+        // ...while the response still exposes only a gateway-minted challenge.
+        assert!(!resp.challenge.is_empty());
+        assert_ne!(resp.challenge, "raw-consent-challenge");
+        assert_eq!(resp.client_id, "pub-client-1");
+        assert_eq!(resp.subject, "subject-1");
+    }
+
+    #[tokio::test]
+    async fn accept_consent_passes_through_raw_hydra_challenge() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "raw-consent-accept",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "raw-consent-accept".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let resp = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/callback");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::GetConsent(g), Call::AcceptConsent(a)]
+                if g == "raw-consent-accept" && a == "raw-consent-accept"
+        ));
+    }
+
+    /// Regression: Hydra's redirect to the logout app carries the raw Hydra
+    /// logout_challenge; the lookup miss must pass through, using the caller's
+    /// tenant from the request context for id mapping.
+    #[tokio::test]
+    async fn get_logout_request_passes_through_raw_hydra_challenge() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "raw-logout-challenge",
+            "subject": "ory-subject-1",
+            "client": { "client_id": "client-1" },
+            "request_url": "https://example.com/logout",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "raw-logout-challenge".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_logout_request(auth_context(&[]), req)
+            .await
+            .unwrap()
+            .body;
+        assert!(
+            matches!(mock.take_calls().as_slice(), [Call::GetLogout(c)] if c == "raw-logout-challenge")
+        );
+        assert!(!resp.challenge.is_empty());
+        assert_ne!(resp.challenge, "raw-logout-challenge");
+        assert_eq!(resp.client_id, "pub-client-1");
+        assert_eq!(resp.subject, "subject-1");
+    }
+
+    #[tokio::test]
+    async fn accept_logout_passes_through_raw_hydra_challenge() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/logout-callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptLogoutRequest {
+                challenge: "raw-logout-accept".into(),
+                ..Default::default()
+            },
+            AcceptLogoutRequest
+        );
+        let resp = svc
+            .accept_logout(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/logout-callback");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::AcceptLogout(c)] if c == "raw-logout-accept"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_logout_passes_through_raw_hydra_challenge() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/logout-rejected",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            RejectLogoutRequest {
+                challenge: "raw-logout-reject".into(),
+                error: "invalid_request".into(),
+                ..Default::default()
+            },
+            RejectLogoutRequest
+        );
+        let resp = svc
+            .reject_logout(request_context(), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/logout-rejected");
+        let calls = mock.take_calls();
+        assert!(matches!(
+            calls.as_slice(),
+            [Call::RejectLogout(c)] if c == "raw-logout-reject"
+        ));
     }
 
     #[tokio::test]
