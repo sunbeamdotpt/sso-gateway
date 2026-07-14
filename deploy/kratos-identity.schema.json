@@ -1,30 +1,30 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://schemas.sunbeam.studio/base-identity.json",
+  "$id": "https://schemas.sunbeam.pt/base-identity.json",
   "title": "Base Identity",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "traits": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["email"],
-      "additionalProperties": true,
       "properties": {
         "email": {
           "type": "string",
           "format": "email",
           "title": "Email",
+          "maxLength": 320,
           "ory.sh/kratos": {
             "credentials": {
-              "password": {
-                "identifier": true
-              }
+              "password": { "identifier": true },
+              "webauthn": { "identifier": true },
+              "totp": { "account_name": true },
+              "code": { "identifier": true, "via": "email" },
+              "passkey": { "display_name": true }
             },
-            "recovery": {
-              "via": "email"
-            },
-            "verification": {
-              "via": "email"
-            }
+            "recovery": { "via": "email" },
+            "verification": { "via": "email" }
           }
         }
       }
