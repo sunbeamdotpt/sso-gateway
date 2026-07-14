@@ -7,6 +7,8 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.9] - 2026-07-14
+
 ### Fixed
 
 - Recovery and verification token submissions (`SubmitRecoveryToken` /
