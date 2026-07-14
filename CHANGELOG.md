@@ -7,6 +7,17 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Fixed
+
+- Recovery and verification token submissions (`SubmitRecoveryToken` /
+  `SubmitVerificationToken`) no longer leak raw Kratos flow UUIDs: the `flow`
+  query parameter in Kratos' redirect location is replaced with an opaque
+  gateway-minted ULID that round-trips through `GetSettingsFlow`. The same
+  scrubbing now applies to Kratos-owned URLs inside self-service flow payloads
+  (`request_url`, `ui.action`, and UI-node anchor/image/script/input URLs),
+  while caller- and application-owned URLs (`return_to`, OAuth2 client URIs)
+  remain host-rewrite-only.
+
 ## [2026.07.8] - 2026-07-10
 
 ### Changed

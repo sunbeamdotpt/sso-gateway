@@ -12,11 +12,10 @@ use tracing::instrument;
 
 use crate::db::{
     DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
-    TenantMembershipRepo, TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
-    TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
-    TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, TransientTokenStore,
+    TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+    TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+    TenantMembershipRepo, TenantMembershipStore, TransientTokenRepo, TransientTokenStore,
 };
-use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     BrowserSession, CreateLoginFlowRequest, CreateLogoutFlowRequest, CreateRecoveryFlowRequest,
@@ -27,6 +26,7 @@ use crate::proto::iam::v1::{
     SubmitRecoveryTokenResponse, SubmitVerificationTokenRequest, SubmitVerificationTokenResponse,
     TenantCapabilities, ToSessionRequest, WebAuthnJsResponse,
 };
+use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 use buffa_types::google::protobuf::Empty;
 
 const BACKEND_KRATOS: &str = "kratos";
@@ -439,62 +439,121 @@ impl IdentitySelfServiceImpl {
         }
     }
 
-    fn rewrite_flow_urls(&self, flow: &mut SelfServiceFlow) {
+    /// Replace every non-empty `flow` query parameter in `value` with the
+    /// gateway's opaque public flow id, minted (idempotently) through
+    /// [`Self::public_flow`]. Unrelated query parameters are preserved.
+    ///
+    /// Kratos-owned URLs (flow `request_url`, `ui.action`, token-submit
+    /// redirect locations, …) embed the raw Kratos flow UUID as
+    /// `?flow=<uuid>`; leaking it would expose a backend identifier the
+    /// gateway itself cannot resolve. When `strict` is false (flow payload
+    /// URLs) a value that does not parse as an absolute URL is returned
+    /// unchanged, preserving the historical tolerance of relative or non-URL
+    /// strings. When `strict` is true (Kratos token-submit redirect
+    /// locations, which must be absolute URLs) a parse failure is
+    /// `ServiceError::Internal`.
+    async fn scrub_flow_id_in_url(
+        &self,
+        tenant_id: &str,
+        value: &str,
+        strict: bool,
+    ) -> Result<String, ServiceError> {
+        let mut url = match reqwest::Url::parse(value) {
+            Ok(url) => url,
+            Err(_) if strict => {
+                return Err(ServiceError::Internal(
+                    "kratos returned an invalid redirect location".into(),
+                ));
+            }
+            Err(_) => return Ok(value.to_string()),
+        };
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(key, val)| (key.into_owned(), val.into_owned()))
+            .collect();
+        // Leave URLs without a scrubbable flow parameter byte-identical.
+        if !pairs
+            .iter()
+            .any(|(key, val)| key == "flow" && !val.is_empty())
+        {
+            return Ok(value.to_string());
+        }
+        let mut scrubbed = Vec::with_capacity(pairs.len());
+        for (key, val) in pairs {
+            if key == "flow" && !val.is_empty() {
+                scrubbed.push((key, self.public_flow(tenant_id, &val).await?));
+            } else {
+                scrubbed.push((key, val));
+            }
+        }
+        url.query_pairs_mut().clear().extend_pairs(scrubbed);
+        Ok(url.into())
+    }
+
+    /// Apply the Kratos→gateway host rewrite to a Kratos-owned flow URL and
+    /// scrub any embedded raw Kratos flow id in one pass.
+    async fn rewrite_and_scrub_flow_url(
+        &self,
+        tenant_id: &str,
+        value: &str,
+    ) -> Result<String, ServiceError> {
+        let rewritten = rewrite_url(value, &self.kratos_public_url, &self.gateway_public_url);
+        self.scrub_flow_id_in_url(tenant_id, &rewritten, false)
+            .await
+    }
+
+    async fn rewrite_flow_urls(
+        &self,
+        tenant_id: &str,
+        flow: &mut SelfServiceFlow,
+    ) -> Result<(), ServiceError> {
+        // `return_to` is a caller-supplied application URL: host rewrite only,
+        // its query parameters are not gateway-owned.
         flow.return_to = rewrite_url(
             &flow.return_to,
             &self.kratos_public_url,
             &self.gateway_public_url,
         );
-        flow.request_url = rewrite_url(
-            &flow.request_url,
-            &self.kratos_public_url,
-            &self.gateway_public_url,
-        );
+        flow.request_url = self
+            .rewrite_and_scrub_flow_url(tenant_id, &flow.request_url)
+            .await?;
         if let Some(ui) = flow.ui.as_option_mut() {
-            ui.action = rewrite_url(
-                &ui.action,
-                &self.kratos_public_url,
-                &self.gateway_public_url,
-            );
+            ui.action = self
+                .rewrite_and_scrub_flow_url(tenant_id, &ui.action)
+                .await?;
             for node in &mut ui.nodes {
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Anchor(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.href = rewrite_url(
-                        &attrs.href,
-                        &self.kratos_public_url,
-                        &self.gateway_public_url,
-                    );
+                    attrs.href = self
+                        .rewrite_and_scrub_flow_url(tenant_id, &attrs.href)
+                        .await?;
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Image(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(
-                        &attrs.src,
-                        &self.kratos_public_url,
-                        &self.gateway_public_url,
-                    );
+                    attrs.src = self
+                        .rewrite_and_scrub_flow_url(tenant_id, &attrs.src)
+                        .await?;
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Script(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(
-                        &attrs.src,
-                        &self.kratos_public_url,
-                        &self.gateway_public_url,
-                    );
+                    attrs.src = self
+                        .rewrite_and_scrub_flow_url(tenant_id, &attrs.src)
+                        .await?;
                 }
                 if let Some(crate::proto::iam::v1::ui_node::Attributes::Input(attrs)) =
                     node.attributes.as_mut()
                 {
-                    attrs.src = rewrite_url(
-                        &attrs.src,
-                        &self.kratos_public_url,
-                        &self.gateway_public_url,
-                    );
+                    attrs.src = self
+                        .rewrite_and_scrub_flow_url(tenant_id, &attrs.src)
+                        .await?;
                 }
             }
         }
+        // OAuth2 client URIs are application-owned URLs: host rewrite only,
+        // they may legitimately carry unrelated `flow` parameters.
         if let Some(oauth2) = flow.oauth2_login_request.as_option_mut()
             && let Some(client) = oauth2.client.as_option_mut()
         {
@@ -527,6 +586,7 @@ impl IdentitySelfServiceImpl {
                 &self.gateway_public_url,
             );
         }
+        Ok(())
     }
 
     async fn resolve_flow(
@@ -712,7 +772,10 @@ impl IdentitySelfServiceImpl {
             }
         }
         if let Some(m) = merged.as_object_mut() {
-            m.insert("email".to_string(), serde_json::json!(current_email.clone()));
+            m.insert(
+                "email".to_string(),
+                serde_json::json!(current_email.clone()),
+            );
         }
         self.memberships
             .upsert(
@@ -725,7 +788,10 @@ impl IdentitySelfServiceImpl {
             .await?;
 
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("traits".to_string(), serde_json::json!({ "email": current_email }));
+            obj.insert(
+                "traits".to_string(),
+                serde_json::json!({ "email": current_email }),
+            );
         }
         Ok(())
     }
@@ -832,7 +898,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -855,7 +922,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -878,7 +946,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -901,7 +970,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -924,7 +994,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -948,7 +1019,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -972,7 +1044,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -998,7 +1071,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1022,7 +1096,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1046,7 +1121,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1077,12 +1153,9 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("via", req.via));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = resolve_login_challenge(
-                self.transient.as_ref(),
-                &tenant_id,
-                &req.login_challenge,
-            )
-            .await?;
+            let ory_challenge =
+                resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
+                    .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -1098,7 +1171,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1117,12 +1191,9 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             query_owned.push(("return_to", req.return_to));
         }
         if !req.login_challenge.is_empty() {
-            let ory_challenge = resolve_login_challenge(
-                self.transient.as_ref(),
-                &tenant_id,
-                &req.login_challenge,
-            )
-            .await?;
+            let ory_challenge =
+                resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
+                    .await?;
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -1138,7 +1209,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1165,7 +1237,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1192,7 +1265,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1290,7 +1364,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(&tenant_id, &mut response.body)
             .await?;
-        self.rewrite_flow_urls(&mut response.body);
+        self.rewrite_flow_urls(&tenant_id, &mut response.body)
+            .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
     }
@@ -1337,6 +1412,9 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos recovery token response missing location".into())
         })?;
+        let redirect_to = self
+            .scrub_flow_id_in_url(&tenant_id, &redirect_to, true)
+            .await?;
         let mut response = Response::new(SubmitRecoveryTokenResponse {
             redirect_to,
             __buffa_unknown_fields: Default::default(),
@@ -1387,6 +1465,9 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos verification token response missing location".into())
         })?;
+        let redirect_to = self
+            .scrub_flow_id_in_url(&tenant_id, &redirect_to, true)
+            .await?;
         let mut response = Response::new(SubmitVerificationTokenResponse {
             redirect_to,
             __buffa_unknown_fields: Default::default(),
@@ -1485,9 +1566,9 @@ mod tests {
 
     use crate::db::{
         DbError, IdMappingRow, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore,
-        TenantMembershipRow, TenantMembershipStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
-        TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
-        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRow, TransientTokenStore,
+        TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
+        TenantMembershipRow, TenantMembershipStore, TransientTokenRow, TransientTokenStore,
     };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
@@ -2586,8 +2667,8 @@ mod tests {
         assert!(caps.oauth2_consent_enabled);
     }
 
-    #[test]
-    fn rewrite_flow_urls_rewrites_ui_action() {
+    #[tokio::test]
+    async fn rewrite_flow_urls_rewrites_ui_action() {
         let svc = service(FakeKratos::default());
         let mut flow = SelfServiceFlow {
             ui: Some(crate::proto::iam::v1::UiContainer {
@@ -2597,10 +2678,20 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        svc.rewrite_flow_urls(&mut flow);
-        assert_eq!(
-            flow.ui.as_option().unwrap().action,
-            "https://gateway.example.com/self-service/login?flow=1"
+        svc.rewrite_flow_urls("", &mut flow).await.unwrap();
+        let action = &flow.ui.as_option().unwrap().action;
+        let url = reqwest::Url::parse(action).unwrap();
+        assert_eq!(url.host_str(), Some("gateway.example.com"));
+        assert_eq!(url.path(), "/self-service/login");
+        let flow_param = url
+            .query_pairs()
+            .find(|(key, _)| key == "flow")
+            .map(|(_, val)| val.into_owned())
+            .unwrap();
+        assert_ne!(flow_param, "1");
+        assert!(
+            Ulid::from_string(&flow_param).is_ok(),
+            "flow param should be a public ULID, got {flow_param}"
         );
     }
 
@@ -3170,7 +3261,7 @@ mod tests {
     async fn submit_recovery_token_happy_path() {
         let fake = FakeKratos::default();
         fake.reseed_token_submit(
-            "https://ui.example.com/settings?flow=privileged",
+            "https://ui.example.com/settings?flow=privileged&foo=bar",
             &[
                 "ory_kratos_session=abc; Path=/; HttpOnly",
                 "csrf_token_1234=xyz; Path=/; SameSite=Lax",
@@ -3185,16 +3276,41 @@ mod tests {
         });
 
         let resp = svc.submit_recovery_token(ctx, req).await.unwrap();
-        assert_eq!(
-            resp.body.redirect_to,
-            "https://ui.example.com/settings?flow=privileged"
+        let redirect = reqwest::Url::parse(&resp.body.redirect_to).unwrap();
+        assert_eq!(redirect.host_str(), Some("ui.example.com"));
+        assert_eq!(redirect.path(), "/settings");
+        let pairs: std::collections::HashMap<_, _> = redirect.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("foo").map(String::as_str), Some("bar"));
+        let flow = pairs.get("flow").expect("flow param should be present");
+        assert_ne!(flow, "privileged");
+        assert!(
+            Ulid::from_string(flow).is_ok(),
+            "flow param should be a public ULID, got {flow}"
         );
+        assert!(!resp.body.redirect_to.contains("privileged"));
+        assert_eq!(svc.resolve_flow("", flow).await.unwrap(), "privileged");
         let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 2);
         assert_eq!(
             fake.calls.lock().unwrap()[0],
             "submit_recovery_token(token=recovery-token-1, flow=recovery-flow-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_recovery_token_invalid_location_returns_internal() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit("not-a-url", &[]);
+        let svc = service(fake);
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitRecoveryTokenRequest {
+            token: "token".to_string(),
+            flow: "recovery-flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_recovery_token(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
     }
 
     #[tokio::test]
@@ -3268,6 +3384,43 @@ mod tests {
             resp.body.redirect_to,
             "https://ui.example.com/welcome?verified=true"
         );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            "submit_verification_token(token=verification-token-1, flow=verification-flow-1, cookie=Some(\"session=prev\"), csrf_token=Some(\"csrf-header-value\"))"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_verification_token_scrubs_flow_id() {
+        let fake = FakeKratos::default();
+        fake.reseed_token_submit(
+            "https://ui.example.com/welcome?flow=verify-me&verified=true",
+            &["ory_kratos_session=abc; Path=/; HttpOnly"],
+        );
+        let svc = service(fake.clone());
+        let ctx = request_context_with_cookie_and_csrf("session=prev", "csrf-header-value");
+        let req = service_request(SubmitVerificationTokenRequest {
+            token: "verification-token-1".to_string(),
+            flow: "verification-flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_verification_token(ctx, req).await.unwrap();
+        let redirect = reqwest::Url::parse(&resp.body.redirect_to).unwrap();
+        assert_eq!(redirect.host_str(), Some("ui.example.com"));
+        assert_eq!(redirect.path(), "/welcome");
+        let pairs: std::collections::HashMap<_, _> = redirect.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("verified").map(String::as_str), Some("true"));
+        let flow = pairs.get("flow").expect("flow param should be present");
+        assert_ne!(flow, "verify-me");
+        assert!(
+            Ulid::from_string(flow).is_ok(),
+            "flow param should be a public ULID, got {flow}"
+        );
+        assert!(!resp.body.redirect_to.contains("verify-me"));
+        assert_eq!(svc.resolve_flow("", flow).await.unwrap(), "verify-me");
         let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 1);
         assert_eq!(
@@ -3455,6 +3608,50 @@ mod tests {
             fake,
             "create_settings_browser_flow(return_to=Some(\"http://return\"), cookie=None)"
         );
+    }
+
+    #[tokio::test]
+    async fn flow_urls_scrub_flow_query_params() {
+        let fake = FakeKratos::default();
+        let svc = service(fake.clone());
+        let public = svc
+            .public_flow("tenant-1", "ory-settings-flow")
+            .await
+            .unwrap();
+        fake.reseed_flow(KratosResponse {
+            body: json!({
+                "id": "ory-settings-flow",
+                "type": "settings",
+                "state": "show_form",
+                "request_url": "http://kratos.example.com/self-service/settings/browser?flow=ory-settings-flow",
+                "ui": {
+                    "action": "http://kratos.example.com/self-service/settings?flow=ory-settings-flow",
+                    "method": "POST",
+                    "nodes": []
+                }
+            }),
+            headers: http::HeaderMap::new(),
+        });
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(GetFlowRequest {
+            id: public.clone(),
+            ..Default::default()
+        });
+
+        let resp = svc.get_settings_flow(ctx, req).await.unwrap();
+        let action = &resp.body.ui.as_option().unwrap().action;
+        for value in [&resp.body.request_url, action] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert_eq!(url.host_str(), Some("gateway.example.com"));
+            let flow = url
+                .query_pairs()
+                .find(|(key, _)| key == "flow")
+                .map(|(_, val)| val.into_owned())
+                .expect("flow param should be present");
+            assert_eq!(flow, public, "expected the same public ULID in {value}");
+            assert!(!value.contains("ory-settings-flow"));
+        }
+        assert_flow_call!(fake, "get_settings_flow(id=ory-settings-flow, cookie=None)");
     }
 
     #[tokio::test]
@@ -3657,7 +3854,10 @@ mod tests {
         assert_eq!(calls[0].2, "default");
         assert_eq!(calls[0].3, 2);
         assert_eq!(calls[0].4["email"], "alice@example.com");
-        assert_eq!(calls[0].4["name"], json!({"first": "Alice", "last": "Smith"}));
+        assert_eq!(
+            calls[0].4["name"],
+            json!({"first": "Alice", "last": "Smith"})
+        );
 
         // Kratos only ever receives the base identity traits.
         let recorded = fake
@@ -3738,7 +3938,10 @@ mod tests {
         let ctx = request_context_with_tenant("tenant-1");
         let req = service_request(SubmitFlowRequest {
             id: "settings-flow".to_string(),
-            body: Some(proto_struct(json!({ "method": "password", "password": "hunter2" }))).into(),
+            body: Some(proto_struct(
+                json!({ "method": "password", "password": "hunter2" }),
+            ))
+            .into(),
             ..Default::default()
         });
 

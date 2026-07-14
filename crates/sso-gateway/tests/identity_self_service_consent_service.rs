@@ -225,7 +225,7 @@ async fn kratos_submit_recovery_token(
     );
     resp_headers.insert(
         "location",
-        "https://ui.example.com/settings?flow=privileged"
+        "https://ui.example.com/settings?flow=3fa85f64-5717-4562-b3fc-2c963f66afa6&foo=bar"
             .parse()
             .unwrap(),
     );
@@ -860,9 +860,52 @@ async fn self_service_and_consent_round_trip() {
         .json()
         .await
         .expect("submit_recovery_token response should be json");
+    let redirect_to = recovery_submit["redirectTo"]
+        .as_str()
+        .expect("redirectTo should be a string");
+    let redirect = reqwest::Url::parse(redirect_to).expect("redirectTo should be a URL");
+    assert_eq!(redirect.host_str(), Some("ui.example.com"));
+    assert_eq!(redirect.path(), "/settings");
+    let redirect_pairs: std::collections::HashMap<_, _> =
+        redirect.query_pairs().into_owned().collect();
+    assert_eq!(redirect_pairs.get("foo").map(String::as_str), Some("bar"));
+    let continuation_flow = redirect_pairs
+        .get("flow")
+        .expect("redirectTo should carry a flow param");
+    assert_ne!(
+        continuation_flow, "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "redirectTo must not leak the raw Kratos flow id"
+    );
+    assert!(
+        ulid::Ulid::from_string(continuation_flow).is_ok(),
+        "flow param should be a public ULID, got {continuation_flow}"
+    );
+    assert!(!redirect_to.contains("3fa85f64-5717-4562-b3fc-2c963f66afa6"));
+
+    // The scrubbed continuation must round-trip: GetSettingsFlow resolves the
+    // public ULID back to the Kratos settings flow.
+    let resp = client
+        .post(format!("{base}/iam.v1.IdentitySelfService/GetSettingsFlow"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .json(&json!({ "id": continuation_flow }))
+        .send()
+        .await
+        .expect("get_settings_flow continuation request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "get_settings_flow continuation failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let settings_flow: serde_json::Value = resp
+        .json()
+        .await
+        .expect("get_settings_flow continuation response should be json");
     assert_eq!(
-        recovery_submit["redirectTo"].as_str().unwrap_or(""),
-        "https://ui.example.com/settings?flow=privileged"
+        settings_flow["id"].as_str().unwrap_or(""),
+        continuation_flow,
+        "GetSettingsFlow should echo the public flow ULID"
     );
 
     // IdentitySelfService::SubmitVerificationToken
