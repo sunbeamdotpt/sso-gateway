@@ -47,6 +47,9 @@ urlencoding = "2"
 url = "2"
 subtle = "2.6"
 aes-gcm = "0.10"
+moka = { version = "0.12", features = ["future"] }
+futures-util = "0.3"
+bytes = "1"
 
 [dev-dependencies]
 rsa = "0.9"
