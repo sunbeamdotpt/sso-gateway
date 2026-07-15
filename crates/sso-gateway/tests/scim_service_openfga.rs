@@ -360,6 +360,7 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
             group_id,
             "member",
             user_id,
+            &sso_gateway::services::permission::QueryOptions::default(),
         )
         .await
         .expect("check should succeed");
