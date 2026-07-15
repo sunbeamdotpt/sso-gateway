@@ -97,21 +97,29 @@ impl OpenFgaClient {
         namespace: &str,
         relations: &[String],
     ) -> Result<String, OpenFgaClientError> {
+        let model = flat_model(namespace, relations);
+        self.write_model(store_id, &model).await
+    }
+
+    /// Write a raw authorization model.
+    ///
+    /// The model is passed through verbatim: `schema_version`,
+    /// `type_definitions`, and optional `conditions`.
+    #[instrument(skip(self, model), fields(base_url = %self.base_url))]
+    pub async fn write_model(
+        &self,
+        store_id: &str,
+        model: &Value,
+    ) -> Result<String, OpenFgaClientError> {
         let url = self
             .base_url
             .join(&format!("stores/{store_id}/authorization-models"))?;
-        debug!(%url, %store_id, %namespace, ?relations, "writing openfga authorization model");
-
-        let type_definitions = build_namespace_model(namespace, relations);
-        let payload = serde_json::json!({
-            "schema_version": "1.1",
-            "type_definitions": type_definitions,
-        });
+        debug!(%url, %store_id, "writing openfga authorization model");
 
         let response = self
             .client
             .post(url)
-            .json(&payload)
+            .json(model)
             .send()
             .await
             .map_err(OpenFgaClientError::Http)?;
@@ -177,25 +185,49 @@ impl OpenFgaClient {
         user: &str,
         operation: WriteTupleOp,
     ) -> Result<(), OpenFgaClientError> {
-        let url = self.base_url.join(&format!("stores/{store_id}/write"))?;
-        debug!(%url, %store_id, %model_id, %namespace, %object, %relation, %user, ?operation, "writing openfga tuple");
-
-        let tuple_key = serde_json::json!({
-            "user": user,
-            "relation": relation,
-            "object": format!("{namespace}:{object}"),
-        });
-
-        let payload = match operation {
-            WriteTupleOp::Insert => serde_json::json!({
-                "writes": { "tuple_keys": [tuple_key] },
-                "authorization_model_id": model_id,
-            }),
-            WriteTupleOp::Delete => serde_json::json!({
-                "deletes": { "tuple_keys": [tuple_key] },
-                "authorization_model_id": model_id,
-            }),
+        let key = TupleKey {
+            user: user.to_string(),
+            relation: relation.to_string(),
+            object: format!("{namespace}:{object}"),
+            condition_name: None,
+            condition_context: None,
         };
+        match operation {
+            WriteTupleOp::Insert => self.write_tuples(store_id, model_id, &[key], &[]).await,
+            WriteTupleOp::Delete => self.write_tuples(store_id, model_id, &[], &[key]).await,
+        }
+    }
+
+    /// Write (create and/or delete) a batch of relation tuples.
+    ///
+    /// OpenFGA accepts at most 100 tuple keys per direction in a single call;
+    /// callers are responsible for staying below that limit. Empty directions
+    /// are omitted from the payload.
+    #[instrument(skip(self, writes, deletes), fields(base_url = %self.base_url))]
+    pub async fn write_tuples(
+        &self,
+        store_id: &str,
+        model_id: &str,
+        writes: &[TupleKey],
+        deletes: &[TupleKey],
+    ) -> Result<(), OpenFgaClientError> {
+        if writes.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let url = self.base_url.join(&format!("stores/{store_id}/write"))?;
+        debug!(%url, %store_id, %model_id, writes = writes.len(), deletes = deletes.len(), "writing openfga tuples");
+
+        let mut payload = serde_json::json!({ "authorization_model_id": model_id });
+        if !writes.is_empty() {
+            payload["writes"] = serde_json::json!({
+                "tuple_keys": writes.iter().map(TupleKey::to_write_json).collect::<Vec<_>>(),
+            });
+        }
+        if !deletes.is_empty() {
+            payload["deletes"] = serde_json::json!({
+                "tuple_keys": deletes.iter().map(TupleKey::to_delete_json).collect::<Vec<_>>(),
+            });
+        }
 
         let response = self
             .client
@@ -213,7 +245,8 @@ impl OpenFgaClient {
     }
 
     /// Check whether a user has a relation on an object.
-    #[instrument(skip(self), fields(base_url = %self.base_url))]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, opts), fields(base_url = %self.base_url))]
     pub async fn check(
         &self,
         store_id: &str,
@@ -222,11 +255,12 @@ impl OpenFgaClient {
         object: &str,
         relation: &str,
         user: &str,
+        opts: &RequestOptions,
     ) -> Result<bool, OpenFgaClientError> {
         let url = self.base_url.join(&format!("stores/{store_id}/check"))?;
         debug!(%url, %store_id, %model_id, %namespace, %object, %relation, %user, "checking openfga permission");
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "tuple_key": {
                 "user": user,
                 "relation": relation,
@@ -234,6 +268,7 @@ impl OpenFgaClient {
             },
             "authorization_model_id": model_id,
         });
+        opts.apply(&mut payload);
 
         let response = self
             .client
@@ -255,7 +290,7 @@ impl OpenFgaClient {
     }
 
     /// Expand a relation for an object.
-    #[instrument(skip(self), fields(base_url = %self.base_url))]
+    #[instrument(skip(self, opts), fields(base_url = %self.base_url))]
     pub async fn expand(
         &self,
         store_id: &str,
@@ -263,17 +298,19 @@ impl OpenFgaClient {
         namespace: &str,
         object: &str,
         relation: &str,
+        opts: &RequestOptions,
     ) -> Result<Value, OpenFgaClientError> {
         let url = self.base_url.join(&format!("stores/{store_id}/expand"))?;
         debug!(%url, %store_id, %model_id, %namespace, %object, %relation, "expanding openfga relation");
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "tuple_key": {
                 "relation": relation,
                 "object": format!("{namespace}:{object}"),
             },
             "authorization_model_id": model_id,
         });
+        opts.apply(&mut payload);
 
         let response = self
             .client
@@ -286,7 +323,7 @@ impl OpenFgaClient {
     }
 
     /// List objects a user has a relation on.
-    #[instrument(skip(self), fields(base_url = %self.base_url))]
+    #[instrument(skip(self, opts), fields(base_url = %self.base_url))]
     pub async fn list_objects(
         &self,
         store_id: &str,
@@ -294,18 +331,20 @@ impl OpenFgaClient {
         namespace: &str,
         relation: &str,
         user: &str,
+        opts: &RequestOptions,
     ) -> Result<Vec<String>, OpenFgaClientError> {
         let url = self
             .base_url
             .join(&format!("stores/{store_id}/list-objects"))?;
         debug!(%url, %store_id, %model_id, %namespace, %relation, %user, "listing openfga objects");
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "user": user,
             "relation": relation,
             "type": namespace,
             "authorization_model_id": model_id,
         });
+        opts.apply(&mut payload);
 
         let response = self
             .client
@@ -327,6 +366,60 @@ impl OpenFgaClient {
             .unwrap_or_default();
         Ok(objects)
     }
+
+    /// List users that have a relation on an object.
+    ///
+    /// Returns canonical subject strings: `type:id`, `type:id#relation`, or
+    /// `type:*` for typed wildcards.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, opts), fields(base_url = %self.base_url))]
+    pub async fn list_users(
+        &self,
+        store_id: &str,
+        model_id: &str,
+        namespace: &str,
+        object: &str,
+        relation: &str,
+        user_type_filters: &[String],
+        opts: &RequestOptions,
+    ) -> Result<Vec<String>, OpenFgaClientError> {
+        let url = self
+            .base_url
+            .join(&format!("stores/{store_id}/list-users"))?;
+        debug!(%url, %store_id, %model_id, %namespace, %object, %relation, "listing openfga users");
+
+        let filters: Vec<Value> = user_type_filters
+            .iter()
+            .map(|f| match f.split_once('#') {
+                Some((ty, rel)) => serde_json::json!({ "type": ty, "relation": rel }),
+                None => serde_json::json!({ "type": f }),
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "object": { "type": namespace, "id": object },
+            "relation": relation,
+            "user_filters": filters,
+            "authorization_model_id": model_id,
+        });
+        opts.apply(&mut payload);
+
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(OpenFgaClientError::Http)?;
+
+        let body = handle_response(response).await?;
+        let users = body
+            .get("users")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(canonical_user).collect())
+            .unwrap_or_default();
+        Ok(users)
+    }
 }
 
 /// Operation for [`OpenFgaClient::write_tuple`].
@@ -336,6 +429,120 @@ pub enum WriteTupleOp {
     Insert,
     /// Delete the tuple.
     Delete,
+}
+
+/// A single OpenFGA tuple key.
+///
+/// `object` and `user` must already be typed (`type:id`, usersets
+/// `type:id#relation`, or wildcards `type:*`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TupleKey {
+    /// Typed subject, e.g. `user:anne` or `team:eng#member`.
+    pub user: String,
+    /// Relation name.
+    pub relation: String,
+    /// Typed object, e.g. `document:1`.
+    pub object: String,
+    /// Optional OpenFGA condition name (writes only).
+    pub condition_name: Option<String>,
+    /// Optional condition context (writes only).
+    pub condition_context: Option<Value>,
+}
+
+impl TupleKey {
+    fn to_write_json(&self) -> Value {
+        let mut key = serde_json::json!({
+            "user": self.user,
+            "relation": self.relation,
+            "object": self.object,
+        });
+        if let Some(name) = &self.condition_name {
+            key["condition"] = serde_json::json!({
+                "name": name,
+                "context": self.condition_context.clone().unwrap_or(Value::Null),
+            });
+        }
+        key
+    }
+
+    fn to_delete_json(&self) -> Value {
+        serde_json::json!({
+            "user": self.user,
+            "relation": self.relation,
+            "object": self.object,
+        })
+    }
+}
+
+/// Optional evaluation parameters shared by check/expand/list endpoints.
+///
+/// Everything set here is passed through to OpenFGA verbatim.
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    /// Evaluation context for conditions.
+    pub context: Option<Value>,
+    /// Contextual tuples used only for this evaluation.
+    pub contextual_tuples: Vec<TupleKey>,
+    /// Consistency preference (e.g. `minimize_latency`, `higher_consistency`).
+    pub consistency: Option<String>,
+}
+
+impl RequestOptions {
+    fn is_default(&self) -> bool {
+        self.context.is_none() && self.contextual_tuples.is_empty() && self.consistency.is_none()
+    }
+
+    fn apply(&self, payload: &mut Value) {
+        if self.is_default() {
+            return;
+        }
+        if let Some(context) = &self.context {
+            payload["context"] = context.clone();
+        }
+        if !self.contextual_tuples.is_empty() {
+            payload["contextual_tuples"] = serde_json::json!({
+                "tuple_keys": self.contextual_tuples.iter().map(TupleKey::to_write_json).collect::<Vec<_>>(),
+            });
+        }
+        if let Some(consistency) = &self.consistency {
+            payload["consistency"] = Value::String(consistency.clone());
+        }
+    }
+}
+
+/// Build a flat single-type authorization model for `namespace`.
+///
+/// Every relation is directly assignable by typed users. Used by gateway
+/// flows (e.g. SCIM groups) that do not author rich models.
+pub fn flat_model(namespace: &str, relations: &[String]) -> Value {
+    serde_json::json!({
+        "schema_version": "1.1",
+        "type_definitions": build_namespace_model(namespace, relations),
+    })
+}
+
+/// Canonicalize a list-users response entry into `type:id`,
+/// `type:id#relation`, or `type:*`. Unknown shapes fall back to raw JSON.
+fn canonical_user(entry: &Value) -> String {
+    if let Some(object) = entry.get("object") {
+        let ty = object.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let id = object.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        return format!("{ty}:{id}");
+    }
+    if let Some(userset) = entry.get("userset") {
+        let ty = userset.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let id = userset.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let relation = userset
+            .get("relation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return format!("{ty}:{id}#{relation}");
+    }
+    if let Some(wildcard) = entry.get("wildcard") {
+        let ty = wildcard.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        return format!("{ty}:*");
+    }
+    entry.to_string()
 }
 
 fn parse_base_url(url: &str) -> Result<Url, OpenFgaClientError> {
@@ -428,6 +635,7 @@ mod tests {
             .route("/stores/{store_id}/check", post(check))
             .route("/stores/{store_id}/expand", post(expand))
             .route("/stores/{store_id}/list-objects", post(list_objects))
+            .route("/stores/{store_id}/list-users", post(list_users))
             .with_state(state)
     }
 
@@ -569,6 +777,42 @@ mod tests {
         Json(json!({ "objects": objects }))
     }
 
+    async fn list_users(
+        State(state): State<FakeState>,
+        Path(store_id): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let object = body
+            .get("object")
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let object_type = body
+            .get("object")
+            .and_then(|o| o.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let relation = body.get("relation").and_then(|v| v.as_str()).unwrap_or("");
+        let want_object = format!("{object_type}:{object}");
+        let users: Vec<Value> = state
+            .tuples
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
+                    && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
+                    && t.get("object").and_then(|v| v.as_str()) == Some(&want_object)
+            })
+            .filter_map(|t| t.get("user").and_then(|v| v.as_str()).map(String::from))
+            .map(|user| match user.split_once(':') {
+                Some((ty, id)) => json!({ "object": { "type": ty, "id": id } }),
+                None => json!({ "object": { "type": "user", "id": user } }),
+            })
+            .collect();
+        Json(json!({ "users": users }))
+    }
+
     async fn start_server() -> (tokio::task::JoinHandle<()>, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -625,6 +869,7 @@ mod tests {
                 "doc-1",
                 "reader",
                 "user:alice",
+                &RequestOptions::default(),
             )
             .await
             .unwrap();
@@ -651,13 +896,21 @@ mod tests {
                 "doc-1",
                 "reader",
                 "user:alice",
+                &RequestOptions::default(),
             )
             .await
             .unwrap();
         assert!(allowed);
 
         let objects = client
-            .list_objects(&store_id, &model_id, "document", "reader", "user:alice")
+            .list_objects(
+                &store_id,
+                &model_id,
+                "document",
+                "reader",
+                "user:alice",
+                &RequestOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(objects, vec!["document:doc-1"]);
@@ -683,6 +936,7 @@ mod tests {
                 "doc-1",
                 "reader",
                 "user:alice",
+                &RequestOptions::default(),
             )
             .await
             .unwrap();
@@ -701,7 +955,14 @@ mod tests {
             .unwrap();
 
         let expanded = client
-            .expand(&store_id, &model_id, "document", "doc-1", "reader")
+            .expand(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                &RequestOptions::default(),
+            )
             .await
             .unwrap();
         assert!(expanded.get("tree").is_some());
@@ -728,5 +989,183 @@ mod tests {
             err,
             OpenFgaClientError::OpenFga { status: 400, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn write_tuples_batch_round_trip() {
+        let (_handle, url) = start_server().await;
+        let client = OpenFgaClient::new(&url).unwrap();
+        let store_id = client.create_store("batch").await.unwrap();
+        let model_id = client
+            .write_authorization_model(&store_id, "document", &["reader".into()])
+            .await
+            .unwrap();
+
+        client
+            .write_tuples(&store_id, &model_id, &[], &[])
+            .await
+            .unwrap();
+
+        let writes = vec![
+            TupleKey {
+                user: "user:alice".into(),
+                relation: "reader".into(),
+                object: "document:doc-1".into(),
+                condition_name: None,
+                condition_context: None,
+            },
+            TupleKey {
+                user: "user:bob".into(),
+                relation: "reader".into(),
+                object: "document:doc-1".into(),
+                condition_name: Some("in_range".into()),
+                condition_context: Some(json!({ "x": 1 })),
+            },
+        ];
+        client
+            .write_tuples(&store_id, &model_id, &writes, &[])
+            .await
+            .unwrap();
+
+        let users = client
+            .list_users(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                &["user".into()],
+                &RequestOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users, vec!["user:alice", "user:bob"]);
+
+        client
+            .write_tuples(&store_id, &model_id, &[], &writes[..1])
+            .await
+            .unwrap();
+        let users = client
+            .list_users(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-1",
+                "reader",
+                &[],
+                &RequestOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users, vec!["user:bob"]);
+    }
+
+    #[tokio::test]
+    async fn check_with_request_options_succeeds() {
+        let (_handle, url) = start_server().await;
+        let client = OpenFgaClient::new(&url).unwrap();
+        let store_id = client.create_store("opts").await.unwrap();
+        let model_id = client
+            .write_authorization_model(&store_id, "document", &["reader".into()])
+            .await
+            .unwrap();
+
+        let opts = RequestOptions {
+            context: Some(json!({ "ip": "10.0.0.1" })),
+            contextual_tuples: vec![TupleKey {
+                user: "user:carol".into(),
+                relation: "reader".into(),
+                object: "document:doc-9".into(),
+                condition_name: None,
+                condition_context: None,
+            }],
+            consistency: Some("higher_consistency".into()),
+        };
+        // The fake server ignores the extra fields; this exercises payload
+        // construction and the success path with options applied.
+        let allowed = client
+            .check(
+                &store_id,
+                &model_id,
+                "document",
+                "doc-9",
+                "reader",
+                "user:carol",
+                &opts,
+            )
+            .await
+            .unwrap();
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn flat_model_builds_single_type_model() {
+        let model = flat_model("document", &["reader".into(), "writer".into()]);
+        assert_eq!(model["schema_version"], "1.1");
+        let defs = model["type_definitions"].as_array().unwrap();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0]["type"], "user");
+        assert_eq!(defs[1]["type"], "document");
+        assert!(defs[1]["relations"]["reader"].is_object());
+        assert!(defs[1]["relations"]["writer"].is_object());
+    }
+
+    #[test]
+    fn canonical_user_formats_all_shapes() {
+        let object = json!({ "object": { "type": "user", "id": "anne" } });
+        assert_eq!(canonical_user(&object), "user:anne");
+
+        let userset = json!({ "userset": { "type": "team", "id": "eng", "relation": "member" } });
+        assert_eq!(canonical_user(&userset), "team:eng#member");
+
+        let wildcard = json!({ "wildcard": { "type": "user" } });
+        assert_eq!(canonical_user(&wildcard), "user:*");
+
+        let unknown = json!({ "something": true });
+        assert_eq!(canonical_user(&unknown), r#"{"something":true}"#);
+    }
+
+    #[test]
+    fn tuple_key_json_shapes() {
+        let key = TupleKey {
+            user: "user:a".into(),
+            relation: "reader".into(),
+            object: "document:1".into(),
+            condition_name: Some("cond".into()),
+            condition_context: Some(json!({ "k": "v" })),
+        };
+        let write = key.to_write_json();
+        assert_eq!(write["condition"]["name"], "cond");
+        assert_eq!(write["condition"]["context"]["k"], "v");
+        let delete = key.to_delete_json();
+        assert!(delete.get("condition").is_none());
+
+        let plain = TupleKey {
+            condition_name: None,
+            condition_context: None,
+            ..key.clone()
+        };
+        assert!(plain.to_write_json().get("condition").is_none());
+    }
+
+    #[test]
+    fn request_options_apply_skips_defaults() {
+        let opts = RequestOptions::default();
+        assert!(opts.is_default());
+        let mut payload = json!({ "a": 1 });
+        opts.apply(&mut payload);
+        assert_eq!(payload, json!({ "a": 1 }));
+
+        let opts = RequestOptions {
+            context: None,
+            contextual_tuples: Vec::new(),
+            consistency: Some("minimize_latency".into()),
+        };
+        assert!(!opts.is_default());
+        let mut payload = json!({});
+        opts.apply(&mut payload);
+        assert_eq!(payload["consistency"], "minimize_latency");
+        assert!(payload.get("context").is_none());
+        assert!(payload.get("contextual_tuples").is_none());
     }
 }
