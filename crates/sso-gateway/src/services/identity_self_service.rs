@@ -76,7 +76,7 @@ use super::identity_self_service_mapper::{
     ory_flow_error_to_proto, ory_flow_to_proto, ory_logout_flow_to_proto, ory_session_to_proto,
     ory_webauthn_js_to_proto, proto_struct_to_json,
 };
-use super::self_service_url_rewriter::rewrite_url;
+use super::self_service_url_rewriter::{rewrite_gateway_facing_url, rewrite_url};
 
 /// Async trait abstracting the Kratos self-service operations used by this
 /// service. Keeps the service implementation decoupled from the concrete HTTP
@@ -442,6 +442,7 @@ pub struct IdentitySelfServiceImpl {
     kratos_public_url: String,
     gateway_public_url: String,
     kratos_default_schema_id: String,
+    paths: crate::config::SelfServicePaths,
 }
 
 impl IdentitySelfServiceImpl {
@@ -457,6 +458,7 @@ impl IdentitySelfServiceImpl {
         kratos_public_url: String,
         gateway_public_url: String,
         kratos_default_schema_id: String,
+        paths: crate::config::SelfServicePaths,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn KratosSelfService>,
@@ -469,6 +471,7 @@ impl IdentitySelfServiceImpl {
             kratos_public_url,
             gateway_public_url,
             kratos_default_schema_id,
+            paths,
         }
     }
 
@@ -523,14 +526,19 @@ impl IdentitySelfServiceImpl {
         Ok(url.into())
     }
 
-    /// Apply the Kratos→gateway host rewrite to a Kratos-owned flow URL and
+    /// Rewrite a Kratos-owned flow URL onto the branded gateway surface and
     /// scrub any embedded raw Kratos flow id in one pass.
     async fn rewrite_and_scrub_flow_url(
         &self,
         tenant_id: &str,
         value: &str,
     ) -> Result<String, ServiceError> {
-        let rewritten = rewrite_url(value, &self.kratos_public_url, &self.gateway_public_url);
+        let rewritten = rewrite_gateway_facing_url(
+            &self.paths,
+            value,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
         self.scrub_flow_id_in_url(tenant_id, &rewritten, false)
             .await
     }
@@ -818,8 +826,9 @@ impl IdentitySelfServiceImpl {
     /// the client as [`OryClientError::Redirect`]) returns a flow carrying only
     /// `redirect_browser_to`; the Kratos session cookie that rides on that 422
     /// is attached to the response so the browser session is established. The
-    /// location is already a browser-reachable URL, so it is passed through
-    /// unchanged. Any other error is mapped normally.
+    /// location is a Kratos-owned self-service URL, so it is rewritten onto
+    /// the branded gateway surface and its raw flow id is scrubbed like any
+    /// other Kratos URL. Any other error is mapped normally.
     async fn map_submit_response(
         &self,
         tenant_id: &str,
@@ -831,6 +840,15 @@ impl IdentitySelfServiceImpl {
                 location,
                 set_cookies,
             }) => {
+                let location = rewrite_gateway_facing_url(
+                    &self.paths,
+                    &location,
+                    &self.kratos_public_url,
+                    &self.gateway_public_url,
+                );
+                let location = self
+                    .scrub_flow_id_in_url(tenant_id, &location, true)
+                    .await?;
                 let body = SelfServiceFlow {
                     redirect_browser_to: location,
                     ..Default::default()
@@ -1440,7 +1458,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .await
             .map_err(map_ory_error)?;
         let mut response = Response::new(ory_logout_flow_to_proto(&flow.body));
-        response.body.logout_url = rewrite_url(
+        response.body.logout_url = rewrite_gateway_facing_url(
+            &self.paths,
             &response.body.logout_url,
             &self.kratos_public_url,
             &self.gateway_public_url,
@@ -1561,6 +1580,12 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos recovery token response missing location".into())
         })?;
+        let redirect_to = rewrite_gateway_facing_url(
+            &self.paths,
+            &redirect_to,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
         let redirect_to = self
             .scrub_flow_id_in_url(&tenant_id, &redirect_to, true)
             .await?;
@@ -1614,6 +1639,12 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos verification token response missing location".into())
         })?;
+        let redirect_to = rewrite_gateway_facing_url(
+            &self.paths,
+            &redirect_to,
+            &self.kratos_public_url,
+            &self.gateway_public_url,
+        );
         let redirect_to = self
             .scrub_flow_id_in_url(&tenant_id, &redirect_to, true)
             .await?;
@@ -2832,6 +2863,7 @@ mod tests {
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
         }
     }
 
@@ -2857,6 +2889,7 @@ mod tests {
             "http://kratos.example.com".to_string(),
             "https://gateway.example.com".to_string(),
             "default".to_string(),
+            crate::config::SelfServicePaths::default(),
         );
         // Field is now a trait object; just verify the service was created.
         assert_eq!(Arc::strong_count(&kratos), 2);
@@ -2930,6 +2963,7 @@ mod tests {
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "kratos-base".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
         };
         let mut flow = SelfServiceFlow {
             id: "flow-1".into(),
@@ -2953,6 +2987,7 @@ mod tests {
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "kratos-base".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
         };
         let mut flow = SelfServiceFlow {
             id: "flow-1".into(),
@@ -4372,6 +4407,7 @@ mod tests {
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
         };
         let ctx = request_context_with_tenant("tenant-1");
         let req = service_request(SubmitFlowRequest {
@@ -4442,6 +4478,7 @@ mod tests {
             kratos_public_url: "http://kratos.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
         };
         let ctx = request_context_with_tenant("tenant-1");
         let req = service_request(SubmitFlowRequest {

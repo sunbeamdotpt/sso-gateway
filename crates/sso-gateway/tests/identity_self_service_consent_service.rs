@@ -524,6 +524,7 @@ async fn self_service_and_consent_round_trip() {
         kratos_url.clone(),
         "http://gateway.test".to_string(),
         "default".to_string(),
+        sso_gateway::config::SelfServicePaths::default(),
     ));
     let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),

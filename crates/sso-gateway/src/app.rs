@@ -306,6 +306,7 @@ pub async fn build_app_with_upstream(
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),
         config.kratos_default_schema_id.clone(),
+        config.self_service_paths.clone(),
     ));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),
@@ -388,7 +389,11 @@ pub async fn build_app_with_upstream(
         oauth_mappings,
         config.public_base_url.clone(),
     ));
-    let self_service_state = Arc::new(SelfServiceState::new(config.kratos_public_url.clone()));
+    let self_service_state = Arc::new(SelfServiceState::new(
+        config.kratos_public_url.clone(),
+        config.public_base_url.clone(),
+        config.self_service_paths.clone(),
+    ));
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
     let saml_state = Arc::new(SamlState::new(federation_service.clone()));
     let saml_idp_state = Arc::new(
@@ -463,6 +468,7 @@ pub async fn build_app_with_upstream(
         .layer(from_fn(auth_middleware))
         .layer(Extension(introspector))
         .layer(Extension(agent_resolver))
+        .layer(Extension(Arc::new(config.self_service_paths.clone())))
         .layer(Extension(session_signer))
         .layer(Extension(session_store))
         .layer(Extension(
@@ -667,6 +673,7 @@ mod tests {
             agent_cache_ttl_seconds: 5,
             public_rate_limit_requests: 100,
             public_rate_limit_window_seconds: 60,
+            self_service_paths: crate::config::SelfServicePaths::default(),
         }
     }
 

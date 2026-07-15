@@ -96,26 +96,35 @@ fn is_public_path(path: &str) -> bool {
         "/saml/metadata" | "/saml/acs" | "/saml/sso" => true,
         "/callbacks/oidc" | "/callbacks/oauth2" => true,
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
+        // Kratos email links (recovery/verification) land here and are
+        // bounced to the branded surface; they authenticate via the token in
+        // the link itself.
+        "/self-service/recovery" | "/self-service/verification" => true,
         "/health" | "/health/ready" | "/health/live" => true,
-        _ => {
-            path.starts_with("/oauth2/device/") || path.starts_with("/.well-known/ory/webauthn.js")
-        }
+        _ => path.starts_with("/oauth2/device/"),
     }
 }
 
 const SESSION_COOKIE_NAME: &str = "__Host-sso_session";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn auth_middleware(
     Extension(introspector): Extension<Arc<dyn TokenIntrospector>>,
     Extension(mappings): Extension<Arc<dyn IdMappingStore>>,
     Extension(session_signer): Extension<SessionTokenSigner>,
     Extension(session_store): Extension<Arc<dyn SessionStore>>,
     agent_resolver: Option<Extension<Arc<dyn AgentTokenResolver>>>,
+    self_service_paths: Option<Extension<Arc<crate::config::SelfServicePaths>>>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if is_public_path(path) {
+    // Branded browser self-service routes carry Kratos cookies, not bearer
+    // tokens; the proxy and Kratos perform the session checks.
+    let is_browser_path = self_service_paths
+        .as_ref()
+        .is_some_and(|Extension(paths)| paths.is_browser_path(path));
+    if is_public_path(path) || is_browser_path {
         return next.run(request).await;
     }
 
@@ -618,9 +627,55 @@ mod tests {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/health/ready"));
         assert!(is_public_path("/health/live"));
-        assert!(is_public_path("/.well-known/ory/webauthn.js"));
+        assert!(is_public_path("/self-service/recovery"));
+        assert!(is_public_path("/self-service/verification"));
+        assert!(!is_public_path("/.well-known/ory/webauthn.js"));
         assert!(!is_public_path("/self-service/login/browser"));
+        assert!(!is_public_path("/identity/login"));
         assert!(!is_public_path("/iam/v1/tenants"));
+    }
+
+    #[tokio::test]
+    async fn branded_browser_path_bypasses_auth() {
+        let router = Router::new()
+            .route("/identity/login", get(ok_handler))
+            .layer(from_fn(auth_middleware))
+            .layer(Extension(
+                Arc::new(StubIntrospector(Mutex::new(None))) as Arc<dyn TokenIntrospector>
+            ))
+            .layer(Extension(SessionTokenSigner::new(
+                "test-secret-that-is-at-least-32-bytes-long",
+                3600,
+                "https://gateway.example.com",
+            )))
+            .layer(Extension(
+                Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
+            ))
+            .layer(Extension(no_mappings()))
+            .layer(Extension(Arc::new(crate::config::SelfServicePaths::default())));
+        let response = router
+            .oneshot(
+                Request::get("/identity/login?aal=aal2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_browser_path_still_requires_auth_with_paths_extension() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            no_mappings(),
+        )
+        .layer(Extension(Arc::new(crate::config::SelfServicePaths::default())));
+        let response = router
+            .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

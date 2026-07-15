@@ -46,6 +46,7 @@ pub struct Config {
     pub agent_cache_ttl_seconds: u64,
     pub public_rate_limit_requests: u32,
     pub public_rate_limit_window_seconds: u64,
+    pub self_service_paths: SelfServicePaths,
 }
 
 impl std::fmt::Debug for Config {
@@ -144,6 +145,7 @@ impl std::fmt::Debug for Config {
                 "public_rate_limit_window_seconds",
                 &self.public_rate_limit_window_seconds,
             )
+            .field("self_service_paths", &self.self_service_paths)
             .finish()
     }
 }
@@ -152,6 +154,156 @@ impl std::fmt::Debug for Config {
 pub enum PermissionsBackend {
     Keto,
     OpenFga,
+}
+
+/// Branded, browser-facing paths for the Kratos self-service surface.
+///
+/// Every Kratos self-service URL that can reach a browser (flow init
+/// redirects, AAL2 upgrades, logout chains, email token links, OIDC
+/// callbacks, the WebAuthn script) is rewritten to these gateway paths so no
+/// Ory construct leaks into an address bar, redirect chain, or inbox. Each
+/// path is independently configurable so downstream deployments can shape
+/// their own URL namespace; the gateway rewrites to whatever is configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelfServicePaths {
+    pub login: String,
+    pub registration: String,
+    pub settings: String,
+    pub recovery: String,
+    pub verification: String,
+    pub logout: String,
+    pub errors: String,
+    pub oidc_callback: String,
+    pub webauthn_js: String,
+}
+
+impl Default for SelfServicePaths {
+    fn default() -> Self {
+        Self {
+            login: "/identity/login".to_string(),
+            registration: "/identity/registration".to_string(),
+            settings: "/identity/settings".to_string(),
+            recovery: "/identity/recovery".to_string(),
+            verification: "/identity/verification".to_string(),
+            logout: "/identity/logout".to_string(),
+            errors: "/identity/errors".to_string(),
+            oidc_callback: "/identity/oidc/callback".to_string(),
+            webauthn_js: "/identity/webauthn.js".to_string(),
+        }
+    }
+}
+
+/// All `SELF_SERVICE_*_PATH` environment variables, for tests and docs.
+#[cfg(test)]
+pub(crate) const SELF_SERVICE_PATH_VARS: [&str; 9] = [
+    "SELF_SERVICE_LOGIN_PATH",
+    "SELF_SERVICE_REGISTRATION_PATH",
+    "SELF_SERVICE_SETTINGS_PATH",
+    "SELF_SERVICE_RECOVERY_PATH",
+    "SELF_SERVICE_VERIFICATION_PATH",
+    "SELF_SERVICE_LOGOUT_PATH",
+    "SELF_SERVICE_ERRORS_PATH",
+    "SELF_SERVICE_OIDC_CALLBACK_PATH",
+    "SELF_SERVICE_WEBAUTHN_JS_PATH",
+];
+
+impl SelfServicePaths {
+    /// Prefixes already owned by other gateway surfaces. Branded self-service
+    /// paths must not squat on them (and `/self-service` is reserved for the
+    /// interim email-link shim).
+    const RESERVED_PREFIXES: &'static [&'static str] = &[
+        "/oauth2",
+        "/saml",
+        "/scim",
+        "/callbacks",
+        "/iam",
+        "/.well-known",
+        "/health",
+        "/self-service",
+    ];
+
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        let paths = Self {
+            login: Self::env_or("SELF_SERVICE_LOGIN_PATH", &defaults.login),
+            registration: Self::env_or("SELF_SERVICE_REGISTRATION_PATH", &defaults.registration),
+            settings: Self::env_or("SELF_SERVICE_SETTINGS_PATH", &defaults.settings),
+            recovery: Self::env_or("SELF_SERVICE_RECOVERY_PATH", &defaults.recovery),
+            verification: Self::env_or("SELF_SERVICE_VERIFICATION_PATH", &defaults.verification),
+            logout: Self::env_or("SELF_SERVICE_LOGOUT_PATH", &defaults.logout),
+            errors: Self::env_or("SELF_SERVICE_ERRORS_PATH", &defaults.errors),
+            oidc_callback: Self::env_or("SELF_SERVICE_OIDC_CALLBACK_PATH", &defaults.oidc_callback),
+            webauthn_js: Self::env_or("SELF_SERVICE_WEBAUTHN_JS_PATH", &defaults.webauthn_js),
+        };
+        paths.validate()?;
+        Ok(paths)
+    }
+
+    fn env_or(var: &str, default: &str) -> String {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Every `(env var, configured path)` pair, in a stable order.
+    fn vars(&self) -> [(&'static str, &str); 9] {
+        [
+            ("SELF_SERVICE_LOGIN_PATH", self.login.as_str()),
+            ("SELF_SERVICE_REGISTRATION_PATH", self.registration.as_str()),
+            ("SELF_SERVICE_SETTINGS_PATH", self.settings.as_str()),
+            ("SELF_SERVICE_RECOVERY_PATH", self.recovery.as_str()),
+            ("SELF_SERVICE_VERIFICATION_PATH", self.verification.as_str()),
+            ("SELF_SERVICE_LOGOUT_PATH", self.logout.as_str()),
+            ("SELF_SERVICE_ERRORS_PATH", self.errors.as_str()),
+            ("SELF_SERVICE_OIDC_CALLBACK_PATH", self.oidc_callback.as_str()),
+            ("SELF_SERVICE_WEBAUTHN_JS_PATH", self.webauthn_js.as_str()),
+        ]
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let all = self.vars();
+        for (var, path) in &all {
+            if !path.starts_with('/') || path.len() == 1 {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "{var} must be an absolute path below the root, got '{path}'"
+                )));
+            }
+            if path.ends_with('/') || path.contains(['?', '#']) {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "{var} must be a bare path without trailing slash, query, or fragment, got '{path}'"
+                )));
+            }
+            if Self::RESERVED_PREFIXES
+                .iter()
+                .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+            {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "{var} must not shadow a reserved gateway prefix, got '{path}'"
+                )));
+            }
+        }
+        for (index, (var, path)) in all.iter().enumerate() {
+            for (other_var, other) in &all[index + 1..] {
+                if path == other {
+                    return Err(ConfigError::InvalidConfig(format!(
+                        "{var} and {other_var} must be distinct, both are '{path}'"
+                    )));
+                }
+            }
+            // The OIDC callback also matches `{oidc_callback}/{provider}`, so
+            // no other branded path may live underneath it.
+            if *path != self.oidc_callback
+                && path.starts_with(&format!("{}/", self.oidc_callback))
+            {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "{var} must not live under SELF_SERVICE_OIDC_CALLBACK_PATH, got '{path}'"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Choose the default permissions backend based on compiled features.
@@ -404,6 +556,7 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60),
+            self_service_paths: SelfServicePaths::from_env()?,
         })
     }
 
@@ -533,6 +686,9 @@ mod tests {
         clear_env("PUBLIC_RATE_LIMIT_REQUESTS");
         clear_env("PUBLIC_RATE_LIMIT_WINDOW_SECONDS");
         clear_env("UI_PUBLIC_URL");
+        for var in SELF_SERVICE_PATH_VARS {
+            clear_env(var);
+        }
     }
 
     #[test]
@@ -899,6 +1055,93 @@ mod tests {
         drop(_guard);
         assert!(
             matches!(err, ConfigError::InvalidConfig(ref s) if s.contains("change-me-in-production-cookie-secret")),
+        );
+    }
+
+    #[test]
+    fn self_service_paths_default_to_identity_namespace() {
+        let paths = SelfServicePaths::default();
+        assert_eq!(paths.login, "/identity/login");
+        assert_eq!(paths.registration, "/identity/registration");
+        assert_eq!(paths.settings, "/identity/settings");
+        assert_eq!(paths.recovery, "/identity/recovery");
+        assert_eq!(paths.verification, "/identity/verification");
+        assert_eq!(paths.logout, "/identity/logout");
+        assert_eq!(paths.errors, "/identity/errors");
+        assert_eq!(paths.oidc_callback, "/identity/oidc/callback");
+        assert_eq!(paths.webauthn_js, "/identity/webauthn.js");
+        paths.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn self_service_paths_read_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        set_env("SELF_SERVICE_LOGIN_PATH", "/signin");
+        set_env("SELF_SERVICE_WEBAUTHN_JS_PATH", "/assets/passkeys.js");
+        set_env("SELF_SERVICE_OIDC_CALLBACK_PATH", "/sso/callback");
+
+        let paths = SelfServicePaths::from_env().expect("paths should parse");
+        drop(_guard);
+        assert_eq!(paths.login, "/signin");
+        assert_eq!(paths.webauthn_js, "/assets/passkeys.js");
+        assert_eq!(paths.oidc_callback, "/sso/callback");
+        // Untouched knobs keep their defaults.
+        assert_eq!(paths.logout, "/identity/logout");
+    }
+
+    #[test]
+    fn self_service_paths_reject_malformed_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        for (var, value) in [
+            ("SELF_SERVICE_LOGIN_PATH", "identity/login"),
+            ("SELF_SERVICE_REGISTRATION_PATH", "/"),
+            ("SELF_SERVICE_SETTINGS_PATH", "/identity/settings/"),
+            ("SELF_SERVICE_RECOVERY_PATH", "/identity/recovery?x=1"),
+            ("SELF_SERVICE_VERIFICATION_PATH", "/identity/verification#frag"),
+            ("SELF_SERVICE_LOGOUT_PATH", "/oauth2/logout"),
+            ("SELF_SERVICE_ERRORS_PATH", "/self-service/errors"),
+            ("SELF_SERVICE_WEBAUTHN_JS_PATH", "/.well-known/webauthn.js"),
+        ] {
+            clear_all_config_env();
+            set_env(var, value);
+            let err = SelfServicePaths::from_env().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidConfig(_)),
+                "{var}={value} must be rejected"
+            );
+        }
+        drop(_guard);
+    }
+
+    #[test]
+    fn self_service_paths_reject_duplicates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        set_env("SELF_SERVICE_LOGIN_PATH", "/identity/shared");
+        set_env("SELF_SERVICE_LOGOUT_PATH", "/identity/shared");
+
+        let err = SelfServicePaths::from_env().unwrap_err();
+        drop(_guard);
+        assert!(
+            matches!(err, ConfigError::InvalidConfig(ref s) if s.contains("must be distinct")),
+            "duplicates must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn self_service_paths_reject_paths_under_oidc_callback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        set_env("SELF_SERVICE_OIDC_CALLBACK_PATH", "/identity");
+        set_env("SELF_SERVICE_ERRORS_PATH", "/identity/errors");
+
+        let err = SelfServicePaths::from_env().unwrap_err();
+        drop(_guard);
+        assert!(
+            matches!(err, ConfigError::InvalidConfig(ref s) if s.contains("OIDC_CALLBACK")),
+            "nesting under the OIDC callback must be rejected: {err}"
         );
     }
 }

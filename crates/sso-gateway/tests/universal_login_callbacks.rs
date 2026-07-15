@@ -167,6 +167,7 @@ impl CallbackHarness {
             agent_cache_ttl_seconds: 5,
             public_rate_limit_requests: 100,
             public_rate_limit_window_seconds: 60,
+            self_service_paths: sso_gateway::config::SelfServicePaths::default(),
         };
 
         let app = build_app_with_upstream(&config, pool.clone(), upstream_oauth)
