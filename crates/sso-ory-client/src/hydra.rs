@@ -414,6 +414,86 @@ impl HydraClient {
         handle_response(response).await
     }
 
+    /// Proxy a device-verification request to Hydra's public
+    /// `/oauth2/device/verify` endpoint.
+    ///
+    /// Behaves like [`Self::authorize`]: Hydra answers with a redirect, which
+    /// is surfaced as [`OryClientError::Redirect`] carrying the location and
+    /// the response's `Set-Cookie` headers (the device CSRF cookie the
+    /// browser needs on the post-accept leg). `cookie` is the browser's
+    /// incoming `Cookie` header, forwarded verbatim.
+    #[instrument(skip(self))]
+    pub async fn get_device_verify(
+        &self,
+        query: Vec<(String, String)>,
+        cookie: Option<&str>,
+    ) -> Result<Value, OryClientError> {
+        let url = self
+            .public_url
+            .join("oauth2/device/verify")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "proxying device verification request");
+        let mut request = self
+            .client
+            .get(url)
+            .query(&query)
+            .header("accept", "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request.send().await.map_err(OryClientError::Http)?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .map(String::from)
+                .unwrap_or_default();
+            let set_cookies = response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|h| h.to_str().ok())
+                .map(String::from)
+                .collect();
+            return Err(OryClientError::Redirect {
+                location,
+                set_cookies,
+            });
+        }
+
+        handle_response(response).await
+    }
+
+    /// Accept a device user code at Hydra's admin
+    /// `/oauth2/auth/requests/device/accept` endpoint.
+    ///
+    /// Returns Hydra's response, which carries `redirect_to` — the URL the
+    /// browser must follow to continue the device flow.
+    #[instrument(skip(self))]
+    pub async fn accept_device_verification(
+        &self,
+        challenge: &str,
+        user_code: &str,
+    ) -> Result<Value, OryClientError> {
+        let url = self
+            .admin_url
+            .join("admin/oauth2/auth/requests/device/accept")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "accepting device user code");
+        let response = self
+            .client
+            .put(url)
+            .query(&[("device_challenge", challenge)])
+            .header("accept", "application/json")
+            .json(&serde_json::json!({ "user_code": user_code }))
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        handle_response(response).await
+    }
+
     /// Proxy a device-authorization request to Hydra's public
     /// `/oauth2/device/{path}` endpoint.
     #[instrument(skip(self, form))]
@@ -1275,6 +1355,136 @@ mod tests {
         let client = HydraClient::new(&url, &url).unwrap();
         let resp = client.authorize(vec![], None).await.unwrap();
         assert_eq!(resp["cookie"], "");
+    }
+
+    #[tokio::test]
+    async fn get_device_verify_captures_redirect_location_and_cookies() {
+        async fn verify_redirect(
+            Query(params): Query<HashMap<String, String>>,
+            headers: axum::http::HeaderMap,
+        ) -> (axum::http::StatusCode, axum::http::HeaderMap) {
+            assert_eq!(
+                params.get("user_code").map(String::as_str),
+                Some("ABCD-EFGH")
+            );
+            assert_eq!(
+                headers
+                    .get(axum::http::header::COOKIE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("ory_hydra_device_csrf=csrf-value")
+            );
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::LOCATION,
+                "https://login.example.com/device?device_challenge=challenge-1&user_code=ABCD-EFGH"
+                    .parse()
+                    .unwrap(),
+            );
+            headers.append(
+                axum::http::header::SET_COOKIE,
+                "ory_hydra_device_csrf=csrf-value; Path=/; HttpOnly"
+                    .parse()
+                    .unwrap(),
+            );
+            (axum::http::StatusCode::FOUND, headers)
+        }
+
+        let app = Router::new().route("/oauth2/device/verify", get(verify_redirect));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .get_device_verify(
+                vec![("user_code".to_string(), "ABCD-EFGH".to_string())],
+                Some("ory_hydra_device_csrf=csrf-value"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            OryClientError::Redirect {
+                location,
+                set_cookies,
+            } => {
+                assert!(location.contains("device_challenge=challenge-1"));
+                assert_eq!(set_cookies.len(), 1);
+                assert!(set_cookies[0].starts_with("ory_hydra_device_csrf="));
+            }
+            other => panic!("expected redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_device_verify_error() {
+        let app = Router::new().route("/oauth2/device/verify", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.get_device_verify(vec![], None).await.unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn accept_device_verification_round_trip() {
+        async fn accept(
+            Query(params): Query<HashMap<String, String>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            assert_eq!(
+                params.get("device_challenge").map(String::as_str),
+                Some("challenge-1")
+            );
+            assert_eq!(body["user_code"], "ABCD-EFGH");
+            Json(json!({
+                "redirect_to": "https://gateway.example.com/oauth2/device/verify?device_verifier=v1&client_id=ory-client",
+            }))
+        }
+
+        let app = Router::new().route("/admin/oauth2/auth/requests/device/accept", put(accept));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let resp = client
+            .accept_device_verification("challenge-1", "ABCD-EFGH")
+            .await
+            .unwrap();
+        assert!(
+            resp["redirect_to"]
+                .as_str()
+                .unwrap()
+                .contains("device_verifier=v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_device_verification_error() {
+        let app = Router::new().route(
+            "/admin/oauth2/auth/requests/device/accept",
+            put(error_handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            HydraClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client
+            .accept_device_verification("challenge-1", "ABCD-EFGH")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 
     #[tokio::test]

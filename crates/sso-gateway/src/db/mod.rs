@@ -63,10 +63,10 @@ pub use tenant::{PgTenantStore, TenantRow, TenantStore};
 pub use tenant_membership::{PgTenantMembershipStore, TenantMembershipRow, TenantMembershipStore};
 pub use token_cache::{PgTokenIntrospectionCache, TokenIntrospectionCache, TokenIntrospectionRow};
 pub use transient_token::{
-    PgTransientTokenStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
-    TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
-    TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
-    TransientTokenRow, TransientTokenStore,
+    PgTransientTokenStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_DEVICE_CHALLENGE,
+    TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE,
+    TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+    TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRow, TransientTokenStore,
 };
 
 // Backward-compatible concrete repo aliases.

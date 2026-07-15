@@ -14,6 +14,7 @@ pub const TOKEN_TYPE_VERIFICATION_TOKEN: &str = "verification_token";
 pub const TOKEN_TYPE_CONSENT_CHALLENGE: &str = "consent_challenge";
 pub const TOKEN_TYPE_LOGIN_CHALLENGE: &str = "login_challenge";
 pub const TOKEN_TYPE_LOGOUT_CHALLENGE: &str = "logout_challenge";
+pub const TOKEN_TYPE_DEVICE_CHALLENGE: &str = "device_challenge";
 
 #[derive(Debug, Clone)]
 pub struct TransientTokenRow {

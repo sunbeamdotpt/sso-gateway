@@ -301,6 +301,7 @@ pub async fn build_app_with_upstream(
     let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
+        transient.clone(),
     ));
 
     let federation_service = Arc::new(FederationServiceImpl::new(

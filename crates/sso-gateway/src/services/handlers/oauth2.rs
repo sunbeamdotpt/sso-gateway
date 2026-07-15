@@ -43,6 +43,11 @@ pub trait HydraOperations: Send + Sync + 'static {
         form: Vec<(String, String)>,
         client_credentials: Option<(String, String)>,
     ) -> Result<serde_json::Value, OryClientError>;
+    async fn get_device_verify(
+        &self,
+        query: Vec<(String, String)>,
+        cookie: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError>;
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError>;
@@ -85,6 +90,14 @@ impl HydraOperations for HydraClient {
             .as_ref()
             .map(|(id, secret)| (id.as_str(), secret.as_str()));
         self.device(path, form, creds).await
+    }
+
+    async fn get_device_verify(
+        &self,
+        query: Vec<(String, String)>,
+        cookie: Option<&str>,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.get_device_verify(query, cookie).await
     }
 
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError> {
@@ -149,6 +162,7 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth2/auth", get(authorize))
         .route("/oauth2/token", post(token))
+        .route("/oauth2/device/verify", get(device_verify))
         .route("/oauth2/device/{*path}", post(device))
         .route("/oauth2/userinfo", get(userinfo))
         .route("/userinfo", get(userinfo))
@@ -352,6 +366,71 @@ async fn device(
         .await
     {
         Ok(value) => json_response(value),
+        Err(err) => map_ory_error(err),
+    }
+}
+
+async fn device_verify(
+    State(state): State<Arc<Oauth2State>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Hydra's device CSRF cookie must reach Hydra on the post-accept
+    // verification leg, or Hydra rejects the request. HTTP/2 clients may split
+    // cookies across multiple Cookie header fields (RFC 7540 §8.1.2.5), so
+    // reassemble them with "; " before forwarding.
+    let joined = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let cookie = if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    };
+
+    // The post-accept leg carries the gateway's public client id; translate it
+    // back before forwarding. The initial user-code leg has no client_id.
+    let mut query = Vec::with_capacity(params.len());
+    for (k, v) in params {
+        if k == "client_id" {
+            let ory_id = match resolve_public_client(&state, &v).await {
+                Ok(id) => id,
+                Err(err) => return *err,
+            };
+            query.push((k, ory_id));
+        } else {
+            query.push((k, v));
+        }
+    }
+
+    match state
+        .hydra
+        .get_device_verify(query, cookie.as_deref())
+        .await
+    {
+        Ok(value) => json_response(value),
+        Err(OryClientError::Redirect {
+            location,
+            set_cookies,
+        }) => {
+            if location.is_empty() {
+                return internal_error();
+            }
+            let Ok(location) = axum::http::HeaderValue::try_from(location) else {
+                return internal_error();
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::LOCATION, location);
+            for cookie in set_cookies {
+                if let Ok(value) = axum::http::HeaderValue::try_from(cookie) {
+                    headers.append(axum::http::header::SET_COOKIE, value);
+                }
+            }
+            (StatusCode::FOUND, headers, String::new()).into_response()
+        }
         Err(err) => map_ory_error(err),
     }
 }
@@ -746,6 +825,14 @@ mod tests {
             _cookie: Option<&str>,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub authorize not configured")
+        }
+
+        async fn get_device_verify(
+            &self,
+            _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!("stub get_device_verify not configured")
         }
 
         async fn token(
@@ -1207,6 +1294,14 @@ mod tests {
             Ok(self.response.clone())
         }
 
+        async fn get_device_verify(
+            &self,
+            _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(self.response.clone())
+        }
+
         async fn token(
             &self,
             _form: Vec<(String, String)>,
@@ -1274,6 +1369,19 @@ mod tests {
     #[async_trait]
     impl HydraOperations for RecordingHydra {
         async fn authorize(
+            &self,
+            query: Vec<(String, String)>,
+            cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.authorize_calls.lock().unwrap().push(query);
+            self.authorize_cookies
+                .lock()
+                .unwrap()
+                .push(cookie.map(str::to_owned));
+            Ok(self.response.clone())
+        }
+
+        async fn get_device_verify(
             &self,
             query: Vec<(String, String)>,
             cookie: Option<&str>,
@@ -1395,6 +1503,17 @@ mod tests {
     #[async_trait]
     impl HydraOperations for RedirectHydra {
         async fn authorize(
+            &self,
+            _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(OryClientError::Redirect {
+                location: self.location.clone(),
+                set_cookies: self.set_cookies.clone(),
+            })
+        }
+
+        async fn get_device_verify(
             &self,
             _query: Vec<(String, String)>,
             _cookie: Option<&str>,
@@ -1561,6 +1680,118 @@ mod tests {
             cookies[0].as_deref(),
             Some("ory_hydra_login_csrf=login-csrf; oauth2_authentication_csrf=consent-csrf")
         );
+    }
+
+    #[tokio::test]
+    async fn device_verify_forwards_set_cookie_on_redirect() {
+        let state = Arc::new(redirect_state(
+            "https://gateway.example.com/device?device_challenge=abc&user_code=ABCD-EFGH"
+                .to_string(),
+            vec!["ory_hydra_device_csrf=a; Path=/; HttpOnly".to_string()],
+        ));
+        let params = HashMap::from([("user_code".to_string(), "ABCD-EFGH".to_string())]);
+        let resp = device_verify(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://gateway.example.com/device?device_challenge=abc&user_code=ABCD-EFGH")
+        );
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .collect();
+        assert_eq!(cookies.len(), 1);
+    }
+
+    /// The browser's `Cookie` header must reach Hydra on `/oauth2/device/verify`
+    /// or Hydra rejects the post-accept leg with a CSRF error.
+    #[tokio::test]
+    async fn device_verify_forwards_browser_cookie_to_hydra() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("user_code".to_string(), "ABCD-EFGH".to_string())]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("ory_hydra_device_csrf=device-csrf"),
+        );
+        let _ = device_verify(State(state), headers, Query(params))
+            .await
+            .into_response();
+        let cookies = hydra.authorize_cookies.lock().unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0].as_deref(),
+            Some("ory_hydra_device_csrf=device-csrf")
+        );
+    }
+
+    /// Same RFC 7540 §8.1.2.5 split-cookie hazard as `/oauth2/auth`: all Cookie
+    /// fields must reach Hydra reassembled with "; ".
+    #[tokio::test]
+    async fn device_verify_joins_split_cookie_headers() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("user_code".to_string(), "ABCD-EFGH".to_string())]);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("ory_hydra_device_csrf=device-csrf"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("ory_kratos_session=session"),
+        );
+        let _ = device_verify(State(state), headers, Query(params))
+            .await
+            .into_response();
+        let cookies = hydra.authorize_cookies.lock().unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0].as_deref(),
+            Some("ory_hydra_device_csrf=device-csrf; ory_kratos_session=session")
+        );
+    }
+
+    /// The post-accept leg carries the gateway's public client id; it must be
+    /// translated back to the Hydra client id before forwarding.
+    #[tokio::test]
+    async fn device_verify_replaces_client_id_with_ory_id() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("user_code".to_string(), "ABCD-EFGH".to_string()),
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+        ]);
+        let _ = device_verify(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .iter()
+                .find(|(k, _)| k == "client_id")
+                .map(|(_, v)| v),
+            Some(&"hydra-client-id-1".to_string())
+        );
+        assert!(
+            calls[0]
+                .iter()
+                .any(|(k, v)| k == "user_code" && v == "ABCD-EFGH")
+        );
+    }
+
+    #[tokio::test]
+    async fn device_verify_returns_bad_gateway_on_hydra_error() {
+        let state = Arc::new(err_state(Some("tenant-1".to_string())));
+        let params = HashMap::from([("user_code".to_string(), "ABCD-EFGH".to_string())]);
+        let resp = device_verify(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1872,6 +2103,14 @@ mod tests {
     #[async_trait]
     impl HydraOperations for AlwaysErrHydra {
         async fn authorize(
+            &self,
+            _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
+        async fn get_device_verify(
             &self,
             _query: Vec<(String, String)>,
             _cookie: Option<&str>,
@@ -2405,6 +2644,13 @@ mod tests {
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!()
         }
+        async fn get_device_verify(
+            &self,
+            _query: Vec<(String, String)>,
+            _cookie: Option<&str>,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
         async fn token(
             &self,
             _form: Vec<(String, String)>,
@@ -2557,6 +2803,13 @@ mod tests {
         #[async_trait]
         impl HydraOperations for BadUrlHydra {
             async fn authorize(
+                &self,
+                _query: Vec<(String, String)>,
+                _cookie: Option<&str>,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn get_device_verify(
                 &self,
                 _query: Vec<(String, String)>,
                 _cookie: Option<&str>,

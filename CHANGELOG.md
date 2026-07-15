@@ -7,6 +7,27 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Added
+
+- Device verification for the OAuth 2.0 Device Authorization Grant (RFC 8628).
+  Two new `OAuth2DeviceService` RPCs cover the user side of the flow:
+  `GetDeviceVerification` exchanges the device-displayed user code for an
+  opaque gateway challenge (relaying Hydra's device CSRF cookie to the
+  caller), and `AcceptDeviceVerification` approves the code and returns the
+  URL the browser must follow, with the embedded client id scrubbed back to
+  the gateway's public ULID. A browser-facing `GET /oauth2/device/verify`
+  proxy route forwards the post-accept verifier leg to Hydra, translating the
+  public client id and reassembling split `Cookie` header fields so Hydra's
+  device CSRF check passes.
+
+### Fixed
+
+- `OAuth2DeviceService.GetDeviceToken` polled `/oauth2/device/token`, a route
+  that does not exist in Hydra — every poll returned 404. RFC 8628 §3.4
+  polls the standard token endpoint with the
+  `urn:ietf:params:oauth:grant-type:device_code` grant; the RPC now posts to
+  `/oauth2/token`.
+
 ### Changed
 
 - Updated `sunbeam-g2v` from 0.3.3 to 0.5.2. The framework's `jwt` and `keto`
