@@ -64,6 +64,41 @@ All configuration is read from environment variables.
 | `PUBLIC_RATE_LIMIT_REQUESTS` | `100` | Maximum number of requests allowed per public IP in the rate-limit window. |
 | `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Duration of the rate-limit window in seconds. |
 
+## Branded self-service paths
+
+The gateway owns the browser-facing self-service namespace: every Kratos URL
+that can reach an address bar, redirect chain, or inbox (flow init redirects,
+AAL2 upgrades, logout chains, email token links, OIDC callbacks, the WebAuthn
+script) is rewritten onto these paths, and the configured paths are proxied to
+Kratos. Each path is independently configurable so a deployment can shape its
+own URL namespace.
+
+| Variable | Default | Proxied upstream route |
+|---|---|---|
+| `SELF_SERVICE_LOGIN_PATH` | `/identity/login` | `/self-service/login/browser` |
+| `SELF_SERVICE_REGISTRATION_PATH` | `/identity/registration` | `/self-service/registration/browser` |
+| `SELF_SERVICE_SETTINGS_PATH` | `/identity/settings` | `/self-service/settings/browser` |
+| `SELF_SERVICE_RECOVERY_PATH` | `/identity/recovery` | `/self-service/recovery/browser` |
+| `SELF_SERVICE_VERIFICATION_PATH` | `/identity/verification` | `/self-service/verification/browser` |
+| `SELF_SERVICE_LOGOUT_PATH` | `/identity/logout` | `/self-service/logout/browser` |
+| `SELF_SERVICE_ERRORS_PATH` | `/identity/errors` | `/self-service/errors` |
+| `SELF_SERVICE_OIDC_CALLBACK_PATH` | `/identity/oidc/callback` | `/self-service/methods/oidc/callback/{provider}` |
+| `SELF_SERVICE_WEBAUTHN_JS_PATH` | `/identity/webauthn.js` | `/.well-known/ory/webauthn.js` |
+
+Constraints (validated at startup): each value must be an absolute path below
+the root with no trailing slash, query, or fragment; all nine must be
+distinct; none may shadow a reserved gateway prefix (`/oauth2`, `/saml`,
+`/scim`, `/callbacks`, `/iam`, `/.well-known`, `/health`, `/self-service`);
+and no other path may live underneath the OIDC callback path.
+
+For recovery/verification email links, point Kratos' `serve.public.base_url`
+at `PUBLIC_BASE_URL`: Kratos emits the links with its own path shape
+(`/self-service/recovery?token=…`), and the gateway bounces them to the
+branded path with a 302 without consuming the token. The bundled
+`deploy/kratos.yml` is configured this way and also renames the Kratos session
+cookie to `sunbeam_session` (`session.cookie.name`); the gateway treats the
+cookie as opaque, so the rename is safe.
+
 ## Default identity schema
 
 Kratos must expose one base identity schema at the id configured in

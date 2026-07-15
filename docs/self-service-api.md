@@ -245,20 +245,49 @@ extracted from the upstream link's query parameters. Callers can pass
 
 ## Public self-service proxy
 
-The general `/self-service/{*path}` HTTP proxy has been removed. Self-service
-flows are now handled entirely through `IdentitySelfService` Connect-RPC methods,
-and magic-link URLs point directly at the UI via `UI_PUBLIC_URL`.
+Self-service flows are handled through `IdentitySelfService` Connect-RPC
+methods, and magic-link URLs point directly at the UI via `UI_PUBLIC_URL`. In
+addition, the gateway exposes a **branded browser surface**: the small set of
+routes a browser may be sent to by a Kratos-emitted URL (flow init redirects,
+AAL2 upgrades, logout chains, OIDC callbacks, the WebAuthn script). Every
+Kratos URL that can reach an address bar or an inbox is rewritten onto these
+paths so no upstream construct leaks to end users.
 
-The only remaining plain-HTTP Kratos proxy endpoint is the WebAuthn JavaScript
-bundle:
-
-| Path | Upstream |
+| Gateway path (default) | Upstream Kratos route |
 |---|---|
-| `/.well-known/ory/webauthn.js` | `kratos-public-url/.well-known/ory/webauthn.js` |
+| `/identity/login` | `/self-service/login/browser` |
+| `/identity/registration` | `/self-service/registration/browser` |
+| `/identity/settings` | `/self-service/settings/browser` |
+| `/identity/recovery` | `/self-service/recovery/browser` |
+| `/identity/verification` | `/self-service/verification/browser` |
+| `/identity/logout` | `/self-service/logout/browser` |
+| `/identity/errors` | `/self-service/errors` |
+| `/identity/oidc/callback/{provider}` | `/self-service/methods/oidc/callback/{provider}` |
+| `/identity/webauthn.js` | `/.well-known/ory/webauthn.js` |
 
-The proxy forwards method and cookies, strips hop-by-hop headers, and returns
-the upstream JavaScript body unchanged. The browser should fetch this bundle from
-the gateway rather than from Kratos directly.
+Each path is independently configurable with the `SELF_SERVICE_*_PATH`
+environment variables (see [configuration](configuration.md#branded-self-service-paths)),
+so a deployment can shape its own URL namespace.
+
+Behavior notes:
+
+- Token-bearing links (recovery/verification emails, logout) carry `?token=…`;
+  the proxy forwards those to the Kratos token-submission route instead of the
+  flow-init route.
+- Redirect (`Location`) responses from Kratos are rewritten onto the branded
+  surface, including URLs nested in `return_to` / `redirect_uri` parameters.
+- Email links are emitted by Kratos in its own path shape regardless of
+  configuration (`{base_url}/self-service/recovery?token=…`). Point Kratos'
+  `serve.public.base_url` at the gateway and the gateway bounces those links
+  to the branded path with a 302 — the token is not consumed by the redirect.
+- These routes skip bearer-token authentication; they carry the Kratos session
+  and CSRF cookies instead. The proxy forwards method, query, body, and
+  cookies, and preserves every upstream `Set-Cookie`.
+
+The browser should fetch the WebAuthn bundle from the configured gateway path
+rather than from Kratos directly. The gateway previously served it at
+`/.well-known/ory/webauthn.js`; that route has been replaced by the branded
+`SELF_SERVICE_WEBAUTHN_JS_PATH` (default `/identity/webauthn.js`).
 
 ## Cookie handling
 
@@ -270,7 +299,7 @@ returned through the gateway's Connect-RPC response metadata.
 Typical metadata for a browser call:
 
 ```text
-cookie: ory_kratos_session=...; csrf_token_...=...
+cookie: sunbeam_session=...; csrf_token_...=...
 ```
 
 For form submissions that require CSRF protection, also forward the

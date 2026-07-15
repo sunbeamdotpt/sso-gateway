@@ -77,6 +77,36 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
     client-credentials tokens are rejected at authentication.
   - `agents`, `agent_delegations`, and `agent_act_tokens` tables (cascading
     deletes; act-tokens stored as hashes only).
+- Branded browser self-service surface. Every Kratos URL that can reach a
+  browser (flow init redirects, AAL2 upgrades, logout chains, email token
+  links, OIDC callbacks, the WebAuthn script) is rewritten onto gateway-owned
+  paths, so no upstream construct leaks into an address bar, redirect chain,
+  or inbox:
+  - The gateway proxies the browser routes at nine independently configurable
+    paths (`SELF_SERVICE_LOGIN_PATH`, `SELF_SERVICE_REGISTRATION_PATH`,
+    `SELF_SERVICE_SETTINGS_PATH`, `SELF_SERVICE_RECOVERY_PATH`,
+    `SELF_SERVICE_VERIFICATION_PATH`, `SELF_SERVICE_LOGOUT_PATH`,
+    `SELF_SERVICE_ERRORS_PATH`, `SELF_SERVICE_OIDC_CALLBACK_PATH`,
+    `SELF_SERVICE_WEBAUTHN_JS_PATH`; defaults under `/identity/…`). Token-
+    bearing links dispatch to the Kratos token-submission routes; redirect
+    (`Location`) responses are rewritten onto the branded surface, including
+    URLs nested in `return_to` / `redirect_uri` parameters.
+  - Branded routes skip bearer-token authentication (they carry Kratos session
+    and CSRF cookies) and are proxied with method, query, body, and cookies
+    preserved, including repeated `Set-Cookie` headers.
+  - With Kratos `serve.public.base_url` pointed at the gateway, recovery and
+    verification email links land on `/self-service/{recovery,verification}`
+    shims that bounce the browser to the branded path (302) without consuming
+    the token.
+  - `deploy/kratos.yml` points Kratos' public base URL at the gateway and
+    renames the session cookie to `sunbeam_session`
+    (`session.cookie.name`).
+
+### Changed
+
+- The WebAuthn JavaScript bundle is now served at the branded
+  `SELF_SERVICE_WEBAUTHN_JS_PATH` (default `/identity/webauthn.js`) instead of
+  `/.well-known/ory/webauthn.js`.
 
 ### Fixed
 
@@ -91,6 +121,15 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   and returns Hydra's `redirect_to` as `redirect_browser_to`. When `skip` is
   unset, the session is missing, or the login request cannot be fetched, flow
   creation proceeds through Kratos exactly as before.
+- Self-service submits that end in Kratos' `browser_location_change_required`
+  (AAL2 upgrades, post-login bounces) returned the Kratos-hosted URL verbatim
+  in `redirect_browser_to`, leaking the upstream endpoint and path shape to
+  browsers. The location is now rewritten onto the branded surface and its raw
+  Kratos flow id is scrubbed, matching every other gateway-facing URL.
+  Recovery and verification token exchange responses
+  (`SubmitRecoveryTokenResponse.redirect_to`,
+  `SubmitVerificationTokenResponse.redirect_to`) and `LogoutFlow.logout_url`
+  are branded the same way.
 
 ## [2026.07.14] - 2026-07-15
 
