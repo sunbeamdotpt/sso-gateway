@@ -35,6 +35,12 @@ via Hydra and the tenant is resolved from the token subject.
 | `ListIdentities` | List identities for the tenant. |
 | `UpdateIdentity` | Update an identity. |
 | `DeleteIdentity` | Delete an identity. |
+| `CreateIdentitySchema` | Create a versioned tenant identity schema. |
+| `GetIdentitySchema` | Get a tenant identity schema. |
+| `ListIdentitySchemas` | List tenant identity schemas. |
+| `UpdateIdentitySchema` | Update a tenant identity schema. |
+| `DeleteIdentitySchema` | Delete a tenant identity schema. |
+| `SetDefaultIdentitySchema` | Set the tenant's default identity schema. |
 | `CreateLoginFlow` | Start a Kratos login flow. |
 | `CreateRegistrationFlow` | Start a Kratos registration flow. |
 | `GetSession` | Get a session by gateway ID. |
@@ -102,6 +108,9 @@ Protected by `application:read` / `application:admin`.
 | `DeleteUser` | SCIM delete user. |
 | `ListGroups` | SCIM list groups. |
 | `GetGroup` | SCIM get group. |
+| `CreateGroup` | SCIM create group. |
+| `UpdateGroup` | SCIM update group. |
+| `DeleteGroup` | SCIM delete group. |
 
 ### `iam.v1.IdentitySelfService`
 
@@ -154,6 +163,8 @@ OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
 |---|---|
 | `AuthorizeDevice` | Initiate a device authorization request. |
 | `GetDeviceToken` | Poll for tokens using the device code. |
+| `GetDeviceVerification` | Exchange the user code for a device verification challenge. |
+| `AcceptDeviceVerification` | Approve the user code and return the browser continuation URL. |
 
 ## Protocol endpoints
 
@@ -163,10 +174,12 @@ OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
 | `GET /.well-known/jwks.json` | Public signing keys | Public |
 | `GET /oauth2/auth` | Authorization endpoint | Public (client_id must be registered) |
 | `POST /oauth2/token` | Token endpoint | Public (client credentials) |
+| `POST /oauth2/register` | Dynamic client registration | Public |
 | `GET /oauth2/userinfo` | Userinfo endpoint | Bearer token |
 | `POST /oauth2/introspect` | Token introspection | Public (forwards to Hydra) |
 | `POST /oauth2/revoke` | Token revocation | Public (client credentials) |
-| `GET /oauth2/device/{*path}` | Device authorization grant proxy | Public (forwards to Hydra) |
+| `GET /oauth2/device/verify` | Device verification proxy (user confirmation leg) | Public (forwards to Hydra) |
+| `POST /oauth2/device/{*path}` | Device authorization grant proxy | Public (forwards to Hydra) |
 | `GET /.well-known/ory/webauthn.js` | Kratos WebAuthn JS bundle | Public (forwards to Kratos) |
 | `GET /callbacks/oidc` | OIDC upstream IdP callback | Public (OIDC callback state) |
 | `GET /callbacks/oauth2` | OAuth2 upstream IdP callback | Public (OAuth2 callback state) |
