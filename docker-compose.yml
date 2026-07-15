@@ -121,6 +121,7 @@ services:
       HYDRA_PUBLIC_URL: http://hydra:4444
       KRATOS_ADMIN_URL: http://kratos:4434
       KRATOS_PUBLIC_URL: http://kratos:4433
+      PUBLIC_BASE_URL: http://localhost:8080
       KETO_READ_URL: http://keto:4466
       KETO_WRITE_URL: http://keto:4467
       KETO_GRPC_URL: http://keto:4469

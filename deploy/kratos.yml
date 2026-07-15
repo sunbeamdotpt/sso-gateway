@@ -4,13 +4,21 @@ dsn: memory
 
 serve:
   public:
-    base_url: http://localhost:4433/
+    # Browsers only ever talk to the gateway; Kratos emits its browser-facing
+    # URLs (email links, redirect targets) with this host, and the gateway
+    # rewrites the paths onto its branded self-service surface.
+    base_url: http://localhost:8080/
     host: 0.0.0.0
     port: 4433
   admin:
     base_url: http://localhost:4434/
     host: 0.0.0.0
     port: 4434
+
+session:
+  cookie:
+    # Branded session cookie; the gateway treats it as opaque.
+    name: sunbeam_session
 
 selfservice:
   default_browser_return_url: http://localhost:8080/
