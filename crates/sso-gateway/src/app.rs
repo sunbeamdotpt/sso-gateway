@@ -7,23 +7,28 @@ use crate::services::permission::PermissionBackend;
 use crate::services::permission::OpenFgaPermissionBackend;
 use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
+    agent_tokens::{
+        AgentInvalidator, AgentTokenAuthority, AgentTokenResolver, run_invalidation_subscriber,
+    },
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionNamespaceRepo,
-        PermissionTupleRepo, PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo,
-        SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo,
-        TenantConnectionRepo, TenantDomainRepo, TenantMembershipRepo, TenantRepo,
-        TransientTokenRepo, bootstrap_system_tenant, create_pool,
+        AgentActTokenRepo, AgentDelegationRepo, AgentRepo, DbPool, IdMappingRepo,
+        IdentitySchemaRepo, LoginStateRepo, PermissionNamespaceRepo, PermissionTupleRepo,
+        PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
+        SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
+        TenantDomainRepo, TenantMembershipRepo, TenantRepo, TransientTokenRepo,
+        bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
     proto::iam::v1::{
-        ApplicationServiceExt, ClientCredentialServiceExt, FederationServiceExt,
+        AgentServiceExt, ApplicationServiceExt, ClientCredentialServiceExt, FederationServiceExt,
         IdentitySelfServiceExt, IdentityServiceExt, OAuth2ConsentServiceExt,
         OAuth2DeviceServiceExt, PermissionServiceExt, ScimServiceExt, TenantServiceExt,
     },
     services::{
+        agent::AgentServiceImpl,
         application::ApplicationServiceImpl,
         client_credential::ClientCredentialServiceImpl,
         federation::FederationServiceImpl,
@@ -60,8 +65,10 @@ use sso_openfga_client::OpenFgaClient;
 use sso_ory_client::KetoClient;
 use sso_ory_client::{HydraClient, KratosClient, error::OryClientError};
 use sunbeam_g2v::{
+    config::NatsConfig,
     error::ServiceResult,
     health::HealthRouter,
+    mq::NatsClient,
     router::ServiceRouter,
     server::{ServerConfig, builder::ServerBuilder},
 };
@@ -175,6 +182,11 @@ pub async fn build_app_with_upstream(
     let login_state = LoginStateRepo::new(pool.clone());
     let transient = TransientTokenRepo::new(pool.clone());
     let memberships = TenantMembershipRepo::new(pool.clone());
+    let agents: Arc<dyn crate::db::AgentStore> = Arc::new(AgentRepo::new(pool.clone()));
+    let agent_delegations: Arc<dyn crate::db::AgentDelegationStore> =
+        Arc::new(AgentDelegationRepo::new(pool.clone()));
+    let agent_act_tokens: Arc<dyn crate::db::AgentActTokenStore> =
+        Arc::new(AgentActTokenRepo::new(pool.clone()));
 
     // Keep trait-object handles for the public callback handlers; the concrete
     // repos are moved into FederationServiceImpl below.
@@ -305,6 +317,48 @@ pub async fn build_app_with_upstream(
         transient.clone(),
     ));
 
+    // Cross-replica act-token cache invalidation rides core NATS pub/sub.
+    // NATS is optional: without it the token authority degrades to
+    // single-instance revocation semantics, so a failed connect is a warning,
+    // not a startup error.
+    let nats = match config.nats_url.as_deref() {
+        Some(url) => match NatsClient::connect(&NatsConfig {
+            url: url.to_string(),
+            jetstream: false,
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(client) => Some(client),
+            Err(err) => {
+                tracing::warn!(%err, "NATS_URL is set but the connection failed; agent cache invalidation will be local-only");
+                None
+            }
+        },
+        None => None,
+    };
+    let agent_authority = Arc::new(AgentTokenAuthority::new(
+        agent_act_tokens,
+        agent_delegations.clone(),
+        agents.clone(),
+        AgentInvalidator::new(nats.clone()),
+        std::time::Duration::from_secs(config.agent_cache_ttl_seconds),
+        time::Duration::seconds(config.agent_act_token_ttl_seconds as i64),
+    ));
+    if let Some(nats) = nats {
+        tokio::spawn(run_invalidation_subscriber(nats, agent_authority.clone()));
+    }
+    let agent_resolver: Arc<dyn AgentTokenResolver> = agent_authority.clone();
+
+    let agent_service = Arc::new(AgentServiceImpl::new(
+        hydra.clone(),
+        Arc::new(mappings.clone()),
+        agents,
+        agent_delegations,
+        Arc::new(memberships.clone()),
+        agent_authority,
+    ));
+
     let federation_service = Arc::new(FederationServiceImpl::new(
         kratos.clone(),
         providers,
@@ -364,6 +418,7 @@ pub async fn build_app_with_upstream(
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
     let connect_router: ConnectRouter = client_credential_service.register(connect_router);
+    let connect_router: ConnectRouter = agent_service.register(connect_router);
     let connect_router: ConnectRouter = identity_service.register(connect_router);
     let connect_router: ConnectRouter = permission_service.register(connect_router);
     let connect_router: ConnectRouter = scim_service.register(connect_router);
@@ -406,6 +461,7 @@ pub async fn build_app_with_upstream(
         .layer(from_fn(audit_middleware))
         .layer(from_fn(auth_middleware))
         .layer(Extension(introspector))
+        .layer(Extension(agent_resolver))
         .layer(Extension(session_signer))
         .layer(Extension(session_store))
         .layer(Extension(
@@ -420,7 +476,7 @@ pub async fn build_app_with_upstream(
 /// provision tenants, identities, applications, SCIM resources, and permission
 /// tuples without requiring a second client.
 const BOOTSTRAP_CLIENT_SCOPE: &str = "tenant:read tenant:admin identity:read identity:admin application:read application:admin \
-     scim:read scim:admin permission:read permission:admin";
+     scim:read scim:admin permission:read permission:admin agent:read agent:admin";
 
 async fn bootstrap_system_client(
     hydra: &HydraClient,
@@ -605,6 +661,9 @@ mod tests {
             database_statement_timeout_seconds: 5,
             token_introspection_cache_ttl_seconds: 30,
             session_ttl_seconds: 86400,
+            nats_url: None,
+            agent_act_token_ttl_seconds: 3600,
+            agent_cache_ttl_seconds: 5,
             public_rate_limit_requests: 100,
             public_rate_limit_window_seconds: 60,
         }
@@ -625,6 +684,8 @@ mod tests {
             "scim:admin",
             "permission:read",
             "permission:admin",
+            "agent:read",
+            "agent:admin",
         ] {
             assert!(scopes.contains(scope), "missing bootstrap scope {scope}");
         }

@@ -103,6 +103,9 @@ impl Gateway {
             database_statement_timeout_seconds: 30,
             token_introspection_cache_ttl_seconds: 30,
             session_ttl_seconds: 86400,
+            nats_url: None,
+            agent_act_token_ttl_seconds: 3600,
+            agent_cache_ttl_seconds: 5,
             public_rate_limit_requests: 100,
             public_rate_limit_window_seconds: 60,
         };

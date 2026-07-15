@@ -41,6 +41,9 @@ pub struct Config {
     pub database_statement_timeout_seconds: u64,
     pub token_introspection_cache_ttl_seconds: u64,
     pub session_ttl_seconds: u64,
+    pub nats_url: Option<String>,
+    pub agent_act_token_ttl_seconds: u64,
+    pub agent_cache_ttl_seconds: u64,
     pub public_rate_limit_requests: u32,
     pub public_rate_limit_window_seconds: u64,
 }
@@ -127,6 +130,12 @@ impl std::fmt::Debug for Config {
                 &self.token_introspection_cache_ttl_seconds,
             )
             .field("session_ttl_seconds", &self.session_ttl_seconds)
+            .field("nats_url", &self.nats_url.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "agent_act_token_ttl_seconds",
+                &self.agent_act_token_ttl_seconds,
+            )
+            .field("agent_cache_ttl_seconds", &self.agent_cache_ttl_seconds)
             .field(
                 "public_rate_limit_requests",
                 &self.public_rate_limit_requests,
@@ -378,6 +387,15 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(86400),
+            nats_url: std::env::var("NATS_URL").ok(),
+            agent_act_token_ttl_seconds: std::env::var("AGENT_ACT_TOKEN_TTL_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600),
+            agent_cache_ttl_seconds: std::env::var("AGENT_CACHE_TTL_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5),
             public_rate_limit_requests: std::env::var("PUBLIC_RATE_LIMIT_REQUESTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -509,6 +527,9 @@ mod tests {
         clear_env("DATABASE_STATEMENT_TIMEOUT_SECONDS");
         clear_env("TOKEN_INTROSPECTION_CACHE_TTL_SECONDS");
         clear_env("SESSION_TTL_SECONDS");
+        clear_env("NATS_URL");
+        clear_env("AGENT_ACT_TOKEN_TTL_SECONDS");
+        clear_env("AGENT_CACHE_TTL_SECONDS");
         clear_env("PUBLIC_RATE_LIMIT_REQUESTS");
         clear_env("PUBLIC_RATE_LIMIT_WINDOW_SECONDS");
         clear_env("UI_PUBLIC_URL");
@@ -556,6 +577,9 @@ mod tests {
         assert_eq!(config.saml_idp_entity_id, None);
         assert_eq!(config.saml_request_ttl_seconds, 900);
         assert_eq!(config.session_ttl_seconds, 86400);
+        assert_eq!(config.nats_url, None);
+        assert_eq!(config.agent_act_token_ttl_seconds, 3600);
+        assert_eq!(config.agent_cache_ttl_seconds, 5);
         assert_eq!(config.public_rate_limit_requests, 100);
         assert_eq!(config.public_rate_limit_window_seconds, 60);
         assert!(config.saml_require_signed_assertions);
@@ -826,6 +850,35 @@ mod tests {
             config.allowed_return_to_hosts,
             vec!["gateway.example.com".to_string()]
         );
+    }
+
+    #[test]
+    fn config_agent_settings_parse_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("NATS_URL", "nats://user:secret@nats:4222");
+        set_env("AGENT_ACT_TOKEN_TTL_SECONDS", "900");
+        set_env("AGENT_CACHE_TTL_SECONDS", "2");
+
+        let config = Config::from_env().expect("config should parse");
+        let debug = format!("{config:?}");
+        drop(_guard);
+        assert_eq!(
+            config.nats_url,
+            Some("nats://user:secret@nats:4222".to_string())
+        );
+        assert_eq!(config.agent_act_token_ttl_seconds, 900);
+        assert_eq!(config.agent_cache_ttl_seconds, 2);
+        assert!(!debug.contains("nats://user:secret"), "nats url is redacted");
     }
 
     #[test]
