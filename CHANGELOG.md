@@ -7,6 +7,17 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Changed
+
+- Updated `sunbeam-g2v` from 0.3.3 to 0.5.2. The framework's `jwt` and `keto`
+  features were removed upstream (the gateway used neither), and the `auth`
+  feature is now enabled — 0.5.2 fails to compile without it because
+  `AuthConfig::validate` references the optional `ulid` dependency
+  unconditionally. `jsonwebtoken` now pins the `aws_lc_rs` crypto provider
+  explicitly; g2v's removed `jwt` feature previously supplied a provider
+  through feature unification, and without one the OIDC callback panics at
+  runtime.
+
 ## [2026.07.13] - 2026-07-14
 
 ### Added

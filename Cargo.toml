@@ -10,16 +10,15 @@ license = "AGPL-3.0-or-later"
 authors = ["Sunbeam Engineering"]
 
 [workspace.dependencies]
-sunbeam-g2v = { version = "0.3.3", default-features = false, features = [
+sunbeam-g2v = { version = "0.5.2", default-features = false, features = [
     "axum",
+    "auth",
     "metrics",
     "tracing",
     "logging",
     "sqlx",
     "sqlx-postgres",
     "nats",
-    "jwt",
-    "keto",
     "vault",
     "tls",
 ] }
