@@ -8,8 +8,9 @@ use serde_json::json;
 use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
-        TOKEN_TYPE_LOGOUT_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN,
-        TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo, bootstrap_system_tenant, create_pool,
+        TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_VERIFICATION_TOKEN, TransientTokenRepo,
+        bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{IdentitySelfServiceExt, OAuth2ConsentServiceExt},
@@ -282,6 +283,11 @@ async fn kratos_webauthn_js() -> &'static str {
 
 fn hydra_app() -> Router {
     Router::new()
+        .route("/admin/oauth2/auth/requests/login", get(hydra_get_login))
+        .route(
+            "/admin/oauth2/auth/requests/login/accept",
+            put(hydra_accept_login),
+        )
         .route(
             "/admin/oauth2/auth/requests/consent",
             get(hydra_get_consent),
@@ -303,6 +309,28 @@ fn hydra_app() -> Router {
             "/admin/oauth2/auth/requests/logout/reject",
             put(hydra_reject_logout),
         )
+}
+
+async fn hydra_get_login(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let challenge = params.get("login_challenge").cloned().unwrap_or_default();
+    Json(json!({
+        "challenge": challenge,
+        "client": { "client_id": "client-1", "client_name": "App" },
+        "subject": "subject-1",
+        // Only the dedicated challenge reports Hydra's skip flag, mirroring a
+        // live Hydra session; anything else wants authentication.
+        "skip": challenge == "skip-challenge-1"
+    }))
+}
+
+async fn hydra_accept_login(
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "redirect_to": format!("http://redirect-after-login?subject={}", body["subject"].as_str().unwrap_or(""))
+    }))
 }
 
 async fn hydra_get_consent(
@@ -444,6 +472,14 @@ async fn self_service_and_consent_round_trip() {
         "challenge-1",
     )
     .await;
+    let pub_skip_challenge = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "hydra",
+        TOKEN_TYPE_LOGIN_CHALLENGE,
+        "skip-challenge-1",
+    )
+    .await;
     let pub_logout_challenge = seed_token(
         &transient,
         &system_tenant_ulid,
@@ -479,6 +515,7 @@ async fn self_service_and_consent_round_trip() {
 
     let self_service = Arc::new(IdentitySelfServiceImpl::new(
         kratos.clone(),
+        hydra.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
         sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
@@ -617,6 +654,61 @@ async fn self_service_and_consent_round_trip() {
             .iter()
             .any(|v| v.to_str().unwrap_or("").contains("ory_kratos_session")),
         "create_login_flow should propagate Set-Cookie headers"
+    );
+
+    // IdentitySelfService::CreateLoginFlow with a skippable Hydra login
+    // request and a live Kratos session: the gateway must accept the login
+    // with the session's subject instead of surfacing Kratos'
+    // session_already_available error.
+    let resp = client
+        .post(format!("{base}/iam.v1.IdentitySelfService/CreateLoginFlow"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .json(&json!({ "loginChallenge": &pub_skip_challenge }))
+        .send()
+        .await
+        .expect("create_login_flow (skip) request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "create_login_flow (skip) failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let body: serde_json::Value = resp.json().await.expect("skip response should be json");
+    assert_eq!(
+        body["redirectBrowserTo"].as_str().unwrap_or_default(),
+        "http://redirect-after-login?subject=identity-1",
+        "skip path should return hydra's redirect_to: {body}"
+    );
+
+    // Same call with a challenge Hydra does not skip: a normal login flow is
+    // created and Hydra is never asked to accept.
+    let resp = client
+        .post(format!("{base}/iam.v1.IdentitySelfService/CreateLoginFlow"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .json(&json!({ "loginChallenge": "raw-no-skip-challenge" }))
+        .send()
+        .await
+        .expect("create_login_flow (no skip) request should succeed");
+    assert!(
+        resp.status().is_success(),
+        "create_login_flow (no skip) failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("no-skip response should be json");
+    let flow_id = body["id"].as_str().unwrap_or_default();
+    assert!(
+        ulid::Ulid::from_string(flow_id).is_ok(),
+        "no-skip path should create a flow with a public id: {body}"
+    );
+    assert!(
+        body["redirectBrowserTo"].as_str().unwrap_or_default().is_empty(),
+        "no-skip path must not redirect: {body}"
     );
 
     // IdentitySelfService::CreateRegistrationFlow

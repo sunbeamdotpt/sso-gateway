@@ -5,6 +5,7 @@ use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use serde_json::Value;
 use sso_ory_client::{
     error::OryClientError,
+    hydra::HydraClient,
     kratos::{KratosClient, KratosResponse},
 };
 use sunbeam_g2v::error::ServiceError;
@@ -400,9 +401,39 @@ impl KratosSelfService for KratosClient {
     }
 }
 
+/// Async trait abstracting the Hydra login-request operations used by this
+/// service. Keeps the service implementation decoupled from the concrete HTTP
+/// client so unit tests can inject stubs.
+#[async_trait]
+pub trait LoginHydra: Send + Sync {
+    async fn get_login_request(&self, challenge: &str) -> Result<Value, OryClientError>;
+
+    async fn accept_login_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl LoginHydra for HydraClient {
+    async fn get_login_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+        self.get_login_request(challenge).await
+    }
+
+    async fn accept_login_request(
+        &self,
+        challenge: &str,
+        body: Value,
+    ) -> Result<Value, OryClientError> {
+        self.accept_login_request(challenge, body).await
+    }
+}
+
 #[derive(Clone)]
 pub struct IdentitySelfServiceImpl {
     kratos: Arc<dyn KratosSelfService>,
+    hydra: Arc<dyn LoginHydra>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
@@ -417,6 +448,7 @@ impl IdentitySelfServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kratos: Arc<KratosClient>,
+        hydra: Arc<HydraClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
         schemas: IdentitySchemaRepo,
@@ -428,6 +460,7 @@ impl IdentitySelfServiceImpl {
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn KratosSelfService>,
+            hydra: hydra as Arc<dyn LoginHydra>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
@@ -681,6 +714,101 @@ impl IdentitySelfServiceImpl {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Accept the Hydra login request with the caller's existing session when
+    /// Hydra reports the login may be skipped.
+    ///
+    /// Kratos' browser login route does the same server-side: with a valid
+    /// session and a `login_challenge` whose Hydra login request has `skip`
+    /// set, it accepts the login with Hydra and redirects the browser to
+    /// Hydra's `redirect_to`. On the JSON content-negotiation path, however,
+    /// Kratos discards that redirect and answers with a bare
+    /// `session_already_available` error — after having already consumed the
+    /// challenge. API callers (the login UI via this gateway) then cannot
+    /// complete the OAuth2 flow and fall back to a logout-and-retry dance.
+    /// Mirror the browser behavior here so the challenge is accepted exactly
+    /// once, with the current session's subject.
+    ///
+    /// Returns `Ok(None)` when normal Kratos flow creation should proceed: the
+    /// login request could not be fetched (Kratos surfaces the same failure
+    /// when it fetches the request itself), its `skip` flag is unset (Hydra
+    /// wants authentication; Kratos forces a refresh flow), or the caller has
+    /// no valid Kratos session to accept with.
+    async fn accept_skippable_login(
+        &self,
+        ory_challenge: &str,
+        cookie: Option<&str>,
+    ) -> Result<Option<SelfServiceFlow>, ServiceError> {
+        let login_request = match self.hydra.get_login_request(ory_challenge).await {
+            Ok(request) => request,
+            Err(err) => {
+                tracing::debug!(?err, "hydra login request fetch failed; creating kratos flow");
+                return Ok(None);
+            }
+        };
+        if !login_request
+            .get("skip")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let Some(cookie) = cookie else {
+            return Ok(None);
+        };
+        let session = match self.kratos.to_session(Some(cookie), None).await {
+            Ok(session) => session,
+            Err(_) => return Ok(None),
+        };
+        let subject = session
+            .pointer("/identity/id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if subject.is_empty() {
+            return Ok(None);
+        }
+        let amr: Vec<String> = session
+            .get("authentication_methods")
+            .and_then(Value::as_array)
+            .map(|methods| {
+                methods
+                    .iter()
+                    .filter_map(|method| {
+                        method
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut accept_body = serde_json::json!({
+            "subject": subject,
+            "amr": amr,
+        });
+        if let Some(session_id) = session.get("id").and_then(Value::as_str) {
+            accept_body["identity_provider_session_id"] = Value::String(session_id.to_string());
+        }
+        let accept = self
+            .hydra
+            .accept_login_request(ory_challenge, accept_body)
+            .await
+            .map_err(map_ory_error)?;
+        let redirect_to = accept
+            .get("redirect_to")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if redirect_to.is_empty() {
+            return Err(ServiceError::Internal(
+                "hydra accept login response missing redirect_to".into(),
+            ));
+        }
+        Ok(Some(SelfServiceFlow {
+            redirect_browser_to: redirect_to,
+            ..Default::default()
+        }))
     }
 
     /// Map a Kratos submit outcome to a public flow response.
@@ -1171,6 +1299,12 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             let ory_challenge =
                 resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
                     .await?;
+            if let Some(flow) = self
+                .accept_skippable_login(&ory_challenge, cookie.as_deref())
+                .await?
+            {
+                return Ok(Response::new(flow));
+            }
             query_owned.push(("login_challenge", ory_challenge));
         }
         if !req.identity_schema.is_empty() {
@@ -1596,7 +1730,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        BACKEND_HYDRA, BACKEND_KRATOS, IdentitySelfServiceImpl, KratosSelfService,
+        BACKEND_HYDRA, BACKEND_KRATOS, IdentitySelfServiceImpl, KratosSelfService, LoginHydra,
         cookie_from_context, csrf_token_from_context, map_ory_error, tenant_from_context,
     };
 
@@ -2024,6 +2158,50 @@ mod tests {
                 cookie, csrf_token
             ));
             self.take_token_submit()
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct FakeHydra {
+        login_request: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        accept_login: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeHydra {
+        fn record(&self, call: impl Into<String>) {
+            self.calls.lock().unwrap().push(call.into());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LoginHydra for FakeHydra {
+        async fn get_login_request(&self, challenge: &str) -> Result<Value, OryClientError> {
+            self.record(format!("get_login_request(challenge={challenge})"));
+            self.login_request
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::MissingTenant))
+        }
+
+        async fn accept_login_request(
+            &self,
+            challenge: &str,
+            body: Value,
+        ) -> Result<Value, OryClientError> {
+            self.record(format!(
+                "accept_login_request(challenge={challenge}, body={body})"
+            ));
+            self.accept_login
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::MissingTenant))
         }
     }
 
@@ -2639,8 +2817,13 @@ mod tests {
     }
 
     fn service(kratos: FakeKratos) -> IdentitySelfServiceImpl {
+        service_with_hydra(kratos, FakeHydra::default())
+    }
+
+    fn service_with_hydra(kratos: FakeKratos, hydra: FakeHydra) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
+            hydra: Arc::new(hydra),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),
@@ -2655,9 +2838,17 @@ mod tests {
     #[tokio::test]
     async fn new_stores_kratos_client() {
         let kratos = Arc::new(KratosClient::new("http://localhost:4434").unwrap());
+        let hydra = Arc::new(
+            sso_ory_client::hydra::HydraClient::new(
+                "http://localhost:4445",
+                "http://localhost:4444",
+            )
+            .unwrap(),
+        );
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
         let svc = IdentitySelfServiceImpl::new(
             kratos.clone(),
+            hydra,
             crate::db::TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool.clone()),
             crate::db::IdentitySchemaRepo::new(pool.clone()),
@@ -2721,6 +2912,7 @@ mod tests {
     async fn map_flow_response_surfaces_gateway_schema_and_hides_kratos_schema() {
         let svc = IdentitySelfServiceImpl {
             kratos: Arc::new(FakeKratos::default()),
+            hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(StubSchemaStore::with_default(IdentitySchemaRow {
@@ -2752,6 +2944,7 @@ mod tests {
     async fn map_flow_response_clears_schema_when_no_gateway_default() {
         let svc = IdentitySelfServiceImpl {
             kratos: Arc::new(FakeKratos::default()),
+            hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(StubSchemaStore::with_default_error(DbError::SchemaNotFound)),
@@ -3128,6 +3321,330 @@ mod tests {
         let err = svc.create_login_flow(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
     }
+
+    // Regression: with an existing Kratos session and a Hydra login request
+    // whose `skip` flag is set, Kratos' JSON path answers
+    // `session_already_available` after consuming the challenge and dropping
+    // Hydra's `redirect_to`, trapping the login UI in a logout-and-retry
+    // dance. The gateway must instead accept the login with the current
+    // session's subject, mirroring Kratos' browser behavior.
+    #[tokio::test]
+    async fn create_login_flow_accepts_skippable_login_with_session_subject() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [
+                    { "method": "password", "aal": "aal1" },
+                    { "method": "totp", "aal": "aal2" }
+                ]
+            }))))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+        );
+
+        // The challenge is accepted exactly once; Kratos never creates a flow.
+        let kratos_calls = fake.calls.lock().unwrap().clone();
+        assert!(
+            kratos_calls
+                .iter()
+                .all(|call| !call.starts_with("create_login_browser_flow")),
+            "kratos must not create a login flow: {kratos_calls:?}"
+        );
+        let hydra_calls = hydra.calls();
+        assert!(
+            hydra_calls
+                .iter()
+                .any(|call| call == "get_login_request(challenge=challenge-1)")
+        );
+        let accept_call = hydra_calls
+            .iter()
+            .find(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
+            .expect("login request should be accepted");
+        assert!(accept_call.contains("\"subject\":\"identity-1\""));
+        assert!(accept_call.contains("\"identity_provider_session_id\":\"session-1\""));
+        assert!(accept_call.contains("\"amr\":[\"password\",\"totp\"]"));
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_hydra_skip_is_false() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": false
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(resp.body.redirect_browser_to.is_empty());
+        // skip=false means Hydra wants authentication; never accept, never
+        // probe the session.
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("create_login_browser_flow"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_skip_without_cookie() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_without_cookie();
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        // No browser session cookie: nothing to accept with, so Kratos renders
+        // the login flow and Hydra is never asked to accept.
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.starts_with("to_session"))
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_session_is_invalid() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 401,
+                message: "unauthenticated".into(),
+            })))),
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=stale");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_login_request_fetch_fails() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        // Default FakeHydra fails every call; the gateway must fall through
+        // and let Kratos surface the failure as it does today.
+        let hydra = FakeHydra::default();
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("create_login_browser_flow"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_maps_skip_accept_error() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(sample_session())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 409,
+                message: "challenge already used".into(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra);
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::AlreadyExists);
+        // A failed accept must not fall through: Kratos would consume the
+        // challenge a second time and report session_already_available.
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.starts_with("create_login_browser_flow"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_skip_accept_missing_redirect_to_is_internal() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(sample_session())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({}))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake, hydra);
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_session_lacks_identity() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true
+            }))))),
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake, hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_without_challenge_never_calls_hydra() {
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra::default();
+        let svc = service_with_hydra(fake, hydra.clone());
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(CreateLoginFlowRequest::default());
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(hydra.calls().is_empty());
+    }
+
 
     #[tokio::test]
     async fn create_logout_flow_happy_path() {
@@ -3846,6 +4363,7 @@ mod tests {
         }));
         let svc = IdentitySelfServiceImpl {
             kratos: Arc::new(fake.clone()),
+            hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),
@@ -3906,6 +4424,7 @@ mod tests {
         };
         let svc = IdentitySelfServiceImpl {
             kratos: Arc::new(fake.clone()),
+            hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),

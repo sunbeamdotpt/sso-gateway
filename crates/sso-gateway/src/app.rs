@@ -297,6 +297,7 @@ pub async fn build_app_with_upstream(
     let consent_enabled = !config.hydra_admin_url.is_empty();
     let self_service = Arc::new(IdentitySelfServiceImpl::new(
         kratos.clone(),
+        hydra.clone(),
         transient.clone(),
         mappings.clone(),
         schemas.clone(),

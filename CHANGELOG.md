@@ -78,6 +78,20 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   - `agents`, `agent_delegations`, and `agent_act_tokens` tables (cascading
     deletes; act-tokens stored as hashes only).
 
+### Fixed
+
+- `CreateLoginFlow` with a `login_challenge` no longer strands the browser on
+  Kratos' `session_already_available` error when the caller already has a
+  Kratos session and Hydra's login request has `skip` set. Kratos accepts the
+  login server-side on that path but drops Hydra's `redirect_to` for JSON
+  clients, which trapped login UIs in a logout-and-retry loop. The gateway now
+  mirrors Kratos' browser behavior: it fetches the Hydra login request first,
+  and when `skip` is set and the caller's Kratos session is valid, it accepts
+  the login request with the session's subject (plus its AMR and session id)
+  and returns Hydra's `redirect_to` as `redirect_browser_to`. When `skip` is
+  unset, the session is missing, or the login request cannot be fetched, flow
+  creation proceeds through Kratos exactly as before.
+
 ## [2026.07.14] - 2026-07-15
 
 ### Added

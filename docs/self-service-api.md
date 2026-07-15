@@ -87,6 +87,16 @@ parameters the browser UI needs:
 
 The remaining parameters are forwarded to Kratos as query string arguments.
 
+One exception: when `login_challenge` is present, the gateway first fetches
+the Hydra login request. If Hydra reports `skip` (the user has a live Hydra
+session) and the caller's Kratos session cookie is valid, the gateway accepts
+the login request with the session's subject and returns Hydra's `redirect_to`
+in `SelfServiceFlow.redirect_browser_to` — no login flow is created. This
+mirrors Kratos' own browser behavior, which JSON clients cannot use because
+Kratos drops the redirect and answers `session_already_available` after
+consuming the challenge. When `skip` is unset or there is no valid session,
+flow creation proceeds through Kratos as usual.
+
 ### Flow getters
 
 | Method | Request | Response |
