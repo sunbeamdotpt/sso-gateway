@@ -929,6 +929,7 @@ mod tests {
             _object: &str,
             _relation: &str,
             _subject_id: &str,
+            _opts: &crate::services::permission::QueryOptions,
         ) -> Result<bool, crate::services::permission::PermissionBackendError> {
             Ok(false)
         }
@@ -975,6 +976,7 @@ mod tests {
             _namespace: &str,
             _object: &str,
             _relation: &str,
+            _opts: &crate::services::permission::QueryOptions,
         ) -> Result<Value, crate::services::permission::PermissionBackendError> {
             Ok(Value::Null)
         }
@@ -989,8 +991,30 @@ mod tests {
             _subject_set_object: Option<&str>,
             _subject_set_relation: Option<&str>,
             _max_depth: Option<i32>,
+            _opts: &crate::services::permission::QueryOptions,
         ) -> Result<Value, crate::services::permission::PermissionBackendError> {
             Ok(Value::Null)
+        }
+
+        async fn write_tuples(
+            &self,
+            _tenant_id: &str,
+            _writes: &[crate::services::permission::RelationTupleKey],
+            _deletes: &[crate::services::permission::RelationTupleKey],
+        ) -> Result<(), crate::services::permission::PermissionBackendError> {
+            Ok(())
+        }
+
+        async fn list_users(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _object: &str,
+            _relation: &str,
+            _user_type_filters: &[String],
+            _opts: &crate::services::permission::QueryOptions,
+        ) -> Result<Vec<String>, crate::services::permission::PermissionBackendError> {
+            Ok(Vec::new())
         }
 
         async fn ensure_namespace(
@@ -998,6 +1022,23 @@ mod tests {
             _tenant_id: &str,
             _namespace: &str,
             _relations: &[String],
+        ) -> Result<(), crate::services::permission::PermissionBackendError> {
+            Ok(())
+        }
+
+        async fn ensure_model(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _model: &Value,
+        ) -> Result<(), crate::services::permission::PermissionBackendError> {
+            Ok(())
+        }
+
+        async fn delete_namespace(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
         ) -> Result<(), crate::services::permission::PermissionBackendError> {
             Ok(())
         }

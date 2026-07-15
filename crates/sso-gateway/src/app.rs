@@ -4,17 +4,17 @@ use std::sync::Arc;
 use crate::jwks::ReqwestJwksService;
 use crate::services::permission::PermissionBackend;
 #[cfg(feature = "openfga")]
-use crate::services::permission::{MemoryNamespaceMappingRepo, OpenFgaPermissionBackend};
+use crate::services::permission::OpenFgaPermissionBackend;
 use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionTupleRepo,
-        PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
-        SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
-        TenantDomainRepo, TenantMembershipRepo, TenantRepo, TransientTokenRepo,
-        bootstrap_system_tenant, create_pool,
+        DbPool, IdMappingRepo, IdentitySchemaRepo, LoginStateRepo, PermissionNamespaceRepo,
+        PermissionTupleRepo, PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo,
+        SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo,
+        TenantConnectionRepo, TenantDomainRepo, TenantMembershipRepo, TenantRepo,
+        TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
@@ -129,6 +129,8 @@ pub async fn build_app_with_upstream(
             .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
     );
 
+    let namespaces: Arc<dyn crate::services::permission::NamespaceMappingRepo> =
+        Arc::new(PermissionNamespaceRepo::new(pool.clone()));
     let backend: Arc<dyn PermissionBackend> = match config.permissions_backend {
         #[cfg(feature = "keto")]
         crate::config::PermissionsBackend::Keto => Arc::new(
@@ -145,9 +147,7 @@ pub async fn build_app_with_upstream(
         crate::config::PermissionsBackend::OpenFga => {
             let client = OpenFgaClient::new(&config.openfga_url)
                 .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?;
-            let mappings: Arc<dyn crate::services::permission::NamespaceMappingRepo> =
-                Arc::new(MemoryNamespaceMappingRepo::default());
-            Arc::new(OpenFgaPermissionBackend::new(client, mappings))
+            Arc::new(OpenFgaPermissionBackend::new(client, namespaces.clone()))
         }
         #[cfg(not(feature = "openfga"))]
         crate::config::PermissionsBackend::OpenFga => {
@@ -272,6 +272,7 @@ pub async fn build_app_with_upstream(
         backend.clone(),
         tuples,
         mappings.clone(),
+        namespaces,
     ));
     let scim_service = Arc::new(ScimServiceImpl::new(
         kratos.clone(),
