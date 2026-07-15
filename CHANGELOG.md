@@ -7,6 +7,8 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+## [2026.07.13] - 2026-07-14
+
 ### Added
 
 - `SelfServiceFlow.redirect_browser_to` (field 14) carries the browser
