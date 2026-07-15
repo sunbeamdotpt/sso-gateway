@@ -15,6 +15,7 @@ mod identity_schema;
 mod local_auth;
 mod login_state;
 mod permission;
+mod permission_namespace;
 mod pool;
 mod saml_identity_mapping;
 mod saml_idp_key;
@@ -41,7 +42,8 @@ pub use local_auth::{
     LocalAuthMethod, PgTenantLocalAuthStore, TenantLocalAuthRow, TenantLocalAuthStore,
 };
 pub use login_state::{LoginStateRow, LoginStateStore, PgLoginStateStore};
-pub use permission::{PermissionTupleRow, PermissionTupleStore, PgPermissionTupleStore};
+pub use permission::{PermissionTupleRow, PermissionTupleStore, PgPermissionTupleStore, TupleKeyInput};
+pub use permission_namespace::{PermissionNamespaceRow, PgPermissionNamespaceStore};
 pub use pool::{DbPool, bootstrap_system_tenant, create_pool};
 pub use saml_identity_mapping::{
     PgSamlIdentityMappingStore, SamlIdentityMappingRow, SamlIdentityMappingStore,
@@ -77,6 +79,7 @@ pub use identity_schema::PgIdentitySchemaStore as IdentitySchemaRepo;
 pub use local_auth::PgTenantLocalAuthStore as TenantLocalAuthRepo;
 pub use login_state::PgLoginStateStore as LoginStateRepo;
 pub use permission::PgPermissionTupleStore as PermissionTupleRepo;
+pub use permission_namespace::PgPermissionNamespaceStore as PermissionNamespaceRepo;
 pub use saml_identity_mapping::PgSamlIdentityMappingStore as SamlIdentityMappingRepo;
 pub use saml_idp_key::PgSamlIdpKeyStore as SamlIdpKeyRepo;
 pub use saml_nameid_mapping::PgSamlNameIdMappingStore as SamlNameIdMappingRepo;

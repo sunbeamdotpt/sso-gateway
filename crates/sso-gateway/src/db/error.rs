@@ -71,6 +71,9 @@ pub enum DbError {
 
     #[error("invalid local auth method: {0}")]
     InvalidLocalAuthMethod(String),
+
+    #[error("permission namespace type already registered: {0}")]
+    NamespaceTypeConflict(String),
 }
 
 impl From<DbError> for sunbeam_g2v::error::ServiceError {
@@ -118,6 +121,9 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             }
             DbError::InvalidLocalAuthMethod(s) => {
                 Self::InvalidArgument(format!("invalid local auth method: {s}"))
+            }
+            DbError::NamespaceTypeConflict(s) => {
+                Self::AlreadyExists(format!("permission namespace type already registered: {s}"))
             }
         }
     }
@@ -229,6 +235,12 @@ mod tests {
             (
                 DbError::InvalidLocalAuthMethod("bar".to_string()),
                 ServiceError::InvalidArgument("invalid local auth method: bar".into()),
+            ),
+            (
+                DbError::NamespaceTypeConflict("doc".to_string()),
+                ServiceError::AlreadyExists(
+                    "permission namespace type already registered: doc".into(),
+                ),
             ),
         ];
         for (err, expected) in cases {
