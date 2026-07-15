@@ -10,11 +10,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
-    auth::{
-        AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_APPLICATION_READ, SCOPE_IDENTITY_ADMIN,
-        SCOPE_IDENTITY_READ, SCOPE_OPENID, SCOPE_PERMISSION_ADMIN, SCOPE_PERMISSION_READ,
-        SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, SCOPE_TENANT_ADMIN, SCOPE_TENANT_READ, require_scope,
-    },
+    auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_APPLICATION_READ, require_scope},
     db::{IdMappingRepo, IdMappingStore},
     middleware::TenantId,
     proto::iam::v1::{
@@ -294,21 +290,8 @@ fn validate_scopes(scopes: &[String]) -> Result<(), ServiceError> {
             "at least one scope is required".into(),
         ));
     }
-    const KNOWN_SCOPES: &[&str] = &[
-        SCOPE_OPENID,
-        SCOPE_TENANT_ADMIN,
-        SCOPE_TENANT_READ,
-        SCOPE_IDENTITY_ADMIN,
-        SCOPE_IDENTITY_READ,
-        SCOPE_SCIM_ADMIN,
-        SCOPE_SCIM_READ,
-        SCOPE_PERMISSION_ADMIN,
-        SCOPE_PERMISSION_READ,
-        SCOPE_APPLICATION_ADMIN,
-        SCOPE_APPLICATION_READ,
-    ];
     for scope in scopes {
-        if !KNOWN_SCOPES.contains(&scope.as_str()) {
+        if !crate::auth::KNOWN_SCOPES.contains(&scope.as_str()) {
             return Err(ServiceError::InvalidArgument(format!(
                 "unknown scope: {scope}"
             )));
@@ -331,7 +314,7 @@ fn validate_or_default_token_endpoint_auth_method(method: &str) -> Result<String
     Ok(method.to_string())
 }
 
-fn map_ory_error(err: OryClientError) -> ServiceError {
+pub(crate) fn map_ory_error(err: OryClientError) -> ServiceError {
     match err {
         OryClientError::Ory { status, message } => match status {
             400 => ServiceError::InvalidArgument(message),
@@ -409,6 +392,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::auth::SubjectType;
     use crate::db::{DbError, IdMappingRow};
     use crate::proto::iam::v1::ClientCredentialService;
     use buffa::bytes::Bytes;
@@ -442,6 +426,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.to_string(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),

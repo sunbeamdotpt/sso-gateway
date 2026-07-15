@@ -432,6 +432,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::auth::SubjectType;
     use crate::db::{DbError, IdMappingRow};
     use crate::proto::iam::v1::ApplicationService;
     use buffa::bytes::Bytes;
@@ -469,6 +470,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.to_string(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),

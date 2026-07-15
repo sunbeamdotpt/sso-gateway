@@ -24,6 +24,61 @@ pub const SCOPE_PERMISSION_ADMIN: &str = "permission:admin";
 pub const SCOPE_PERMISSION_READ: &str = "permission:read";
 pub const SCOPE_APPLICATION_ADMIN: &str = "application:admin";
 pub const SCOPE_APPLICATION_READ: &str = "application:read";
+pub const SCOPE_AGENT_ADMIN: &str = "agent:admin";
+pub const SCOPE_AGENT_READ: &str = "agent:read";
+/// Allows an agent to mint on-behalf-of act-tokens against its delegations.
+pub const SCOPE_AGENT_ACT: &str = "agent:act";
+
+/// Every scope the gateway recognizes, for validating client/agent scope sets.
+pub const KNOWN_SCOPES: &[&str] = &[
+    SCOPE_OPENID,
+    SCOPE_TENANT_ADMIN,
+    SCOPE_TENANT_READ,
+    SCOPE_IDENTITY_ADMIN,
+    SCOPE_IDENTITY_READ,
+    SCOPE_SCIM_ADMIN,
+    SCOPE_SCIM_READ,
+    SCOPE_PERMISSION_ADMIN,
+    SCOPE_PERMISSION_READ,
+    SCOPE_APPLICATION_ADMIN,
+    SCOPE_APPLICATION_READ,
+    SCOPE_AGENT_ADMIN,
+    SCOPE_AGENT_READ,
+    SCOPE_AGENT_ACT,
+];
+
+/// What kind of identity the authenticated subject is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectType {
+    /// A human user (a Kratos-backed identity). This is also the subject type
+    /// of a delegated agent act-token, whose `sub` is the delegating user.
+    User,
+    /// A registered agent acting autonomously with its own client credentials.
+    Agent,
+    /// A machine-to-machine OAuth2 client credential that is not a registered
+    /// agent.
+    Client,
+}
+
+impl SubjectType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubjectType::User => "user",
+            SubjectType::Agent => "agent",
+            SubjectType::Client => "client",
+        }
+    }
+}
+
+/// The agent acting on behalf of the subject, present when the request was
+/// authenticated with an agent act-token.
+#[derive(Clone, Debug)]
+pub struct ActorContext {
+    /// Public ULID of the acting agent (the token's `act` claim).
+    pub agent_id: String,
+    /// The delegation grant the token was minted against.
+    pub delegation_id: String,
+}
 
 /// Authentication context attached to a request after successful token introspection.
 ///
@@ -33,6 +88,9 @@ pub const SCOPE_APPLICATION_READ: &str = "application:read";
 pub struct AuthContext {
     pub tenant_id: String,
     pub subject: String,
+    pub subject_type: SubjectType,
+    /// The acting agent, when this request runs under a delegation grant.
+    pub actor: Option<ActorContext>,
     pub scopes: Vec<String>,
     pub token_hash: String,
     /// Authentication Method Reference values asserted for this session.
@@ -278,10 +336,51 @@ pub async fn resolve_public_subject(
     Err(AuthError::UnknownSubject)
 }
 
+/// Which Ory backend a subject resolved through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectBackend {
+    Hydra,
+    Kratos,
+}
+
+/// Resolve an authenticated subject to `(tenant_id, public_id, backend)` in a
+/// single pass over the known backends. The first backend whose mapping
+/// resolves both the tenant and the public id wins.
+pub async fn resolve_subject(
+    mappings: &dyn IdMappingStore,
+    subject: &str,
+) -> Result<(String, String, SubjectBackend), AuthError> {
+    for (backend_name, backend) in [
+        ("hydra", SubjectBackend::Hydra),
+        ("kratos", SubjectBackend::Kratos),
+    ] {
+        match mappings.get_tenant_id_by_ory_id(backend_name, subject).await {
+            Ok(Some(tenant_id)) => {
+                match mappings.get_public_id_by_ory_id(backend_name, subject).await {
+                    Ok(public_id) => return Ok((tenant_id, public_id, backend)),
+                    Err(DbError::MappingNotFound) => continue,
+                    Err(e) => {
+                        warn!("failed to resolve public subject: {}", e);
+                        return Err(AuthError::Database(e));
+                    }
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                warn!("failed to resolve tenant for subject: {}", e);
+                return Err(AuthError::Database(e));
+            }
+        }
+    }
+    Err(AuthError::UnknownSubject)
+}
+
 /// Build an `AuthContext` from an introspection result and tenant mapping.
 pub fn build_auth_context(
     tenant_id: String,
     subject: String,
+    subject_type: SubjectType,
+    actor: Option<ActorContext>,
     scopes: Vec<String>,
     authentication_methods: Vec<String>,
     token: &str,
@@ -289,6 +388,8 @@ pub fn build_auth_context(
     AuthContext {
         tenant_id,
         subject,
+        subject_type,
+        actor,
         scopes,
         token_hash: hash_token(token),
         authentication_methods,
@@ -304,6 +405,24 @@ pub fn require_scope(ctx: &RequestContext, scope: &str) -> Result<(), ServiceErr
     if !auth.scopes.iter().any(|s| s == scope) {
         return Err(ServiceError::PermissionDenied(format!(
             "missing required scope: {scope}"
+        )));
+    }
+    Ok(())
+}
+
+/// Require the authenticated subject to be of a specific type.
+pub fn require_subject_type(
+    ctx: &RequestContext,
+    expected: SubjectType,
+) -> Result<(), ServiceError> {
+    let auth = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+    if auth.subject_type != expected {
+        return Err(ServiceError::PermissionDenied(format!(
+            "requires a {} subject",
+            expected.as_str()
         )));
     }
     Ok(())
@@ -434,6 +553,8 @@ mod tests {
         let ctx = build_auth_context(
             "tenant-1".into(),
             "sub-1".into(),
+            SubjectType::User,
+            None,
             vec!["tenant:read".into()],
             vec!["password".into(), "totp".into()],
             "secret-token",
@@ -448,6 +569,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec!["tenant:read".into()],
             token_hash: "hash".into(),
             authentication_methods: vec![],
@@ -470,6 +593,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![],
             token_hash: "hash".into(),
             authentication_methods: vec!["password".into(), "totp".into()],
@@ -484,6 +609,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![],
             token_hash: "hash".into(),
             authentication_methods: vec!["password".into()],

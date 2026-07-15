@@ -9,11 +9,12 @@ use axum::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::agent_tokens::AgentTokenResolver;
 use crate::auth::{
-    AuthContext, TokenIntrospector, bearer_token, build_auth_context, resolve_public_subject,
-    resolve_tenant_from_subject,
+    ActorContext, AuthContext, SubjectBackend, SubjectType, TokenIntrospector, bearer_token,
+    build_auth_context, resolve_subject,
 };
-use crate::db::{IdMappingStore, SessionStore};
+use crate::db::{AGENT_STATUS_ACTIVE, IdMappingStore, SessionStore};
 use crate::session_token::SessionTokenSigner;
 
 /// Re-exported helper for RPC handlers that need stepped-up authentication.
@@ -109,6 +110,7 @@ pub async fn auth_middleware(
     Extension(mappings): Extension<Arc<dyn IdMappingStore>>,
     Extension(session_signer): Extension<SessionTokenSigner>,
     Extension(session_store): Extension<Arc<dyn SessionStore>>,
+    agent_resolver: Option<Extension<Arc<dyn AgentTokenResolver>>>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -118,7 +120,13 @@ pub async fn auth_middleware(
     }
 
     let auth_result = if let Some(token) = bearer_token(request.headers()) {
-        authenticate_bearer_token(introspector.as_ref(), mappings.as_ref(), &token).await
+        authenticate_bearer_token(
+            introspector.as_ref(),
+            mappings.as_ref(),
+            agent_resolver.as_ref().map(|Extension(r)| r.as_ref()),
+            &token,
+        )
+        .await
     } else if let Some(cookie) = session_cookie(request.headers()) {
         authenticate_session_cookie(&session_signer, session_store.as_ref(), cookie).await
     } else {
@@ -195,6 +203,8 @@ async fn authenticate_session_cookie(
     Ok(build_auth_context(
         claims.tenant_id,
         claims.sub,
+        SubjectType::User,
+        None,
         vec![],
         vec![],
         &cookie,
@@ -204,8 +214,35 @@ async fn authenticate_session_cookie(
 async fn authenticate_bearer_token(
     introspector: &dyn TokenIntrospector,
     mappings: &dyn IdMappingStore,
+    agent_resolver: Option<&dyn AgentTokenResolver>,
     token: &str,
 ) -> Result<AuthContext, Box<Response>> {
+    // Agent act-tokens are opaque and unknown to Hydra, so they must be
+    // resolved before falling through to Hydra introspection.
+    if let Some(resolver) = agent_resolver {
+        match resolver.resolve_act_token(token).await {
+            Ok(Some(resolution)) => {
+                return Ok(build_auth_context(
+                    resolution.tenant_id,
+                    resolution.user_identity_id,
+                    SubjectType::User,
+                    Some(ActorContext {
+                        agent_id: resolution.agent_id,
+                        delegation_id: resolution.delegation_id,
+                    }),
+                    resolution.scopes,
+                    vec![],
+                    token,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(%err, "agent act-token resolution failed");
+                return Err(Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR)));
+            }
+        }
+    }
+
     let introspection = introspector.introspect(token).await.map_err(|err| {
         tracing::debug!(%err, "token introspection failed");
         Box::new(auth_error(StatusCode::UNAUTHORIZED))
@@ -220,10 +257,9 @@ async fn authenticate_bearer_token(
         Box::new(auth_error(StatusCode::UNAUTHORIZED))
     })?;
 
-    let tenant_id = resolve_tenant_from_subject(mappings, &subject)
-        .await
-        .map_err(|err| {
-            tracing::debug!(%err, "failed to resolve tenant for subject");
+    let (tenant_id, public_subject, backend) =
+        resolve_subject(mappings, &subject).await.map_err(|err| {
+            tracing::debug!(%err, "failed to resolve subject");
             match err {
                 crate::auth::AuthError::UnknownSubject => {
                     Box::new(auth_error(StatusCode::UNAUTHORIZED))
@@ -232,21 +268,34 @@ async fn authenticate_bearer_token(
             }
         })?;
 
-    let public_subject = resolve_public_subject(mappings, &subject)
-        .await
-        .map_err(|err| {
-            tracing::debug!(%err, "failed to resolve public subject");
-            match err {
-                crate::auth::AuthError::UnknownSubject => {
-                    Box::new(auth_error(StatusCode::UNAUTHORIZED))
-                }
-                _ => Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR)),
+    let subject_type = match backend {
+        SubjectBackend::Kratos => SubjectType::User,
+        SubjectBackend::Hydra => {
+            // A Hydra-backed subject is either a registered agent or a plain
+            // machine client. A disabled agent is rejected here: the big red
+            // button also kills the agent's own client-credentials tokens.
+            match agent_resolver {
+                Some(resolver) => match resolver.agent_status(&public_subject).await {
+                    Ok(Some(status)) if status != AGENT_STATUS_ACTIVE => {
+                        return Err(Box::new(auth_error(StatusCode::UNAUTHORIZED)));
+                    }
+                    Ok(Some(_)) => SubjectType::Agent,
+                    Ok(None) => SubjectType::Client,
+                    Err(err) => {
+                        tracing::warn!(%err, "agent status lookup failed");
+                        return Err(Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR)));
+                    }
+                },
+                None => SubjectType::Client,
             }
-        })?;
+        }
+    };
 
     Ok(build_auth_context(
         tenant_id,
         public_subject,
+        subject_type,
+        None,
         introspection.scope,
         introspection.authentication_methods,
         token,
@@ -290,6 +339,14 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
         .extensions()
         .get::<AuthContext>()
         .map(|c| c.subject.clone());
+    let subject_type = request
+        .extensions()
+        .get::<AuthContext>()
+        .map(|c| c.subject_type.as_str());
+    let agent = request
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|c| c.actor.as_ref().map(|a| a.agent_id.clone()));
     let method = request.method().to_string();
     let resource = request.uri().path().to_string();
 
@@ -305,6 +362,8 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
         target: "sso_gateway::audit",
         tenant_id = tenant_id.as_deref(),
         actor = actor.as_deref(),
+        subject_type = subject_type,
+        agent = agent.as_deref(),
         action = method.as_str(),
         resource = resource.as_str(),
         outcome = outcome,
@@ -369,7 +428,12 @@ mod tests {
         }
     }
 
-    struct StubMappingStore(Mutex<Option<Result<Option<String>, crate::db::DbError>>>);
+    /// Backend-aware mapping stub: each field is the tenant the corresponding
+    /// backend resolves for any subject.
+    struct StubMappingStore {
+        hydra: Option<String>,
+        kratos: Option<String>,
+    }
 
     #[async_trait::async_trait]
     impl IdMappingStore for StubMappingStore {
@@ -428,23 +492,91 @@ mod tests {
 
         async fn get_tenant_id_by_ory_id(
             &self,
-            _backend: &str,
+            backend: &str,
             _ory_global_id: &str,
         ) -> Result<Option<String>, crate::db::DbError> {
-            self.0.lock().unwrap().take().unwrap_or(Ok(None))
+            match backend {
+                "hydra" => Ok(self.hydra.clone()),
+                _ => Ok(self.kratos.clone()),
+            }
         }
+    }
+
+    #[derive(Default)]
+    struct StubAgentResolver {
+        resolve_result:
+            Mutex<Option<Result<Option<crate::agent_tokens::ActTokenResolution>, crate::db::DbError>>>,
+        status_result: Mutex<Option<Result<Option<String>, crate::db::DbError>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTokenResolver for StubAgentResolver {
+        async fn resolve_act_token(
+            &self,
+            _token: &str,
+        ) -> Result<Option<crate::agent_tokens::ActTokenResolution>, crate::db::DbError> {
+            self.resolve_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(None))
+        }
+
+        async fn agent_status(
+            &self,
+            _agent_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            self.status_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    fn no_mappings() -> Arc<dyn IdMappingStore> {
+        Arc::new(StubMappingStore {
+            hydra: None,
+            kratos: None,
+        })
+    }
+
+    fn hydra_mappings(tenant: &str) -> Arc<dyn IdMappingStore> {
+        Arc::new(StubMappingStore {
+            hydra: Some(tenant.to_string()),
+            kratos: None,
+        })
     }
 
     async fn ok_handler() -> &'static str {
         "ok"
     }
 
+    /// Handler echoing the resolved AuthContext for classification assertions.
+    async fn ctx_handler(Extension(ctx): Extension<AuthContext>) -> String {
+        format!(
+            "{}|{}|{}",
+            ctx.subject,
+            ctx.subject_type.as_str(),
+            ctx.actor.map(|a| a.agent_id).unwrap_or_default()
+        )
+    }
+
     fn test_router(
         introspector: Arc<dyn TokenIntrospector>,
         mappings: Arc<dyn IdMappingStore>,
     ) -> Router {
-        Router::new()
+        test_router_with_resolver(introspector, mappings, None)
+    }
+
+    fn test_router_with_resolver(
+        introspector: Arc<dyn TokenIntrospector>,
+        mappings: Arc<dyn IdMappingStore>,
+        resolver: Option<Arc<dyn AgentTokenResolver>>,
+    ) -> Router {
+        let mut router = Router::new()
             .route("/protected", get(ok_handler))
+            .route("/ctx", get(ctx_handler))
             .route("/.well-known/openid-configuration", get(ok_handler))
             .route("/oauth2/auth", get(ok_handler))
             .layer(from_fn(auth_middleware))
@@ -457,7 +589,11 @@ mod tests {
             .layer(Extension(
                 Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
             ))
-            .layer(Extension(mappings))
+            .layer(Extension(mappings));
+        if let Some(resolver) = resolver {
+            router = router.layer(Extension(resolver));
+        }
+        router
     }
 
     #[test]
@@ -491,7 +627,7 @@ mod tests {
     async fn public_path_bypasses_auth() {
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(None))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -508,7 +644,7 @@ mod tests {
     async fn missing_token_or_cookie_returns_unauthorized() {
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(None))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
@@ -527,7 +663,7 @@ mod tests {
         let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(None))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -554,7 +690,7 @@ mod tests {
         let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(None))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -573,7 +709,7 @@ mod tests {
     async fn invalid_session_cookie_returns_unauthorized() {
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(None))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -609,9 +745,7 @@ mod tests {
             .layer(Extension(
                 Arc::new(StubSessionStore(Mutex::new(Some(Ok(false))))) as Arc<dyn SessionStore>,
             ))
-            .layer(Extension(
-                Arc::new(StubMappingStore(Mutex::new(None))) as Arc<dyn IdMappingStore>
-            ));
+            .layer(Extension(no_mappings()));
         let response = router
             .oneshot(
                 Request::get("/protected")
@@ -636,9 +770,7 @@ mod tests {
                     authentication_methods: vec![],
                 },
             ))))),
-            Arc::new(StubMappingStore(Mutex::new(Some(Ok(Some(
-                "tenant-1".into(),
-            )))))),
+            hydra_mappings("tenant-1"),
         );
         let response = router
             .oneshot(
@@ -664,7 +796,7 @@ mod tests {
                     authentication_methods: vec![],
                 },
             ))))),
-            Arc::new(StubMappingStore(Mutex::new(None))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -690,7 +822,7 @@ mod tests {
                     authentication_methods: vec![],
                 },
             ))))),
-            Arc::new(StubMappingStore(Mutex::new(Some(Ok(None))))),
+            no_mappings(),
         );
         let response = router
             .oneshot(
@@ -798,6 +930,11 @@ mod tests {
             .layer(Extension(AuthContext {
                 tenant_id: "tenant-42".into(),
                 subject: "actor-7".into(),
+                subject_type: SubjectType::User,
+                actor: Some(crate::auth::ActorContext {
+                    agent_id: "agent-9".into(),
+                    delegation_id: "del-9".into(),
+                }),
                 scopes: vec![],
                 token_hash: "hash".into(),
                 authentication_methods: vec![],
@@ -823,5 +960,162 @@ mod tests {
         assert_eq!(fields.get("action"), Some(&"GET".to_string()));
         assert_eq!(fields.get("outcome"), Some(&"failure".to_string()));
         assert_eq!(fields.get("status"), Some(&"403".to_string()));
+        assert_eq!(fields.get("subject_type"), Some(&"user".to_string()));
+        assert_eq!(fields.get("agent"), Some(&"agent-9".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent subject classification
+    // -----------------------------------------------------------------------
+
+    fn active_introspector(sub: &str) -> Arc<dyn TokenIntrospector> {
+        Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+            IntrospectionResult {
+                active: true,
+                sub: Some(sub.to_string()),
+                scope: vec!["tenant:read".into()],
+                exp: None,
+                authentication_methods: vec![],
+            },
+        )))))
+    }
+
+    async fn ctx_body(router: Router) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::get("/ctx")
+                    .header("Authorization", "Bearer some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn act_token_authenticates_as_user_with_actor() {
+        let resolver = Arc::new(StubAgentResolver {
+            resolve_result: Mutex::new(Some(Ok(Some(
+                crate::agent_tokens::ActTokenResolution {
+                    tenant_id: "tenant-1".into(),
+                    user_identity_id: "user-1".into(),
+                    agent_id: "agent-1".into(),
+                    delegation_id: "del-1".into(),
+                    scopes: vec!["kanban:read".into()],
+                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                },
+            )))),
+            ..Default::default()
+        });
+        // The introspector must never be consulted for act-tokens: it holds
+        // no result and would fail the request if called.
+        let router = test_router_with_resolver(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            no_mappings(),
+            Some(resolver),
+        );
+
+        let (status, body) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "user-1|user|agent-1");
+    }
+
+    #[tokio::test]
+    async fn act_token_resolution_error_fails_closed() {
+        let resolver = Arc::new(StubAgentResolver {
+            resolve_result: Mutex::new(Some(Err(crate::db::DbError::AgentNotFound))),
+            ..Default::default()
+        });
+        let router = test_router_with_resolver(
+            active_introspector("sub-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        );
+
+        let (status, _) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn kratos_subject_classifies_as_user() {
+        let router = test_router(
+            active_introspector("kratos-identity-1"),
+            Arc::new(StubMappingStore {
+                hydra: None,
+                kratos: Some("tenant-1".into()),
+            }),
+        );
+
+        let (status, body) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|user|");
+    }
+
+    #[tokio::test]
+    async fn hydra_subject_with_active_agent_status_classifies_as_agent() {
+        let resolver = Arc::new(StubAgentResolver {
+            status_result: Mutex::new(Some(Ok(Some("active".into())))),
+            ..Default::default()
+        });
+        let router = test_router_with_resolver(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        );
+
+        let (status, body) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|agent|");
+    }
+
+    #[tokio::test]
+    async fn hydra_subject_with_disabled_agent_status_is_rejected() {
+        let resolver = Arc::new(StubAgentResolver {
+            status_result: Mutex::new(Some(Ok(Some("disabled".into())))),
+            ..Default::default()
+        });
+        let router = test_router_with_resolver(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        );
+
+        let (status, _) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn hydra_subject_without_agent_record_classifies_as_client() {
+        let resolver = Arc::new(StubAgentResolver::default());
+        let router = test_router_with_resolver(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        );
+
+        let (status, body) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|client|");
+    }
+
+    #[tokio::test]
+    async fn agent_status_lookup_error_fails_closed() {
+        let resolver = Arc::new(StubAgentResolver {
+            status_result: Mutex::new(Some(Err(crate::db::DbError::MappingNotFound))),
+            ..Default::default()
+        });
+        let router = test_router_with_resolver(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        );
+
+        let (status, _) = ctx_body(router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

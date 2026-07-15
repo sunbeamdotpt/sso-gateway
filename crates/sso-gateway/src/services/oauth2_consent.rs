@@ -490,6 +490,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::SubjectType;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -920,6 +921,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "subject-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),

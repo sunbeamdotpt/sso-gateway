@@ -811,6 +811,7 @@ fn map_ory_error(err: OryClientError) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::SubjectType;
     use super::*;
     use axum::http::HeaderValue;
 
@@ -2297,6 +2298,8 @@ mod tests {
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec!["openid".into()],
             token_hash: "hash".into(),
             authentication_methods: vec![],
@@ -2334,6 +2337,8 @@ mod tests {
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
             token_hash: "hash".into(),
             authentication_methods: vec![],
@@ -2372,6 +2377,8 @@ mod tests {
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
             token_hash: "hash".into(),
             authentication_methods: vec![],
@@ -2414,6 +2421,8 @@ mod tests {
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
             token_hash: "hash".into(),
             authentication_methods: vec![],
@@ -2521,6 +2530,8 @@ mod tests {
         AuthContext {
             tenant_id: "tenant-1".into(),
             subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes,
             token_hash: "hash".into(),
             authentication_methods: vec![],

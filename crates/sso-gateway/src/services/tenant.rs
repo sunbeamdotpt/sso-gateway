@@ -163,6 +163,7 @@ fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), Servic
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::SubjectType;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -188,6 +189,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![SCOPE_TENANT_READ.into()],
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),
@@ -201,6 +204,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec![SCOPE_TENANT_ADMIN.into()],
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),
@@ -214,6 +219,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: vec!["other:scope".into()],
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),

@@ -17,7 +17,7 @@ use tracing::{debug, instrument};
 use ulid::Ulid;
 
 use crate::{
-    auth::{AuthContext, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, require_scope},
+    auth::{AuthContext, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, SubjectType, require_scope},
     db::{
         IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaRow, IdentitySchemaStore,
         ScimGroupRepo, ScimGroupRow, ScimGroupStore,
@@ -750,6 +750,8 @@ fn request_context(tenant_id: String) -> RequestContext {
     ctx.extensions_mut().insert(AuthContext {
         tenant_id,
         subject: "scim-subject".into(),
+        subject_type: SubjectType::User,
+        actor: None,
         scopes: vec![SCOPE_SCIM_READ.into(), SCOPE_SCIM_ADMIN.into()],
         token_hash: "hash".into(),
         authentication_methods: Vec::new(),
@@ -781,6 +783,7 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::SubjectType;
     use super::*;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
@@ -1985,6 +1988,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.into(),
             subject: "scim-subject".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),

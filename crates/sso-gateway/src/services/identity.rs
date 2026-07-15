@@ -1356,6 +1356,7 @@ fn parse_timestamp(value: &str) -> Option<Timestamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::SubjectType;
     use std::collections::HashMap;
 
     use async_trait::async_trait;
@@ -1393,6 +1394,8 @@ mod tests {
         ctx.extensions_mut().insert(AuthContext {
             tenant_id: tenant_id.to_string(),
             subject: "sub-1".into(),
+            subject_type: SubjectType::User,
+            actor: None,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             token_hash: "hash".into(),
             authentication_methods: Vec::new(),
