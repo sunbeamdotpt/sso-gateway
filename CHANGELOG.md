@@ -39,6 +39,45 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   tenant namespace registry (replacing the in-memory placeholder), plus a
   keyset index on `permission_tuples`.
 
+## [2026.07.16] - 2026-07-15
+
+### Added
+
+- Agent identities and on-behalf-of delegation (`iam.v1.AgentService`).
+  Agents are gateway-owned non-human identities — never Kratos identities —
+  backed by a managed Hydra `client_credentials` client:
+  - `CreateAgent` / `GetAgent` / `ListAgents` / `UpdateAgent` / `DeleteAgent`
+    / `RotateAgentSecret` manage the agent lifecycle (`agent:read` /
+    `agent:admin`). The OAuth2 client secret is returned exactly once, at
+    creation or rotation. Disabling an agent immediately invalidates its
+    act-tokens and rejects its own client-credentials tokens.
+  - `CreateAgentDelegation` / `ListAgentDelegations` /
+    `RevokeAgentDelegation` implement the grant model: a user pre-authorizes
+    an agent to act on their behalf with a bounded scope set until expiry.
+    Only user subjects grant delegations, and the delegating user (or an
+    `agent:admin` caller) revokes.
+  - `MintAgentActToken` lets the agent mint a short-lived opaque act-token
+    (`sat_…`) against a live delegation (requires `agent:act`). Act-tokens
+    never outlive their delegation.
+  - `IntrospectAgentActToken` returns RFC 7662-shaped claims (`sub` = user,
+    `act` = agent) to any authenticated caller in the token's tenant;
+    cross-tenant tokens introspect as inactive.
+  - Act-tokens are opaque and re-validated on every use. Resolutions are
+    cached in-process (moka) with invalidate-on-write: revocation or agent
+    disable evicts locally and broadcasts over core NATS pub/sub
+    (`NATS_URL`) so other replicas evict too. A seconds-long TTL
+    (`AGENT_CACHE_TTL_SECONDS`, default 5) is only a backstop for missed
+    broadcasts; without NATS the gateway degrades to single-instance
+    semantics. Act-token lifetime is bounded by
+    `AGENT_ACT_TOKEN_TTL_SECONDS` (default 3600).
+  - The shared auth middleware resolves act-tokens before Hydra
+    introspection, classifies every subject as `user`, `agent` (registered
+    agent client), or `client` (plain machine client), and records
+    `subject_type` and `agent` on audit events. A disabled agent's own
+    client-credentials tokens are rejected at authentication.
+  - `agents`, `agent_delegations`, and `agent_act_tokens` tables (cascading
+    deletes; act-tokens stored as hashes only).
+
 ## [2026.07.14] - 2026-07-15
 
 ### Added

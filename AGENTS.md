@@ -13,7 +13,8 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - **Identifiers**: All gateway-level identifiers are ULIDs (`ulid` crate). Do **not** use UUIDs for primary keys.
 - **Tenancy**: Protected endpoints require an `Authorization: Bearer <token>` header. The shared auth middleware introspects the token via Hydra and resolves the tenant from the token subject. The system tenant ULID is configured via `SYSTEM_TENANT_ULID`; a system bootstrap OAuth2 client is created on startup.
 - **Identity model (gateway-owned traits)**: Kratos persists only the minimal base identity — `{email}` plus credentials — bound to the base schema id set via `KRATOS_DEFAULT_SCHEMA_ID` (dev `default`, prod `employee`). The gateway owns the full trait set and the per-tenant schema binding. Reads assemble the caller-facing identity from `tenant_memberships`; writes validate against the tenant's versioned schema in `tenant_identity_schemas` and persist only the base email to Kratos. Email is the Kratos identifier, so it is normalized (lowercase + trim) and immutable. A single base identity may belong to many tenants via `tenant_memberships` (invites/SCIM add membership); superset schemas may add traits and enable extra methods (SAML/SCIM/OIDC) that Kratos never sees.
-- **Audit**: Request audit records are emitted as structured logs to the standard log stream by `audit_middleware`, tagged with `sso_gateway::audit`.
+- **Agent identities**: Agents are gateway-owned non-human identities — never Kratos identities. Each agent is an `agents` row (single-tenant via `tenant_id`) backed by a managed Hydra `client_credentials` client linked through `id_mappings` (`backend = 'hydra'`, `public_id = <agent ULID>`). On-behalf-of delegation uses pre-authorized grants (`agent_delegations`); act-tokens (`agent_act_tokens`, SHA-256 hashes only) are opaque and introspected with moka-cached resolution, invalidated on write and broadcast over core NATS (`NATS_URL`) — the seconds-long TTL is only a backstop. The auth middleware classifies every subject as `user`, `agent`, or `client` (plain M2M) and resolves act-tokens before Hydra introspection.
+- **Audit**: Request audit records are emitted as structured logs to the standard log stream by `audit_middleware`, tagged with `sso_gateway::audit`. Records include `subject_type` and, for delegated actions, the acting `agent`.
 - **SAML**: The gateway is both a SAML Service Provider (`/saml/metadata`, `/saml/acs`) and a SAML Identity Provider (`/saml/sso`). IdP signing keys are stored in `saml_idp_keys`; SP client configuration is stored in `saml_sp_clients`.
 - **Latest versions**: Use the latest compatible versions of crates. Do not pin versions unless required to resolve a known incompatibility.
 
@@ -64,7 +65,7 @@ buf breaking --against "https://github.com/sunbeamdotpt/sso-gateway.git#branch=m
 
 The gateway never exposes Ory paths or IDs to callers. Internally:
 
-- Hydra OAuth2 clients are mapped via `id_mappings`.
+- Hydra OAuth2 clients are mapped via `id_mappings` — including each agent's managed client (the Hydra client id is never exposed to callers).
 - Kratos identities are mapped via `id_mappings` and hold only the base `{email}` trait; tenant membership and every other trait live in the gateway (`tenant_memberships`), never in Kratos.
 - Keto namespaces and object IDs are prefixed with the tenant slug.
 

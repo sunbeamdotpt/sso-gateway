@@ -52,6 +52,9 @@ All configuration is read from environment variables.
 | `COOKIE_SAMESITE` | `Lax` | `SameSite` policy for the session cookie (`Strict`, `Lax`, or `None`). |
 | `SESSION_TTL_SECONDS` | `86400` | Lifetime of browser session cookies. |
 | `TOKEN_INTROSPECTION_CACHE_TTL_SECONDS` | `30` | Cache TTL for active Hydra token introspection results. Inactive tokens are not cached. |
+| `NATS_URL` | — | Core NATS connection URL for cross-replica agent cache invalidation (pub/sub, no JetStream). When unset, agent act-token revocation is single-instance only (the cache TTL bounds staleness). |
+| `AGENT_ACT_TOKEN_TTL_SECONDS` | `3600` | Maximum lifetime of an agent on-behalf-of act-token. A token never outlives its delegation. |
+| `AGENT_CACHE_TTL_SECONDS` | `5` | Backstop TTL for cached act-token resolutions and agent statuses. The cache is invalidated on write; the TTL only covers a missed cross-replica invalidation. |
 | `DATABASE_SSL_REQUIRED` | `true` | Require SSL for `DATABASE_URL`. Rejects URLs containing `sslmode=disable`. |
 | `DATABASE_MAX_CONNECTIONS` | `25` | Maximum size of the Postgres connection pool. |
 | `DATABASE_ACQUIRE_TIMEOUT_SECONDS` | `10` | Timeout for acquiring a connection from the pool. |

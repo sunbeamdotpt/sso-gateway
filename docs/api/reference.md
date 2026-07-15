@@ -74,6 +74,28 @@ Protected by `application:read` / `application:admin`.
 | `DeleteClientCredential` | Delete a client credentials OAuth2 client. |
 | `RotateClientCredentialSecret` | Rotate a client credentials client secret. |
 
+### `iam.v1.AgentService`
+
+Non-human identities. Each agent is a gateway-owned identity (not a Kratos
+identity) backed by a managed Hydra `client_credentials` client. Agents can act
+*on behalf of* a user through pre-authorized delegation grants; on-behalf-of
+act-tokens are opaque, introspectable, and instantly revocable. Protected by
+`agent:read` / `agent:admin` / `agent:act`.
+
+| Method | Description |
+|---|---|
+| `CreateAgent` | Create an agent and its OAuth2 client. The client secret is returned exactly once. |
+| `GetAgent` | Get an agent by gateway ID. |
+| `ListAgents` | List agents for the tenant (keyset-paginated). |
+| `UpdateAgent` | Rename an agent or disable/enable it. Disabling immediately invalidates its act-tokens and rejects its own client-credentials tokens. |
+| `DeleteAgent` | Delete an agent, its delegations, its act-tokens, and its OAuth2 client. |
+| `RotateAgentSecret` | Rotate an agent's OAuth2 client secret. |
+| `CreateAgentDelegation` | Pre-authorize an agent to act on behalf of the authenticated user (requires a user subject). |
+| `ListAgentDelegations` | List grants made by the caller, or grants for an agent with `agent:read`/`agent:admin`. |
+| `RevokeAgentDelegation` | Revoke a grant; minted act-tokens fail introspection immediately. |
+| `MintAgentActToken` | Mint a short-lived opaque act-token against a live delegation (called by the agent; requires `agent:act`). |
+| `IntrospectAgentActToken` | Validate an act-token and return its claims (`sub` = user, `act` = agent). Any authenticated caller in the token's tenant may introspect. |
+
 ### `iam.v1.PermissionService`
 
 | Method | Description |
