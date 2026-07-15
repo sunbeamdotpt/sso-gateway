@@ -6,6 +6,9 @@
 //! `db.rs`, the old `*Repo` names are re-exported as aliases to the concrete
 //! PostgreSQL stores.
 
+mod agent;
+mod agent_act_token;
+mod agent_delegation;
 mod connection;
 mod crypto;
 mod domain;
@@ -31,6 +34,11 @@ mod tenant_membership;
 mod token_cache;
 mod transient_token;
 
+pub use agent::{
+    AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED, AgentRow, AgentStore, PgAgentStore,
+};
+pub use agent_act_token::{AgentActTokenRow, AgentActTokenStore, PgAgentActTokenStore};
+pub use agent_delegation::{AgentDelegationRow, AgentDelegationStore, PgAgentDelegationStore};
 pub use connection::{
     ConnectionType, PgTenantConnectionStore, TenantConnectionRow, TenantConnectionStore,
 };
@@ -72,6 +80,9 @@ pub use transient_token::{
 };
 
 // Backward-compatible concrete repo aliases.
+pub use agent::PgAgentStore as AgentRepo;
+pub use agent_act_token::PgAgentActTokenStore as AgentActTokenRepo;
+pub use agent_delegation::PgAgentDelegationStore as AgentDelegationRepo;
 pub use connection::PgTenantConnectionStore as TenantConnectionRepo;
 pub use domain::PgTenantDomainStore as TenantDomainRepo;
 pub use id_mapping::PgIdMappingStore as IdMappingRepo;

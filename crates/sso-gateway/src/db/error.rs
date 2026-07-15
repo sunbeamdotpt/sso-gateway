@@ -74,6 +74,12 @@ pub enum DbError {
 
     #[error("permission namespace type already registered: {0}")]
     NamespaceTypeConflict(String),
+
+    #[error("agent not found")]
+    AgentNotFound,
+
+    #[error("agent delegation not found")]
+    AgentDelegationNotFound,
 }
 
 impl From<DbError> for sunbeam_g2v::error::ServiceError {
@@ -124,6 +130,10 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             }
             DbError::NamespaceTypeConflict(s) => {
                 Self::AlreadyExists(format!("permission namespace type already registered: {s}"))
+            }
+            DbError::AgentNotFound => Self::NotFound("agent not found".to_string()),
+            DbError::AgentDelegationNotFound => {
+                Self::NotFound("agent delegation not found".to_string())
             }
         }
     }
@@ -241,6 +251,14 @@ mod tests {
                 ServiceError::AlreadyExists(
                     "permission namespace type already registered: doc".into(),
                 ),
+            ),
+            (
+                DbError::AgentNotFound,
+                ServiceError::NotFound("agent not found".into()),
+            ),
+            (
+                DbError::AgentDelegationNotFound,
+                ServiceError::NotFound("agent delegation not found".into()),
             ),
         ];
         for (err, expected) in cases {
