@@ -117,6 +117,11 @@ message SelfServiceFlow {
   bool refresh = 12;
   // Requested authenticator assurance level.
   string requested_aal = 13;
+  // Set when a submit completes with a browser-redirect outcome (Kratos
+  // `browser_location_change_required`, e.g. a login-challenge flow that must
+  // bounce the browser back to the authorize URL). The session cookie rides on
+  // this response's Set-Cookie headers; the browser must follow this URL.
+  string redirect_browser_to = 14;
 }
 
 // UiContainer carries the action, method, nodes and messages rendered by the UI.

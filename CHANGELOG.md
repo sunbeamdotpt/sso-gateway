@@ -7,6 +7,28 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Added
+
+- `SelfServiceFlow.redirect_browser_to` (field 14) carries the browser
+  redirect target when a self-service submit completes with Kratos'
+  `browser_location_change_required` outcome (e.g. a login-challenge flow
+  that must bounce the browser back to the authorize URL). Clients no longer
+  need to scrape the target out of an error string.
+
+### Fixed
+
+- A successful login or registration submit on a flow created with a
+  `login_challenge` is answered by Kratos with 422
+  `browser_location_change_required`, and the `Set-Cookie:
+  ory_kratos_session` rides on that 422 response. The Kratos client treated
+  every non-2xx as an error and discarded the headers, so the session cookie
+  never reached the browser — downstream consumers (consent, token claims,
+  mail login) then saw an anonymous session. The client now surfaces the 422
+  as a redirect carrying the location and the cookie headers, and all five
+  submit RPCs (`Submit{Login,Registration,Settings,Recovery,Verification}Flow`)
+  return `redirect_browser_to` and attach the captured cookies to the
+  response.
+
 ## [2026.07.12] - 2026-07-14
 
 ### Fixed

@@ -683,6 +683,45 @@ impl IdentitySelfServiceImpl {
         Ok(())
     }
 
+    /// Map a Kratos submit outcome to a public flow response.
+    ///
+    /// A successful submit returns the flow body as usual. A submit that
+    /// completes with Kratos' `browser_location_change_required` (surfaced by
+    /// the client as [`OryClientError::Redirect`]) returns a flow carrying only
+    /// `redirect_browser_to`; the Kratos session cookie that rides on that 422
+    /// is attached to the response so the browser session is established. The
+    /// location is already a browser-reachable URL, so it is passed through
+    /// unchanged. Any other error is mapped normally.
+    async fn map_submit_response(
+        &self,
+        tenant_id: &str,
+        result: Result<KratosResponse, OryClientError>,
+    ) -> ServiceResult<SelfServiceFlow> {
+        let flow = match result {
+            Ok(flow) => flow,
+            Err(OryClientError::Redirect {
+                location,
+                set_cookies,
+            }) => {
+                let body = SelfServiceFlow {
+                    redirect_browser_to: location,
+                    ..Default::default()
+                };
+                let mut response = Response::new(body);
+                attach_set_cookie_values(&mut response, &set_cookies);
+                return Ok(response);
+            }
+            Err(err) => return Err(map_ory_error(err).into()),
+        };
+        let mut response = Response::new(ory_flow_to_proto(&flow.body));
+        self.map_flow_response(tenant_id, &mut response.body)
+            .await?;
+        self.rewrite_flow_urls(tenant_id, &mut response.body)
+            .await?;
+        attach_set_cookies(&mut response, &flow.headers);
+        Ok(response)
+    }
+
     /// Intercept a settings-flow profile update so the gateway stays the trait owner.
     ///
     /// Profile (traits) submissions are normalized, validated against the membership's
@@ -821,6 +860,17 @@ fn tenant_from_context(ctx: &RequestContext) -> String {
 fn attach_set_cookies<T>(response: &mut Response<T>, headers: &http::HeaderMap) {
     for cookie in headers.get_all("set-cookie") {
         response.headers.append("set-cookie", cookie.clone());
+    }
+}
+
+/// Attach raw `Set-Cookie` header values captured from an upstream response
+/// (e.g. a Kratos `browser_location_change_required` redirect) to the outgoing
+/// response. Values that fail to parse as header values are skipped.
+fn attach_set_cookie_values<T>(response: &mut Response<T>, set_cookies: &[String]) {
+    for cookie in set_cookies {
+        if let Ok(value) = http::HeaderValue::from_str(cookie) {
+            response.headers.append("set-cookie", value);
+        }
     }
 }
 
@@ -1011,18 +1061,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
-        let flow = self
+        let result = self
             .kratos
             .submit_login_flow(&ory_flow_id, cookie.as_deref(), body)
-            .await
-            .map_err(map_ory_error)?;
-        let mut response = Response::new(ory_flow_to_proto(&flow.body));
-        self.map_flow_response(&tenant_id, &mut response.body)
-            .await?;
-        self.rewrite_flow_urls(&tenant_id, &mut response.body)
-            .await?;
-        attach_set_cookies(&mut response, &flow.headers);
-        Ok(response)
+            .await;
+        self.map_submit_response(&tenant_id, result).await
     }
 
     #[instrument(skip(self, request))]
@@ -1036,18 +1079,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
-        let flow = self
+        let result = self
             .kratos
             .submit_registration_flow(&ory_flow_id, cookie.as_deref(), body)
-            .await
-            .map_err(map_ory_error)?;
-        let mut response = Response::new(ory_flow_to_proto(&flow.body));
-        self.map_flow_response(&tenant_id, &mut response.body)
-            .await?;
-        self.rewrite_flow_urls(&tenant_id, &mut response.body)
-            .await?;
-        attach_set_cookies(&mut response, &flow.headers);
-        Ok(response)
+            .await;
+        self.map_submit_response(&tenant_id, result).await
     }
 
     #[instrument(skip(self, request))]
@@ -1063,18 +1099,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
         self.intercept_settings_profile(&tenant_id, cookie.as_deref(), &mut body)
             .await?;
-        let flow = self
+        let result = self
             .kratos
             .submit_settings_flow(&ory_flow_id, cookie.as_deref(), body)
-            .await
-            .map_err(map_ory_error)?;
-        let mut response = Response::new(ory_flow_to_proto(&flow.body));
-        self.map_flow_response(&tenant_id, &mut response.body)
-            .await?;
-        self.rewrite_flow_urls(&tenant_id, &mut response.body)
-            .await?;
-        attach_set_cookies(&mut response, &flow.headers);
-        Ok(response)
+            .await;
+        self.map_submit_response(&tenant_id, result).await
     }
 
     #[instrument(skip(self, request))]
@@ -1088,18 +1117,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
-        let flow = self
+        let result = self
             .kratos
             .submit_recovery_flow(&ory_flow_id, cookie.as_deref(), body)
-            .await
-            .map_err(map_ory_error)?;
-        let mut response = Response::new(ory_flow_to_proto(&flow.body));
-        self.map_flow_response(&tenant_id, &mut response.body)
-            .await?;
-        self.rewrite_flow_urls(&tenant_id, &mut response.body)
-            .await?;
-        attach_set_cookies(&mut response, &flow.headers);
-        Ok(response)
+            .await;
+        self.map_submit_response(&tenant_id, result).await
     }
 
     #[instrument(skip(self, request))]
@@ -1113,18 +1135,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let tenant_id = tenant_from_context(&ctx);
         let body = proto_struct_to_json(req.body.as_option());
         let ory_flow_id = self.resolve_flow(&tenant_id, &req.id).await?;
-        let flow = self
+        let result = self
             .kratos
             .submit_verification_flow(&ory_flow_id, cookie.as_deref(), body)
-            .await
-            .map_err(map_ory_error)?;
-        let mut response = Response::new(ory_flow_to_proto(&flow.body));
-        self.map_flow_response(&tenant_id, &mut response.body)
-            .await?;
-        self.rewrite_flow_urls(&tenant_id, &mut response.body)
-            .await?;
-        attach_set_cookies(&mut response, &flow.headers);
-        Ok(response)
+            .await;
+        self.map_submit_response(&tenant_id, result).await
     }
 
     #[instrument(skip(self, request))]
@@ -1697,6 +1712,13 @@ mod tests {
             *self.flow.lock().unwrap() = Some(Err(OryClientError::Ory {
                 status,
                 message: message.to_string(),
+            }));
+        }
+
+        fn reseed_flow_redirect(&self, location: &str, cookies: &[&str]) {
+            *self.flow.lock().unwrap() = Some(Err(OryClientError::Redirect {
+                location: location.to_string(),
+                set_cookies: cookies.iter().map(|c| c.to_string()).collect(),
             }));
         }
 
@@ -4177,6 +4199,70 @@ mod tests {
         assert_eq!(resp.body.id, "flow-1");
         let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_returns_redirect_and_session_cookie_on_browser_location_change() {
+        let fake = FakeKratos::default();
+        fake.reseed_flow_redirect(
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1",
+            &[
+                "ory_kratos_session=session-422; Path=/; HttpOnly",
+                "csrf_token_422=xyz; Path=/; HttpOnly",
+            ],
+        );
+        let svc = service(fake);
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
+        );
+        assert!(resp.body.id.is_empty());
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=session-422")
+        );
+        assert!(cookies[1].to_str().unwrap().contains("csrf_token_422=xyz"));
+    }
+
+    #[tokio::test]
+    async fn submit_registration_flow_returns_redirect_and_session_cookie_on_browser_location_change()
+     {
+        let fake = FakeKratos::default();
+        fake.reseed_flow_redirect(
+            "https://gateway.example.com/oauth2/auth?login_verifier=v2",
+            &["ory_kratos_session=session-reg; Path=/; HttpOnly"],
+        );
+        let svc = service(fake);
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_registration_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v2"
+        );
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0]
+                .to_str()
+                .unwrap()
+                .contains("ory_kratos_session=session-reg")
+        );
     }
 
     #[tokio::test]

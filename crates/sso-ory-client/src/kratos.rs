@@ -781,8 +781,51 @@ async fn handle_response_with_headers(
         let headers = response.headers().clone();
         let body = response.json().await.map_err(OryClientError::Http)?;
         Ok(KratosResponse { body, headers })
+    } else if response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        Err(browser_redirect_or_error(response).await)
     } else {
         Err(ory_error(response).await)
+    }
+}
+
+/// Kratos answers a successful browser submit that must continue elsewhere
+/// (login challenge, `return_to`) with 422 `browser_location_change_required`.
+/// The session `Set-Cookie` rides on that 422 response, so surface the target
+/// and the cookies via [`OryClientError::Redirect`] instead of a bare error.
+/// Any other 422 keeps the plain error behavior.
+async fn browser_redirect_or_error(response: reqwest::Response) -> OryClientError {
+    let headers = response.headers().clone();
+    let status = response.status().as_u16();
+    let message = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let body: Value = match serde_json::from_str(&message) {
+        Ok(body) => body,
+        Err(_) => return OryClientError::Ory { status, message },
+    };
+    let is_browser_redirect = body
+        .get("error")
+        .and_then(|error| error.get("id"))
+        .and_then(Value::as_str)
+        == Some("browser_location_change_required");
+    if !is_browser_redirect {
+        return OryClientError::Ory { status, message };
+    }
+    let location = body
+        .get("redirect_browser_to")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let set_cookies = headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .map(String::from)
+        .collect();
+    OryClientError::Redirect {
+        location,
+        set_cookies,
     }
 }
 
@@ -1056,7 +1099,45 @@ mod tests {
         params: std::collections::HashMap<String, String>,
         body: Value,
     ) -> (axum::http::StatusCode, axum::http::HeaderMap, Json<Value>) {
+        let flow_id = params.get("flow").cloned().unwrap_or_default();
         let mut headers = axum::http::HeaderMap::new();
+        if flow_id == "flow-422-redirect" {
+            headers.append(
+                "set-cookie",
+                "ory_kratos_session=session-422; Path=/; HttpOnly"
+                    .parse()
+                    .unwrap(),
+            );
+            headers.append(
+                "set-cookie",
+                "csrf_token_422=xyz; Path=/; HttpOnly".parse().unwrap(),
+            );
+            return (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                headers,
+                Json(json!({
+                    "error": {
+                        "id": "browser_location_change_required",
+                        "code": 422,
+                        "reason": "The browser needs to be redirected to a different location.",
+                    },
+                    "redirect_browser_to": "https://gateway.example.com/oauth2/auth?login_verifier=v1",
+                })),
+            );
+        }
+        if flow_id == "flow-422-other" {
+            return (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                headers,
+                Json(json!({
+                    "error": {
+                        "id": "session_already_available",
+                        "code": 422,
+                        "reason": "Already logged in.",
+                    },
+                })),
+            );
+        }
         headers.insert(
             "set-cookie",
             format!("ory_kratos_session={flow}; Path=/; HttpOnly")
@@ -1067,7 +1148,7 @@ mod tests {
             axum::http::StatusCode::OK,
             headers,
             Json(json!({
-                "id": params.get("flow").cloned().unwrap_or_default(),
+                "id": flow_id,
                 "type": flow,
                 "state": "passed_challenge",
                 "body": body
@@ -1315,6 +1396,56 @@ mod tests {
                 .unwrap()
                 .contains("ory_kratos_session=login")
         );
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_captures_browser_location_change_redirect_and_cookies() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let err = client
+            .submit_login_flow(
+                "flow-422-redirect",
+                Some("cookie"),
+                json!({ "identifier": "a" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            OryClientError::Redirect {
+                location,
+                set_cookies,
+            } => {
+                assert_eq!(
+                    location,
+                    "https://gateway.example.com/oauth2/auth?login_verifier=v1"
+                );
+                assert_eq!(set_cookies.len(), 2);
+                assert!(set_cookies[0].contains("ory_kratos_session=session-422"));
+                assert!(set_cookies[1].contains("csrf_token_422=xyz"));
+            }
+            other => panic!("expected redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_preserves_other_422_errors() {
+        let (_handle, url) = start_server().await;
+        let client = KratosClient::new_with_public(&url, &url).unwrap();
+        let err = client
+            .submit_login_flow(
+                "flow-422-other",
+                Some("cookie"),
+                json!({ "identifier": "a" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            OryClientError::Ory { status, message } => {
+                assert_eq!(status, 422);
+                assert!(message.contains("session_already_available"));
+            }
+            other => panic!("expected ory error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
