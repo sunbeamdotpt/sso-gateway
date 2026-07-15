@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.15] - 2026-07-15
+
+### Added
+
+- Tenant namespace lifecycle on `PermissionService`. Third-party services can
+  now register their own permission namespaces with full OpenFGA authorization
+  models instead of relying on the internal SCIM-only provisioning path:
+  - `EnsurePermissionNamespace` registers a namespace with an arbitrary rich
+    model (`schema_version`, `type_definitions`, `conditions` as
+    `google.protobuf.Struct`). Re-ensuring the identical model is a no-op; a
+    changed model publishes a new OpenFGA model version into the existing
+    store, so relation tuples are never re-initialized. Object types are
+    indexed per tenant so tuple and check calls resolve a type
+    (`KanbanProject`) to its owning namespace store; a type may be claimed by
+    only one namespace per tenant.
+  - `GetPermissionNamespace` / `ListPermissionNamespaces` read back the
+    registered model and its type list.
+  - `DeletePermissionNamespace` tears down the OpenFGA store, the mirrored
+    tuples, and the registration.
+  - `WriteRelationTuples` batches creates and deletes (up to 100 keys per
+    direction), with optional OpenFGA conditions and condition context per
+    key.
+  - `ListUsers` lists the subjects that have a relation on an object
+    (OpenFGA backend only).
+  - `CheckPermission`, `ExpandPermissions`, `ExpandObjects`, and `ListUsers`
+    accept optional `context`, `contextual_tuples`, and `consistency`
+    (`minimize_latency` / `higher_consistency`) which pass through to OpenFGA
+    verbatim; the Keto backend rejects them with a configuration error.
+  - `ListRelationTuples` is now keyset-paginated (default 50, max 200) over
+    the mirrored tuples.
+- `permission_namespaces` and `permission_namespace_types` tables persist the
+  tenant namespace registry (replacing the in-memory placeholder), plus a
+  keyset index on `permission_tuples`.
+
 ## [2026.07.14] - 2026-07-15
 
 ### Added

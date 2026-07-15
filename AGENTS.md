@@ -68,6 +68,24 @@ The gateway never exposes Ory paths or IDs to callers. Internally:
 - Kratos identities are mapped via `id_mappings` and hold only the base `{email}` trait; tenant membership and every other trait live in the gateway (`tenant_memberships`), never in Kratos.
 - Keto namespaces and object IDs are prefixed with the tenant slug.
 
+## Permissions backends
+
+`PermissionService` is a discrete, opaque multitenant wrapper over the
+configured backend (`PERMISSIONS_BACKEND`, `keto` or `openfga`); every
+OpenFGA capability (rich authorization models, conditions, contextual tuples,
+consistency) must stay reachable through the gateway API.
+
+- Tenant namespaces are registered via `EnsurePermissionNamespace` with a full
+  OpenFGA model; the registry lives in `permission_namespaces` (plus the
+  `permission_namespace_types` index mapping object type → namespace).
+  Ensuring an identical model is a no-op; a changed model publishes a new
+  OpenFGA model version into the existing store — tuples are never
+  re-initialized.
+- On OpenFGA, each (tenant, namespace) maps to exactly one store; tuple and
+  check calls resolve the store through the type index.
+- `ListRelationTuples` reads from the `permission_tuples` mirror with keyset
+  pagination; backend calls (check/expand/list) never hit the mirror.
+
 ## Documentation
 
 - Keep docs in `docs/` so the sunbeam docs-server discovers them.

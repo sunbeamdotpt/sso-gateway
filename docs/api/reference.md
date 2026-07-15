@@ -78,12 +78,18 @@ Protected by `application:read` / `application:admin`.
 
 | Method | Description |
 |---|---|
-| `CheckPermission` | Check a permission tuple. |
+| `CheckPermission` | Check a permission tuple. Supports `context`, `contextual_tuples`, and `consistency` on the OpenFGA backend. |
 | `CreateRelationTuple` | Create a relation tuple. |
 | `DeleteRelationTuple` | Delete a relation tuple. |
 | `ExpandPermissions` | Expand a permission set. |
 | `ExpandObjects` | Expand the objects a subject has a relation on. |
-| `ListRelationTuples` | List relation tuples. |
+| `ListRelationTuples` | List relation tuples (keyset-paginated). |
+| `EnsurePermissionNamespace` | Register a namespace with a full OpenFGA authorization model, or publish a new model version when the model changes. The store is created once; tuples are never re-initialized. |
+| `GetPermissionNamespace` | Retrieve a registered namespace and its current model. |
+| `ListPermissionNamespaces` | List the namespaces registered for the tenant. |
+| `DeletePermissionNamespace` | Delete a namespace, its OpenFGA store, and all of its tuples. |
+| `WriteRelationTuples` | Create and/or delete relation tuples in one batch (up to 100 keys per direction). |
+| `ListUsers` | List the subjects that have a relation on an object (OpenFGA backend only). |
 
 ### `iam.v1.FederationService`
 
