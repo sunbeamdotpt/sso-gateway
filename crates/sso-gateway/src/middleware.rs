@@ -14,7 +14,7 @@ use crate::auth::{
     ActorContext, AuthContext, SubjectBackend, SubjectType, TokenIntrospector, bearer_token,
     build_auth_context, resolve_subject,
 };
-use crate::db::{AGENT_STATUS_ACTIVE, IdMappingStore, SessionStore};
+use crate::db::{AGENT_STATUS_ACTIVE, ApplicationStore, IdMappingStore, SessionStore};
 use crate::session_token::SessionTokenSigner;
 
 /// Re-exported helper for RPC handlers that need stepped-up authentication.
@@ -113,6 +113,7 @@ pub async fn auth_middleware(
     Extension(mappings): Extension<Arc<dyn IdMappingStore>>,
     Extension(session_signer): Extension<SessionTokenSigner>,
     Extension(session_store): Extension<Arc<dyn SessionStore>>,
+    applications: Option<Extension<Arc<dyn ApplicationStore>>>,
     agent_resolver: Option<Extension<Arc<dyn AgentTokenResolver>>>,
     self_service_paths: Option<Extension<Arc<crate::config::SelfServicePaths>>>,
     mut request: Request,
@@ -144,9 +145,13 @@ pub async fn auth_middleware(
 
     match auth_result {
         Ok(ctx) => {
-            request
-                .extensions_mut()
-                .insert(TenantId(ctx.tenant_id.clone()));
+            let target_tenant = resolve_target_tenant(
+                &ctx,
+                request.headers(),
+                applications.as_ref().map(|Extension(a)| a.as_ref()),
+            )
+            .await;
+            request.extensions_mut().insert(TenantId(target_tenant));
             request.extensions_mut().insert(AuthOutcome::Success);
             request.extensions_mut().insert(ctx);
         }
@@ -157,6 +162,50 @@ pub async fn auth_middleware(
     }
 
     next.run(request).await
+}
+
+async fn resolve_target_tenant(
+    ctx: &AuthContext,
+    headers: &HeaderMap,
+    applications: Option<&dyn ApplicationStore>,
+) -> String {
+    if ctx.subject_type != SubjectType::Client {
+        return ctx.tenant_id.clone();
+    }
+    let header_value = match headers.get(TENANT_ID_HEADER).and_then(|v| v.to_str().ok()) {
+        Some(v) => v,
+        None => return ctx.tenant_id.clone(),
+    };
+    if ulid::Ulid::from_string(header_value).is_err() {
+        tracing::debug!(%header_value, "ignoring malformed x-tenant-id header");
+        return ctx.tenant_id.clone();
+    }
+    let applications = match applications {
+        Some(a) => a,
+        None => return ctx.tenant_id.clone(),
+    };
+    match applications.get_by_public_id(&ctx.subject).await {
+        Ok(row) if row.cross_tenant => {
+            tracing::debug!(
+                subject = %ctx.subject,
+                home_tenant = %ctx.tenant_id,
+                target_tenant = %header_value,
+                "cross-tenant header honored"
+            );
+            header_value.to_string()
+        }
+        Ok(_) => {
+            tracing::debug!(
+                subject = %ctx.subject,
+                "ignoring x-tenant-id for client without cross_tenant flag"
+            );
+            ctx.tenant_id.clone()
+        }
+        Err(err) => {
+            tracing::debug!(%err, subject = %ctx.subject, "application lookup failed");
+            ctx.tenant_id.clone()
+        }
+    }
 }
 
 /// Outcome of authentication, recorded by the audit middleware.
@@ -332,18 +381,23 @@ pub fn auth_error(status: StatusCode) -> Response {
 /// response status, and emits a structured log event to the standard log
 /// stream tagged with `sso_gateway::audit`.
 pub async fn audit_middleware(request: Request, next: Next) -> Response {
-    let tenant_id = request
+    let auth_tenant_id = request
         .extensions()
         .get::<AuthContext>()
-        .map(|c| c.tenant_id.clone())
-        .or_else(|| request.extensions().get::<TenantId>().map(|t| t.0.clone()))
-        .or_else(|| {
-            request
-                .headers()
-                .get(TENANT_ID_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        });
+        .map(|c| c.tenant_id.clone());
+    let target_tenant_id = request.extensions().get::<TenantId>().map(|t| t.0.clone());
+    // Tenant ID is never taken from x-tenant-id for unauthenticated requests;
+    // that would let arbitrary callers spoof the audit tenant label.
+    let tenant_id = auth_tenant_id.clone();
+    let cross_tenant = match (&auth_tenant_id, &target_tenant_id) {
+        (Some(auth), Some(target)) => auth != target,
+        _ => false,
+    };
+    let target_tenant = if cross_tenant {
+        target_tenant_id.as_deref()
+    } else {
+        None
+    };
     let actor = request
         .extensions()
         .get::<AuthContext>()
@@ -370,6 +424,8 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
     tracing::info!(
         target: "sso_gateway::audit",
         tenant_id = tenant_id.as_deref(),
+        target_tenant = target_tenant,
+        cross_tenant = cross_tenant,
         actor = actor.as_deref(),
         subject_type = subject_type,
         agent = agent.as_deref(),
@@ -387,6 +443,7 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use crate::auth::IntrospectionResult;
+    use crate::db::MemoryApplicationStore;
     use crate::session_token::SessionTokenSigner;
     use axum::{Extension, Router, body::Body, http::Request, middleware::from_fn, routing::get};
     use std::sync::Mutex;
@@ -1052,6 +1109,45 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    fn client_introspector(sub: &str) -> Arc<dyn TokenIntrospector> {
+        Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+            IntrospectionResult {
+                active: true,
+                sub: Some(sub.to_string()),
+                scope: vec!["tenant:read".into()],
+                exp: None,
+                authentication_methods: vec![],
+            },
+        )))))
+    }
+
+    fn cross_tenant_router(applications: Arc<dyn ApplicationStore>) -> Router {
+        test_router_with_resolver(
+            client_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            None,
+        )
+        .layer(Extension(applications))
+    }
+
+    async fn ctx_body_with_header(router: Router, header_value: &str) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::get("/ctx")
+                    .header("Authorization", "Bearer some-token")
+                    .header("x-tenant-id", header_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
     #[tokio::test]
     async fn act_token_authenticates_as_user_with_actor() {
         let resolver = Arc::new(StubAgentResolver {
@@ -1172,5 +1268,165 @@ mod tests {
 
         let (status, _) = ctx_body(router).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-tenant x-tenant-id header gate
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cross_tenant_header_overrides_tenant_for_flagged_client() {
+        let apps = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let router = cross_tenant_router(apps);
+        let (status, body) = ctx_body_with_header(router, &target_tenant).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|client|");
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_header_ignored_for_user() {
+        let apps = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let router = test_router(
+            client_introspector("kratos-identity-1"),
+            Arc::new(StubMappingStore {
+                hydra: None,
+                kratos: Some("tenant-1".into()),
+            }),
+        )
+        .layer(Extension(apps));
+
+        let (status, body) = ctx_body_with_header(router, &target_tenant).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|user|");
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_header_ignored_for_agent() {
+        let apps = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let resolver = Arc::new(StubAgentResolver {
+            status_result: Mutex::new(Some(Ok(Some("active".into())))),
+            ..Default::default()
+        });
+        let router = test_router_with_resolver(
+            client_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+            Some(resolver),
+        )
+        .layer(Extension(apps));
+
+        let (status, body) = ctx_body_with_header(router, &target_tenant).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|agent|");
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_header_ignored_for_unflagged_client() {
+        let apps = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", false).await.unwrap();
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let router = cross_tenant_router(apps);
+        let (status, body) = ctx_body_with_header(router, &target_tenant).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|client|");
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_header_ignored_when_value_is_not_ulid() {
+        let apps = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+
+        let router = cross_tenant_router(apps);
+        let (status, body) = ctx_body_with_header(router, "not-a-ulid").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "pub-sub-1|client|");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_request_does_not_use_header_in_audit_tenant_id() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let app = Router::new()
+            .route("/protected", get(|| async { StatusCode::UNAUTHORIZED }))
+            .layer(from_fn(audit_middleware));
+
+        let response = app
+            .oneshot(
+                Request::get("/protected")
+                    .header("x-tenant-id", "tenant-spoof")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let audit_events: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].fields.get("tenant_id"), None);
+        assert_eq!(audit_events[0].fields.get("target_tenant"), None);
+    }
+
+    #[tokio::test]
+    async fn audit_middleware_logs_cross_tenant_override() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let app = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(from_fn(audit_middleware))
+            .layer(Extension(AuthContext {
+                tenant_id: "home-tenant".into(),
+                subject: "sub-1".into(),
+                subject_type: SubjectType::Client,
+                actor: None,
+                scopes: vec![],
+                token_hash: "hash".into(),
+                authentication_methods: Vec::new(),
+            }))
+            .layer(Extension(TenantId("target-tenant".into())));
+
+        let response = app
+            .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let audit_events: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit_events.len(), 1);
+        let fields = &audit_events[0].fields;
+        assert_eq!(fields.get("tenant_id"), Some(&"home-tenant".to_string()));
+        assert_eq!(
+            fields.get("target_tenant"),
+            Some(&"target-tenant".to_string())
+        );
+        assert_eq!(fields.get("cross_tenant"), Some(&"true".to_string()));
     }
 }

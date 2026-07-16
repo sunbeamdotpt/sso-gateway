@@ -13,7 +13,7 @@ use crate::{
     auth::{CachedTokenIntrospector, HydraTokenIntrospector},
     config::Config,
     db::{
-        AgentActTokenRepo, AgentDelegationRepo, AgentRepo, DbPool, IdMappingRepo,
+        AgentActTokenRepo, AgentDelegationRepo, AgentRepo, ApplicationRepo, DbPool, IdMappingRepo,
         IdentitySchemaRepo, LoginStateRepo, PermissionNamespaceRepo, PermissionTupleRepo,
         PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
         SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
@@ -177,6 +177,9 @@ pub async fn build_app_with_upstream(
     let sp_clients = SamlSpClientRepo::new(pool.clone());
     let scim_groups = ScimGroupRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
+    let application_repo = ApplicationRepo::new(pool.clone());
+    let application_store: Arc<dyn crate::db::ApplicationStore> =
+        Arc::new(application_repo.clone());
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
@@ -265,8 +268,12 @@ pub async fn build_app_with_upstream(
         tenant_repo,
         config.system_tenant_ulid.clone(),
     ));
-    let application_service =
-        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_service = Arc::new(ApplicationServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+        application_repo,
+        config.system_tenant_ulid.clone(),
+    ));
     let client_credential_service = Arc::new(ClientCredentialServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
@@ -471,6 +478,7 @@ pub async fn build_app_with_upstream(
         .layer(Extension(Arc::new(config.self_service_paths.clone())))
         .layer(Extension(session_signer))
         .layer(Extension(session_store))
+        .layer(Extension(application_store))
         .layer(Extension(
             Arc::new(mappings) as Arc<dyn crate::db::IdMappingStore>
         ));
