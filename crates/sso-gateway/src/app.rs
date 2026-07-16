@@ -117,6 +117,7 @@ pub async fn build_app_with_upstream(
     );
 
     let mappings = IdMappingRepo::new(pool.clone());
+    let application_repo = ApplicationRepo::new(pool.clone());
 
     if let (Some(client_id), Some(client_secret)) = (
         config.system_bootstrap_client_id.as_deref(),
@@ -125,6 +126,7 @@ pub async fn build_app_with_upstream(
         bootstrap_system_client(
             hydra.as_ref(),
             &mappings,
+            &application_repo,
             &config.system_tenant_ulid,
             client_id,
             client_secret,
@@ -177,7 +179,6 @@ pub async fn build_app_with_upstream(
     let sp_clients = SamlSpClientRepo::new(pool.clone());
     let scim_groups = ScimGroupRepo::new(pool.clone());
     let tenant_repo = TenantRepo::new(pool.clone());
-    let application_repo = ApplicationRepo::new(pool.clone());
     let application_store: Arc<dyn crate::db::ApplicationStore> =
         Arc::new(application_repo.clone());
     let connections = TenantConnectionRepo::new(pool.clone());
@@ -497,6 +498,7 @@ const BOOTSTRAP_CLIENT_SCOPE: &str = "tenant:read tenant:admin identity:read ide
 async fn bootstrap_system_client(
     hydra: &HydraClient,
     mappings: &IdMappingRepo,
+    applications: &ApplicationRepo,
     system_tenant_ulid: &str,
     client_id: &str,
     client_secret: &str,
@@ -509,19 +511,21 @@ async fn bootstrap_system_client(
         "scope": BOOTSTRAP_CLIENT_SCOPE,
     });
 
-    match mappings.get_tenant_id_by_ory_id("hydra", client_id).await {
-        Ok(Some(_)) => {
-            // The mapping exists; make sure the upstream Hydra client carries
-            // the scopes required for bootstrapping. This lets deployments that
-            // created the client under an older release pick up new scopes
-            // without manual intervention.
-            match hydra.get_oauth2_client(client_id).await {
-                Ok(existing) => {
-                    let existing_scope = existing["scope"].as_str().unwrap_or("");
-                    if existing_scope == BOOTSTRAP_CLIENT_SCOPE {
-                        info!("system bootstrap OAuth2 client already configured");
-                        return Ok(());
-                    }
+    let mapping_exists = match mappings.get_tenant_id_by_ory_id("hydra", client_id).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            return Err(sunbeam_g2v::error::ServiceError::Database(e.to_string()));
+        }
+    };
+
+    if mapping_exists {
+        // The mapping exists; make sure the upstream Hydra client carries
+        // the scopes required for bootstrapping.
+        match hydra.get_oauth2_client(client_id).await {
+            Ok(existing) => {
+                let existing_scope = existing["scope"].as_str().unwrap_or("");
+                if existing_scope != BOOTSTRAP_CLIENT_SCOPE {
                     info!("updating system bootstrap OAuth2 client scopes");
                     let mut updated = existing;
                     updated["scope"] =
@@ -534,32 +538,81 @@ async fn bootstrap_system_client(
                                 "bootstrap client update: {e}"
                             ))
                         })?;
-                    return Ok(());
-                }
-                Err(OryClientError::Ory { status: 404, .. }) => {
-                    info!("bootstrap client mapping exists but Hydra client missing; recreating");
-                }
-                Err(e) => {
-                    return Err(sunbeam_g2v::error::ServiceError::Configuration(format!(
-                        "bootstrap client lookup: {e}"
-                    )));
+                } else {
+                    info!("system bootstrap OAuth2 client already configured");
                 }
             }
+            Err(OryClientError::Ory { status: 404, .. }) => {
+                info!("bootstrap client mapping exists but Hydra client missing; recreating");
+                hydra.create_oauth2_client(payload).await.map_err(|e| {
+                    sunbeam_g2v::error::ServiceError::Configuration(format!(
+                        "bootstrap client: {e}"
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(sunbeam_g2v::error::ServiceError::Configuration(format!(
+                    "bootstrap client lookup: {e}"
+                )));
+            }
         }
-        Ok(None) => {}
-        Err(e) => {
-            return Err(sunbeam_g2v::error::ServiceError::Database(e.to_string()));
-        }
+    } else {
+        hydra.create_oauth2_client(payload).await.map_err(|e| {
+            sunbeam_g2v::error::ServiceError::Configuration(format!("bootstrap client: {e}"))
+        })?;
+        mappings
+            .create(system_tenant_ulid, "hydra", client_id, client_id)
+            .await
+            .map_err(|e| sunbeam_g2v::error::ServiceError::Database(e.to_string()))?;
     }
 
-    hydra.create_oauth2_client(payload).await.map_err(|e| {
-        sunbeam_g2v::error::ServiceError::Configuration(format!("bootstrap client: {e}"))
-    })?;
-
-    mappings
-        .create(system_tenant_ulid, "hydra", client_id, client_id)
-        .await
-        .map_err(|e| sunbeam_g2v::error::ServiceError::Database(e.to_string()))?;
+    // The bootstrap client is a first-party service credential that must be
+    // able to route requests via x-tenant-id. Ensure the gateway's own
+    // application row exists and is flagged cross-tenant.
+    match applications.get_by_public_id(client_id).await {
+        Ok(row) if row.cross_tenant => {
+            info!(
+                system_tenant = %system_tenant_ulid,
+                client_id = %client_id,
+                "system bootstrap application already cross-tenant"
+            );
+        }
+        Ok(row) => {
+            info!(
+                system_tenant = %system_tenant_ulid,
+                client_id = %client_id,
+                "enabling cross_tenant for existing system bootstrap application"
+            );
+            applications
+                .set_cross_tenant(&row.tenant_id, &row.public_id, true)
+                .await
+                .map_err(|e| {
+                    sunbeam_g2v::error::ServiceError::Database(format!(
+                        "bootstrap application cross_tenant update: {e}"
+                    ))
+                })?;
+        }
+        Err(crate::db::DbError::ApplicationNotFound) => {
+            info!(
+                system_tenant = %system_tenant_ulid,
+                client_id = %client_id,
+                "creating system bootstrap application with cross_tenant"
+            );
+            applications
+                .create(system_tenant_ulid, client_id, true)
+                .await
+                .map_err(|e| {
+                    sunbeam_g2v::error::ServiceError::Database(format!(
+                        "bootstrap application create: {e}"
+                    ))
+                })?;
+        }
+        Err(e) => {
+            return Err(sunbeam_g2v::error::ServiceError::Database(format!(
+                "bootstrap application lookup: {e}"
+            )));
+        }
+    }
 
     info!(
         system_tenant = %system_tenant_ulid,
@@ -612,7 +665,11 @@ mod tests {
 
     use super::*;
     use crate::middleware::RateLimiter;
-    use crate::{config::Config, db::create_pool, test_support::postgres_url};
+    use crate::{
+        config::Config,
+        db::create_pool,
+        test_support::postgres_url,
+    };
 
     async fn ok_handler() -> StatusCode {
         StatusCode::OK
@@ -980,5 +1037,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap client cross-tenant provisioning regression tests
+    // -----------------------------------------------------------------------
+
+    /// Starts a minimal Hydra admin stub for bootstrap_system_client tests.
+    /// The GET /admin/clients/{id} endpoint always returns 404 (so the client
+    /// is created), and POST /admin/clients echoes a minimal client document.
+    async fn start_bootstrap_hydra_stub() -> (tokio::task::JoinHandle<()>, String) {
+        let app = axum::Router::new()
+            .route(
+                "/admin/clients/{id}",
+                axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/admin/clients",
+                axum::routing::post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let client_id = body
+                        .get("client_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("bootstrap-client")
+                        .to_string();
+                    axum::Json(serde_json::json!({ "client_id": client_id }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (handle, format!("http://{addr}"))
+    }
+
+    async fn bootstrap_test_pool(db_name: &str) -> (DbPool, String) {
+        let base = postgres_url().await;
+        let url = db_url_with_name(base, db_name);
+        let pool = create_pool(&url, false).await.unwrap();
+        let system_tenant_ulid = Ulid::new().to_string();
+        bootstrap_system_tenant(&pool, &system_tenant_ulid).await.unwrap();
+        (pool, system_tenant_ulid)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_system_client_creates_cross_tenant_application_row() {
+        let (pool, system_tenant_ulid) =
+            bootstrap_test_pool(&format!("bs_create_{}", Ulid::new().to_string().to_lowercase())).await;
+
+        let mappings = IdMappingRepo::new(pool.clone());
+        let applications = ApplicationRepo::new(pool.clone());
+        let (_handle, hydra_url) = start_bootstrap_hydra_stub().await;
+        let hydra = HydraClient::new(&hydra_url, "http://ignored").unwrap();
+
+        bootstrap_system_client(
+            &hydra,
+            &mappings,
+            &applications,
+            &system_tenant_ulid,
+            "bootstrap-client",
+            "bootstrap-secret",
+        )
+        .await
+        .unwrap();
+
+        let mapping = mappings
+            .get_tenant_id_by_ory_id("hydra", "bootstrap-client")
+            .await
+            .unwrap();
+        assert_eq!(mapping, Some(system_tenant_ulid.clone()));
+
+        let app = applications.get_by_public_id("bootstrap-client").await.unwrap();
+        assert_eq!(app.tenant_id, system_tenant_ulid);
+        assert!(app.cross_tenant, "bootstrap application must be cross-tenant");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_system_client_upgrades_existing_application_to_cross_tenant() {
+        let (pool, system_tenant_ulid) =
+            bootstrap_test_pool(&format!("bs_upgrade_{}", Ulid::new().to_string().to_lowercase())).await;
+
+        let mappings = IdMappingRepo::new(pool.clone());
+        let applications = ApplicationRepo::new(pool.clone());
+
+        // Pre-create an application row without cross_tenant, as would happen
+        // if the bootstrap client was provisioned before this release.
+        mappings
+            .create(&system_tenant_ulid, "hydra", "bootstrap-client", "bootstrap-client")
+            .await
+            .unwrap();
+        let existing = applications
+            .create(&system_tenant_ulid, "bootstrap-client", false)
+            .await
+            .unwrap();
+        assert!(!existing.cross_tenant);
+
+        let (_handle, hydra_url) = start_bootstrap_hydra_stub().await;
+        let hydra = HydraClient::new(&hydra_url, "http://ignored").unwrap();
+
+        bootstrap_system_client(
+            &hydra,
+            &mappings,
+            &applications,
+            &system_tenant_ulid,
+            "bootstrap-client",
+            "bootstrap-secret",
+        )
+        .await
+        .unwrap();
+
+        let app = applications.get_by_public_id("bootstrap-client").await.unwrap();
+        assert!(app.cross_tenant, "bootstrap application must be upgraded to cross-tenant");
     }
 }

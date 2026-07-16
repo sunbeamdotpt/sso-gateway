@@ -197,12 +197,18 @@ async fn resolve_target_tenant(
         Ok(_) => {
             tracing::debug!(
                 subject = %ctx.subject,
+                header_value = %header_value,
                 "ignoring x-tenant-id for client without cross_tenant flag"
             );
             ctx.tenant_id.clone()
         }
         Err(err) => {
-            tracing::debug!(%err, subject = %ctx.subject, "application lookup failed");
+            tracing::debug!(
+                %err,
+                subject = %ctx.subject,
+                header_value = %header_value,
+                "ignoring x-tenant-id because application lookup failed"
+            );
             ctx.tenant_id.clone()
         }
     }
@@ -443,7 +449,7 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use crate::auth::IntrospectionResult;
-    use crate::db::MemoryApplicationStore;
+    use crate::db::{ApplicationStore, MemoryApplicationStore};
     use crate::session_token::SessionTokenSigner;
     use axum::{Extension, Router, body::Body, http::Request, middleware::from_fn, routing::get};
     use std::sync::Mutex;
@@ -626,6 +632,11 @@ mod tests {
             ctx.subject_type.as_str(),
             ctx.actor.map(|a| a.agent_id).unwrap_or_default()
         )
+    }
+
+    /// Handler echoing the resolved target tenant for cross-tenant routing assertions.
+    async fn tenant_handler(Extension(TenantId(tenant_id)): Extension<TenantId>) -> String {
+        tenant_id
     }
 
     fn test_router(
@@ -1288,6 +1299,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_tenant_header_overrides_resolved_tenant_for_flagged_client() {
+        let apps: Arc<dyn ApplicationStore> = Arc::new(MemoryApplicationStore::default());
+        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let router = Router::new()
+            .route("/tenant", get(tenant_handler))
+            .layer(from_fn(auth_middleware))
+            .layer(Extension(client_introspector("hydra-client-1")))
+            .layer(Extension(SessionTokenSigner::new(
+                "test-secret-that-is-at-least-32-bytes-long",
+                3600,
+                "https://gateway.example.com",
+            )))
+            .layer(Extension(
+                Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
+            ))
+            .layer(Extension(hydra_mappings("tenant-1")))
+            .layer(Extension(apps));
+
+        let response = router
+            .oneshot(
+                Request::get("/tenant")
+                    .header("Authorization", "Bearer some-token")
+                    .header("x-tenant-id", &target_tenant)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), target_tenant);
+    }
+
+    #[tokio::test]
     async fn cross_tenant_header_ignored_for_user() {
         let apps = Arc::new(MemoryApplicationStore::default());
         apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
@@ -1340,6 +1389,46 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "pub-sub-1|client|");
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_header_ignored_when_application_row_missing() {
+        // This is the historical bootstrap-client bug: a service token whose
+        // subject has no applications row must never route via x-tenant-id,
+        // even when the header is a valid ULID.
+        let apps: Arc<dyn ApplicationStore> = Arc::new(MemoryApplicationStore::default());
+        let target_tenant = ulid::Ulid::new().to_string();
+
+        let router = Router::new()
+            .route("/tenant", get(tenant_handler))
+            .layer(from_fn(auth_middleware))
+            .layer(Extension(client_introspector("hydra-client-1")))
+            .layer(Extension(SessionTokenSigner::new(
+                "test-secret-that-is-at-least-32-bytes-long",
+                3600,
+                "https://gateway.example.com",
+            )))
+            .layer(Extension(
+                Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
+            ))
+            .layer(Extension(hydra_mappings("tenant-1")))
+            .layer(Extension(apps));
+
+        let response = router
+            .oneshot(
+                Request::get("/tenant")
+                    .header("Authorization", "Bearer some-token")
+                    .header("x-tenant-id", &target_tenant)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "tenant-1");
     }
 
     #[tokio::test]
