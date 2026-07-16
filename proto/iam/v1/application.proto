@@ -4,6 +4,7 @@ package iam.v1;
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 import "iam/v1/common.proto";
 
 option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
@@ -32,6 +33,10 @@ message Application {
   google.protobuf.Timestamp updated_at = 10;
   // Current OAuth2 client secret; only exposed immediately after rotation.
   string client_secret = 11;
+  // When true, the application's client credentials may target any tenant
+  // via the x-tenant-id header. Only the system tenant may create or enable
+  // cross-tenant applications.
+  bool cross_tenant = 12;
 }
 
 // ApplicationSecret contains the credentials returned after secret rotation.
@@ -56,6 +61,10 @@ message CreateApplicationRequest {
   repeated string scope = 5;
   // Client authentication method used at the token endpoint.
   string token_endpoint_auth_method = 6;
+  // When true, the application's client credentials may target any tenant
+  // via the x-tenant-id header. Only the system tenant may create
+  // cross-tenant applications.
+  bool cross_tenant = 7;
 }
 
 // GetApplicationRequest identifies an application to fetch.
@@ -94,6 +103,10 @@ message UpdateApplicationRequest {
   repeated string scope = 6;
   // Client authentication method used at the token endpoint.
   string token_endpoint_auth_method = 7;
+  // When set, toggles whether the application's client credentials may target
+  // any tenant via the x-tenant-id header. Only the system tenant may enable
+  // cross-tenant applications; omitting this field leaves the flag unchanged.
+  google.protobuf.BoolValue cross_tenant = 8;
 }
 
 // DeleteApplicationRequest identifies an application to delete.
