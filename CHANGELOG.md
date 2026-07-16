@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.18] - 2026-07-16
+
+### Added
+
+- Cross-tenant machine-client routing via the `x-tenant-id` header.
+  - `Application.cross_tenant` flag (proto, `applications` table, and
+    `CreateApplicationRequest` / `UpdateApplicationRequest`) marks a service
+    client as allowed to act across tenants.
+  - Only the system tenant may create or update an application with
+    `cross_tenant = true`, preventing privilege escalation by non-system
+    tenants.
+  - The shared auth middleware honors `x-tenant-id` only for authenticated
+    `client` subjects whose application has `cross_tenant = true`. User and
+    agent tokens remain bound to the tenant resolved by introspection.
+  - Audit events log `target_tenant` and `cross_tenant = true` on override,
+    and the audit middleware no longer trusts `x-tenant-id` from
+    unauthenticated requests.
+  - Unit and integration tests cover the gate conditions and the system-tenant
+    provisioning restriction.
+
 ## [2026.07.17] - 2026-07-16
 
 ### Changed
