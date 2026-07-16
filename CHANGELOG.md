@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.21] - 2026-07-16
+
+### Fixed
+
+- Self-service registration identity provisioning. Kratos self-service
+  registration now creates the gateway `kratos` id mapping and a tenant
+  membership for the newly registered identity, matching the admin
+  `CreateIdentity` path. This fixes OAuth2 consent failures where
+  `public_subject` could not map the consent request's Kratos subject to a
+  gateway public id.
+  - Mapping and membership are created from the registration submit response
+    when Kratos returns the identity inline.
+  - For `browser_location_change_required` redirects, the fresh session cookie
+    is used to call `/sessions/whoami` and provision from the returned
+    identity.
+  - Trait validation or membership upsert failure rolls back the mapping so
+    no half-provisioned identity remains.
+
+- Backfill missing Kratos identity mappings during consent resolution.
+  `OAuth2ConsentServiceImpl::public_subject` now mints a public ULID and
+  creates the `kratos` mapping on `MappingNotFound`, so pre-existing or
+  migrated Kratos identities can complete OAuth2 consent/login flows. The
+  tenant membership is backfilled on the first read via
+  `IdentityServiceImpl::resolve_identity`.
+
+### Changed
+
+- Aligned the `identity_self_service_consent_service` integration test with
+  the relaxed existing-session login acceptance: the no-skip path is now
+  exercised without a session cookie so it verifies normal login-flow
+  creation.
+
 ## [2026.07.20] - 2026-07-16
 
 ### Fixed
