@@ -4,7 +4,7 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
-    db::{IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::{application::ApplicationServiceImpl, tenant::TenantServiceImpl},
@@ -51,7 +51,13 @@ async fn application_service_round_trip() {
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let application_service = Arc::new(ApplicationServiceImpl::new(hydra, mappings.clone()));
+    let application_repo = ApplicationRepo::new(pool.clone());
+    let application_service = Arc::new(ApplicationServiceImpl::new(
+        hydra,
+        mappings.clone(),
+        application_repo,
+        system_tenant_ulid.clone(),
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);

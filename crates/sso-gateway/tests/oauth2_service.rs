@@ -5,7 +5,7 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::session_token::SessionTokenSigner;
 use sso_gateway::{
-    db::{IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::handlers::oauth2::{Oauth2State, router as oauth2_router},
@@ -49,14 +49,19 @@ async fn oauth2_public_endpoints_round_trip() {
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
     let mappings = IdMappingRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let application_service =
-        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_repo = ApplicationRepo::new(pool.clone());
+    let application_service = Arc::new(ApplicationServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+        application_repo,
+        system_tenant_ulid.clone(),
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);
@@ -287,14 +292,19 @@ async fn oauth2_missing_client_id_is_rejected() {
         HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
     );
     let mappings = IdMappingRepo::new(pool.clone());
-    let tenant_repo = TenantRepo::new(pool);
+    let tenant_repo = TenantRepo::new(pool.clone());
 
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let application_service =
-        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_repo = ApplicationRepo::new(pool.clone());
+    let application_service = Arc::new(ApplicationServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+        application_repo,
+        system_tenant_ulid.clone(),
+    ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let connect_router: ConnectRouter = application_service.register(connect_router);

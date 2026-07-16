@@ -7,8 +7,8 @@ use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::{
     db::{
-        IdMappingRepo, IdMappingStore, IdentitySchemaRepo, ScimGroupRepo, TenantRepo,
-        TransientTokenRepo, bootstrap_system_tenant, create_pool,
+        ApplicationRepo, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, ScimGroupRepo,
+        TenantRepo, TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, IdentityServiceExt, ScimServiceExt, TenantServiceExt},
@@ -75,8 +75,13 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
         tenant_repo,
         system_tenant_ulid.clone(),
     ));
-    let application_service =
-        Arc::new(ApplicationServiceImpl::new(hydra.clone(), mappings.clone()));
+    let application_repo = ApplicationRepo::new(pool.clone());
+    let application_service = Arc::new(ApplicationServiceImpl::new(
+        hydra.clone(),
+        mappings.clone(),
+        application_repo,
+        system_tenant_ulid.clone(),
+    ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
         mappings.clone(),
