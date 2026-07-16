@@ -9,6 +9,7 @@
 mod agent;
 mod agent_act_token;
 mod agent_delegation;
+mod application;
 mod connection;
 mod crypto;
 mod domain;
@@ -39,6 +40,9 @@ pub use agent::{
 };
 pub use agent_act_token::{AgentActTokenRow, AgentActTokenStore, PgAgentActTokenStore};
 pub use agent_delegation::{AgentDelegationRow, AgentDelegationStore, PgAgentDelegationStore};
+pub use application::{
+    ApplicationRow, ApplicationStore, MemoryApplicationStore, PgApplicationStore,
+};
 pub use connection::{
     ConnectionType, PgTenantConnectionStore, TenantConnectionRow, TenantConnectionStore,
 };
@@ -83,6 +87,7 @@ pub use transient_token::{
 pub use agent::PgAgentStore as AgentRepo;
 pub use agent_act_token::PgAgentActTokenStore as AgentActTokenRepo;
 pub use agent_delegation::PgAgentDelegationStore as AgentDelegationRepo;
+pub use application::PgApplicationStore as ApplicationRepo;
 pub use connection::PgTenantConnectionStore as TenantConnectionRepo;
 pub use domain::PgTenantDomainStore as TenantDomainRepo;
 pub use id_mapping::PgIdMappingStore as IdMappingRepo;

@@ -80,6 +80,9 @@ pub enum DbError {
 
     #[error("agent delegation not found")]
     AgentDelegationNotFound,
+
+    #[error("application not found")]
+    ApplicationNotFound,
 }
 
 impl From<DbError> for sunbeam_g2v::error::ServiceError {
@@ -135,6 +138,7 @@ impl From<DbError> for sunbeam_g2v::error::ServiceError {
             DbError::AgentDelegationNotFound => {
                 Self::NotFound("agent delegation not found".to_string())
             }
+            DbError::ApplicationNotFound => Self::NotFound("application not found".to_string()),
         }
     }
 }
@@ -259,6 +263,10 @@ mod tests {
             (
                 DbError::AgentDelegationNotFound,
                 ServiceError::NotFound("agent delegation not found".into()),
+            ),
+            (
+                DbError::ApplicationNotFound,
+                ServiceError::NotFound("application not found".into()),
             ),
         ];
         for (err, expected) in cases {
