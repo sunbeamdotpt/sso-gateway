@@ -446,6 +446,40 @@ pub struct IdentitySelfServiceImpl {
     paths: crate::config::SelfServicePaths,
 }
 
+/// Parse an AAL string (e.g. "aal1", "aal2", "aal3") into its numeric level.
+fn parse_aal_level(value: &str) -> Option<i32> {
+    value
+        .strip_prefix("aal")
+        .and_then(|rest| rest.parse::<i32>().ok())
+        .filter(|level| *level > 0)
+}
+
+/// Determine the highest AAL level required by a Hydra login request.
+///
+/// Hydra surfaces the requirement in `oidc_context.acr_values` (a list that
+/// may contain "aal1", "aal2", etc.) and sometimes in `requested_aal`.
+fn aal_level_from_login_request(login_request: &Value) -> i32 {
+    let mut required = 1;
+    if let Some(level) = login_request
+        .get("requested_aal")
+        .and_then(Value::as_str)
+        .and_then(parse_aal_level)
+    {
+        required = required.max(level);
+    }
+    if let Some(values) = login_request
+        .pointer("/oidc_context/acr_values")
+        .and_then(Value::as_array)
+    {
+        for value in values {
+            if let Some(level) = value.as_str().and_then(parse_aal_level) {
+                required = required.max(level);
+            }
+        }
+    }
+    required
+}
+
 impl IdentitySelfServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -737,25 +771,18 @@ impl IdentitySelfServiceImpl {
         Ok(())
     }
 
-    /// Accept the Hydra login request with the caller's existing session when
-    /// Hydra reports the login may be skipped.
+    /// Accept the Hydra login request with the caller's existing session.
     ///
-    /// Kratos' browser login route does the same server-side: with a valid
-    /// session and a `login_challenge` whose Hydra login request has `skip`
-    /// set, it accepts the login with Hydra and redirects the browser to
-    /// Hydra's `redirect_to`. On the JSON content-negotiation path, however,
-    /// Kratos discards that redirect and answers with a bare
-    /// `session_already_available` error — after having already consumed the
-    /// challenge. API callers (the login UI via this gateway) then cannot
-    /// complete the OAuth2 flow and fall back to a logout-and-retry dance.
-    /// Mirror the browser behavior here so the challenge is accepted exactly
-    /// once, with the current session's subject.
+    /// Whenever the caller already has a valid Kratos session and presents a
+    /// `login_challenge`, accept the login with Hydra and redirect the browser
+    /// to Hydra's `redirect_to`. This matches Kratos' browser behavior and
+    /// avoids the `session_already_available` dead-end that Kratos returns on
+    /// JSON content-negotiation after consuming the challenge.
     ///
     /// Returns `Ok(None)` when normal Kratos flow creation should proceed: the
     /// login request could not be fetched (Kratos surfaces the same failure
-    /// when it fetches the request itself), its `skip` flag is unset (Hydra
-    /// wants authentication; Kratos forces a refresh flow), or the caller has
-    /// no valid Kratos session to accept with.
+    /// when it fetches the request itself), or the caller has no valid Kratos
+    /// session to accept with.
     async fn accept_skippable_login(
         &self,
         ory_challenge: &str,
@@ -768,13 +795,6 @@ impl IdentitySelfServiceImpl {
                 return Ok(None);
             }
         };
-        if !login_request
-            .get("skip")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(None);
-        }
         let Some(cookie) = cookie else {
             return Ok(None);
         };
@@ -789,6 +809,25 @@ impl IdentitySelfServiceImpl {
         if subject.is_empty() {
             return Ok(None);
         }
+
+        // Enforce the AAL required by the login request. If Hydra (or the
+        // client) is asking for aal2/aal3, an aal1 session must not be accepted
+        // here; fall through so Kratos renders the step-up flow.
+        let required_aal = aal_level_from_login_request(&login_request);
+        let session_aal = session
+            .get("authenticator_assurance_level")
+            .and_then(Value::as_str)
+            .and_then(parse_aal_level)
+            .unwrap_or(1);
+        if session_aal < required_aal {
+            tracing::debug!(
+                required_aal,
+                session_aal,
+                "session AAL insufficient; creating login flow for step-up"
+            );
+            return Ok(None);
+        }
+
         let amr: Vec<String> = session
             .get("authentication_methods")
             .and_then(Value::as_array)
@@ -3387,6 +3426,7 @@ mod tests {
             session: Arc::new(Mutex::new(Some(Ok(json!({
                 "id": "session-1",
                 "active": true,
+                "authenticator_assurance_level": "aal2",
                 "identity": { "id": "identity-1" },
                 "authentication_methods": [
                     { "method": "password", "aal": "aal1" },
@@ -3442,15 +3482,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_login_flow_proceeds_when_hydra_skip_is_false() {
+    async fn create_login_flow_accepts_login_with_session_even_when_skip_is_false() {
+        // Hydra may report skip=false (e.g. when AAL requirements changed or the
+        // session is fresh enough that Hydra wants re-authentication), but if
+        // the caller already has a valid Kratos session the gateway must still
+        // accept it rather than forcing a redundant login flow that would
+        // consume the challenge and trap the UI.
         let fake = FakeKratos {
-            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal1",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [{ "method": "password", "aal": "aal1" }]
+            }))))),
             ..Default::default()
         };
         let hydra = FakeHydra {
             login_request: Arc::new(Mutex::new(Some(Ok(json!({
                 "challenge": "challenge-1",
                 "skip": false
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
             }))))),
             ..Default::default()
         };
@@ -3462,22 +3516,23 @@ mod tests {
         });
 
         let resp = svc.create_login_flow(ctx, req).await.unwrap();
-        assert_eq!(resp.body.id, "flow-1");
-        assert!(resp.body.redirect_browser_to.is_empty());
-        // skip=false means Hydra wants authentication; never accept, never
-        // probe the session.
-        assert!(
-            hydra
-                .calls()
-                .iter()
-                .all(|call| !call.starts_with("accept_login_request"))
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
         );
+
+        let kratos_calls = fake.calls.lock().unwrap().clone();
         assert!(
-            fake.calls
-                .lock()
-                .unwrap()
+            kratos_calls
                 .iter()
-                .any(|call| call.starts_with("create_login_browser_flow"))
+                .all(|call| !call.starts_with("create_login_browser_flow")),
+            "kratos must not create a login flow: {kratos_calls:?}"
+        );
+        let hydra_calls = hydra.calls();
+        assert!(
+            hydra_calls
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
         );
     }
 
@@ -3517,6 +3572,105 @@ mod tests {
                 .calls()
                 .iter()
                 .all(|call| !call.starts_with("accept_login_request"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_proceeds_when_session_aal_is_insufficient() {
+        // A client requiring aal2 must not be accepted with an aal1 session,
+        // even when Hydra says skip=true. Falling through lets Kratos render
+        // the step-up flow instead of silently bypassing MFA.
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal1",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [{ "method": "password", "aal": "aal1" }]
+            }))))),
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true,
+                "requested_aal": "aal2"
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(resp.body.id, "flow-1");
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("create_login_browser_flow"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_accepts_when_acr_values_require_session_aal() {
+        // Hydra may express the AAL requirement via oidc_context.acr_values.
+        // When the session already satisfies it, the login is accepted.
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal2",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [
+                    { "method": "password", "aal": "aal1" },
+                    { "method": "totp", "aal": "aal2" }
+                ]
+            }))))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": false,
+                "oidc_context": { "acr_values": ["aal2"] }
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        let svc = service_with_hydra(fake.clone(), hydra.clone());
+        let ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
         );
     }
 
