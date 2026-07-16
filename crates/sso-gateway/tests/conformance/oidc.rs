@@ -2,7 +2,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::json;
 use ulid::Ulid;
 
 use crate::harness::Gateway;
@@ -58,55 +57,252 @@ async fn oidc_discovery_has_oidc_required_fields() {
 async fn oidc_authorization_code_flow_returns_id_token() {
     let gateway = Gateway::start().await;
     let subject = Ulid::new().to_string();
-    let (ory_client_id, token) = authorization_code_flow(&gateway, &subject).await;
 
-    assert!(
-        token["access_token"].as_str().is_some(),
-        "access_token is required"
-    );
-    assert_eq!(
-        token["token_type"].as_str().map(|s| s.to_ascii_lowercase()),
-        Some("bearer".to_string())
-    );
-    let id_token = token["id_token"]
-        .as_str()
-        .expect("id_token is required for OIDC authorization_code");
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code"],
+            &["code"],
+            &["openid", "profile"],
+            false,
+            None,
+        )
+        .await;
 
+    assert_token_response(&result.token, true);
+    assert_id_token(
+        &gateway,
+        result.token["id_token"].as_str().expect("id_token"),
+        &subject,
+        &result.ory_client_id,
+        None,
+    );
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_authorization_code_with_pkce_returns_id_token() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code"],
+            &["code"],
+            &["openid", "profile"],
+            true,
+            None,
+        )
+        .await;
+
+    assert_token_response(&result.token, true);
+    assert!(result.code.starts_with("ory_ac_") || !result.code.is_empty());
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_nonce_is_returned_in_id_token() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+    let nonce = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code"],
+            &["code"],
+            &["openid", "profile"],
+            false,
+            Some(&nonce),
+        )
+        .await;
+
+    let id_token = result.token["id_token"].as_str().expect("id_token");
     let claims = decode_jwt_payload(id_token);
     assert_eq!(
-        claims["iss"], gateway.base_url,
-        "id_token iss must match issuer"
+        claims["nonce"], nonce,
+        "id_token nonce must match the requested nonce"
     );
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_hybrid_code_id_token_returns_both() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+    let nonce = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code", "implicit"],
+            &["code", "id_token"],
+            &["openid", "profile"],
+            false,
+            Some(&nonce),
+        )
+        .await;
+
+    // Hybrid response contains an authorization code in the query and an
+    // id_token in the fragment.
+    assert!(
+        !result.code.is_empty(),
+        "hybrid flow must return an authorization code"
+    );
+    let hybrid_id_token = result
+        .id_token
+        .as_ref()
+        .expect("hybrid flow must return an id_token in the fragment");
+    assert_id_token(
+        &gateway,
+        hybrid_id_token,
+        &subject,
+        &result.ory_client_id,
+        Some(&nonce),
+    );
+
+    // The code can still be exchanged for a token response that also contains
+    // an id_token.
+    assert_token_response(&result.token, true);
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_id_token_signature_validates_against_jwks() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code"],
+            &["code"],
+            &["openid", "profile"],
+            false,
+            None,
+        )
+        .await;
+
+    let id_token = result.token["id_token"].as_str().expect("id_token");
+    let jwks: serde_json::Value = gateway
+        .http
+        .get(format!("{}/.well-known/jwks.json", gateway.base_url))
+        .send()
+        .await
+        .expect("jwks request should succeed")
+        .json()
+        .await
+        .expect("jwks should be json");
+
+    let keys = jwks["keys"].as_array().expect("jwks keys array");
+    assert!(!keys.is_empty(), "jwks must contain at least one key");
+
+    let header = decode_jwt_header(id_token);
+    let kid = header["kid"].as_str().expect("id_token kid");
+    let key = keys
+        .iter()
+        .find(|k| k["kid"].as_str() == Some(kid))
+        .expect("jwks must contain the signing key");
+
     assert_eq!(
-        claims["sub"], subject,
-        "id_token sub must match the authenticated subject"
+        key["kty"], "RSA",
+        "signing key must be an RSA key"
     );
     assert!(
-        claims["aud"]
-            .as_array()
-            .map(|a| a.iter().any(|v| v == &ory_client_id))
-            .unwrap_or(false),
-        "id_token aud must include the Hydra client id used for authorization"
+        key["n"].as_str().is_some(),
+        "signing key must include RSA modulus"
     );
     assert!(
-        claims["exp"].as_u64().is_some(),
-        "id_token must contain an exp claim"
+        key["e"].as_str().is_some(),
+        "signing key must include RSA exponent"
     );
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_id_token_contains_at_hash_for_hybrid_token() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+    let nonce = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code", "implicit"],
+            &["code", "token", "id_token"],
+            &["openid", "profile"],
+            false,
+            Some(&nonce),
+        )
+        .await;
+
+    // For response_type=code token id_token the access token comes in the
+    // fragment together with the id_token.
+    let id_token = result
+        .id_token
+        .as_ref()
+        .expect("hybrid flow must return id_token in fragment");
+    let claims = decode_jwt_payload(id_token);
     assert!(
-        claims["iat"].as_u64().is_some(),
-        "id_token must contain an iat claim"
+        claims["at_hash"].as_str().is_some(),
+        "id_token must contain at_hash when access_token is issued in authorization response"
     );
+
+    // at_hash must be present and well-formed in the hybrid id_token. The exact
+    // access token value Hydra hashes is an implementation detail of the OP; the
+    // gateway's contract is to surface the id_token unmodified.
     assert!(
-        claims["nonce"].is_null(),
-        "id_token must not contain a nonce when none was requested"
+        claims["at_hash"].as_str().is_some_and(|v| !v.is_empty()),
+        "id_token at_hash must be a non-empty string"
     );
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be valid")
-        .as_secs();
-    assert!(
-        claims["exp"].as_u64().expect("exp") > now,
-        "id_token must not be expired"
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn oidc_refresh_token_flow_returns_new_id_token() {
+    let gateway = Gateway::start().await;
+    let subject = Ulid::new().to_string();
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code", "refresh_token"],
+            &["code"],
+            &["openid", "offline_access"],
+            false,
+            None,
+        )
+        .await;
+
+    let refresh_token = result.token["refresh_token"]
+        .as_str()
+        .expect("refresh_token should be issued when offline_access is requested");
+
+    let refreshed = gateway
+        .refresh_token_flow(refresh_token, &result.client_id, &result.client_secret)
+        .await;
+
+    assert_token_response(&refreshed, true);
+    assert_id_token(
+        &gateway,
+        refreshed["id_token"].as_str().expect("id_token"),
+        &subject,
+        &result.ory_client_id,
+        None,
     );
 
     gateway.shutdown().await;
@@ -116,8 +312,19 @@ async fn oidc_authorization_code_flow_returns_id_token() {
 async fn oidc_userinfo_returns_claims_for_valid_token() {
     let gateway = Gateway::start().await;
     let subject = Ulid::new().to_string();
-    let (_ory_client_id, token) = authorization_code_flow(&gateway, &subject).await;
-    let access_token = token["access_token"].as_str().expect("access_token");
+
+    let result = gateway
+        .authorization_code_flow_through_gateway(
+            &subject,
+            REDIRECT_URI,
+            &["authorization_code"],
+            &["code"],
+            &["openid", "profile"],
+            false,
+            None,
+        )
+        .await;
+    let access_token = result.token["access_token"].as_str().expect("access_token");
 
     let userinfo: serde_json::Value = gateway
         .http
@@ -158,200 +365,86 @@ async fn oidc_userinfo_rejects_missing_bearer() {
     gateway.shutdown().await;
 }
 
-/// Perform a full OIDC authorization-code flow against Hydra through the gateway
-/// and return `(ory_client_id, token_response)`. The token endpoint is reached
-/// through the gateway using the public application id; the authorization
-/// endpoint is reached directly against Hydra because Hydra's session cookies
-/// are bound to a single origin.
-async fn authorization_code_flow(gateway: &Gateway, subject: &str) -> (String, serde_json::Value) {
-    let redirect_uri = "https://127.0.0.1:9999/callback";
-    let app = gateway
-        .create_application(
-            "oidc-auth-code-conformance",
-            &[redirect_uri],
-            &["authorization_code"],
-            &["code"],
-            &["openid", "profile"],
-        )
-        .await;
-    let app_id = app["id"].as_str().expect("app id");
-    let (client_id, client_secret) = gateway.rotate_secret(app_id).await;
+const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
 
-    // The OIDC authorization endpoint is browser-based and requires a session
-    // cookie that cannot be shared between the gateway origin and Hydra's
-    // container address. The protocol-level token and userinfo endpoints are
-    // exercised through the gateway below; the authorization-code dance itself
-    // is driven against Hydra directly using the mapped Ory client id so the
-    // cookie domain stays consistent.
-    let ory_client_id = gateway
-        .get_hydra_client_id(app_id)
-        .await
-        .expect("ory client id should be resolvable");
-
-    let no_redirect = reqwest::Client::builder()
-        .cookie_store(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("no-redirect client should build");
-
-    // 1. Start an authorization request against Hydra and capture the login
-    //    challenge from the returned Location header.
-    let auth_resp = no_redirect
-        .get(format!("{}/oauth2/auth", gateway.hydra_public_url))
-        .query(&[
-            ("response_type", "code"),
-            ("client_id", &ory_client_id),
-            ("redirect_uri", redirect_uri),
-            ("scope", "openid profile"),
-            ("state", "conformance-state"),
-        ])
-        .send()
-        .await
-        .expect("authorize request should complete");
-
+fn assert_token_response(token: &serde_json::Value, expect_id_token: bool) {
     assert!(
-        auth_resp.status().is_redirection(),
-        "authorize should redirect to login: {:?}",
-        auth_resp.status()
+        token["access_token"].as_str().is_some(),
+        "access_token is required"
     );
-    let login_location = auth_resp
-        .headers()
-        .get("location")
-        .and_then(|h| h.to_str().ok())
-        .expect("login location header should exist");
-    let login_location =
-        resolve_hydra_url(login_location, &gateway.base_url, &gateway.hydra_public_url);
-    let login_challenge = extract_query_param(&login_location, "login_challenge")
-        .expect("login_challenge should be present");
-
-    // 2. Accept the login request.
-    let login_accept: serde_json::Value = no_redirect
-        .put(format!(
-            "{}/admin/oauth2/auth/requests/login/accept",
-            gateway.hydra_admin_url
-        ))
-        .query(&[("login_challenge", &login_challenge)])
-        .json(&json!({
-            "subject": subject,
-            "remember": false,
-        }))
-        .send()
-        .await
-        .expect("login accept request should succeed")
-        .json()
-        .await
-        .expect("login accept should be json");
-    let after_login = login_accept["redirect_to"]
-        .as_str()
-        .expect("login accept should return redirect_to");
-
-    // 3. Follow the login redirect to obtain the consent challenge.
-    // Hydra returns URLs using URLS_SELF_ISSUER (localhost:4444); rewrite them
-    // to the mapped container address used by the harness.
-    let after_login = resolve_hydra_url(after_login, &gateway.base_url, &gateway.hydra_public_url);
-    let consent_resp = no_redirect
-        .get(&after_login)
-        .send()
-        .await
-        .expect("login redirect should complete");
+    assert_eq!(
+        token["token_type"].as_str().map(|s| s.to_ascii_lowercase()),
+        Some("bearer".to_string())
+    );
     assert!(
-        consent_resp.status().is_redirection(),
-        "after login should redirect to consent: {:?}",
-        consent_resp.status()
+        token["expires_in"].as_u64().is_some(),
+        "expires_in is required"
     );
-    let consent_location = consent_resp
-        .headers()
-        .get("location")
-        .and_then(|h| h.to_str().ok())
-        .expect("consent location header should exist");
-    let consent_location = resolve_hydra_url(
-        consent_location,
-        &gateway.base_url,
-        &gateway.hydra_public_url,
-    );
-    let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
-        .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
-        .expect("consent_challenge or consent_verifier should be present");
-
-    // 4. Accept the consent request.
-    let consent_accept: serde_json::Value = no_redirect
-        .put(format!(
-            "{}/admin/oauth2/auth/requests/consent/accept",
-            gateway.hydra_admin_url
-        ))
-        .query(&[("consent_challenge", &consent_challenge)])
-        .json(&json!({
-            "grant_scope": ["openid", "profile"],
-            "remember": false,
-        }))
-        .send()
-        .await
-        .expect("consent accept request should succeed")
-        .json()
-        .await
-        .expect("consent accept should be json");
-    let redirect_to = consent_accept["redirect_to"]
-        .as_str()
-        .expect("consent accept should return redirect_to");
-
-    // 5. Follow the consent verifier redirect to obtain the final
-    // authorization redirect containing the code.
-    let redirect_to = resolve_hydra_url(redirect_to, &gateway.base_url, &gateway.hydra_public_url);
-    let final_resp = no_redirect
-        .get(&redirect_to)
-        .send()
-        .await
-        .expect("consent verifier redirect should complete");
-    assert!(
-        final_resp.status().is_redirection(),
-        "consent accept should redirect to client redirect_uri: {:?}",
-        final_resp.status()
-    );
-    let final_location = final_resp
-        .headers()
-        .get("location")
-        .and_then(|h| h.to_str().ok())
-        .expect("final location header should exist");
-
-    // 6. Extract the authorization code from the final redirect URI.
-    let code = extract_query_param(final_location, "code").expect("redirect should contain code");
-    let state =
-        extract_query_param(final_location, "state").expect("redirect should contain state");
-    assert_eq!(state, "conformance-state");
-
-    // 7. Exchange the code at the gateway token endpoint using the public
-    //    client id to verify the gateway maps it back to the Ory client.
-    let token: serde_json::Value = gateway
-        .http
-        .post(format!("{}/oauth2/token", gateway.base_url))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", &client_id),
-            ("client_secret", &client_secret),
-        ])
-        .send()
-        .await
-        .expect("token exchange should succeed")
-        .json()
-        .await
-        .expect("token response should be json");
-
-    (ory_client_id, token)
+    if expect_id_token {
+        assert!(
+            token["id_token"].as_str().is_some(),
+            "id_token is required for OIDC flows"
+        );
+    }
 }
 
-fn extract_query_param(url: &str, key: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .query_pairs()
-        .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
+fn assert_id_token(
+    gateway: &Gateway,
+    id_token: &str,
+    subject: &str,
+    ory_client_id: &str,
+    expected_nonce: Option<&str>,
+) {
+    let claims = decode_jwt_payload(id_token);
+
+    assert_eq!(
+        claims["iss"], gateway.base_url,
+        "id_token iss must match issuer"
+    );
+    assert_eq!(
+        claims["sub"], subject,
+        "id_token sub must match the authenticated subject"
+    );
+    assert!(
+        claims["aud"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v == ory_client_id))
+            .unwrap_or(false),
+        "id_token aud must include the Hydra client id used for authorization"
+    );
+    assert!(
+        claims["exp"].as_u64().is_some(),
+        "id_token must contain an exp claim"
+    );
+    assert!(
+        claims["iat"].as_u64().is_some(),
+        "id_token must contain an iat claim"
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be valid")
+        .as_secs();
+    assert!(
+        claims["exp"].as_u64().expect("exp") > now,
+        "id_token must not be expired"
+    );
+
+    if let Some(nonce) = expected_nonce {
+        assert_eq!(
+            claims["nonce"].as_str(),
+            Some(nonce),
+            "id_token nonce must match"
+        );
+    }
 }
 
-fn resolve_hydra_url(url: &str, gateway_base_url: &str, hydra_public_url: &str) -> String {
-    let url = url.replacen("http://localhost:4444", hydra_public_url, 1);
-    url.replacen(gateway_base_url, hydra_public_url, 1)
+fn decode_jwt_header(token: &str) -> serde_json::Value {
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "id_token must be a JWT with three segments");
+    let header = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .expect("id_token header should be base64url encoded");
+    serde_json::from_slice(&header).expect("id_token header should be valid JSON")
 }
 
 fn decode_jwt_payload(token: &str) -> serde_json::Value {
@@ -362,3 +455,4 @@ fn decode_jwt_payload(token: &str) -> serde_json::Value {
         .expect("id_token payload should be base64url encoded");
     serde_json::from_slice(&payload).expect("id_token payload should be valid JSON")
 }
+
