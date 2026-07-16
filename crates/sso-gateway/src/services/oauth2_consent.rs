@@ -7,6 +7,7 @@ use serde_json::Value;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
+use ulid::Ulid;
 
 use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
 use crate::db::{
@@ -268,10 +269,28 @@ impl OAuth2ConsentServiceImpl {
         if ory_subject.is_empty() {
             return Ok(String::new());
         }
-        self.mappings
+        match self
+            .mappings
             .get_public_id(tenant_id, BACKEND_KRATOS, ory_subject)
             .await
-            .map_err(map_db_error)
+        {
+            Ok(public_id) => Ok(public_id),
+            Err(DbError::MappingNotFound) => {
+                // Pre-existing Kratos identity that was never mapped in the
+                // gateway (e.g., created before self-service provisioning was
+                // added, or migrated from another environment). Mint a public
+                // id and create the mapping so consent/login flows can proceed.
+                // The tenant membership is backfilled on the first read via
+                // `IdentityServiceImpl::resolve_identity`.
+                let public_id = Ulid::new().to_string();
+                self.mappings
+                    .create(tenant_id, BACKEND_KRATOS, &public_id, ory_subject)
+                    .await
+                    .map_err(map_db_error)?;
+                Ok(public_id)
+            }
+            Err(err) => Err(map_db_error(err)),
+        }
     }
 
     async fn map_consent_request(
@@ -778,12 +797,21 @@ mod tests {
     impl IdMappingStore for StubMappingStore {
         async fn create(
             &self,
-            _tenant_id: &str,
-            _backend: &str,
-            _public_id: &str,
-            _ory_global_id: &str,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+            ory_global_id: &str,
         ) -> Result<IdMappingRow, crate::db::DbError> {
-            unimplemented!()
+            let row = IdMappingRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                public_id: public_id.to_string(),
+                ory_global_id: ory_global_id.to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(row)
         }
 
         async fn get_ory_id(
@@ -1035,6 +1063,36 @@ mod tests {
         assert!(!resp.skip);
         assert!(
             matches!(mock.take_calls().as_slice(), [Call::GetConsent(c)] if c == "consent-challenge-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_consent_request_backfills_mapping_for_unmapped_subject() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-1",
+            "client": { "client_id": "client-1", "client_name": "App" },
+            "subject": "ory-unmapped-subject",
+            "skip": false,
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "pub-consent-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_consent_request(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        assert!(
+            Ulid::from_string(&resp.subject).is_ok(),
+            "subject should be a minted public ULID, got {}",
+            resp.subject
         );
     }
 
