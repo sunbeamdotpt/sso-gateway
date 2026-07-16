@@ -683,13 +683,12 @@ async fn self_service_and_consent_round_trip() {
         "skip path should return hydra's redirect_to: {body}"
     );
 
-    // Same call with a challenge Hydra does not skip: a normal login flow is
-    // created and Hydra is never asked to accept.
+    // Same call with a challenge Hydra does not skip and no browser session:
+    // a normal login flow is created and Hydra is never asked to accept.
     let resp = client
         .post(format!("{base}/iam.v1.IdentitySelfService/CreateLoginFlow"))
         .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
         .header("content-type", "application/json")
-        .header("cookie", "ory_kratos_session=abc")
         .json(&json!({ "loginChallenge": "raw-no-skip-challenge" }))
         .send()
         .await
