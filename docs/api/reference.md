@@ -208,7 +208,10 @@ OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
 | `POST /oauth2/revoke` | Token revocation | Public (client credentials) |
 | `GET /oauth2/device/verify` | Device verification proxy (user confirmation leg) | Public (forwards to Hydra) |
 | `POST /oauth2/device/{*path}` | Device authorization grant proxy | Public (forwards to Hydra) |
-| `GET /.well-known/ory/webauthn.js` | Kratos WebAuthn JS bundle | Public (forwards to Kratos) |
+| `GET /identity/{login,registration,settings,recovery,verification,logout,errors}` | Branded browser self-service routes (defaults; per-path configurable via `SELF_SERVICE_*_PATH`) | Public (Kratos session/CSRF cookies; forwards to Kratos) |
+| `GET\|POST /identity/oidc/callback/{provider}` | Branded OIDC callback | Public (forwards to Kratos) |
+| `GET /identity/webauthn.js` | WebAuthn JS bundle | Public (forwards to Kratos) |
+| `GET /self-service/recovery`, `GET /self-service/verification` | Kratos-shaped email links; 302 bounce to the branded path without consuming the token | Public |
 | `GET /callbacks/oidc` | OIDC upstream IdP callback | Public (OIDC callback state) |
 | `GET /callbacks/oauth2` | OAuth2 upstream IdP callback | Public (OAuth2 callback state) |
 | `GET /saml/metadata` | SAML SP metadata | Public |

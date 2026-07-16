@@ -22,11 +22,15 @@ This document summarizes the security-focused code review performed on the SSO G
 - **Session cookies** are accepted for browser-facing flows and the federation callback handlers. The cookie (`__Host-sso_session`) is signed with HMAC-SHA256 using a key derived via HKDF-SHA256, uses the `__Host-` prefix, and is verified locally by the middleware.
 - **Scopes and step-up auth** are enforced per RPC by `require_scope` and `require_amr`. The tenant, scopes, and authentication methods come from the `AuthContext` produced by introspection or cookie verification.
 - **Tenant isolation** is enforced at the HTTP middleware layer for Connect-RPC calls and at the handler layer for OAuth2, SAML, SCIM, and federation protocol endpoints.
-- **Public paths** (`/.well-known/`, `/oauth2/`, `/callbacks/`, `/saml/`, `/scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`, `/scim/v2/Schemas`) skip shared bearer-token authentication because they perform protocol-native authentication (OAuth2 client credentials, SAML assertions, SCIM bearer tokens, OIDC/OAuth2 callback state).
+- **Public paths** (`/.well-known/`, `/oauth2/`, `/callbacks/`, `/saml/`, `/scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`, `/scim/v2/Schemas`) skip shared bearer-token authentication because they perform protocol-native authentication (OAuth2 client credentials, SAML assertions, SCIM bearer tokens, OIDC/OAuth2 callback state). The branded browser self-service routes (`SELF_SERVICE_*_PATH`, defaults `/identity/…`) and the `/self-service/{recovery,verification}` email-link shims skip it as well; they carry Kratos session and CSRF cookies and Kratos performs the session checks upstream.
 
 ## Audit logging
 
-The `audit_middleware` records method, path, resolved tenant, authenticated actor, and outcome asynchronously. Failures to write audit rows are logged with `tracing::warn` but do not block the response.
+The `audit_middleware` emits one structured log event per request to the
+standard log stream, tagged with `sso_gateway::audit`. Records include the HTTP
+method, path, response status, outcome, resolved tenant, authenticated actor,
+`subject_type` (`user`, `agent`, or `client`), and — for delegated actions —
+the acting `agent`. Audit capture is best-effort: it never blocks the response.
 
 ## Input validation and output encoding
 
@@ -69,8 +73,8 @@ The `audit_middleware` records method, path, resolved tenant, authenticated acto
 |---|---|
 | Introspection responses are cached in Postgres. | Cache entries are keyed by SHA-256 hash of the token and expire based on `cached_at` and the token `exp`. Revoked tokens remain usable until the cache entry expires; set `TOKEN_INTROSPECTION_CACHE_TTL_SECONDS` short enough for your revocation requirements. |
 | Session cookies are verified locally. | Sessions are also stored server-side in `gateway_sessions` and can be revoked. Rotate `STATE_COOKIE_SECRET` to invalidate all existing sessions. |
-| Public protocol endpoints bypass shared bearer-token auth. | Each endpoint validates tenants from protocol-specific data (`client_id`, SAML issuer/SP client, SCIM bearer token, OIDC/OAuth2 callback state). Keep Ory admin endpoints network-restricted. |
-| Audit logs are best-effort. | Monitor `audit log insertion failed` warnings and alert if audit writes fail repeatedly. |
+| Public protocol endpoints bypass shared bearer-token auth. | Each endpoint validates tenants from protocol-specific data (`client_id`, SAML issuer/SP client, SCIM bearer token, OIDC/OAuth2 callback state); the branded self-service routes defer session checks to Kratos. Keep Ory admin endpoints network-restricted. |
+| Audit logs are best-effort. | Audit records are structured log events on the standard log stream; ship logs to a durable sink and alert on ingestion gaps for the `sso_gateway::audit` target. |
 | Federation relies on upstream provider security. | Only configure trusted providers, enforce `https://`, and verify tenant domains via DNS TXT records before enabling HRD. |
 
 ## Operational checklist
@@ -79,4 +83,4 @@ The `audit_middleware` records method, path, resolved tenant, authenticated acto
 - [ ] Restrict Ory admin endpoints to the gateway via mTLS or network policies.
 - [ ] Rotate SAML signing certificates and IdP keys on a regular schedule.
 - [ ] Back up Postgres and encrypt backups at rest.
-- [ ] Monitor `/health/ready` and `/health/alive` endpoints.
+- [ ] Monitor `/health/ready` and `/health/live` endpoints.

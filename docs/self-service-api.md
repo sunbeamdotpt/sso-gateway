@@ -39,7 +39,8 @@ The spec-mandated OAuth2/OIDC endpoints (`/.well-known/openid-configuration`,
 Self-service RPCs are called from the browser, so the gateway does not require a
 bearer token for the browser flows themselves. Tenant is resolved instead from:
 
-- The session cookie (`ory_kratos_session`) for `ToSession` and flow submission.
+- The session cookie (`sunbeam_session`, the configured Kratos session cookie
+  name) for `ToSession` and flow submission.
 - The login/registration challenge for OAuth2 consent/logout flows.
 - The configured public base URL and host mapping for flow creation.
 
@@ -132,7 +133,7 @@ gateway forwards it to Kratos unchanged.
 | `SubmitVerificationToken` | `SubmitVerificationTokenRequest` | `SubmitVerificationTokenResponse` | Validate a verification magic-link token and return the redirect target. |
 
 Both methods forward the browser's `Cookie` and `X-CSRF-Token` metadata to Kratos,
-capture any `Set-Cookie` headers (including `ory_kratos_session` and CSRF cookies),
+capture any `Set-Cookie` headers (including `sunbeam_session` and CSRF cookies),
 and return Kratos's final `redirect_to` URL in the response. The browser should
 follow the redirect and send the returned cookies along.
 

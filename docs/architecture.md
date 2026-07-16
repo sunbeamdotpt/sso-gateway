@@ -20,7 +20,7 @@ The gateway is a vendor-neutral facade. Callers never see Ory paths or global ID
 3. **Translation** — gateway ULIDs are mapped to Ory global IDs through `id_mappings`.
 4. **Audit** — the audit middleware records method, path, actor, tenant, and outcome, and emits them as structured logs tagged with `sso_gateway::audit`.
 
-Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) skip the shared bearer-token middleware and authenticate using protocol-specific mechanisms.
+Protocol endpoints (`/.well-known/`, `/oauth2/`, `/saml/`, and SCIM discovery) skip the shared bearer-token middleware and authenticate using protocol-specific mechanisms. The branded browser self-service routes (defaults under `/identity/…`, configurable via `SELF_SERVICE_*_PATH`) and the `/self-service/{recovery,verification}` email-link shims also skip it — they carry Kratos session and CSRF cookies and are proxied to Kratos, which performs the session checks. Every Kratos URL that can reach a browser is rewritten onto the branded surface, so no Ory path ever appears in an address bar, redirect chain, or inbox.
 
 ## Multi-tenancy model
 
@@ -62,6 +62,7 @@ Callback handlers validate state, verify the upstream response, provision or lin
 
 - **Connect-RPC** — primary API for identity, applications, permissions, tenants, federation, self-service, consent, device authorization, and SCIM.
 - **OAuth2/OIDC** — standard `/.well-known/openid-configuration`, `/oauth2/auth`, `/oauth2/token`, `/oauth2/userinfo`, device authorization, etc.
+- **Branded browser self-service** — cookie-authenticated proxy routes for flow init, token submission, OIDC callbacks, and the WebAuthn bundle at configurable paths (defaults `/identity/…`), with Kratos-shaped email links bounced in via 302 shims.
 - **Federation callbacks** — `/callbacks/oidc` and `/callbacks/oauth2` for upstream identity provider redirects.
 - **SCIM 2.0** — `/scim/v2/Users` and `/scim/v2/Groups`.
 - **SAML** — `/saml/metadata`, `/saml/acs`, and `/saml/sso` for SP and IdP flows.
