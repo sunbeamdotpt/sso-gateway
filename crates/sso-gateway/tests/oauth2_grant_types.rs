@@ -28,6 +28,7 @@ async fn authorization_code_flow_through_gateway_returns_tokens() {
             &["code"],
             &["openid", "profile"],
             false,
+            None,
         )
         .await;
 
@@ -50,6 +51,7 @@ async fn authorization_code_with_pkce_s256_returns_tokens() {
             &["code"],
             &["openid", "profile"],
             true,
+            None,
         )
         .await;
 
@@ -76,6 +78,7 @@ async fn refresh_token_flow_returns_new_access_token() {
             &["code"],
             &["openid", "offline_access"],
             false,
+            None,
         )
         .await;
 
@@ -116,6 +119,7 @@ async fn implicit_flow_returns_access_token_in_fragment() {
             &["token"],
             &["openid", "profile"],
             false,
+            None,
         )
         .await;
 
@@ -196,6 +200,7 @@ async fn token_endpoint_rejects_invalid_requests() {
             &["code"],
             &["openid", "profile"],
             false,
+            None,
         )
         .await;
 
@@ -332,6 +337,7 @@ async fn userinfo_returns_claims_after_authorization_code_flow() {
             &["code"],
             &["openid", "profile"],
             false,
+            None,
         )
         .await;
     let access_token = token["access_token"].as_str().expect("access_token");

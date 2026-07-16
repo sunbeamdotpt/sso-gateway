@@ -175,13 +175,18 @@ impl Gateway {
     }
 }
 
-/// Result of driving an authorization-code or implicit flow through the gateway.
+/// Result of driving an authorization-code, implicit, or hybrid flow through the
+/// gateway.
 pub struct AuthorizationFlowResult {
     pub ory_client_id: String,
     pub client_id: String,
     pub client_secret: String,
     pub code: String,
+    /// Token endpoint response (authorization-code, refresh-token, client-creds,
+    /// or implicit fragment parsed as JSON).
     pub token: serde_json::Value,
+    /// ID token returned directly from a hybrid flow response fragment, if any.
+    pub id_token: Option<String>,
 }
 
 impl Gateway {
@@ -466,6 +471,7 @@ impl Gateway {
     /// Login and consent are accepted directly against Hydra's admin API so the
     /// test can focus on the gateway's public OAuth2 surface. Any Hydra-issued
     /// redirect URLs are rewritten back onto the gateway host before following.
+    #[allow(clippy::too_many_arguments)]
     pub async fn authorization_code_flow_through_gateway(
         &self,
         subject: &str,
@@ -474,13 +480,18 @@ impl Gateway {
         response_types: &[&str],
         scopes: &[&str],
         use_pkce: bool,
+        nonce: Option<&str>,
     ) -> AuthorizationFlowResult {
+        // Hydra matches the requested response_type as a space-separated string
+        // against the client's registered response_types list, so register the
+        // exact combination (e.g. "code id_token") as a single element.
+        let response_type = response_types.join(" ");
         let app = self
             .create_application(
                 "oauth2-auth-code-gateway",
                 &[redirect_uri],
                 grant_types,
-                response_types,
+                &[response_type.as_str()],
                 scopes,
             )
             .await;
@@ -507,7 +518,6 @@ impl Gateway {
         };
 
         // 1. Initiate the authorization request through the gateway.
-        let response_type = response_types.join(" ");
         let scope = scopes.join(" ");
         let state = "conformance-state".to_string();
         let mut auth_query: Vec<(&str, String)> = vec![
@@ -520,6 +530,9 @@ impl Gateway {
         if let Some(challenge) = code_challenge.clone() {
             auth_query.push(("code_challenge", challenge));
             auth_query.push(("code_challenge_method", "S256".to_string()));
+        }
+        if let Some(nonce) = nonce {
+            auth_query.push(("nonce", nonce.to_string()));
         }
 
         let auth_resp = no_redirect
@@ -540,6 +553,10 @@ impl Gateway {
             .and_then(|h| h.to_str().ok())
             .expect("login location header should exist");
         let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        assert!(
+            login_location.contains("login_challenge="),
+            "authorize did not redirect to login; location: {login_location}"
+        );
         let login_challenge = extract_query_param(&login_location, "login_challenge")
             .expect("login_challenge should be present");
 
@@ -633,19 +650,31 @@ impl Gateway {
             url::Url::parse(redirect_uri).unwrap().origin().unicode_serialization(),
             "final redirect must target the requested redirect_uri"
         );
-        // For the implicit flow, the token (and state) is in the URL fragment.
+        // 6. Extract the authorization result from the final redirect URI.
+        //    Pure implicit flows return parameters in the fragment; hybrid flows
+        //    may return both query parameters (code) and fragment parameters
+        //    (id_token, access_token).
+        let fragment_params = redirect_url
+            .fragment()
+            .map(fragment_to_map)
+            .unwrap_or_default();
+        let query_params: std::collections::HashMap<String, String> = redirect_url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            query_params.get("state").map(String::as_str).or(fragment_params.get("state").map(String::as_str)),
+            Some("conformance-state"),
+            "authorization response must return the requested state"
+        );
+
+        // Pure implicit flow: everything lives in the fragment.
         if response_types.contains(&"token") && !response_types.contains(&"code") {
-            let fragment = redirect_url.fragment().unwrap_or("");
             assert!(
-                fragment.contains("access_token="),
-                "implicit flow fragment must contain access_token: {fragment}"
+                fragment_params.contains_key("access_token"),
+                "implicit flow fragment must contain access_token: {fragment_params:?}"
             );
-            let fragment_params = fragment_to_map(fragment);
-            assert_eq!(
-                fragment_params.get("state").map(String::as_str),
-                Some("conformance-state"),
-                "implicit flow must return the requested state"
-            );
+            let id_token = fragment_params.get("id_token").cloned();
             let token = serde_json::Value::Object(
                 fragment_params
                     .into_iter()
@@ -658,18 +687,21 @@ impl Gateway {
                 client_secret,
                 code: String::new(),
                 token,
+                id_token,
             };
         }
 
-        let code = redirect_url
-            .query_pairs()
-            .find_map(|(k, v)| if k == "code" { Some(v.into_owned()) } else { None })
-            .expect("redirect should contain code");
-        let state = redirect_url
-            .query_pairs()
-            .find_map(|(k, v)| if k == "state" { Some(v.into_owned()) } else { None })
-            .expect("redirect should contain state");
-        assert_eq!(state, "conformance-state");
+        let code = match query_params.get("code").cloned().or_else(|| {
+            // Some OPs (including Hydra for some hybrid configurations) return
+            // the authorization code in the fragment rather than the query.
+            fragment_params.get("code").cloned()
+        }) {
+            Some(code) => code,
+            None => panic!(
+                "redirect should contain code; location={final_location} query={query_params:?} fragment={fragment_params:?}"
+            ),
+        };
+        let hybrid_id_token = fragment_params.get("id_token").cloned();
 
         // 7. Exchange the code at the gateway token endpoint using the public
         //    client id to verify the gateway maps it back to the Ory client.
@@ -701,6 +733,7 @@ impl Gateway {
             client_secret,
             code,
             token,
+            id_token: hybrid_id_token,
         }
     }
 
@@ -867,6 +900,10 @@ impl Gateway {
             .and_then(|h| h.to_str().ok())
             .expect("login location should exist");
         let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        assert!(
+            login_location.contains("login_challenge="),
+            "authorize did not redirect to login; location: {login_location}"
+        );
         let login_challenge = extract_query_param(&login_location, "login_challenge")
             .expect("login_challenge should be present");
 
