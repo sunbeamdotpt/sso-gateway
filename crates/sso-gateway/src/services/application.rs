@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_APPLICATION_READ, require_scope},
-    db::{IdMappingRepo, IdMappingStore},
+    db::{ApplicationRepo, ApplicationStore, IdMappingRepo, IdMappingStore},
     middleware::TenantId,
     proto::iam::v1::{
         Application, ApplicationSecret, CreateApplicationRequest, DeleteApplicationRequest,
@@ -64,14 +64,23 @@ impl ApplicationHydra for HydraClient {
 pub struct ApplicationServiceImpl {
     hydra: Arc<dyn ApplicationHydra>,
     mappings: Arc<dyn IdMappingStore>,
+    applications: Arc<dyn ApplicationStore>,
+    system_tenant_ulid: String,
     allow_http_redirect_uris: bool,
 }
 
 impl ApplicationServiceImpl {
-    pub fn new(hydra: Arc<HydraClient>, mappings: IdMappingRepo) -> Self {
+    pub fn new(
+        hydra: Arc<HydraClient>,
+        mappings: IdMappingRepo,
+        applications: ApplicationRepo,
+        system_tenant_ulid: String,
+    ) -> Self {
         Self {
             hydra: hydra as Arc<dyn ApplicationHydra>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            applications: Arc::new(applications) as Arc<dyn ApplicationStore>,
+            system_tenant_ulid,
             allow_http_redirect_uris: false,
         }
     }
@@ -82,6 +91,13 @@ impl ApplicationServiceImpl {
     pub fn with_allow_http_redirect_uris(mut self, allow: bool) -> Self {
         self.allow_http_redirect_uris = allow;
         self
+    }
+
+    fn is_system_tenant(&self, ctx: &RequestContext) -> bool {
+        ctx.extensions()
+            .get::<AuthContext>()
+            .map(|a| a.tenant_id == self.system_tenant_ulid)
+            .unwrap_or(false)
     }
 }
 
@@ -96,6 +112,13 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope(&ctx, SCOPE_APPLICATION_ADMIN)?;
         let req = request.to_owned_message();
+
+        if req.cross_tenant && !self.is_system_tenant(&ctx) {
+            return Err(ServiceError::PermissionDenied(
+                "only the system tenant can create cross-tenant applications".into(),
+            )
+            .into());
+        }
 
         validate_redirect_uris(&req.redirect_uris, self.allow_http_redirect_uris)?;
         validate_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
@@ -116,8 +139,11 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         self.mappings
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
             .await?;
+        self.applications
+            .create(&tenant_id, &public_id, req.cross_tenant)
+            .await?;
 
-        let mut app = hydra_to_application(&created, &tenant_id, &public_id);
+        let mut app = hydra_to_application(&created, &tenant_id, &public_id, req.cross_tenant);
         app.client_secret = client_secret;
         Ok(Response::new(app))
     }
@@ -136,13 +162,17 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .get_ory_id(&tenant_id, BACKEND_HYDRA, &req.id)
             .await?;
 
+        let app_row = self.applications.get(&tenant_id, &req.id).await.ok();
         let client = self
             .hydra
             .get_oauth2_client(&ory_id)
             .await
             .map_err(map_ory_error)?;
         Ok(Response::new(hydra_to_application(
-            &client, &tenant_id, &req.id,
+            &client,
+            &tenant_id,
+            &req.id,
+            app_row.map(|r| r.cross_tenant).unwrap_or(false),
         )))
     }
 
@@ -159,6 +189,16 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .list_public_ids(&tenant_id, BACKEND_HYDRA)
             .await?;
 
+        let app_rows = self
+            .applications
+            .list_by_tenant(&tenant_id)
+            .await
+            .unwrap_or_default();
+        let cross_tenant_by_id: std::collections::HashMap<String, bool> = app_rows
+            .into_iter()
+            .map(|r| (r.public_id, r.cross_tenant))
+            .collect();
+
         let mut applications = Vec::with_capacity(public_ids.len());
         for public_id in public_ids {
             match self
@@ -168,7 +208,13 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             {
                 Ok(ory_id) => match self.hydra.get_oauth2_client(&ory_id).await {
                     Ok(client) => {
-                        applications.push(hydra_to_application(&client, &tenant_id, &public_id))
+                        let cross_tenant = cross_tenant_by_id.get(&public_id).copied().unwrap_or(false);
+                        applications.push(hydra_to_application(
+                            &client,
+                            &tenant_id,
+                            &public_id,
+                            cross_tenant,
+                        ))
                     }
                     Err(err) => debug!(%public_id, "failed to fetch hydra client: {}", err),
                 },
@@ -194,10 +240,24 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         validate_redirect_uris(&req.redirect_uris, self.allow_http_redirect_uris)?;
         validate_token_endpoint_auth_method(&req.token_endpoint_auth_method)?;
 
+        let cross_tenant = req.cross_tenant.as_option().map(|v| v.value);
+        if cross_tenant == Some(true) && !self.is_system_tenant(&ctx) {
+            return Err(ServiceError::PermissionDenied(
+                "only the system tenant can enable cross-tenant applications".into(),
+            )
+            .into());
+        }
+
         let ory_id = self
             .mappings
             .get_ory_id(&tenant_id, BACKEND_HYDRA, &req.id)
             .await?;
+
+        if let Some(cross_tenant) = cross_tenant {
+            self.applications
+                .set_cross_tenant(&tenant_id, &req.id, cross_tenant)
+                .await?;
+        }
 
         let payload = build_hydra_update_payload(&req, &ory_id);
         let updated = self
@@ -206,8 +266,12 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
+        let app_row = self.applications.get(&tenant_id, &req.id).await.ok();
         Ok(Response::new(hydra_to_application(
-            &updated, &tenant_id, &req.id,
+            &updated,
+            &tenant_id,
+            &req.id,
+            app_row.map(|r| r.cross_tenant).unwrap_or(false),
         )))
     }
 
@@ -229,6 +293,10 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .delete_oauth2_client(&ory_id)
             .await
             .map_err(map_ory_error)?;
+        self.applications
+            .delete(&tenant_id, &req.id)
+            .await
+            .ok();
         self.mappings
             .delete(&tenant_id, BACKEND_HYDRA, &req.id)
             .await?;
@@ -394,6 +462,7 @@ fn hydra_to_application(
     client: &serde_json::Value,
     tenant_id: &str,
     public_id: &str,
+    cross_tenant: bool,
 ) -> Application {
     let scope_string = client["scope"].as_str().unwrap_or("");
     Application {
@@ -412,6 +481,7 @@ fn hydra_to_application(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        cross_tenant,
         ..Default::default()
     }
 }
@@ -433,11 +503,12 @@ mod tests {
 
     use super::*;
     use crate::auth::SubjectType;
-    use crate::db::{DbError, IdMappingRow};
+    use crate::db::{DbError, IdMappingRow, MemoryApplicationStore};
     use crate::proto::iam::v1::ApplicationService;
     use buffa::bytes::Bytes;
     use buffa::view::MessageView;
     use buffa::{HasMessageView, Message};
+    use buffa_types::google::protobuf::BoolValue;
     use serde_json::json;
 
     // -----------------------------------------------------------------------
@@ -651,6 +722,8 @@ mod tests {
         ApplicationServiceImpl {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
+            applications: Arc::new(MemoryApplicationStore::default()),
+            system_tenant_ulid: "system-tenant".to_string(),
             allow_http_redirect_uris: false,
         }
     }
@@ -662,7 +735,24 @@ mod tests {
         ApplicationServiceImpl {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
+            applications: Arc::new(MemoryApplicationStore::default()),
+            system_tenant_ulid: "system-tenant".to_string(),
             allow_http_redirect_uris: true,
+        }
+    }
+
+    fn build_service_with_apps(
+        hydra: StubHydra,
+        mappings: StubMappings,
+        applications: MemoryApplicationStore,
+        system_tenant_ulid: &str,
+    ) -> ApplicationServiceImpl {
+        ApplicationServiceImpl {
+            hydra: Arc::new(hydra),
+            mappings: Arc::new(mappings),
+            applications: Arc::new(applications),
+            system_tenant_ulid: system_tenant_ulid.to_string(),
+            allow_http_redirect_uris: false,
         }
     }
 
@@ -759,6 +849,175 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, connectrpc::ErrorCode::Internal, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_cross_tenant_allowed_for_system_tenant() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            create_result: Mutex::new(Some(Ok(mapping_row(
+                "system-tenant",
+                BACKEND_HYDRA,
+                "pub-1",
+                "ory-123",
+            )))),
+            ..Default::default()
+        };
+        let apps = MemoryApplicationStore::default();
+        let service = build_service_with_apps(hydra, mappings, apps.clone(), "system-tenant");
+
+        let req = CreateApplicationRequest {
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            cross_tenant: true,
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let resp = service
+            .create_application(admin_context("system-tenant"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(resp.cross_tenant);
+        let row = apps
+            .get_by_public_id(&resp.id)
+            .await
+            .expect("application row should exist");
+        assert!(row.cross_tenant);
+    }
+
+    #[tokio::test]
+    async fn create_cross_tenant_denied_for_non_system_tenant() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            create_result: Mutex::new(Some(Ok(mapping_row(
+                "tenant-1",
+                BACKEND_HYDRA,
+                "pub-1",
+                "ory-123",
+            )))),
+            ..Default::default()
+        };
+        let service = build_service_with_apps(
+            hydra,
+            mappings,
+            MemoryApplicationStore::default(),
+            "system-tenant",
+        );
+
+        let req = CreateApplicationRequest {
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            cross_tenant: true,
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let err = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn update_cross_tenant_allowed_for_system_tenant() {
+        let hydra = StubHydra {
+            update_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let apps = MemoryApplicationStore::default();
+        apps.create("system-tenant", "pub-1", false)
+            .await
+            .unwrap();
+        let service = build_service_with_apps(hydra, mappings, apps.clone(), "system-tenant");
+
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            cross_tenant: Some(BoolValue {
+                value: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let resp = service
+            .update_application(admin_context("system-tenant"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(resp.cross_tenant);
+        let row = apps.get("system-tenant", "pub-1").await.unwrap();
+        assert!(row.cross_tenant);
+    }
+
+    #[tokio::test]
+    async fn update_cross_tenant_denied_for_non_system_tenant() {
+        let hydra = StubHydra {
+            update_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let apps = MemoryApplicationStore::default();
+        apps.create("tenant-1", "pub-1", false).await.unwrap();
+        let service = build_service_with_apps(hydra, mappings, apps.clone(), "system-tenant");
+
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            cross_tenant: Some(BoolValue {
+                value: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let err = service
+            .update_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied, "{err:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -1122,18 +1381,19 @@ mod tests {
             "response_types": ["code"],
             "token_endpoint_auth_method": "none"
         });
-        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        let app = hydra_to_application(&client, "tenant-1", "pub-1", false);
         assert_eq!(app.id, "pub-1");
         assert_eq!(app.tenant_id, "tenant-1");
         assert_eq!(app.name, "app");
         assert_eq!(app.scope, vec!["openid", "profile"]);
         assert_eq!(app.redirect_uris, vec!["https://a"]);
+        assert!(!app.cross_tenant);
     }
 
     #[test]
     fn hydra_to_application_handles_empty_scope() {
         let client = json!({});
-        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        let app = hydra_to_application(&client, "tenant-1", "pub-1", false);
         assert!(app.scope.is_empty());
     }
 
@@ -1214,7 +1474,7 @@ mod tests {
     #[test]
     fn hydra_to_application_handles_missing_fields() {
         let client = json!({"scope": ""});
-        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        let app = hydra_to_application(&client, "tenant-1", "pub-1", false);
         assert_eq!(app.id, "pub-1");
         assert_eq!(app.tenant_id, "tenant-1");
         assert!(app.name.is_empty());
@@ -1233,11 +1493,12 @@ mod tests {
             "response_types": ["code", {"nested": 1}],
             "scope": "openid profile"
         });
-        let app = hydra_to_application(&client, "tenant-1", "pub-1");
+        let app = hydra_to_application(&client, "tenant-1", "pub-1", true);
         assert_eq!(app.redirect_uris, vec!["https://a"]);
         assert_eq!(app.grant_types, vec!["authorization_code"]);
         assert_eq!(app.response_types, vec!["code"]);
         assert_eq!(app.scope, vec!["openid", "profile"]);
+        assert!(app.cross_tenant);
     }
 
     #[tokio::test]
