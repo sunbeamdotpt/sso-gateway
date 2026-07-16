@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.20] - 2026-07-16
+
+### Fixed
+
+- Bootstrap client `x-tenant-id` routing. `bootstrap_system_client` now creates
+  or updates the gateway `applications` row with `cross_tenant = true`, so the
+  system bootstrap token can route calls via `x-tenant-id` instead of being
+  silently directed to the system tenant. Existing deployments that already have
+  the bootstrap Hydra client are upgraded idempotently.
+  - Added debug logging in the auth middleware when `x-tenant-id` is ignored
+    because the application lookup failed or the row lacks the `cross_tenant`
+    flag.
+  - Regression tests cover both fresh provisioning and upgrading an existing
+    non-cross-tenant application row, plus middleware tests that assert the
+    resolved tenant is overridden (or not) based on the application record.
+
+- Existing-session login acceptance regardless of Hydra's `skip` flag.
+  `accept_skippable_login` previously only accepted the login request when Hydra
+  set `skip = true`. With 2FA and similar flows Hydra may set `skip = false`
+  even though the caller already has a valid Kratos session; Kratos' JSON path
+  then returns `session_already_available` after consuming the challenge and
+  drops Hydra's `redirect_to`, trapping the UI. The gateway now accepts the
+  login when a valid Kratos session is present and satisfies the requested
+  AAL, matching Kratos' browser behavior. The requirement is read from
+  `requested_aal` or `oidc_context.acr_values` and compared against the
+  session's `authenticator_assurance_level`; if the session's AAL is
+  insufficient, the request falls through to Kratos for step-up instead of
+  silently bypassing MFA. Regression tests cover acceptance when `skip = false`,
+  AAL-sufficient sessions, and AAL-insufficient sessions.
+
 ## [2026.07.19] - 2026-07-16
 
 ### Fixed
