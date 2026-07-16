@@ -440,6 +440,7 @@ pub struct IdentitySelfServiceImpl {
     memberships: Arc<dyn TenantMembershipStore>,
     consent_enabled: bool,
     kratos_public_url: String,
+    hydra_public_url: String,
     gateway_public_url: String,
     kratos_default_schema_id: String,
     paths: crate::config::SelfServicePaths,
@@ -456,6 +457,7 @@ impl IdentitySelfServiceImpl {
         memberships: TenantMembershipRepo,
         consent_enabled: bool,
         kratos_public_url: String,
+        hydra_public_url: String,
         gateway_public_url: String,
         kratos_default_schema_id: String,
         paths: crate::config::SelfServicePaths,
@@ -469,10 +471,21 @@ impl IdentitySelfServiceImpl {
             memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
             consent_enabled,
             kratos_public_url,
+            hydra_public_url,
             gateway_public_url,
             kratos_default_schema_id,
             paths,
         }
+    }
+
+    /// Rewrite a Hydra public URL onto the gateway public URL.
+    ///
+    /// Kratos submit flows and Hydra login accepts can return Hydra's raw
+    /// public URL in `redirect_browser_to`. If that reaches the browser, the
+    /// CSRF cookie issued for the gateway host no longer matches and Hydra
+    /// returns `request_forbidden`. Always surface the gateway host instead.
+    fn rewrite_hydra_url(&self, value: &str) -> String {
+        rewrite_url(value, &self.hydra_public_url, &self.gateway_public_url)
     }
 
     /// Replace every non-empty `flow` query parameter in `value` with the
@@ -814,7 +827,7 @@ impl IdentitySelfServiceImpl {
             ));
         }
         Ok(Some(SelfServiceFlow {
-            redirect_browser_to: redirect_to,
+            redirect_browser_to: self.rewrite_hydra_url(&redirect_to),
             ..Default::default()
         }))
     }
@@ -849,6 +862,7 @@ impl IdentitySelfServiceImpl {
                 let location = self
                     .scrub_flow_id_in_url(tenant_id, &location, true)
                     .await?;
+                let location = self.rewrite_hydra_url(&location);
                 let body = SelfServiceFlow {
                     redirect_browser_to: location,
                     ..Default::default()
@@ -2861,6 +2875,7 @@ mod tests {
             memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
             paths: crate::config::SelfServicePaths::default(),
@@ -2887,6 +2902,7 @@ mod tests {
             crate::db::TenantMembershipRepo::new(pool),
             true,
             "http://kratos.example.com".to_string(),
+            "https://hydra.example.com".to_string(),
             "https://gateway.example.com".to_string(),
             "default".to_string(),
             crate::config::SelfServicePaths::default(),
@@ -2961,6 +2977,7 @@ mod tests {
             memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "kratos-base".to_string(),
             paths: crate::config::SelfServicePaths::default(),
@@ -2985,6 +3002,7 @@ mod tests {
             memberships: Arc::new(default_membership_store()),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "kratos-base".to_string(),
             paths: crate::config::SelfServicePaths::default(),
@@ -3397,7 +3415,7 @@ mod tests {
         let resp = svc.create_login_flow(ctx, req).await.unwrap();
         assert_eq!(
             resp.body.redirect_browser_to,
-            "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
         );
 
         // The challenge is accepted exactly once; Kratos never creates a flow.
@@ -4405,6 +4423,7 @@ mod tests {
             memberships: memberships.clone(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
             paths: crate::config::SelfServicePaths::default(),
@@ -4476,6 +4495,7 @@ mod tests {
             })),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
             gateway_public_url: "https://gateway.example.com".to_string(),
             kratos_default_schema_id: "default".to_string(),
             paths: crate::config::SelfServicePaths::default(),
@@ -4818,6 +4838,27 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("ory_kratos_session=session-reg")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_rewrites_hydra_redirect_to_gateway() {
+        let fake = FakeKratos::default();
+        fake.reseed_flow_redirect(
+            "https://hydra.example.com/oauth2/auth?login_verifier=v1",
+            &["ory_kratos_session=session-422; Path=/; HttpOnly"],
+        );
+        let svc = service(fake);
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
         );
     }
 

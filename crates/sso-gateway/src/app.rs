@@ -311,6 +311,7 @@ pub async fn build_app_with_upstream(
         memberships.clone(),
         consent_enabled,
         config.kratos_public_url.clone(),
+        config.hydra_public_url.clone(),
         config.public_base_url.clone(),
         config.kratos_default_schema_id.clone(),
         config.self_service_paths.clone(),

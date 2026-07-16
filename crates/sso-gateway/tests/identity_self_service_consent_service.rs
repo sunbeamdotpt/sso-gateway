@@ -522,6 +522,7 @@ async fn self_service_and_consent_round_trip() {
         sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         true,
         kratos_url.clone(),
+        hydra_url.clone(),
         "http://gateway.test".to_string(),
         "default".to_string(),
         sso_gateway::config::SelfServicePaths::default(),
