@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.19] - 2026-07-16
+
+### Fixed
+
+- Leaked Hydra public URLs in self-service browser redirects. Kratos submit
+  flows that return `browser_location_change_required` and Hydra login-accept
+  responses that return `redirect_to` now rewrite any Hydra public URL onto the
+  gateway public URL before surfacing `redirect_browser_to`. This keeps the
+  browser on the gateway host so Hydra's login CSRF cookie remains valid.
+  - Added `hydra_public_url` to `IdentitySelfServiceImpl` and wired it from
+    `config.hydra_public_url`.
+  - Added `rewrite_hydra_url` helper and applied it in
+    `map_submit_response` and `accept_skippable_login`.
+  - Regression tests verify that both paths rewrite Hydra URLs to gateway URLs.
+
 ## [2026.07.18] - 2026-07-16
 
 ### Added
