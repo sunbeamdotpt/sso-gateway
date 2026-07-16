@@ -9,7 +9,8 @@ use sso_ory_client::{
     kratos::{KratosClient, KratosResponse},
 };
 use sunbeam_g2v::error::ServiceError;
-use tracing::instrument;
+use tracing::{instrument, warn};
+use ulid::Ulid;
 
 use crate::db::{
     DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
@@ -520,6 +521,126 @@ impl IdentitySelfServiceImpl {
     /// returns `request_forbidden`. Always surface the gateway host instead.
     fn rewrite_hydra_url(&self, value: &str) -> String {
         rewrite_url(value, &self.hydra_public_url, &self.gateway_public_url)
+    }
+
+    /// Turn a list of `Set-Cookie` values into a `Cookie` header value.
+    ///
+    /// `Set-Cookie` carries attributes (`Path`, `HttpOnly`, ...) after the
+    /// first `;`; the `Cookie` header only needs `name=value` pairs.
+    fn cookie_header_from_set_cookies(set_cookies: &[String]) -> Option<String> {
+        let pairs: Vec<String> = set_cookies
+            .iter()
+            .filter_map(|cookie| {
+                let name_value = cookie.split(';').next()?.trim();
+                if name_value.contains('=') && !name_value.is_empty() {
+                    Some(name_value.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(pairs.join("; "))
+        }
+    }
+
+    /// Ensure a Kratos identity created through self-service has a gateway
+    /// mapping and tenant membership, mirroring the admin `CreateIdentity`
+    /// path.
+    ///
+    /// If the identity is already mapped, this is a no-op. Traits are
+    /// normalized and validated against the tenant's default gateway schema.
+    async fn provision_self_service_identity(
+        &self,
+        tenant_id: &str,
+        identity: &serde_json::Value,
+    ) -> Result<(), ServiceError> {
+        let ory_identity_id = identity["id"].as_str().ok_or_else(|| {
+            ServiceError::Internal("kratos self-service identity missing id".into())
+        })?;
+
+        // Idempotent: a replayed submission or concurrent request may have
+        // already created the mapping.
+        if self
+            .mappings
+            .get_public_id(tenant_id, BACKEND_KRATOS, ory_identity_id)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        let public_id = Ulid::new().to_string();
+        self.mappings
+            .create(tenant_id, BACKEND_KRATOS, &public_id, ory_identity_id)
+            .await?;
+
+        let schema = self.schemas.get_default(tenant_id).await?;
+        let mut traits = identity["traits"].clone();
+        if !traits.is_object() {
+            traits = serde_json::json!({});
+        }
+        normalize_traits(&mut traits);
+        if let Err(err) = validate_traits(&schema.schema_json, &traits) {
+            // Roll back the mapping so we don't leave a half-provisioned
+            // identity; the Kratos record itself is unchanged.
+            let _ = self.mappings.delete(tenant_id, BACKEND_KRATOS, &public_id).await;
+            return Err(err);
+        }
+
+        if let Err(err) = self
+            .memberships
+            .upsert(tenant_id, &public_id, &schema.schema_id, schema.version, traits)
+            .await
+        {
+            let _ = self.mappings.delete(tenant_id, BACKEND_KRATOS, &public_id).await;
+            return Err(err.into());
+        }
+
+        Ok(())
+    }
+
+    /// Extract the identity from a registration submit outcome and provision
+    /// the gateway-side mapping + membership.
+    ///
+    /// A successful submit returns the identity in the flow body. A submit
+    /// that completes with Kratos' `browser_location_change_required` carries
+    /// the session in `Set-Cookie` headers; we call `/sessions/whoami` to read
+    /// the identity from the freshly established session.
+    async fn provision_identity_from_registration_result(
+        &self,
+        tenant_id: &str,
+        result: &Result<KratosResponse, OryClientError>,
+    ) -> Result<(), ServiceError> {
+        let identity = match result {
+            Ok(flow) => flow.body["identity"].clone(),
+            Err(OryClientError::Redirect { set_cookies, .. }) => {
+                let cookie = match Self::cookie_header_from_set_cookies(set_cookies) {
+                    Some(cookie) => cookie,
+                    None => return Ok(()),
+                };
+                match self.kratos.to_session(Some(&cookie), None).await {
+                    Ok(session) => session["identity"].clone(),
+                    Err(err) => {
+                        warn!(
+                            %tenant_id,
+                            "unable to resolve session after registration redirect: {}",
+                            err
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(_) => return Ok(()),
+        };
+
+        if identity.is_null() || identity["id"].as_str().is_none() {
+            return Ok(());
+        }
+
+        self.provision_self_service_identity(tenant_id, &identity).await
     }
 
     /// Replace every non-empty `flow` query parameter in `value` with the
@@ -1282,6 +1403,8 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .kratos
             .submit_registration_flow(&ory_flow_id, cookie.as_deref(), body)
             .await;
+        self.provision_identity_from_registration_result(&tenant_id, &result)
+            .await?;
         self.map_submit_response(&tenant_id, result).await
     }
 
@@ -2289,9 +2412,9 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct StubMappingStore {
-        rows: Mutex<Vec<IdMappingRow>>,
+        rows: Arc<Mutex<Vec<IdMappingRow>>>,
     }
 
     impl StubMappingStore {
@@ -2312,7 +2435,7 @@ mod tests {
             };
             self.rows.lock().unwrap().push(row);
             Self {
-                rows: Mutex::new(std::mem::take(&mut *self.rows.lock().unwrap())),
+                rows: Arc::new(Mutex::new(std::mem::take(&mut *self.rows.lock().unwrap()))),
             }
         }
     }
@@ -4992,6 +5115,118 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("ory_kratos_session=session-reg")
+        );
+    }
+
+    fn service_with_stores(
+        kratos: FakeKratos,
+        mappings: StubMappingStore,
+        memberships: StubMembershipStore,
+    ) -> IdentitySelfServiceImpl {
+        IdentitySelfServiceImpl {
+            kratos: Arc::new(kratos),
+            hydra: Arc::new(FakeHydra::default()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(mappings),
+            schemas: Arc::new(default_schema_store()),
+            memberships: Arc::new(memberships),
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_registration_flow_creates_mapping_and_membership_from_ok_response() {
+        let fake = FakeKratos::default();
+        fake.reseed_flow_with_cookies(
+            json!({
+                "id": "flow-1",
+                "type": "registration",
+                "state": "passed_challenge",
+                "identity": {
+                    "id": "ory-identity-new",
+                    "traits": { "email": "NEW@example.com" }
+                }
+            }),
+            &["ory_kratos_session=new-session; Path=/; HttpOnly"],
+        );
+        let mappings = StubMappingStore::default();
+        let memberships = StubMembershipStore::default();
+        let svc = service_with_stores(fake, mappings.clone(), memberships.clone());
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_registration_flow(ctx, req).await.unwrap();
+        assert!(resp.body.redirect_browser_to.is_empty());
+
+        let public_id = mappings
+            .get_public_id("", BACKEND_KRATOS, "ory-identity-new")
+            .await
+            .expect("mapping should be created for the new identity");
+        assert!(Ulid::from_string(&public_id).is_ok());
+
+        let calls = memberships.upsert_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "");
+        assert_eq!(calls[0].1, public_id);
+        assert_eq!(calls[0].2, "default");
+        assert_eq!(calls[0].4, json!({ "email": "new@example.com" }));
+    }
+
+    #[tokio::test]
+    async fn submit_registration_flow_creates_mapping_and_membership_from_redirect_session() {
+        let fake = FakeKratos::default();
+        fake.reseed_flow_redirect(
+            "https://gateway.example.com/oauth2/auth?login_verifier=v-reg",
+            &["ory_kratos_session=session-reg; Path=/; HttpOnly"],
+        );
+        *fake.session.lock().unwrap() = Some(Ok(json!({
+            "id": "session-reg",
+            "active": true,
+            "identity": {
+                "id": "ory-identity-redirect",
+                "traits": { "email": "redirect@example.com" }
+            }
+        })));
+        let mappings = StubMappingStore::default();
+        let memberships = StubMembershipStore::default();
+        let svc = service_with_stores(fake.clone(), mappings.clone(), memberships.clone());
+        let ctx = request_context_without_cookie();
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.submit_registration_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v-reg"
+        );
+
+        let public_id = mappings
+            .get_public_id("", BACKEND_KRATOS, "ory-identity-redirect")
+            .await
+            .expect("mapping should be created from the redirect session");
+        assert!(Ulid::from_string(&public_id).is_ok());
+
+        let calls = memberships.upsert_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].4, json!({ "email": "redirect@example.com" }));
+
+        let recorded = fake.calls.lock().unwrap();
+        assert!(
+            recorded.iter().any(|c| c.starts_with(
+                "to_session(cookie=Some(\"ory_kratos_session=session-reg\")"
+            )),
+            "to_session should be called with the redirected session cookie: {:?}",
+            recorded
         );
     }
 
