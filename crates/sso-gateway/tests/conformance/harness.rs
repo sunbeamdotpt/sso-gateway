@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use sso_gateway::{
@@ -171,7 +173,18 @@ impl Gateway {
         let _ = self.shutdown.send(());
         let _ = self.handle.await;
     }
+}
 
+/// Result of driving an authorization-code or implicit flow through the gateway.
+pub struct AuthorizationFlowResult {
+    pub ory_client_id: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub code: String,
+    pub token: serde_json::Value,
+}
+
+impl Gateway {
     /// Create an OAuth2/OIDC application and return the created resource as JSON.
     pub async fn create_application(
         &self,
@@ -180,6 +193,28 @@ impl Gateway {
         grant_types: &[&str],
         response_types: &[&str],
         scopes: &[&str],
+    ) -> serde_json::Value {
+        self.create_application_with_auth(
+            name,
+            redirect_uris,
+            grant_types,
+            response_types,
+            scopes,
+            "client_secret_post",
+        )
+        .await
+    }
+
+    /// Create an OAuth2/OIDC application with an explicit token endpoint auth
+    /// method and return the created resource as JSON.
+    pub async fn create_application_with_auth(
+        &self,
+        name: &str,
+        redirect_uris: &[&str],
+        grant_types: &[&str],
+        response_types: &[&str],
+        scopes: &[&str],
+        token_endpoint_auth_method: &str,
     ) -> serde_json::Value {
         let resp = self
             .http
@@ -195,7 +230,7 @@ impl Gateway {
                 "grantTypes": grant_types,
                 "responseTypes": response_types,
                 "scope": scopes,
-                "tokenEndpointAuthMethod": "client_secret_post"
+                "tokenEndpointAuthMethod": token_endpoint_auth_method
             }))
             .send()
             .await
@@ -424,7 +459,549 @@ impl Gateway {
         .fetch_one(&self.pool)
         .await
     }
+
+    /// Perform a full authorization-code or implicit flow through the gateway's
+    /// public `/oauth2/auth` endpoint.
+    ///
+    /// Login and consent are accepted directly against Hydra's admin API so the
+    /// test can focus on the gateway's public OAuth2 surface. Any Hydra-issued
+    /// redirect URLs are rewritten back onto the gateway host before following.
+    pub async fn authorization_code_flow_through_gateway(
+        &self,
+        subject: &str,
+        redirect_uri: &str,
+        grant_types: &[&str],
+        response_types: &[&str],
+        scopes: &[&str],
+        use_pkce: bool,
+    ) -> AuthorizationFlowResult {
+        let app = self
+            .create_application(
+                "oauth2-auth-code-gateway",
+                &[redirect_uri],
+                grant_types,
+                response_types,
+                scopes,
+            )
+            .await;
+        let app_id = app["id"].as_str().expect("app id");
+        let (client_id, client_secret) = self.rotate_secret(app_id).await;
+        let ory_client_id = self
+            .get_hydra_client_id(app_id)
+            .await
+            .expect("ory client id should be resolvable");
+
+        let no_redirect = reqwest::Client::builder()
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("no-redirect client should build");
+
+        let (code_verifier, code_challenge) = if use_pkce {
+            let verifier = generate_code_verifier();
+            let challenge = generate_code_challenge(&verifier);
+            (Some(verifier), Some(challenge))
+        } else {
+            (None, None)
+        };
+
+        // 1. Initiate the authorization request through the gateway.
+        let response_type = response_types.join(" ");
+        let scope = scopes.join(" ");
+        let state = "conformance-state".to_string();
+        let mut auth_query: Vec<(&str, String)> = vec![
+            ("response_type", response_type),
+            ("client_id", client_id.clone()),
+            ("redirect_uri", redirect_uri.to_string()),
+            ("scope", scope),
+            ("state", state),
+        ];
+        if let Some(challenge) = code_challenge.clone() {
+            auth_query.push(("code_challenge", challenge));
+            auth_query.push(("code_challenge_method", "S256".to_string()));
+        }
+
+        let auth_resp = no_redirect
+            .get(format!("{}/oauth2/auth", self.base_url))
+            .query(&auth_query)
+            .send()
+            .await
+            .expect("authorize request should complete");
+
+        assert!(
+            auth_resp.status().is_redirection(),
+            "authorize should redirect to login: {:?}",
+            auth_resp.status()
+        );
+        let login_location = auth_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .expect("login location header should exist");
+        let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        let login_challenge = extract_query_param(&login_location, "login_challenge")
+            .expect("login_challenge should be present");
+
+        // 2. Accept the login request.
+        let login_accept: serde_json::Value = no_redirect
+            .put(format!(
+                "{}/admin/oauth2/auth/requests/login/accept",
+                self.hydra_admin_url
+            ))
+            .query(&[("login_challenge", &login_challenge)])
+            .json(&serde_json::json!({
+                "subject": subject,
+                "remember": false,
+            }))
+            .send()
+            .await
+            .expect("login accept request should succeed")
+            .json()
+            .await
+            .expect("login accept should be json");
+        let after_login = login_accept["redirect_to"]
+            .as_str()
+            .expect("login accept should return redirect_to");
+
+        // 3. Follow the login verifier redirect through the gateway.
+        let after_login = resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
+        let consent_resp = no_redirect
+            .get(&after_login)
+            .send()
+            .await
+            .expect("login redirect should complete");
+        assert!(
+            consent_resp.status().is_redirection(),
+            "after login should redirect to consent: {:?}",
+            consent_resp.status()
+        );
+        let consent_location = consent_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .expect("consent location header should exist");
+        let consent_location = resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
+        let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
+            .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
+            .expect("consent_challenge or consent_verifier should be present");
+
+        // 4. Accept the consent request.
+        let consent_accept: serde_json::Value = no_redirect
+            .put(format!(
+                "{}/admin/oauth2/auth/requests/consent/accept",
+                self.hydra_admin_url
+            ))
+            .query(&[("consent_challenge", &consent_challenge)])
+            .json(&serde_json::json!({
+                "grant_scope": scopes,
+                "remember": false,
+            }))
+            .send()
+            .await
+            .expect("consent accept request should succeed")
+            .json()
+            .await
+            .expect("consent accept should be json");
+        let redirect_to = consent_accept["redirect_to"]
+            .as_str()
+            .expect("consent accept should return redirect_to");
+
+        // 5. Follow the consent verifier redirect through the gateway.
+        let redirect_to = resolve_to_gateway_url(redirect_to, &self.base_url, &self.hydra_public_url);
+        let final_resp = no_redirect
+            .get(&redirect_to)
+            .send()
+            .await
+            .expect("consent verifier redirect should complete");
+        assert!(
+            final_resp.status().is_redirection(),
+            "consent accept should redirect to client redirect_uri: {:?}",
+            final_resp.status()
+        );
+        let final_location = final_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .expect("final location header should exist");
+
+        // 6. Extract the authorization result from the final redirect URI.
+        let redirect_url = url::Url::parse(final_location)
+            .unwrap_or_else(|_| panic!("final redirect should be a valid URL: {final_location}"));
+        assert_eq!(
+            redirect_url.origin().unicode_serialization(),
+            url::Url::parse(redirect_uri).unwrap().origin().unicode_serialization(),
+            "final redirect must target the requested redirect_uri"
+        );
+        // For the implicit flow, the token (and state) is in the URL fragment.
+        if response_types.contains(&"token") && !response_types.contains(&"code") {
+            let fragment = redirect_url.fragment().unwrap_or("");
+            assert!(
+                fragment.contains("access_token="),
+                "implicit flow fragment must contain access_token: {fragment}"
+            );
+            let fragment_params = fragment_to_map(fragment);
+            assert_eq!(
+                fragment_params.get("state").map(String::as_str),
+                Some("conformance-state"),
+                "implicit flow must return the requested state"
+            );
+            let token = serde_json::Value::Object(
+                fragment_params
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            );
+            return AuthorizationFlowResult {
+                ory_client_id,
+                client_id,
+                client_secret,
+                code: String::new(),
+                token,
+            };
+        }
+
+        let code = redirect_url
+            .query_pairs()
+            .find_map(|(k, v)| if k == "code" { Some(v.into_owned()) } else { None })
+            .expect("redirect should contain code");
+        let state = redirect_url
+            .query_pairs()
+            .find_map(|(k, v)| if k == "state" { Some(v.into_owned()) } else { None })
+            .expect("redirect should contain state");
+        assert_eq!(state, "conformance-state");
+
+        // 7. Exchange the code at the gateway token endpoint using the public
+        //    client id to verify the gateway maps it back to the Ory client.
+        let mut token_form: Vec<(&str, String)> = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.clone()),
+            ("redirect_uri", redirect_uri.to_string()),
+            ("client_id", client_id.clone()),
+            ("client_secret", client_secret.clone()),
+        ];
+        if let Some(verifier) = code_verifier {
+            token_form.push(("code_verifier", verifier));
+        }
+
+        let token: serde_json::Value = self
+            .http
+            .post(format!("{}/oauth2/token", self.base_url))
+            .form(&token_form)
+            .send()
+            .await
+            .expect("token exchange should succeed")
+            .json()
+            .await
+            .expect("token response should be json");
+
+        AuthorizationFlowResult {
+            ory_client_id,
+            client_id,
+            client_secret,
+            code,
+            token,
+        }
+    }
+
+    /// Exchange a refresh token at the gateway token endpoint.
+    pub async fn refresh_token_flow(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> serde_json::Value {
+        self.http
+            .post(format!("{}/oauth2/token", self.base_url))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("scope", "openid offline_access"),
+            ])
+            .send()
+            .await
+            .expect("refresh token request should succeed")
+            .json()
+            .await
+            .expect("refresh token response should be json")
+    }
+
+    /// Complete a full OAuth2 device-code flow through the gateway and return
+    /// the token response. Login and consent are accepted directly against
+    /// Hydra's admin API; the device verification leg exercises the gateway's
+    /// `/oauth2/device/verify` proxy and the Connect-RPC device service.
+    pub async fn device_code_flow(&self, subject: &str) -> serde_json::Value {
+        let scopes = vec!["openid", "profile"];
+        let app = self
+            .create_application_with_auth(
+                "oauth2-device-gateway",
+                &[REDIRECT_URI],
+                &["urn:ietf:params:oauth:grant-type:device_code"],
+                &["token"],
+                &scopes,
+                "none",
+            )
+            .await;
+        let app_id = app["id"].as_str().expect("app id");
+        let client_id = app_id.to_string();
+
+        // 1. Initiate the device flow.
+        let auth_resp = self
+            .http
+            .post(format!(
+                "{}/iam.v1.OAuth2DeviceService/AuthorizeDevice",
+                self.base_url
+            ))
+            .header("authorization", format!("Bearer {}", self.admin_token))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "clientId": client_id,
+                "scope": scopes,
+            }))
+            .send()
+            .await
+            .expect("authorize_device request should complete");
+        let auth_status = auth_resp.status();
+        let auth_body = auth_resp
+            .text()
+            .await
+            .expect("authorize_device response should have a body");
+        assert!(
+            auth_status.is_success(),
+            "authorize_device failed: {} - {}",
+            auth_status,
+            auth_body
+        );
+        let auth: serde_json::Value = serde_json::from_str(&auth_body)
+            .expect("authorize_device response should be json");
+        let device_code = auth["deviceCode"]
+            .as_str()
+            .expect("deviceCode should exist")
+            .to_string();
+        let user_code = auth["userCode"]
+            .as_str()
+            .expect("userCode should exist")
+            .to_string();
+
+        // 2. Resolve the user code to a gateway challenge and capture Hydra's
+        //    device CSRF cookie.
+        let verify_resp = self
+            .http
+            .post(format!(
+                "{}/iam.v1.OAuth2DeviceService/GetDeviceVerification",
+                self.base_url
+            ))
+            .header("authorization", format!("Bearer {}", self.admin_token))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({ "userCode": user_code }))
+            .send()
+            .await
+            .expect("get_device_verification request should succeed");
+        let set_cookies: Vec<String> = verify_resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(String::from))
+            .collect();
+        let cookie_header = set_cookies
+            .iter()
+            .filter_map(|c| c.split(';').next().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let verification: serde_json::Value = verify_resp
+            .json()
+            .await
+            .expect("get_device_verification response should be json");
+        let challenge = verification["challenge"]
+            .as_str()
+            .expect("challenge should exist")
+            .to_string();
+
+        // 3. Approve the device verification.
+        let accepted: serde_json::Value = self
+            .http
+            .post(format!(
+                "{}/iam.v1.OAuth2DeviceService/AcceptDeviceVerification",
+                self.base_url
+            ))
+            .header("authorization", format!("Bearer {}", self.admin_token))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "challenge": challenge,
+                "userCode": user_code,
+            }))
+            .send()
+            .await
+            .expect("accept_device_verification request should succeed")
+            .json()
+            .await
+            .expect("accept_device_verification response should be json");
+        let redirect_to = accepted["redirectTo"]
+            .as_str()
+            .expect("redirectTo should exist");
+
+        // 4. Follow the verifier redirect through the gateway proxy to obtain the
+        //    login challenge.
+        let no_redirect = reqwest::Client::builder()
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("no-redirect client should build");
+        let login_resp = no_redirect
+            .get(redirect_to)
+            .header("cookie", &cookie_header)
+            .send()
+            .await
+            .expect("device verify leg should complete");
+        assert!(
+            login_resp.status().is_redirection(),
+            "device verify leg should redirect to login: {:?}",
+            login_resp.status()
+        );
+        let login_location = login_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .expect("login location should exist");
+        let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        let login_challenge = extract_query_param(&login_location, "login_challenge")
+            .expect("login_challenge should be present");
+
+        // 5. Accept the login request.
+        let login_accept: serde_json::Value = no_redirect
+            .put(format!(
+                "{}/admin/oauth2/auth/requests/login/accept",
+                self.hydra_admin_url
+            ))
+            .query(&[("login_challenge", &login_challenge)])
+            .json(&serde_json::json!({
+                "subject": subject,
+                "remember": false,
+            }))
+            .send()
+            .await
+            .expect("login accept request should succeed")
+            .json()
+            .await
+            .expect("login accept should be json");
+        let after_login = login_accept["redirect_to"]
+            .as_str()
+            .expect("login accept should return redirect_to");
+
+        // 6. Follow the login verifier redirect to obtain the consent challenge.
+        let after_login = resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
+        let consent_resp = no_redirect
+            .get(&after_login)
+            .send()
+            .await
+            .expect("login verifier redirect should complete");
+        assert!(
+            consent_resp.status().is_redirection(),
+            "after login should redirect to consent: {:?}",
+            consent_resp.status()
+        );
+        let consent_location = consent_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .expect("consent location should exist");
+        let consent_location = resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
+        let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
+            .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
+            .expect("consent_challenge or consent_verifier should be present");
+
+        // 7. Accept the consent request.
+        let consent_accept: serde_json::Value = no_redirect
+            .put(format!(
+                "{}/admin/oauth2/auth/requests/consent/accept",
+                self.hydra_admin_url
+            ))
+            .query(&[("consent_challenge", &consent_challenge)])
+            .json(&serde_json::json!({
+                "grant_scope": scopes,
+                "remember": false,
+            }))
+            .send()
+            .await
+            .expect("consent accept request should succeed")
+            .json()
+            .await
+            .expect("consent accept should be json");
+        let after_consent = consent_accept["redirect_to"]
+            .as_str()
+            .expect("consent accept should return redirect_to");
+
+        // 8. Follow the consent verifier redirect; the device code is now bound.
+        let after_consent = resolve_to_gateway_url(after_consent, &self.base_url, &self.hydra_public_url);
+        let final_resp = no_redirect
+            .get(&after_consent)
+            .send()
+            .await
+            .expect("consent verifier redirect should complete");
+        assert!(
+            final_resp.status().is_redirection(),
+            "consent accept should redirect after approval: {:?}",
+            final_resp.status()
+        );
+
+        // 9. Poll the device code for tokens until approval propagates.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let token_resp = self
+                .http
+                .post(format!(
+                    "{}/iam.v1.OAuth2DeviceService/GetDeviceToken",
+                    self.base_url
+                ))
+                .header("authorization", format!("Bearer {}", self.admin_token))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "clientId": client_id,
+                    "deviceCode": device_code,
+                }))
+                .send()
+                .await
+                .expect("get_device_token request should complete");
+            let token_status = token_resp.status();
+            let token_body = token_resp
+                .text()
+                .await
+                .expect("get_device_token response should have a body");
+            if token_status.is_success() {
+                let token: serde_json::Value = serde_json::from_str(&token_body)
+                    .expect("get_device_token response should be json");
+                // Normalize the Connect-RPC camelCase response to standard
+                // OAuth2 snake_case so callers can use the same assertions.
+                return serde_json::json!({
+                    "access_token": token.get("accessToken"),
+                    "token_type": token.get("tokenType"),
+                    "expires_in": token.get("expiresIn"),
+                    "refresh_token": token.get("refreshToken"),
+                    "id_token": token.get("idToken"),
+                    "scope": token.get("scope"),
+                });
+            }
+            if !token_body.to_ascii_lowercase().contains("pending") {
+                panic!(
+                    "get_device_token failed with non-pending error: {} - {}",
+                    token_status, token_body
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "get_device_token remained pending until deadline: {} - {}",
+                    token_status, token_body
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
 }
+
+const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
 
 async fn fetch_bootstrap_token(
     client: &reqwest::Client,
@@ -469,4 +1046,42 @@ async fn wait_for_ok(
             }
         }
     }
+}
+
+/// Rewrite a Hydra-issued URL onto the gateway host.
+///
+/// Hydra may still emit `http://localhost:4444` in some redirect chains even
+/// when `URLS_SELF_ISSUER` points at the gateway, and verifier URLs use the
+/// container address directly. Both are normalized to the gateway base URL so
+/// tests follow the full public surface.
+fn resolve_to_gateway_url(url: &str, gateway_base_url: &str, hydra_public_url: &str) -> String {
+    let url = url.replacen("http://localhost:4444", gateway_base_url, 1);
+    url.replacen(hydra_public_url, gateway_base_url, 1)
+}
+
+fn extract_query_param(url: &str, key: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
+}
+
+fn generate_code_verifier() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_code_challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn fragment_to_map(fragment: &str) -> std::collections::HashMap<String, String> {
+    url::form_urlencoded::parse(fragment.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
 }
