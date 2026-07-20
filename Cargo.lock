@@ -1871,16 +1871,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5388,7 +5378,6 @@ dependencies = [
  "sso-ory-client",
  "subtle",
  "sunbeam-g2v",
- "sunbeam-test",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.18",
@@ -5425,7 +5414,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sunbeam-test",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
@@ -5549,20 +5537,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sunbeam-test"
-version = "0.1.0"
-source = "git+https://github.com/sunbeamdotpt/test.git?rev=3ef953ca05234206ff62ea860da24a508a0a02c6#3ef953ca05234206ff62ea860da24a508a0a02c6"
-dependencies = [
- "bollard",
- "bytes",
- "flate2",
- "futures-util",
- "serde_json",
- "tar",
- "testcontainers",
-]
-
-[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5642,17 +5616,6 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
-
-[[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
- "xattr",
-]
 
 [[package]]
 name = "tempfile"
