@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.22] - 2026-07-24
+
+### Fixed
+
+- OAuth2/OIDC proxy no longer masks Hydra 4xx error bodies as
+  `{"error":"server_error"}`. Hydra's RFC 6749 §5.2 error responses
+  (`error`/`error_description`) are now relayed verbatim for 4xx statuses, so
+  callers can see the actual rejection — e.g. `invalid_scope` naming the
+  rejected scope, or `authorization_pending` during device-flow polling, which
+  previously surfaced as an opaque `server_error` and broke CLI device-token
+  polling. 5xx and transport failures remain opaque. The `ory backend error`
+  WARN log lines now include the request path and client_id.
+
+- `UpdateApplication` partial updates no longer clear unspecified fields.
+  Hydra's client PUT is a full replacement and the gateway previously
+  serialized proto3 zero-values verbatim, so a request containing only
+  `{id, skipConsent: true}` wiped the client name and redirect URIs and reset
+  the scope to Hydra's DCR `default_scope`. The gateway now merges against the
+  currently stored Hydra client: fields left at their zero value keep their
+  current value, and an explicit `skipConsent` is persisted and returned.
+  Clients already damaged by the old behavior need one full-field
+  `UpdateApplication` to restore their configuration.
+
+- Self-service submit error responses no longer leak raw Kratos flow ids.
+  Kratos answers a failed submit (e.g. invalid credentials) with the flow
+  JSON, whose raw flow UUID previously passed through `map_ory_error` into the
+  ConnectError message unscrubbed. Error bodies are now remapped to the
+  public flow ULID like success responses; when no public mapping exists the
+  raw id is dropped entirely while validation messages are preserved. Covers
+  all submit handlers (login, registration, settings, recovery, verification)
+  including the token-submit variants.
+
 ## [2026.07.21] - 2026-07-16
 
 ### Fixed
