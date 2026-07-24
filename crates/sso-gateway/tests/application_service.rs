@@ -186,6 +186,54 @@ async fn application_service_round_trip() {
     assert_eq!(updated["name"], "test-app-updated");
     assert_eq!(updated["scope"], json![["openid"]]);
 
+    // Regression (agent-mail #55): a partial update must leave unspecified
+    // fields unchanged — notably the scope must not fall back to Hydra's DCR
+    // defaults — and an explicit skipConsent must persist.
+    let partial_resp = client
+        .post(format!(
+            "{base}/iam.v1.ApplicationService/UpdateApplication"
+        ))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "id": app_id,
+            "skipConsent": true
+        }))
+        .send()
+        .await
+        .expect("partial update application request should succeed");
+
+    assert!(
+        partial_resp.status().is_success(),
+        "partial update application failed"
+    );
+    let partial: serde_json::Value = partial_resp
+        .json()
+        .await
+        .expect("application should be json");
+    assert_eq!(partial["name"], "test-app-updated");
+    assert_eq!(
+        partial["redirectUris"],
+        json![["https://localhost/callback", "https://localhost/callback2"]]
+    );
+    assert_eq!(partial["scope"], json![["openid"]]);
+    assert_eq!(partial["skipConsent"], true);
+
+    // The persisted state must reflect the same, not just the response.
+    let reget_resp = client
+        .post(format!("{base}/iam.v1.ApplicationService/GetApplication"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .json(&json!({ "id": app_id }))
+        .send()
+        .await
+        .expect("re-get application request should succeed");
+    assert!(reget_resp.status().is_success(), "re-get application failed");
+    let refetched: serde_json::Value = reget_resp.json().await.expect("application should be json");
+    assert_eq!(refetched["name"], "test-app-updated");
+    assert_eq!(refetched["scope"], json![["openid"]]);
+    assert_eq!(refetched["skipConsent"], true);
+
     // List applications.
     let list_resp = client
         .post(format!("{base}/iam.v1.ApplicationService/ListApplications"))

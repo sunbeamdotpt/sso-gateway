@@ -259,7 +259,17 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
                 .await?;
         }
 
-        let payload = build_hydra_update_payload(&req, &ory_id);
+        // Hydra's PUT replaces the whole client, so fetch the current client
+        // and merge: fields left unset in the request keep their stored
+        // values instead of being cleared (or, for scope, reset to Hydra's
+        // configured DCR defaults).
+        let existing = self
+            .hydra
+            .get_oauth2_client(&ory_id)
+            .await
+            .map_err(map_ory_error)?;
+
+        let payload = build_hydra_update_payload(&req, &ory_id, &existing);
         let updated = self
             .hydra
             .update_oauth2_client(&ory_id, payload)
@@ -443,18 +453,49 @@ fn build_hydra_payload(req: &CreateApplicationRequest, client_id: &str) -> serde
         "response_types": req.response_types,
         "scope": req.scope.join(" "),
         "token_endpoint_auth_method": req.token_endpoint_auth_method,
+        "skip_consent": req.skip_consent,
     })
 }
 
-fn build_hydra_update_payload(req: &UpdateApplicationRequest, ory_id: &str) -> serde_json::Value {
+fn build_hydra_update_payload(
+    req: &UpdateApplicationRequest,
+    ory_id: &str,
+    existing: &serde_json::Value,
+) -> serde_json::Value {
+    // proto3 scalar and repeated fields cannot distinguish "unset" from
+    // "empty", so an empty value means "leave unchanged": fall back to the
+    // currently stored client. This matters most for scope — sending an empty
+    // scope string makes Hydra substitute its configured DCR default scopes.
+    let string_or_current = |new: &str, current: &serde_json::Value| {
+        if new.is_empty() {
+            current.clone()
+        } else {
+            serde_json::json!(new)
+        }
+    };
+    let list_or_current = |new: &[String], current: &serde_json::Value| {
+        if new.is_empty() {
+            current.clone()
+        } else {
+            serde_json::json!(new)
+        }
+    };
+    let skip_consent = match req.skip_consent.as_option() {
+        Some(v) => v.value,
+        None => existing["skip_consent"].as_bool().unwrap_or(false),
+    };
     serde_json::json!({
         "client_id": ory_id,
-        "client_name": req.name,
-        "redirect_uris": req.redirect_uris,
-        "grant_types": req.grant_types,
-        "response_types": req.response_types,
-        "scope": req.scope.join(" "),
-        "token_endpoint_auth_method": req.token_endpoint_auth_method,
+        "client_name": string_or_current(&req.name, &existing["client_name"]),
+        "redirect_uris": list_or_current(&req.redirect_uris, &existing["redirect_uris"]),
+        "grant_types": list_or_current(&req.grant_types, &existing["grant_types"]),
+        "response_types": list_or_current(&req.response_types, &existing["response_types"]),
+        "scope": string_or_current(&req.scope.join(" "), &existing["scope"]),
+        "token_endpoint_auth_method": string_or_current(
+            &req.token_endpoint_auth_method,
+            &existing["token_endpoint_auth_method"],
+        ),
+        "skip_consent": skip_consent,
     })
 }
 
@@ -482,6 +523,7 @@ fn hydra_to_application(
             .unwrap_or("")
             .to_string(),
         cross_tenant,
+        skip_consent: client["skip_consent"].as_bool().unwrap_or(false),
         ..Default::default()
     }
 }
@@ -590,6 +632,7 @@ mod tests {
         create_result: Mutex<Option<Result<Value, OryClientError>>>,
         get_results: Mutex<Vec<Result<Value, OryClientError>>>,
         update_result: Mutex<Option<Result<Value, OryClientError>>>,
+        update_payloads: Arc<Mutex<Vec<Value>>>,
         delete_result: Mutex<Option<Result<(), OryClientError>>>,
         rotate_result: Mutex<Option<Result<Value, OryClientError>>>,
     }
@@ -615,8 +658,9 @@ mod tests {
         async fn update_oauth2_client(
             &self,
             _id: &str,
-            _payload: Value,
+            payload: Value,
         ) -> Result<Value, OryClientError> {
+            self.update_payloads.lock().unwrap().push(payload);
             self.update_result
                 .lock()
                 .unwrap()
@@ -940,6 +984,7 @@ mod tests {
     #[tokio::test]
     async fn update_cross_tenant_allowed_for_system_tenant() {
         let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
             update_result: Mutex::new(Some(Ok(hydra_client_response()))),
             ..Default::default()
         };
@@ -1170,6 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn update_application_happy_path() {
         let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
             update_result: Mutex::new(Some(Ok(hydra_client_response()))),
             ..Default::default()
         };
@@ -1216,6 +1262,162 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn update_application_skip_consent_set_persists() {
+        let update_payloads = Arc::new(Mutex::new(Vec::new()));
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(hydra_client_response())]),
+            update_result: Mutex::new(Some(Ok(json!({
+                "client_id": "ory-123",
+                "client_name": "test-app",
+                "scope": "openid",
+                "redirect_uris": ["https://a/callback"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+                "skip_consent": true,
+            })))),
+            update_payloads: update_payloads.clone(),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            skip_consent: Some(BoolValue {
+                value: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let resp = service
+            .update_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(resp.skip_consent);
+        let payloads = update_payloads.lock().unwrap();
+        assert_eq!(payloads[0]["skip_consent"], true);
+    }
+
+    #[tokio::test]
+    async fn update_application_preserves_existing_skip_consent() {
+        let update_payloads = Arc::new(Mutex::new(Vec::new()));
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(json!({
+                "client_id": "ory-123",
+                "skip_consent": true,
+            }))]),
+            update_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            update_payloads: update_payloads.clone(),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        // No skip_consent in the request: the stored value must survive the
+        // full-client replace.
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        service
+            .update_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap();
+
+        let payloads = update_payloads.lock().unwrap();
+        assert_eq!(payloads[0]["skip_consent"], true);
+    }
+
+    #[tokio::test]
+    async fn update_application_partial_update_preserves_existing_fields() {
+        let update_payloads = Arc::new(Mutex::new(Vec::new()));
+        let hydra = StubHydra {
+            get_results: Mutex::new(vec![Ok(json!({
+                "client_id": "ory-123",
+                "client_name": "test-app",
+                "scope": "openid profile",
+                "redirect_uris": ["https://a/callback"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+                "skip_consent": false,
+            }))]),
+            update_result: Mutex::new(Some(Ok(json!({
+                "client_id": "ory-123",
+                "client_name": "test-app",
+                "scope": "openid profile",
+                "redirect_uris": ["https://a/callback"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+                "skip_consent": true,
+            })))),
+            update_payloads: update_payloads.clone(),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            get_ory_id_results: Mutex::new(vec![Ok("ory-123".into())]),
+            ..Default::default()
+        };
+        let service = build_service(hydra, mappings);
+
+        // Only id + skip_consent: name, redirect_uris and scope must survive.
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            skip_consent: Some(BoolValue {
+                value: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, UpdateApplicationRequest);
+
+        let resp = service
+            .update_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(resp.skip_consent);
+        assert_eq!(resp.name, "test-app");
+        assert_eq!(resp.redirect_uris, vec!["https://a/callback"]);
+        assert_eq!(resp.scope, vec!["openid", "profile"]);
+
+        let payloads = update_payloads.lock().unwrap();
+        assert_eq!(payloads[0]["client_name"], "test-app");
+        assert_eq!(payloads[0]["redirect_uris"], json!(["https://a/callback"]));
+        assert_eq!(payloads[0]["scope"], "openid profile");
+        assert_eq!(payloads[0]["skip_consent"], true);
     }
 
     // -----------------------------------------------------------------------
@@ -1353,6 +1555,18 @@ mod tests {
         assert_eq!(payload["client_id"], "pub-1");
         assert_eq!(payload["client_name"], "app");
         assert_eq!(payload["scope"], "openid profile");
+        assert_eq!(payload["skip_consent"], false);
+    }
+
+    #[test]
+    fn build_hydra_payload_includes_skip_consent() {
+        let req = CreateApplicationRequest {
+            name: "app".into(),
+            skip_consent: true,
+            ..Default::default()
+        };
+        let payload = build_hydra_payload(&req, "pub-1");
+        assert_eq!(payload["skip_consent"], true);
     }
 
     #[test]
@@ -1366,9 +1580,43 @@ mod tests {
             token_endpoint_auth_method: "none".into(),
             ..Default::default()
         };
-        let payload = build_hydra_update_payload(&req, "ory-123");
+        let payload = build_hydra_update_payload(&req, "ory-123", &json!({}));
         assert_eq!(payload["client_id"], "ory-123");
         assert_eq!(payload["client_name"], "updated");
+        assert_eq!(payload["skip_consent"], false);
+    }
+
+    #[test]
+    fn build_hydra_update_payload_merges_unset_fields_from_existing() {
+        // Only skip_consent is set: every Hydra-owned field must keep the
+        // currently stored value, and scope must never collapse to an empty
+        // string (which Hydra would replace with its DCR default scopes).
+        let req = UpdateApplicationRequest {
+            id: "pub-1".into(),
+            skip_consent: Some(BoolValue {
+                value: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let existing = json!({
+            "client_name": "stored-app",
+            "redirect_uris": ["https://a/callback"],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid profile",
+            "token_endpoint_auth_method": "client_secret_basic",
+            "skip_consent": false,
+        });
+        let payload = build_hydra_update_payload(&req, "ory-123", &existing);
+        assert_eq!(payload["client_name"], "stored-app");
+        assert_eq!(payload["redirect_uris"], json!(["https://a/callback"]));
+        assert_eq!(payload["grant_types"], json!(["authorization_code"]));
+        assert_eq!(payload["response_types"], json!(["code"]));
+        assert_eq!(payload["scope"], "openid profile");
+        assert_eq!(payload["token_endpoint_auth_method"], "client_secret_basic");
+        assert_eq!(payload["skip_consent"], true);
     }
 
     #[test]
@@ -1395,6 +1643,14 @@ mod tests {
         let client = json!({});
         let app = hydra_to_application(&client, "tenant-1", "pub-1", false);
         assert!(app.scope.is_empty());
+        assert!(!app.skip_consent);
+    }
+
+    #[test]
+    fn hydra_to_application_maps_skip_consent() {
+        let client = json!({"skip_consent": true});
+        let app = hydra_to_application(&client, "tenant-1", "pub-1", false);
+        assert!(app.skip_consent);
     }
 
     #[test]
