@@ -1001,7 +1001,9 @@ impl IdentitySelfServiceImpl {
     /// is attached to the response so the browser session is established. The
     /// location is a Kratos-owned self-service URL, so it is rewritten onto
     /// the branded gateway surface and its raw flow id is scrubbed like any
-    /// other Kratos URL. Any other error is mapped normally.
+    /// other Kratos URL. Any other error is scrubbed of raw Kratos flow ids
+    /// (Kratos answers a failed submit with the flow JSON itself) and then
+    /// mapped normally.
     async fn map_submit_response(
         &self,
         tenant_id: &str,
@@ -1031,7 +1033,9 @@ impl IdentitySelfServiceImpl {
                 attach_set_cookie_values(&mut response, &set_cookies);
                 return Ok(response);
             }
-            Err(err) => return Err(map_ory_error(err).into()),
+            Err(err) => {
+                return Err(self.map_submit_error(tenant_id, err).await.into());
+            }
         };
         let mut response = Response::new(ory_flow_to_proto(&flow.body));
         self.map_flow_response(tenant_id, &mut response.body)
@@ -1040,6 +1044,75 @@ impl IdentitySelfServiceImpl {
             .await?;
         attach_set_cookies(&mut response, &flow.headers);
         Ok(response)
+    }
+
+    /// Map a Kratos submit error to a service error without leaking raw
+    /// Kratos flow ids.
+    ///
+    /// Kratos answers a failed flow submit (e.g. 400 invalid credentials)
+    /// with the flow JSON itself as the error body, embedding the raw flow
+    /// UUID as the top-level `id` and again as the `flow` query parameter of
+    /// `request_url` / `ui.action`. [`map_ory_error`] passes that body
+    /// through verbatim, so scrub it here where the transient token store is
+    /// available: the id is remapped to its existing public ULID, mirroring
+    /// the success path. When no public mapping exists, the raw id must never
+    /// reach the caller — the id is blanked and the URLs that would carry it
+    /// are dropped.
+    async fn map_submit_error(&self, tenant_id: &str, err: OryClientError) -> ServiceError {
+        map_ory_error(self.scrub_flow_id_in_error_body(tenant_id, err).await)
+    }
+
+    async fn scrub_flow_id_in_error_body(
+        &self,
+        tenant_id: &str,
+        err: OryClientError,
+    ) -> OryClientError {
+        let OryClientError::Ory { status, message } = err else {
+            return err;
+        };
+        let Ok(mut body) = serde_json::from_str::<Value>(&message) else {
+            return OryClientError::Ory { status, message };
+        };
+        let Some(obj) = body.as_object_mut() else {
+            return OryClientError::Ory { status, message };
+        };
+        // Only flow-shaped bodies carry a raw flow id: a top-level string
+        // `id` alongside the flow's `ui` container.
+        let Some(raw_id) = obj.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            return OryClientError::Ory { status, message };
+        };
+        if !obj.contains_key("ui") {
+            return OryClientError::Ory { status, message };
+        }
+        match self
+            .transient
+            .get_public_token(tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &raw_id)
+            .await
+        {
+            Ok(public_id) => {
+                obj.insert("id".to_string(), Value::String(public_id));
+                if let Some(url) = obj.get("request_url").and_then(Value::as_str).map(str::to_owned)
+                    && let Ok(scrubbed) = self.scrub_flow_id_in_url(tenant_id, &url, false).await
+                {
+                    obj.insert("request_url".to_string(), Value::String(scrubbed));
+                }
+                if let Some(ui) = obj.get_mut("ui").and_then(Value::as_object_mut)
+                    && let Some(action) = ui.get("action").and_then(Value::as_str).map(str::to_owned)
+                    && let Ok(scrubbed) = self.scrub_flow_id_in_url(tenant_id, &action, false).await
+                {
+                    ui.insert("action".to_string(), Value::String(scrubbed));
+                }
+            }
+            Err(_) => {
+                obj.insert("id".to_string(), Value::String(String::new()));
+                obj.remove("request_url");
+                if let Some(ui) = obj.get_mut("ui").and_then(Value::as_object_mut) {
+                    ui.remove("action");
+                }
+            }
+        }
+        let message = serde_json::to_string(&body).unwrap_or_default();
+        OryClientError::Ory { status, message }
     }
 
     /// Intercept a settings-flow profile update so the gateway stays the trait owner.
@@ -1743,7 +1816,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .transient
             .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &req.flow)
             .await?;
-        let redirect = self
+        let redirect = match self
             .kratos
             .submit_recovery_token(
                 &ory_token,
@@ -1752,7 +1825,10 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
                 csrf_token.as_deref(),
             )
             .await
-            .map_err(map_ory_error)?;
+        {
+            Ok(redirect) => redirect,
+            Err(err) => return Err(self.map_submit_error(&tenant_id, err).await.into()),
+        };
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos recovery token response missing location".into())
         })?;
@@ -1802,7 +1878,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
             .transient
             .get_ory_token(&tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, &req.flow)
             .await?;
-        let redirect = self
+        let redirect = match self
             .kratos
             .submit_verification_token(
                 &ory_token,
@@ -1811,7 +1887,10 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
                 csrf_token.as_deref(),
             )
             .await
-            .map_err(map_ory_error)?;
+        {
+            Ok(redirect) => redirect,
+            Err(err) => return Err(self.map_submit_error(&tenant_id, err).await.into()),
+        };
         let redirect_to = redirect.location.ok_or_else(|| {
             ServiceError::Internal("kratos verification token response missing location".into())
         })?;
@@ -3375,6 +3454,151 @@ mod tests {
 
         let err = svc.submit_login_flow(ctx, req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    // Regression (agent-mail #1): Kratos answers a failed submit (e.g. 400
+    // invalid credentials) with the flow JSON itself as the error body. The
+    // raw Kratos flow UUID must be remapped to the gateway's public ULID
+    // before the error reaches the caller — the UI re-renders the failed form
+    // against the returned id and resubmits against it.
+    #[tokio::test]
+    async fn submit_login_flow_error_remaps_raw_flow_id_to_public_ulid() {
+        let raw_flow_id = "b2c3a9db-5129-4156-8f2c-6ad045965953";
+        let public_flow_id = Ulid::new().to_string();
+        let body = json!({
+            "id": raw_flow_id,
+            "type": "login",
+            "request_url": format!("http://kratos.example.com/self-service/login/browser?flow={raw_flow_id}"),
+            "ui": {
+                "action": format!("http://kratos.example.com/self-service/login?flow={raw_flow_id}"),
+                "messages": [{"text": "The provided credentials are invalid"}]
+            }
+        });
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 400,
+                message: body.to_string(),
+            })))),
+            ..Default::default()
+        };
+        let transient = default_transient_store();
+        transient.seed("", BACKEND_KRATOS, TOKEN_TYPE_FLOW, &public_flow_id, raw_flow_id);
+        let mut svc = service(fake);
+        svc.transient = Arc::new(transient);
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: public_flow_id.clone(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let message = err.message.as_deref().unwrap_or_default();
+        assert!(
+            !message.contains(raw_flow_id),
+            "raw Kratos flow id leaked in error body: {message}"
+        );
+        let parsed: Value = serde_json::from_str(message).unwrap();
+        assert_eq!(parsed["id"].as_str(), Some(public_flow_id.as_str()));
+        assert!(
+            parsed["ui"]["messages"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("credentials"),
+            "validation messages must survive the scrub: {message}"
+        );
+        for url in [
+            parsed["request_url"].as_str().unwrap_or_default(),
+            parsed["ui"]["action"].as_str().unwrap_or_default(),
+        ] {
+            assert!(
+                url.contains(&public_flow_id),
+                "flow url should carry the public ULID: {url}"
+            );
+        }
+    }
+
+    // A raw flow id with no public mapping must never reach the caller: the id
+    // is blanked and the URLs that would carry it are dropped, while the rest
+    // of the flow error (validation messages) is preserved.
+    #[tokio::test]
+    async fn submit_login_flow_error_without_public_mapping_drops_raw_flow_id() {
+        let raw_flow_id = "b2c3a9db-5129-4156-8f2c-6ad045965953";
+        let body = json!({
+            "id": raw_flow_id,
+            "type": "login",
+            "request_url": format!("http://kratos.example.com/self-service/login/browser?flow={raw_flow_id}"),
+            "ui": {
+                "action": format!("http://kratos.example.com/self-service/login?flow={raw_flow_id}"),
+                "messages": [{"text": "The provided credentials are invalid"}]
+            }
+        });
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Err(OryClientError::Ory {
+                status: 400,
+                message: body.to_string(),
+            })))),
+            ..Default::default()
+        };
+        let svc = service(fake);
+        let ctx = request_context_with_cookie("session=abc");
+        let req = service_request(SubmitFlowRequest {
+            id: "flow-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.submit_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let message = err.message.as_deref().unwrap_or_default();
+        assert!(
+            !message.contains(raw_flow_id),
+            "unmapped raw Kratos flow id leaked in error body: {message}"
+        );
+        let parsed: Value = serde_json::from_str(message).unwrap();
+        assert_eq!(parsed["id"].as_str(), Some(""));
+        assert!(parsed.get("request_url").is_none());
+        assert!(parsed["ui"].get("action").is_none());
+        assert!(
+            parsed["ui"]["messages"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("credentials"),
+            "validation messages must survive the scrub: {message}"
+        );
+    }
+
+    // Error bodies that are not flow JSON (plain text, or the generic
+    // `{"error": …}` envelope) carry no raw flow id and must pass through
+    // byte-identical.
+    #[tokio::test]
+    async fn map_submit_error_passes_non_flow_bodies_through() {
+        let svc = service(FakeKratos::default());
+        for (status, message) in [
+            (400, "invalid".to_string()),
+            (
+                410,
+                json!({"error": {"id": "self_service_flow_expired", "message": "expired"}})
+                    .to_string(),
+            ),
+        ] {
+            let err = svc
+                .map_submit_error(
+                    "",
+                    OryClientError::Ory {
+                        status,
+                        message: message.clone(),
+                    },
+                )
+                .await;
+            let surfaced = match err {
+                ServiceError::InvalidArgument(msg)
+                | ServiceError::NotFound(msg)
+                | ServiceError::Unauthenticated(msg)
+                | ServiceError::Internal(msg) => msg,
+                other => panic!("unexpected error mapping for status {status}: {other:?}"),
+            };
+            assert_eq!(surfaced, message);
+        }
     }
 
     // Regression: a flow id the gateway did not mint (e.g. a raw Kratos UUID

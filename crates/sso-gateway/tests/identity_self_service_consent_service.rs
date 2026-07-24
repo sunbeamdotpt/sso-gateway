@@ -135,7 +135,7 @@ async fn kratos_get_flow(
 
 async fn kratos_submit_flow(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> (
     axum::http::StatusCode,
     axum::http::HeaderMap,
@@ -146,11 +146,38 @@ async fn kratos_submit_flow(
         "set-cookie",
         "ory_kratos_session=mock; Path=/; HttpOnly".parse().unwrap(),
     );
+    let flow_id = params.get("flow").cloned().unwrap_or_else(|| "flow-1".into());
+    // Kratos answers a failed password submit with 400 and the flow JSON
+    // itself as the body — raw flow UUID in `id` and in the flow URLs.
+    if body.get("password").and_then(|p| p.as_str()) == Some("wrong-password") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            headers,
+            Json(json!({
+                "id": flow_id,
+                "type": "login",
+                "state": "choose_method",
+                "request_url": format!("http://kratos.test/self-service/login/browser?flow={flow_id}"),
+                "ui": {
+                    "action": format!("http://kratos.test/self-service/login?flow={flow_id}"),
+                    "method": "POST",
+                    "messages": [
+                        {
+                            "id": 4000006,
+                            "text": "The provided credentials are invalid, check for spelling mistakes in your password or username, email address, or phone number",
+                            "type": "error"
+                        }
+                    ],
+                    "nodes": []
+                }
+            })),
+        );
+    }
     (
         axum::http::StatusCode::OK,
         headers,
         Json(json!({
-            "id": params.get("flow").cloned().unwrap_or_else(|| "flow-1".into()),
+            "id": flow_id,
             "type": "login",
             "state": "passed_challenge"
         })),
@@ -1198,6 +1225,149 @@ async fn self_service_and_consent_round_trip() {
         resp.status().is_success(),
         "reject_logout failed: {}",
         resp.text().await.unwrap_or_default()
+    );
+
+    let _ = shutdown_tx.send(());
+    handle.await.expect("server task should finish");
+}
+
+// Regression (agent-mail #1): a failed browser login submit (wrong password)
+// makes Kratos answer 400 with the flow JSON itself as the error body. The
+// gateway must remap the raw Kratos flow UUID to the public ULID before the
+// ConnectError reaches the caller, and must preserve the Kratos validation
+// message so the UI can re-render the failed form.
+#[tokio::test]
+async fn submit_login_flow_wrong_password_error_scrubs_raw_flow_id() {
+    let (_pg, database_url) = support::start_postgres()
+        .await
+        .expect("postgres should start");
+    let (_kratos_handle, kratos_url) = start_mock_kratos().await;
+    let (_hydra_handle, hydra_url) = start_mock_hydra().await;
+
+    let pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+    let system_tenant_ulid = ulid::Ulid::new().to_string();
+    bootstrap_system_tenant(&pool, &system_tenant_ulid)
+        .await
+        .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
+
+    let kratos = Arc::new(
+        KratosClient::new_with_public(&kratos_url, &kratos_url)
+            .expect("kratos client should build"),
+    );
+    let hydra =
+        Arc::new(HydraClient::new(&hydra_url, &hydra_url).expect("hydra client should build"));
+    let mappings = IdMappingRepo::new(pool.clone());
+
+    let transient = TransientTokenRepo::new(pool.clone());
+    let raw_flow_id = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    let pub_flow = seed_token(
+        &transient,
+        &system_tenant_ulid,
+        "kratos",
+        TOKEN_TYPE_FLOW,
+        raw_flow_id,
+    )
+    .await;
+
+    let self_service = Arc::new(IdentitySelfServiceImpl::new(
+        kratos.clone(),
+        hydra.clone(),
+        TransientTokenRepo::new(pool.clone()),
+        mappings.clone(),
+        sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
+        sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        true,
+        kratos_url.clone(),
+        hydra_url.clone(),
+        "http://gateway.test".to_string(),
+        "default".to_string(),
+        sso_gateway::config::SelfServicePaths::default(),
+    ));
+
+    let connect_router: ConnectRouter = self_service.register(ConnectRouter::new());
+    let service_router = ServiceRouter::from_router(connect_router);
+
+    let server = ServerBuilder::new()
+        .with_router(service_router)
+        .with_health(HealthRouter::new())
+        .build_axum()
+        .expect("server should build");
+
+    let app = server
+        .app()
+        .layer(from_fn(auth_middleware))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
+        .layer(Extension(kratos))
+        .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
+
+    let (listener, addr) = bind_random_port("127.0.0.1")
+        .await
+        .expect("random port should bind");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server should run");
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // IdentitySelfService::SubmitLoginFlow with a wrong password: the mock
+    // Kratos answers 400 with the flow JSON, raw UUID in `id` and flow URLs.
+    let resp = client
+        .post(format!("{base}/iam.v1.IdentitySelfService/SubmitLoginFlow"))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .header("cookie", "ory_kratos_session=abc")
+        .json(&json!({
+            "id": &pub_flow,
+            "body": {
+                "method": "password",
+                "identifier": "user@example.com",
+                "password": "wrong-password"
+            }
+        }))
+        .send()
+        .await
+        .expect("submit_login_flow request should succeed");
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "wrong password should surface as invalid_argument (HTTP 400)"
+    );
+    let err: serde_json::Value = resp.json().await.expect("error body should be json");
+    assert_eq!(
+        err["code"].as_str().unwrap_or_default(),
+        "invalid_argument",
+        "unexpected connect error code: {err}"
+    );
+    let message = err["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(raw_flow_id),
+        "raw Kratos flow id leaked in error message: {message}"
+    );
+    assert!(
+        message.contains(&pub_flow),
+        "error message should carry the public flow ULID: {message}"
+    );
+    assert!(
+        message.contains("credentials are invalid"),
+        "kratos validation message must survive the scrub: {message}"
     );
 
     let _ = shutdown_tx.send(());
