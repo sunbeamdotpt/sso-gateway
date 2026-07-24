@@ -218,12 +218,12 @@ async fn jwks(State(state): State<Arc<Oauth2State>>) -> impl IntoResponse {
         .map_err(OryClientError::Url)
     {
         Ok(url) => url,
-        Err(err) => return map_ory_error(err),
+        Err(err) => return map_ory_error(err, "/.well-known/jwks.json", None),
     };
 
     match state.hydra.get_json(url).await {
         Ok(keys) => json_response(keys),
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(err, "/.well-known/jwks.json", None),
     }
 }
 
@@ -285,7 +285,7 @@ async fn authorize(
             }
             (StatusCode::FOUND, headers, Body::empty()).into_response()
         }
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(err, "/oauth2/auth", Some(&client_id)),
     }
 }
 
@@ -326,7 +326,7 @@ async fn token(
         .await
     {
         Ok(value) => json_response(value),
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(err, "/oauth2/token", Some(&client_id)),
     }
 }
 
@@ -366,7 +366,7 @@ async fn device(
         .await
     {
         Ok(value) => json_response(value),
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(err, &format!("/oauth2/device/{path}"), Some(&client_id)),
     }
 }
 
@@ -393,6 +393,7 @@ async fn device_verify(
 
     // The post-accept leg carries the gateway's public client id; translate it
     // back before forwarding. The initial user-code leg has no client_id.
+    let client_id = params.get("client_id").cloned();
     let mut query = Vec::with_capacity(params.len());
     for (k, v) in params {
         if k == "client_id" {
@@ -431,7 +432,7 @@ async fn device_verify(
             }
             (StatusCode::FOUND, headers, String::new()).into_response()
         }
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(err, "/oauth2/device/verify", client_id.as_deref()),
     }
 }
 
@@ -443,7 +444,7 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
 
     let mut value = match state.hydra.userinfo(token).await {
         Ok(value) => value,
-        Err(err) => return map_ory_error(err),
+        Err(err) => return map_ory_error(err, "/oauth2/userinfo", None),
     };
 
     if let Some(obj) = value.as_object_mut()
@@ -510,7 +511,7 @@ async fn register(
 
     let created = match state.hydra.create_oauth2_client(payload).await {
         Ok(value) => value,
-        Err(err) => return map_ory_error(err),
+        Err(err) => return map_ory_error(err, "/oauth2/register", None),
     };
 
     let ory_id = match created["client_id"].as_str() {
@@ -612,7 +613,15 @@ async fn revoke(
             }
             StatusCode::OK.into_response()
         }
-        Err(err) => map_ory_error(err),
+        Err(err) => map_ory_error(
+            err,
+            "/oauth2/revoke",
+            if client_id.is_empty() {
+                None
+            } else {
+                Some(client_id.as_str())
+            },
+        ),
     }
 }
 
@@ -636,7 +645,7 @@ async fn introspect(
 
     let mut value = match state.hydra.introspect_token(token).await {
         Ok(value) => value,
-        Err(err) => return map_ory_error(err),
+        Err(err) => return map_ory_error(err, "/oauth2/introspect", None),
     };
 
     if !value
@@ -787,26 +796,62 @@ fn internal_error() -> Response<Body> {
         .into_response()
 }
 
+/// Map an Ory backend error to an HTTP response.
+///
+/// Hydra's 4xx bodies follow RFC 6749 §5.2 and are meant for the client, so
+/// they are relayed verbatim — a caller staring at `invalid_scope` can fix its
+/// own request, while `server_error` sends it spelunking through gateway logs.
+/// 5xx and transport failures stay opaque to avoid leaking internals.
 #[instrument(skip(err))]
-fn map_ory_error(err: OryClientError) -> Response<Body> {
-    let status = match &err {
-        OryClientError::Ory { status, .. } => match status {
-            400 => StatusCode::BAD_REQUEST,
-            401 => StatusCode::UNAUTHORIZED,
-            403 => StatusCode::FORBIDDEN,
-            404 => StatusCode::NOT_FOUND,
-            _ => StatusCode::BAD_GATEWAY,
-        },
-        OryClientError::Http(_) | OryClientError::Url(_) => StatusCode::BAD_GATEWAY,
-        OryClientError::Serialization(_) | OryClientError::InvalidResponse(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
+fn map_ory_error(err: OryClientError, path: &str, client_id: Option<&str>) -> Response<Body> {
+    let (status, body) = match &err {
+        OryClientError::Ory {
+            status, message, ..
+        } => {
+            let ory_status = *status;
+            let status = match ory_status {
+                400 => StatusCode::BAD_REQUEST,
+                401 => StatusCode::UNAUTHORIZED,
+                403 => StatusCode::FORBIDDEN,
+                404 => StatusCode::NOT_FOUND,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, relay_client_error_body(ory_status, message))
         }
-        OryClientError::MissingTenant => StatusCode::UNAUTHORIZED,
-        OryClientError::Redirect { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        OryClientError::Http(_) | OryClientError::Url(_) => {
+            (StatusCode::BAD_GATEWAY, server_error_body())
+        }
+        OryClientError::Serialization(_) | OryClientError::InvalidResponse(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, server_error_body())
+        }
+        OryClientError::MissingTenant => (StatusCode::UNAUTHORIZED, server_error_body()),
+        OryClientError::Redirect { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, server_error_body())
+        }
     };
-    warn!(?err, "ory backend error");
-    let body = json!({"error": "server_error"});
+    warn!(
+        ?err,
+        %path,
+        client_id = client_id.unwrap_or_default(),
+        "ory backend error"
+    );
     (status, axum::Json(body)).into_response()
+}
+
+fn server_error_body() -> serde_json::Value {
+    json!({"error": "server_error"})
+}
+
+/// Relay a Hydra 4xx body verbatim when it is a JSON object carrying an
+/// `error` field (the RFC 6749 §5.2 shape); anything else stays opaque.
+fn relay_client_error_body(status: u16, message: &str) -> serde_json::Value {
+    if (400..500).contains(&status)
+        && let Ok(body) = serde_json::from_str::<serde_json::Value>(message)
+        && body.get("error").and_then(|e| e.as_str()).is_some()
+    {
+        return body;
+    }
+    server_error_body()
 }
 
 #[cfg(test)]
@@ -1097,70 +1142,164 @@ mod tests {
 
     #[test]
     fn map_ory_error_sets_expected_status() {
-        let resp = map_ory_error(OryClientError::MissingTenant);
+        let resp = map_ory_error(OryClientError::MissingTenant, "/test", None);
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = map_ory_error(OryClientError::InvalidResponse("fail".into()));
+        let resp = map_ory_error(OryClientError::InvalidResponse("fail".into()), "/test", None);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 400,
-            message: "bad".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 400,
+                message: "bad".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 401,
-            message: "unauth".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 401,
+                message: "unauth".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 403,
-            message: "forbidden".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 403,
+                message: "forbidden".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 404,
-            message: "not found".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 404,
+                message: "not found".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 500,
-            message: "down".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 500,
+                message: "down".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let resp = map_ory_error(OryClientError::Serialization(
-            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
-        ));
+        let resp = map_ory_error(
+            OryClientError::Serialization(
+                serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+            ),
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
     async fn map_ory_error_http_and_url_variants() {
-        let resp = map_ory_error(OryClientError::Http(
-            reqwest::get("http://localhost:1").await.unwrap_err(),
-        ));
+        let resp = map_ory_error(
+            OryClientError::Http(reqwest::get("http://localhost:1").await.unwrap_err()),
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let resp = map_ory_error(OryClientError::Url(
-            reqwest::Url::parse("not-a-url").unwrap_err(),
-        ));
+        let resp = map_ory_error(
+            OryClientError::Url(reqwest::Url::parse("not-a-url").unwrap_err()),
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn map_ory_error_body_is_generic() {
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 500,
-            message: "sensitive details".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 500,
+                message: "sensitive details".into(),
+            },
+            "/test",
+            None,
+        );
         let body = body_to_string(resp).await;
         assert!(body.contains("server_error"));
         assert!(!body.contains("sensitive details"));
+    }
+
+    #[tokio::test]
+    async fn map_ory_error_relays_rfc6749_4xx_body_verbatim() {
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 400,
+                message: "{\"error\":\"invalid_scope\",\"error_description\":\"The requested scope is invalid: not allowed to request scope 'bogus:scope'.\"}".into(),
+            },
+            "/oauth2/device/auth",
+            Some("client-1"),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_scope"));
+        assert!(body.contains("bogus:scope"));
+        assert!(!body.contains("server_error"));
+    }
+
+    #[tokio::test]
+    async fn map_ory_error_relays_device_flow_authorization_pending() {
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 400,
+                message: "{\"error\":\"authorization_pending\",\"error_description\":\"The authorization request is still pending.\"}".into(),
+            },
+            "/oauth2/token",
+            Some("client-1"),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("authorization_pending"));
+    }
+
+    #[tokio::test]
+    async fn map_ory_error_opaque_when_4xx_body_not_rfc_shaped() {
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 400,
+                message: "<html>proxy error</html>".into(),
+            },
+            "/test",
+            None,
+        );
+        let body = body_to_string(resp).await;
+        assert!(body.contains("server_error"));
+        assert!(!body.contains("proxy error"));
+    }
+
+    #[tokio::test]
+    async fn map_ory_error_keeps_5xx_opaque_even_with_rfc_body() {
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 500,
+                message: "{\"error\":\"internal\",\"error_description\":\"db connection string leaked\"}".into(),
+            },
+            "/test",
+            None,
+        );
+        let body = body_to_string(resp).await;
+        assert!(body.contains("server_error"));
+        assert!(!body.contains("db connection string leaked"));
     }
 
     #[tokio::test]
@@ -1217,19 +1356,27 @@ mod tests {
 
     #[test]
     fn map_ory_error_maps_ory_409_to_bad_gateway() {
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 409,
-            message: "conflict".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 409,
+                message: "conflict".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
     fn map_ory_error_maps_unknown_ory_status_to_bad_gateway() {
-        let resp = map_ory_error(OryClientError::Ory {
-            status: 503,
-            message: "unavailable".into(),
-        });
+        let resp = map_ory_error(
+            OryClientError::Ory {
+                status: 503,
+                message: "unavailable".into(),
+            },
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 

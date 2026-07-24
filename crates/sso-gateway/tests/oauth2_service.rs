@@ -227,6 +227,97 @@ async fn oauth2_public_endpoints_round_trip() {
         "introspection response must include the token's tenant_id"
     );
 
+    // Regression (agent-mail #78): Hydra 4xx error bodies must be relayed
+    // verbatim instead of being masked as `server_error`, so callers can see
+    // e.g. which scope was rejected.
+    let bad_scope_resp = client
+        .post(format!("{base}/oauth2/token"))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "openid bogus:scope"),
+        ])
+        .send()
+        .await
+        .expect("bad-scope token request should complete");
+    assert_eq!(
+        bad_scope_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "out-of-ceiling scope should be rejected"
+    );
+    let bad_scope: serde_json::Value = bad_scope_resp
+        .json()
+        .await
+        .expect("error body should be json");
+    assert_eq!(bad_scope["error"], "invalid_scope");
+    assert!(
+        bad_scope["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bogus:scope"),
+        "error_description must name the rejected scope: {bad_scope}"
+    );
+
+    // Same relay guarantee on the device authorization endpoint (the original
+    // production repro from the `sunbeam auth login` incident).
+    let device_app_resp = client
+        .post(format!(
+            "{base}/iam.v1.ApplicationService/CreateApplication"
+        ))
+        .header("authorization", format!("Bearer {}", support::TEST_TOKEN))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "name": "oauth-device-app",
+            "redirectUris": ["https://localhost/callback"],
+            "grantTypes": ["urn:ietf:params:oauth:grant-type:device_code"],
+            "responseTypes": ["token"],
+            "scope": ["openid"],
+            "tokenEndpointAuthMethod": "none"
+        }))
+        .send()
+        .await
+        .expect("create device application request should succeed");
+    assert!(
+        device_app_resp.status().is_success(),
+        "create device application failed: {}",
+        device_app_resp.text().await.unwrap_or_default()
+    );
+    let device_app: serde_json::Value = device_app_resp
+        .json()
+        .await
+        .expect("device application should be json");
+    let device_app_id = device_app["id"]
+        .as_str()
+        .expect("device application id should exist");
+
+    let device_resp = client
+        .post(format!("{base}/oauth2/device/auth"))
+        .form(&[
+            ("client_id", device_app_id),
+            ("scope", "openid bogus:scope"),
+        ])
+        .send()
+        .await
+        .expect("device auth request should complete");
+    assert_eq!(
+        device_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "device auth with bogus scope should be rejected"
+    );
+    let device_err: serde_json::Value = device_resp
+        .json()
+        .await
+        .expect("device error body should be json");
+    assert_eq!(device_err["error"], "invalid_scope");
+    assert!(
+        device_err["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bogus:scope"),
+        "device error_description must name the rejected scope: {device_err}"
+    );
+
     // Unknown client_id is rejected.
     let unknown_auth_resp = client
         .get(format!("{base}/oauth2/auth"))
