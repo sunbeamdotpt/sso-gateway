@@ -26,6 +26,7 @@ pub struct Config {
     pub saml_require_signed_responses: bool,
     pub registration_enabled: bool,
     pub dynamic_client_registration_enabled: bool,
+    pub matrix_email_claim_enabled: bool,
     pub allowed_return_to_hosts: Vec<String>,
     pub force_email_claim_client_ids: Vec<String>,
     pub system_bootstrap_client_id: Option<String>,
@@ -90,6 +91,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "dynamic_client_registration_enabled",
                 &self.dynamic_client_registration_enabled,
+            )
+            .field(
+                "matrix_email_claim_enabled",
+                &self.matrix_email_claim_enabled,
             )
             .field("allowed_return_to_hosts", &self.allowed_return_to_hosts)
             .field(
@@ -517,6 +522,11 @@ impl Config {
             )
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(true),
+            // Matrix (MSC2965) introspection email injection is an opt-out:
+            // zendrite deployments rely on it out of the box.
+            matrix_email_claim_enabled: std::env::var("ENABLE_MATRIX_EMAIL_CLAIM")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
             allowed_return_to_hosts,
             force_email_claim_client_ids: std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS")
                 .ok()
@@ -691,6 +701,7 @@ mod tests {
         clear_env("SAML_REQUIRE_SIGNED_RESPONSES");
         clear_env("REGISTRATION_ENABLED");
         clear_env("ENABLE_DYNAMIC_CLIENT_REGISTRATION");
+        clear_env("ENABLE_MATRIX_EMAIL_CLAIM");
         clear_env("ALLOWED_RETURN_TO_HOSTS");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_ID");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_SECRET");
@@ -769,6 +780,7 @@ mod tests {
         assert!(!config.saml_require_signed_responses);
         assert!(!config.registration_enabled);
         assert!(config.dynamic_client_registration_enabled);
+        assert!(config.matrix_email_claim_enabled);
         assert_eq!(
             config.allowed_return_to_hosts,
             vec!["example.com".to_string()]
@@ -813,6 +825,26 @@ mod tests {
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
         assert!(!config.dynamic_client_registration_enabled);
+    }
+
+    #[test]
+    fn config_matrix_email_claim_can_be_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("ENABLE_MATRIX_EMAIL_CLAIM", "false");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert!(!config.matrix_email_claim_enabled);
     }
 
     #[cfg(feature = "openfga")]

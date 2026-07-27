@@ -147,6 +147,7 @@ impl CallbackHarness {
             saml_require_signed_responses: false,
             registration_enabled: false,
             dynamic_client_registration_enabled: true,
+            matrix_email_claim_enabled: true,
             allowed_return_to_hosts: vec!["app.example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),

@@ -174,6 +174,9 @@ pub struct Oauth2State {
     pub(crate) kratos: Option<Arc<dyn IntrospectKratos>>,
     /// Clients whose introspection responses always carry the user's email.
     pub(crate) force_email_claim_client_ids: Vec<String>,
+    /// Whether the MSC2965 `urn:matrix:client:` scope-prefix match injects
+    /// the email claim into introspection responses.
+    pub(crate) matrix_email_claim_enabled: bool,
 }
 
 impl Oauth2State {
@@ -187,6 +190,7 @@ impl Oauth2State {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -212,6 +216,11 @@ impl Oauth2State {
 
     pub fn with_force_email_claim_client_ids(mut self, client_ids: Vec<String>) -> Self {
         self.force_email_claim_client_ids = client_ids;
+        self
+    }
+
+    pub fn with_matrix_email_claim_enabled(mut self, enabled: bool) -> Self {
+        self.matrix_email_claim_enabled = enabled;
         self
     }
 }
@@ -869,9 +878,10 @@ async fn maybe_inject_introspection_email(
         .get("scope")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let is_matrix_token = scope
-        .split_whitespace()
-        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
+    let is_matrix_token = state.matrix_email_claim_enabled
+        && scope
+            .split_whitespace()
+            .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
     let translated_client_id = value.get("client_id").and_then(|v| v.as_str());
     let is_force_listed = state.force_email_claim_client_ids.iter().any(|id| {
         Some(id.as_str()) == raw_client_id || Some(id.as_str()) == translated_client_id
@@ -1338,6 +1348,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -1351,6 +1362,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -1884,6 +1896,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -2019,6 +2032,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -2309,6 +2323,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         (state, hydra)
     }
@@ -2424,6 +2439,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -2646,6 +2662,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         }
     }
 
@@ -2808,6 +2825,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2852,6 +2870,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2900,6 +2919,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2951,6 +2971,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
@@ -2985,6 +3006,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3082,6 +3104,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: Some(Arc::new(kratos)),
             force_email_claim_client_ids: force_ids,
+            matrix_email_claim_enabled: true,
         })
     }
 
@@ -3162,6 +3185,51 @@ mod tests {
             kratos,
             Vec::new(),
         );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["email"], "m@example.com");
+    }
+
+    #[tokio::test]
+    async fn introspect_skips_matrix_scope_email_when_flag_disabled() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let calls = kratos.calls.clone();
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid urn:matrix:client:api:*",
+            }),
+            kratos,
+            Vec::new(),
+        );
+        let state = Arc::new(Oauth2State {
+            matrix_email_claim_enabled: false,
+            ..(*state).clone()
+        });
+        let value = introspect_admin(state).await;
+        assert_eq!(value["active"], true);
+        assert!(value.get("email").is_none());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn introspect_force_listed_client_injects_email_when_flag_disabled() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+            kratos,
+            vec!["gateway-public-1".to_string()],
+        );
+        let state = Arc::new(Oauth2State {
+            matrix_email_claim_enabled: false,
+            ..(*state).clone()
+        });
         let value = introspect_admin(state).await;
         assert_eq!(value["email"], "m@example.com");
     }
@@ -3347,6 +3415,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         (state, mappings)
     }
@@ -3476,6 +3545,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3577,6 +3647,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3660,6 +3731,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3754,6 +3826,7 @@ mod tests {
             dynamic_client_registration_enabled: true,
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

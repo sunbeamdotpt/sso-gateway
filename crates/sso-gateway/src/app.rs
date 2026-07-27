@@ -404,7 +404,8 @@ pub async fn build_app_with_upstream(
         .with_system_tenant_id(config.system_tenant_ulid.clone())
         .with_dynamic_client_registration_enabled(config.dynamic_client_registration_enabled)
         .with_kratos(kratos.clone())
-        .with_force_email_claim_client_ids(config.force_email_claim_client_ids.clone()),
+        .with_force_email_claim_client_ids(config.force_email_claim_client_ids.clone())
+        .with_matrix_email_claim_enabled(config.matrix_email_claim_enabled),
     );
     let self_service_state = Arc::new(SelfServiceState::new(
         config.kratos_public_url.clone(),
@@ -727,6 +728,7 @@ mod tests {
             saml_require_signed_responses: false,
             registration_enabled: false,
             dynamic_client_registration_enabled: true,
+            matrix_email_claim_enabled: true,
             allowed_return_to_hosts: vec!["example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
             system_bootstrap_client_id: None,
