@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,12 +23,16 @@ pub use crate::auth::require_amr;
 
 pub const TENANT_ID_HEADER: &str = "x-tenant-id";
 
-/// Simple token-bucket rate limiter.
+/// Per-key token-bucket rate limiter.
+///
+/// One bucket per rate-limit key (usually the OAuth2 `client_id`) so a
+/// runaway client cannot drain a shared bucket and starve every other
+/// caller (SSO-015).
 #[derive(Clone, Debug)]
 pub struct RateLimiter {
     max: u32,
     per: Duration,
-    state: Arc<Mutex<RateLimiterState>>,
+    state: Arc<Mutex<HashMap<String, RateLimiterState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -36,26 +41,43 @@ struct RateLimiterState {
     last: Instant,
 }
 
+/// Hard cap on tracked buckets; a limiter is not a database.
+const MAX_RATE_LIMIT_KEYS: usize = 10_000;
+
 impl RateLimiter {
-    /// Create a limiter that allows `max` requests per `per` duration.
+    /// Create a limiter that allows `max` requests per `per` duration for
+    /// each key.
     pub fn new(max: u32, per: Duration) -> Self {
         Self {
             max,
             per,
-            state: Arc::new(Mutex::new(RateLimiterState {
-                tokens: max as f64,
-                last: Instant::now(),
-            })),
+            state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Attempt to consume one token. Returns `true` if the request is allowed.
-    pub fn check(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    /// Attempt to consume one token for `key`. Returns `true` if the request
+    /// is allowed.
+    pub fn check(&self, key: &str) -> bool {
+        let max = self.max as f64;
+        let refill_rate = self.max as f64 / self.per.as_secs_f64();
+        let mut buckets = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !buckets.contains_key(key) && buckets.len() >= MAX_RATE_LIMIT_KEYS {
+            // Evict buckets that have drifted back to full; if everything is
+            // saturated, start over rather than growing without bound.
+            buckets.retain(|_, s| s.tokens < max);
+            if buckets.len() >= MAX_RATE_LIMIT_KEYS {
+                buckets.clear();
+            }
+        }
+        let state = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| RateLimiterState {
+                tokens: max,
+                last: Instant::now(),
+            });
         let now = Instant::now();
         let elapsed = now.duration_since(state.last).as_secs_f64();
-        let refill = elapsed * (self.max as f64 / self.per.as_secs_f64());
-        state.tokens = (state.tokens + refill).min(self.max as f64);
+        state.tokens = (state.tokens + elapsed * refill_rate).min(max);
         state.last = now;
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
@@ -66,13 +88,65 @@ impl RateLimiter {
     }
 }
 
-/// Reject requests with `429 Too Many Requests` when the rate limiter is empty.
+/// Extract the OAuth2 `client_id` from an HTTP Basic Authorization header.
+fn basic_auth_client_id(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, payload) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim()).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (id, _) = decoded.split_once(':')?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn query_client_id(uri: &axum::http::Uri) -> Option<String> {
+    let query = uri.query()?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "client_id")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+fn form_body_client_id(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?;
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        return None;
+    }
+    url::form_urlencoded::parse(body)
+        .find(|(k, _)| k == "client_id")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// Reject requests with `429 Too Many Requests` when the key's bucket is empty.
 pub async fn rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if limiter.check() {
+    let (parts, body) = request.into_parts();
+    // These routes already sit behind a 1 MiB DefaultBodyLimit, so buffering
+    // the body to sniff a form-encoded client_id is bounded.
+    let body = match axum::body::to_bytes(body, 1_048_576).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let key = basic_auth_client_id(&parts.headers)
+        .or_else(|| query_client_id(&parts.uri))
+        .or_else(|| form_body_client_id(&parts.headers, &body))
+        .unwrap_or_else(|| "global".to_string());
+    let request = Request::from_parts(parts, Body::from(body));
+    if limiter.check(&key) {
         next.run(request).await
     } else {
         StatusCode::TOO_MANY_REQUESTS.into_response()
@@ -133,15 +207,17 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
     // Public paths are reachable anonymously (their handlers do protocol-level
-    // authentication). OAuth2 introspection is the one public path that also
-    // serves bearer-authenticated admin callers, so a presented Bearer token
-    // is authenticated there and an invalid one rejects rather than falling
+    // authentication). OAuth2 introspection and dynamic client registration
+    // also serve bearer-authenticated callers (admin introspection; DCR
+    // mapping under the caller's tenant), so a presented Bearer token is
+    // authenticated there and an invalid one rejects rather than falling
     // through as anonymous. On every other public path the bearer token is
     // the protocol credential itself (e.g. userinfo) and must reach the
     // handler untouched — middleware subject resolution would reject valid
     // tokens whose subjects have no gateway mapping.
     if is_public_path(path)
-        && (path != "/oauth2/introspect" || bearer_token(request.headers()).is_none())
+        && (!matches!(path, "/oauth2/introspect" | "/oauth2/register")
+            || bearer_token(request.headers()).is_none())
     {
         return next.run(request).await;
     }
@@ -468,7 +544,10 @@ mod tests {
     use crate::auth::IntrospectionResult;
     use crate::db::{ApplicationStore, MemoryApplicationStore};
     use crate::session_token::SessionTokenSigner;
-    use axum::{Extension, Router, body::Body, http::Request, middleware::from_fn, routing::get};
+    use axum::{
+        Extension, Router, body::Body, http::Request, middleware::from_fn,
+        middleware::from_fn_with_state, routing::get,
+    };
     use std::sync::Mutex;
     use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
@@ -838,6 +917,202 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A valid Bearer token on /oauth2/register authenticates opportunistically
+    /// so the DCR handler can map the client under the caller's tenant.
+    #[tokio::test]
+    async fn public_register_path_with_valid_bearer_authenticates() {
+        let router = test_router(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/register")
+                    .header("Authorization", "Bearer some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// An invalid Bearer token on /oauth2/register rejects instead of falling
+    /// through to anonymous registration.
+    #[tokio::test]
+    async fn public_register_path_with_invalid_bearer_rejects() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            no_mappings(),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/register")
+                    .header("Authorization", "Bearer bad-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyed rate limiting (SSO-015)
+    // -----------------------------------------------------------------------
+
+    async fn echo_body(body: String) -> String {
+        body
+    }
+
+    fn rate_limit_router(limiter: Arc<RateLimiter>) -> Router {
+        Router::new()
+            .route("/limited", get(ok_handler).post(echo_body))
+            .layer(from_fn_with_state(limiter, rate_limit_middleware))
+    }
+
+    fn basic_auth_value(client_id: &str) -> String {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{client_id}:secret"),
+        );
+        format!("Basic {encoded}")
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keys_on_form_body_client_id_and_preserves_body() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let payload = "client_id=form-client&grant_type=client_credentials";
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/limited")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The downstream handler still reads the full body.
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), payload);
+
+        // Second request from the same client exhausts its bucket...
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/limited")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // ...while a different client_id has its own bucket.
+        let response = router
+            .oneshot(
+                Request::post("/limited")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "client_id=other-client&grant_type=client_credentials",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_buckets_are_independent_per_basic_auth_client() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited")
+                    .header("Authorization", basic_auth_value("client-a"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited")
+                    .header("Authorization", basic_auth_value("client-a"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .oneshot(
+                Request::get("/limited")
+                    .header("Authorization", basic_auth_value("client-b"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keys_on_query_client_id() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited?client_id=query-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited?client_id=query-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_falls_back_to_global_bucket() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(2, Duration::from_secs(60))));
+        for i in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "request {i} should pass");
+        }
+        let response = router
+            .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// On every other public path the bearer token is the protocol

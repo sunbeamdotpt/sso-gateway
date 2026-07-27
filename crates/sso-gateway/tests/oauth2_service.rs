@@ -694,6 +694,36 @@ async fn oauth2_dynamic_client_registration_is_public() {
         "bad client secret must yield 401"
     );
 
+    // SSO-015 self-heal: a client whose id_mapping row was lost still
+    // resolves via Hydra, and the mapping is backfilled on the way.
+    sqlx::query("DELETE FROM id_mappings WHERE backend = 'hydra' AND public_id = $1")
+        .bind(&client_id)
+        .execute(&pool)
+        .await
+        .expect("mapping row should delete");
+
+    let token_resp = client
+        .post(format!("{base}/oauth2/token"))
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[("grant_type", "client_credentials"), ("scope", "openid")])
+        .send()
+        .await
+        .expect("self-heal token request should complete");
+    assert_eq!(
+        token_resp.status(),
+        reqwest::StatusCode::OK,
+        "token request with deleted mapping failed: {}",
+        token_resp.text().await.unwrap_or_default()
+    );
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM id_mappings WHERE backend = 'hydra' AND public_id = $1")
+            .bind(&client_id)
+            .fetch_one(&pool)
+            .await
+            .expect("mapping count should query");
+    assert_eq!(count, 1, "mapping row should be backfilled by self-heal");
+
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");
 }

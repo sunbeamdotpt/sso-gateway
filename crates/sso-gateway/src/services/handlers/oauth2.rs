@@ -61,6 +61,7 @@ pub trait HydraOperations: Send + Sync + 'static {
         &self,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, OryClientError>;
+    async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError>;
     fn public_url(&self) -> &reqwest::Url;
 }
@@ -132,6 +133,10 @@ impl HydraOperations for HydraClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, OryClientError> {
         self.create_oauth2_client(payload).await
+    }
+
+    async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+        self.get_oauth2_client(id).await
     }
 
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -574,6 +579,7 @@ const DCR_ALLOWED_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_ac
 
 async fn register(
     State(state): State<Arc<Oauth2State>>,
+    auth: Option<Extension<AuthContext>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if !state.dynamic_client_registration_enabled {
@@ -645,15 +651,23 @@ async fn register(
     };
     let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
 
+    // An authenticated caller (opportunistic bearer on the public route)
+    // owns the mapping under its own tenant; anonymous DCR clients map under
+    // the system tenant.
+    let tenant_id = auth
+        .as_ref()
+        .map(|Extension(a)| a.tenant_id.clone())
+        .unwrap_or_else(|| state.system_tenant_id.clone());
+
     match state
         .mappings
-        .create(&state.system_tenant_id, BACKEND_HYDRA, &public_id, ory_id)
+        .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
         .await
     {
         Ok(_) => {}
         Err(err) => {
             warn!(
-                tenant_id = %state.system_tenant_id,
+                tenant_id = %tenant_id,
                 public_id = %public_id,
                 "failed to store client mapping: {}",
                 err
@@ -926,23 +940,58 @@ async fn resolve_public_client(
         return Err(Box::new(bad_request("missing client_id")));
     }
 
-    state
+    match state
         .mappings
         .get_ory_id_by_public_id(BACKEND_HYDRA, client_id)
         .await
-        .map_err(|e| {
+    {
+        Ok(ory_id) => Ok(ory_id),
+        Err(crate::db::DbError::MappingNotFound) => {
+            heal_client_mapping(state, client_id).await
+        }
+        Err(e) => {
             warn!("failed to resolve public client {}: {}", client_id, e);
-            match e {
-                crate::db::DbError::MappingNotFound => Box::new(
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        json!({"error": "invalid_client"}).to_string(),
-                    )
-                        .into_response(),
-                ),
-                _ => Box::new(internal_error()),
-            }
-        })
+            Err(Box::new(internal_error()))
+        }
+    }
+}
+
+/// Self-healing client resolution (SSO-015): a client may legitimately exist
+/// in Hydra while its id_mapping row is missing (registered out-of-band, or
+/// the row was lost). If Hydra knows the client, backfill the mapping under
+/// the system tenant and carry on; a Hydra 404 stays a terminal
+/// `401 invalid_client`.
+async fn heal_client_mapping(state: &Oauth2State, client_id: &str) -> Result<String, Box<Response>> {
+    let client = match state.hydra.get_oauth2_client(client_id).await {
+        Ok(client) => client,
+        Err(OryClientError::Ory { status: 404, .. }) => {
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    json!({"error": "invalid_client"}).to_string(),
+                )
+                    .into_response(),
+            ));
+        }
+        Err(err) => {
+            warn!("failed to look up client {} in hydra: {}", client_id, err);
+            return Err(Box::new(internal_error()));
+        }
+    };
+    let ory_id = client["client_id"]
+        .as_str()
+        .unwrap_or(client_id)
+        .to_string();
+    if let Err(err) = state
+        .mappings
+        .create(&state.system_tenant_id, BACKEND_HYDRA, client_id, &ory_id)
+        .await
+    {
+        // A racing replica may have written the row first; the client id is
+        // resolved either way, so the backfill failure is not terminal.
+        warn!("failed to backfill client mapping for {}: {}", client_id, err);
+    }
+    Ok(ory_id)
 }
 
 /// Resolve a gateway public client id to the Ory id. If the value is already an
@@ -1166,6 +1215,16 @@ mod tests {
             _payload: serde_json::Value,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub create_oauth2_client not configured")
+        }
+
+        async fn get_oauth2_client(
+            &self,
+            _id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(OryClientError::Ory {
+                status: 404,
+                message: "not found".into(),
+            })
         }
 
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -1673,6 +1732,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_public_client_backfills_mapping_when_hydra_has_client() {
+        let mappings = Arc::new(RecordingMappingStore::default());
+        let state = Oauth2State {
+            hydra: Arc::new(AlwaysOkHydra {
+                response: json!({"client_id": "hydra-generated-id"}),
+            }),
+            mappings: mappings.clone(),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
+        };
+        let ory_id = resolve_public_client(&state, "external-client")
+            .await
+            .unwrap();
+        assert_eq!(ory_id, "hydra-generated-id");
+        let created = mappings.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            created[0],
+            (
+                "system-tenant-1".to_string(),
+                "hydra".to_string(),
+                "external-client".to_string(),
+                "hydra-generated-id".to_string(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_public_client_returns_internal_when_hydra_lookup_fails() {
+        let state = Oauth2State {
+            hydra: Arc::new(AlwaysErrHydra),
+            mappings: Arc::new(RecordingMappingStore::default()),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
+        };
+        let err = resolve_public_client(&state, "external-client")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn authorize_returns_bad_request_when_client_id_missing() {
         let state = Arc::new(test_state(None));
         let params = HashMap::new();
@@ -1756,6 +1867,13 @@ mod tests {
                 "client_id": "ory-client-1",
                 "client_secret": "ory-secret-1",
             }))
+        }
+
+        async fn get_oauth2_client(
+            &self,
+            _id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(self.response.clone())
         }
 
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -1864,6 +1982,13 @@ mod tests {
                 "client_id": "ory-client-1",
                 "client_secret": "ory-secret-1",
             }))
+        }
+
+        async fn get_oauth2_client(
+            &self,
+            _id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Ok(self.response.clone())
         }
 
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -1995,6 +2120,10 @@ mod tests {
             payload: serde_json::Value,
         ) -> Result<serde_json::Value, OryClientError> {
             self.inner.create_oauth2_client(payload).await
+        }
+
+        async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+            self.inner.get_oauth2_client(id).await
         }
 
         async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -2634,6 +2763,13 @@ mod tests {
             Err(hydra_err())
         }
 
+        async fn get_oauth2_client(
+            &self,
+            _id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            Err(hydra_err())
+        }
+
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
@@ -2748,6 +2884,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(client.get_oauth2_client("id").await.is_err());
         assert!(client.revoke(vec![]).await.is_err());
         assert!(
             client
@@ -3433,7 +3570,7 @@ mod tests {
             "scope": "openid profile",
             "token_endpoint_auth_method": "client_secret_basic",
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -3449,6 +3586,33 @@ mod tests {
         assert_eq!(created[0].3, "ory-client-1");
     }
 
+    /// An authenticated caller owns the new client under its own tenant
+    /// instead of the system tenant (SSO-015).
+    #[tokio::test]
+    async fn register_maps_client_under_authenticated_tenant() {
+        let (state, mappings) = register_state();
+        let auth = AuthContext {
+            tenant_id: "tenant-42".into(),
+            subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
+            scopes: vec![],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        };
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(State(state), Some(Extension(auth)), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = mappings.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "tenant-42");
+    }
+
     /// When dynamic client registration is disabled the endpoint refuses
     /// with an OAuth2-style 403 instead of creating a client.
     #[tokio::test]
@@ -3462,7 +3626,7 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("access_denied"));
@@ -3496,7 +3660,7 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["not-a-url"],
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -3512,7 +3676,7 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid tenant:admin email offline_access bogus:scope",
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -3527,7 +3691,7 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "tenant:admin",
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -3551,7 +3715,7 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -3563,7 +3727,7 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "token_endpoint_auth_method": "invalid_method",
         });
-        let resp = register(State(state), Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -3628,6 +3792,12 @@ mod tests {
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(json!({"client_secret": "secret"}))
         }
+        async fn get_oauth2_client(
+            &self,
+            _id: &str,
+        ) -> Result<serde_json::Value, OryClientError> {
+            unimplemented!()
+        }
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
             unimplemented!()
         }
@@ -3653,7 +3823,7 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), Json(body))
+        let resp = register(State(state), None, Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -3737,7 +3907,7 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), Json(body))
+        let resp = register(State(state), None, Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -3799,6 +3969,12 @@ mod tests {
             async fn create_oauth2_client(
                 &self,
                 _payload: serde_json::Value,
+            ) -> Result<serde_json::Value, OryClientError> {
+                unimplemented!()
+            }
+            async fn get_oauth2_client(
+                &self,
+                _id: &str,
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }
