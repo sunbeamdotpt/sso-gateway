@@ -182,6 +182,9 @@ pub struct Oauth2State {
     /// Whether the MSC2965 `urn:matrix:client:` scope-prefix match injects
     /// the email claim into introspection responses.
     pub(crate) matrix_email_claim_enabled: bool,
+    /// Whether Matrix-shaped authorize requests get `offline_access` appended
+    /// and Matrix DCR registrations keep the refresh-token grant.
+    pub(crate) matrix_offline_access_enabled: bool,
 }
 
 impl Oauth2State {
@@ -196,6 +199,7 @@ impl Oauth2State {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -226,6 +230,11 @@ impl Oauth2State {
 
     pub fn with_matrix_email_claim_enabled(mut self, enabled: bool) -> Self {
         self.matrix_email_claim_enabled = enabled;
+        self
+    }
+
+    pub fn with_matrix_offline_access_enabled(mut self, enabled: bool) -> Self {
+        self.matrix_offline_access_enabled = enabled;
         self
     }
 }
@@ -373,6 +382,14 @@ async fn authorize(
         .map(|(k, v)| {
             if k == "client_id" {
                 (k, ory_id.clone())
+            } else if k == "scope" {
+                // Deliberate MSC2965 exception: Matrix native clients request
+                // only `openid urn:matrix:client:*` — never `offline_access` —
+                // so their sessions would die at the access-token TTL. Any
+                // Matrix-shaped authorize request gets `offline_access`
+                // appended here, making the scope legitimately requested so
+                // consent grants it naturally and Hydra issues a refresh token.
+                (k, with_matrix_offline_access(&state, &v))
             } else {
                 (k, v)
             }
@@ -574,7 +591,9 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
 /// Scopes a publicly registered (RFC 7591) client may hold. Registration is
 /// open — there is no way to distinguish e.g. a Matrix client from anyone
 /// else at DCR time — so the ceiling keeps anonymous clients inside the
-/// plain OIDC surface.
+/// plain OIDC surface. MSC2965 `urn:matrix:client:*` scopes are exempt:
+/// per-device Matrix registrations cannot be enumerated, so they pass
+/// through verbatim (see `register`).
 const DCR_ALLOWED_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
 
 async fn register(
@@ -594,19 +613,41 @@ async fn register(
     }
 
     let redirect_uris = json_string_array(&body["redirect_uris"]);
-    let grant_types = json_string_array(&body["grant_types"]);
+    let mut grant_types = json_string_array(&body["grant_types"]);
     let response_types = json_string_array(&body["response_types"]);
+    // MSC2965 exception to the DCR ceiling: `urn:matrix:client:*` scopes are
+    // preserved verbatim (per-device registrations can't be enumerated), and
+    // when the offline-access feature is on the client also gets the
+    // `offline_access` scope and the `refresh_token` grant so Matrix sessions
+    // can outlive the access-token TTL. Non-Matrix registrations keep the
+    // plain-OIDC ceiling exactly.
     let mut scope = body["scope"]
         .as_str()
         .map(|s| {
             s.split_whitespace()
-                .filter(|s| DCR_ALLOWED_SCOPES.contains(s))
+                .filter(|s| {
+                    DCR_ALLOWED_SCOPES.contains(s) || s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
+                })
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     if scope.is_empty() {
         scope.push("openid".to_string());
+    }
+    if grant_types.is_empty() {
+        grant_types.push("authorization_code".to_string());
+    }
+    let is_matrix = scope
+        .iter()
+        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
+    if is_matrix && state.matrix_offline_access_enabled {
+        if !scope.iter().any(|s| s == "offline_access") {
+            scope.push("offline_access".to_string());
+        }
+        if !grant_types.iter().any(|g| g == "refresh_token") {
+            grant_types.push("refresh_token".to_string());
+        }
     }
     let token_endpoint_auth_method = body["token_endpoint_auth_method"]
         .as_str()
@@ -634,7 +675,7 @@ async fn register(
         "client_id": public_id,
         "client_name": client_name,
         "redirect_uris": redirect_uris,
-        "grant_types": if grant_types.is_empty() { vec!["authorization_code".to_string()] } else { grant_types.clone() },
+        "grant_types": grant_types.clone(),
         "response_types": if response_types.is_empty() { vec!["code".to_string()] } else { response_types.clone() },
         "scope": scope.join(" "),
         "token_endpoint_auth_method": token_endpoint_auth_method,
@@ -868,6 +909,24 @@ async fn introspect(
 /// which identifies Matrix-issued tokens — including per-device DCR clients
 /// that no static client-id list could enumerate.
 const MATRIX_CLIENT_SCOPE_PREFIX: &str = "urn:matrix:client:";
+
+/// Append `offline_access` to an authorize-request scope string when it
+/// carries a Matrix (MSC2965) scope and the feature is enabled. An absent or
+/// already-offline scope is returned untouched.
+fn with_matrix_offline_access(state: &Oauth2State, scope: &str) -> String {
+    let mut scopes: Vec<&str> = scope.split_whitespace().collect();
+    if !state.matrix_offline_access_enabled
+        || scopes.is_empty()
+        || !scopes
+            .iter()
+            .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
+        || scopes.contains(&"offline_access")
+    {
+        return scope.to_string();
+    }
+    scopes.push("offline_access");
+    scopes.join(" ")
+}
 
 /// Inject the user's email into an active introspection response.
 ///
@@ -1408,6 +1467,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -1422,6 +1482,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -1746,6 +1807,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         };
         let ory_id = resolve_public_client(&state, "external-client")
             .await
@@ -1776,6 +1838,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         };
         let err = resolve_public_client(&state, "external-client")
             .await
@@ -2022,6 +2085,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -2162,6 +2226,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -2453,6 +2518,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         (state, hydra)
     }
@@ -2473,6 +2539,87 @@ mod tests {
                 .map(|(_, v)| v),
             Some(&"hydra-client-id-1".to_string())
         );
+    }
+
+    /// MSC2965: a Matrix-shaped authorize request gets `offline_access`
+    /// appended before proxying so Hydra issues a refresh token.
+    #[tokio::test]
+    async fn authorize_appends_offline_access_for_matrix_scope() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:* urn:matrix:client:device:ABC".to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(
+                &"openid urn:matrix:client:api:* urn:matrix:client:device:ABC offline_access"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_leaves_matrix_scope_untouched_when_disabled() {
+        let (state, hydra) = recording_state();
+        let state = Arc::new(Oauth2State {
+            matrix_offline_access_enabled: false,
+            ..(*state).clone()
+        });
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:*".to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(&"openid urn:matrix:client:api:*".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_leaves_non_matrix_scope_untouched() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            ("scope".to_string(), "openid profile".to_string()),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(&"openid profile".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_without_scope_stays_without_scope() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([("client_id".to_string(), "gateway-client-1".to_string())]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().all(|(k, _)| k != "scope"));
     }
 
     #[tokio::test]
@@ -2569,6 +2716,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -2799,6 +2947,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         }
     }
 
@@ -2963,6 +3112,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3008,6 +3158,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3057,6 +3208,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3109,6 +3261,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
@@ -3144,6 +3297,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3242,6 +3396,7 @@ mod tests {
             kratos: Some(Arc::new(kratos)),
             force_email_claim_client_ids: force_ids,
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         })
     }
 
@@ -3342,6 +3497,7 @@ mod tests {
         );
         let state = Arc::new(Oauth2State {
             matrix_email_claim_enabled: false,
+            matrix_offline_access_enabled: true,
             ..(*state).clone()
         });
         let value = introspect_admin(state).await;
@@ -3365,6 +3521,7 @@ mod tests {
         );
         let state = Arc::new(Oauth2State {
             matrix_email_claim_enabled: false,
+            matrix_offline_access_enabled: true,
             ..(*state).clone()
         });
         let value = introspect_admin(state).await;
@@ -3553,6 +3710,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         (state, mappings)
     }
@@ -3683,6 +3841,57 @@ mod tests {
         assert_eq!(value["scope"], "openid email offline_access");
     }
 
+    /// MSC2965: Matrix scopes survive the DCR ceiling and, with the feature
+    /// on, the registration gains `offline_access` and the refresh-token
+    /// grant. Non-Matrix scopes are still ceiling-filtered.
+    #[tokio::test]
+    async fn register_matrix_client_preserves_scopes_and_gains_refresh_grant() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "element-x-device",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "openid urn:matrix:client:api:* urn:matrix:client:device:ABC tenant:admin",
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(
+            value["scope"],
+            "openid urn:matrix:client:api:* urn:matrix:client:device:ABC offline_access"
+        );
+        let grant_types: Vec<&str> = value["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(grant_types.contains(&"authorization_code"));
+        assert!(grant_types.contains(&"refresh_token"));
+    }
+
+    /// With the feature off, Matrix scopes are still preserved but no
+    /// `offline_access` scope or refresh-token grant is added.
+    #[tokio::test]
+    async fn register_matrix_client_without_offline_access_feature() {
+        let (state, _) = register_state();
+        let state = Arc::new(Oauth2State {
+            matrix_offline_access_enabled: false,
+            ..(*state).clone()
+        });
+        let body = json!({
+            "client_name": "element-x-device",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "openid urn:matrix:client:api:*",
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(value["scope"], "openid urn:matrix:client:api:*");
+        assert_eq!(value["grant_types"], json!(["authorization_code"]));
+    }
+
     #[tokio::test]
     async fn register_defaults_scope_to_openid_when_ceiling_empties_it() {
         let (state, _) = register_state();
@@ -3710,6 +3919,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3818,6 +4028,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3902,6 +4113,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -4003,6 +4215,7 @@ mod tests {
             kratos: None,
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

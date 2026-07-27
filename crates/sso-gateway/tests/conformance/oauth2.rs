@@ -299,3 +299,198 @@ async fn oauth2_authorize_rejects_unknown_client() {
 
     gateway.shutdown().await;
 }
+
+const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
+
+/// MSC2965 end-to-end: a Matrix-style DCR client that never requests
+/// `offline_access` still receives a usable refresh token. The gateway
+/// preserves the Matrix scopes and adds the refresh-token grant at DCR time,
+/// and appends `offline_access` to the Matrix-shaped authorize request before
+/// proxying to Hydra, so consent grants it and fosite issues the token.
+#[tokio::test]
+async fn matrix_dcr_client_receives_usable_refresh_token() {
+    let gateway = Gateway::start().await;
+
+    // 1. Register a Matrix-style client through public DCR, exactly as
+    //    Element X does: openid + a urn:matrix:client: scope, no
+    //    offline_access anywhere.
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "element-x-device",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid urn:matrix:client:api:*",
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    let registered_scope: Vec<&str> = registration["scope"]
+        .as_str()
+        .expect("registered scope")
+        .split_whitespace()
+        .collect();
+    assert!(
+        registered_scope.contains(&"urn:matrix:client:api:*"),
+        "Matrix scope must survive DCR: {registered_scope:?}"
+    );
+    assert!(
+        registered_scope.contains(&"offline_access"),
+        "offline_access must be added at DCR: {registered_scope:?}"
+    );
+    let registered_grants: Vec<&str> = registration["grant_types"]
+        .as_array()
+        .expect("registered grant_types")
+        .iter()
+        .map(|v| v.as_str().expect("grant type should be a string"))
+        .collect();
+    assert!(
+        registered_grants.contains(&"refresh_token"),
+        "refresh_token grant must be added at DCR: {registered_grants:?}"
+    );
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+    let client_secret = registration["client_secret"]
+        .as_str()
+        .expect("client_secret")
+        .to_string();
+
+    // 2. Run the authorization-code flow requesting only what Element
+    //    requests (no offline_access). Consent grants whatever Hydra
+    //    requested, which includes the gateway-injected offline_access.
+    let subject = ulid::Ulid::new().to_string();
+    let result = gateway
+        .authorization_code_flow_for_client(
+            &subject,
+            &client_id,
+            &client_secret,
+            // DCR sets the Hydra client_id to the public ULID.
+            &client_id,
+            REDIRECT_URI,
+            &["code"],
+            &["openid", "urn:matrix:client:api:*"],
+            None,
+            true,
+            None,
+        )
+        .await;
+    assert!(
+        result.token["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "token response must contain an access token: {}",
+        result.token
+    );
+    let refresh_token = result.token["refresh_token"]
+        .as_str()
+        .expect("Matrix flow must yield a refresh token");
+    assert!(!refresh_token.is_empty());
+
+    // 3. The refresh token actually works — the refresh grant returns a new
+    //    access token, which also proves the client holds the refresh_token
+    //    grant (fosite rejects the exchange otherwise).
+    let refreshed = gateway
+        .refresh_token_flow(refresh_token, &client_id, &client_secret)
+        .await;
+    assert!(
+        refreshed.get("error").is_none(),
+        "refresh grant must not error: {refreshed}"
+    );
+    assert!(
+        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "refresh grant must return a new access token: {refreshed}"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// Probe for the DCR scope-ceiling question: does Hydra v25.4 reject an
+/// authorize request whose scope exceeds the client's registered scope?
+/// Registered scope here is exactly `openid`; the authorize request asks for
+/// `openid profile`. Measured behavior: Hydra ENFORCES the ceiling and
+/// redirects to the client redirect_uri with `error=invalid_scope`.
+///
+/// Consequence for MSC2965: the DCR hygiene (preserving `urn:matrix:client:*`
+/// scopes and adding `offline_access` at registration) is load-bearing, not
+/// cosmetic — the authorize-time `offline_access` injection only passes the
+/// ceiling because registration put it there. Matrix clients registered
+/// before that fix (registered scope lacks the Matrix/offline scopes) must
+/// re-register, or their authorize requests fail with `invalid_scope`.
+#[tokio::test]
+async fn hydra_authorize_enforces_registered_scope_ceiling() {
+    let gateway = Gateway::start().await;
+
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "ceiling-probe",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid",
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    assert_eq!(registration["scope"], "openid");
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+
+    let no_redirect = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("no-redirect client should build");
+    let resp = no_redirect
+        .get(format!("{}/oauth2/auth", gateway.base_url))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", REDIRECT_URI),
+            ("scope", "openid profile"),
+            ("state", "ceiling-probe"),
+        ])
+        .send()
+        .await
+        .expect("authorize request should complete");
+
+    assert!(
+        resp.status().is_redirection(),
+        "authorize must redirect with invalid_scope, got {:?}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|h| h.to_str().ok())
+        .expect("redirect location should exist")
+        .to_string();
+    assert!(
+        location.starts_with(REDIRECT_URI),
+        "scope violation must redirect to the client redirect_uri, got: {location}"
+    );
+    assert!(
+        location.contains("error=invalid_scope"),
+        "expected error=invalid_scope in the redirect, got: {location}"
+    );
+    assert!(
+        !location.contains("login_challenge="),
+        "authorize must not reach login with an out-of-ceiling scope: {location}"
+    );
+
+    gateway.shutdown().await;
+}

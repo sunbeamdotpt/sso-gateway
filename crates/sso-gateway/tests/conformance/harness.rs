@@ -91,6 +91,7 @@ impl Gateway {
             registration_enabled: false,
             dynamic_client_registration_enabled: true,
             matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
             allowed_return_to_hosts: vec!["app.example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
@@ -505,6 +506,46 @@ impl Gateway {
             .await
             .expect("ory client id should be resolvable");
 
+        self.authorization_code_flow_for_client(
+            subject,
+            &client_id,
+            &client_secret,
+            &ory_client_id,
+            redirect_uri,
+            response_types,
+            scopes,
+            Some(scopes),
+            use_pkce,
+            nonce,
+        )
+        .await
+    }
+
+    /// Drive the redirect legs of an authorization-code, implicit, or hybrid
+    /// flow through the gateway for an already-registered client (e.g. one
+    /// created via public DCR). When `grant_scopes` is `None`, consent grants
+    /// whatever Hydra requested — mirroring a consent app that echoes the
+    /// requested scope list, which is how gateway-injected scopes (MSC2965
+    /// `offline_access`) get granted in production.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorization_code_flow_for_client(
+        &self,
+        subject: &str,
+        client_id: &str,
+        client_secret: &str,
+        ory_client_id: &str,
+        redirect_uri: &str,
+        response_types: &[&str],
+        scopes: &[&str],
+        grant_scopes: Option<&[&str]>,
+        use_pkce: bool,
+        nonce: Option<&str>,
+    ) -> AuthorizationFlowResult {
+        let response_type = response_types.join(" ");
+        let client_id = client_id.to_string();
+        let client_secret = client_secret.to_string();
+        let ory_client_id = ory_client_id.to_string();
+
         let no_redirect = reqwest::Client::builder()
             .cookie_store(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -606,7 +647,32 @@ impl Gateway {
             .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
             .expect("consent_challenge or consent_verifier should be present");
 
-        // 4. Accept the consent request.
+        // 4. Accept the consent request. With no explicit grant list, echo
+        //    Hydra's requested_scope — this is what lets gateway-injected
+        //    scopes (e.g. MSC2965 offline_access) get granted.
+        let grant_scope: Vec<String> = match grant_scopes {
+            Some(grant) => grant.iter().map(|s| s.to_string()).collect(),
+            None => {
+                let consent_request: serde_json::Value = no_redirect
+                    .get(format!(
+                        "{}/admin/oauth2/auth/requests/consent",
+                        self.hydra_admin_url
+                    ))
+                    .query(&[("consent_challenge", &consent_challenge)])
+                    .send()
+                    .await
+                    .expect("consent request fetch should succeed")
+                    .json()
+                    .await
+                    .expect("consent request should be json");
+                consent_request["requested_scope"]
+                    .as_array()
+                    .expect("requested_scope should be an array")
+                    .iter()
+                    .map(|s| s.as_str().expect("scope should be a string").to_string())
+                    .collect()
+            }
+        };
         let consent_accept: serde_json::Value = no_redirect
             .put(format!(
                 "{}/admin/oauth2/auth/requests/consent/accept",
@@ -614,7 +680,7 @@ impl Gateway {
             ))
             .query(&[("consent_challenge", &consent_challenge)])
             .json(&serde_json::json!({
-                "grant_scope": scopes,
+                "grant_scope": grant_scope,
                 "remember": false,
             }))
             .send()
