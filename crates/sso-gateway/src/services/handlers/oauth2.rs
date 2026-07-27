@@ -22,7 +22,8 @@ use crate::auth::{
 };
 use crate::db::{IdMappingRepo, IdMappingStore, TokenIntrospectionCache};
 use crate::services::application::{
-    BACKEND_HYDRA, validate_redirect_uris, validate_token_endpoint_auth_method,
+    BACKEND_HYDRA, validate_native_redirect_uris, validate_redirect_uris,
+    validate_token_endpoint_auth_method,
 };
 
 /// Async trait for the Hydra operations used by the public OAuth2/OIDC handlers.
@@ -654,14 +655,22 @@ async fn register(
         .unwrap_or("")
         .to_string();
 
-    if let Err(err) = validate_redirect_uris(&redirect_uris, false) {
+    if let Err(err) = validate_token_endpoint_auth_method(&token_endpoint_auth_method) {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error": "invalid_request", "error_description": err.to_string()})),
         )
             .into_response();
     }
-    if let Err(err) = validate_token_endpoint_auth_method(&token_endpoint_auth_method) {
+    // Public clients (token_endpoint_auth_method "none") get RFC 8252 native
+    // redirect rules — custom URI schemes like io.element.android:/ — while
+    // confidential clients keep the https-only web rules.
+    let redirect_validation = if token_endpoint_auth_method == "none" {
+        validate_native_redirect_uris(&redirect_uris)
+    } else {
+        validate_redirect_uris(&redirect_uris, false)
+    };
+    if let Err(err) = redirect_validation {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error": "invalid_request", "error_description": err.to_string()})),
@@ -3817,6 +3826,40 @@ mod tests {
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["not-a-url"],
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_str = body_to_string(resp).await;
+        assert!(body_str.contains("invalid_request"));
+    }
+
+    /// RFC 8252: public clients (token_endpoint_auth_method "none") may
+    /// register custom-scheme redirect URIs (Element X Android uses
+    /// io.element.android:/).
+    #[tokio::test]
+    async fn register_accepts_custom_scheme_redirect_for_public_client() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "element-x-android",
+            "redirect_uris": ["io.element.android:/"],
+            "token_endpoint_auth_method": "none",
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_str(&body_to_string(resp).await).unwrap();
+        assert_eq!(value["redirect_uris"][0], "io.element.android:/");
+    }
+
+    /// Custom schemes stay rejected for confidential clients, which play by
+    /// the web rules.
+    #[tokio::test]
+    async fn register_rejects_custom_scheme_redirect_for_confidential_client() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "web-client",
+            "redirect_uris": ["io.element.android:/"],
+            "token_endpoint_auth_method": "client_secret_basic",
         });
         let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

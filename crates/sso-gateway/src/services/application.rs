@@ -408,6 +408,40 @@ pub fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), S
     Ok(())
 }
 
+/// RFC 8252 (OAuth 2.0 for Native Apps) redirect validation for native/public
+/// clients: custom URI schemes (e.g. `io.element.android:/`) and loopback
+/// HTTP are permitted per sections 7.1 and 8.4. `https` stays valid, plain
+/// `http` beyond loopback stays rejected, and `javascript:`/`data:`/`file:`
+/// remain forbidden.
+pub fn validate_native_redirect_uris(uris: &[String]) -> Result<(), ServiceError> {
+    for uri in uris {
+        if uri.contains('*') {
+            return Err(ServiceError::InvalidArgument(format!(
+                "redirect_uri contains wildcard: {uri}"
+            )));
+        }
+        let parsed = reqwest::Url::parse(uri).map_err(|e| {
+            ServiceError::InvalidArgument(format!("invalid redirect_uri {uri}: {e}"))
+        })?;
+        match parsed.scheme() {
+            "https" => {}
+            "http" if is_loopback_host(&parsed) => {}
+            "javascript" | "data" | "file" => {
+                return Err(ServiceError::InvalidArgument(format!(
+                    "redirect_uri uses forbidden scheme: {uri}"
+                )));
+            }
+            "http" => {
+                return Err(ServiceError::InvalidArgument(format!(
+                    "redirect_uri must use https scheme: {uri}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_token_endpoint_auth_method(method: &str) -> Result<(), ServiceError> {
     if method.is_empty() {
         return Ok(());
@@ -2070,6 +2104,32 @@ mod tests {
     #[test]
     fn validate_redirect_uris_rejects_javascript_scheme() {
         assert!(validate_redirect_uris(&["javascript://alert(1)".into()], false,).is_err());
+    }
+
+    #[test]
+    fn validate_native_redirect_uris_accepts_custom_scheme() {
+        assert!(validate_native_redirect_uris(&["io.element.android:/".into()]).is_ok());
+        assert!(validate_native_redirect_uris(&["io.element.android:/oauth/callback".into()]).is_ok());
+    }
+
+    #[test]
+    fn validate_native_redirect_uris_accepts_https_and_loopback() {
+        assert!(validate_native_redirect_uris(&["https://example.com/callback".into()]).is_ok());
+        assert!(validate_native_redirect_uris(&["http://127.0.0.1:3000/callback".into()]).is_ok());
+        assert!(validate_native_redirect_uris(&["http://localhost/callback".into()]).is_ok());
+    }
+
+    #[test]
+    fn validate_native_redirect_uris_rejects_plain_http() {
+        assert!(validate_native_redirect_uris(&["http://example.com/callback".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_native_redirect_uris_rejects_forbidden_schemes_and_wildcards() {
+        assert!(validate_native_redirect_uris(&["javascript://alert(1)".into()]).is_err());
+        assert!(validate_native_redirect_uris(&["data:text/html;base64,PHg+".into()]).is_err());
+        assert!(validate_native_redirect_uris(&["file:///etc/passwd".into()]).is_err());
+        assert!(validate_native_redirect_uris(&["io.element.android:/*".into()]).is_err());
     }
 
     #[test]
