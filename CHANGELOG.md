@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Fixed
+
+- Client id resolution self-heals from Hydra. The first native-OIDC
+  Matrix login (SSO-015) failed 311x at the token endpoint with `id
+  mapping not found` for a server-generated client id; resolution now
+  backfills the `id_mappings` row from Hydra (`GET /admin/clients/{id}`)
+  on a miss, so token exchange, refresh, and userinfo work for any client
+  that legitimately exists in Hydra. Unknown clients still get a terminal
+  `401 invalid_client`.
+- Dynamic client registration ties the new client to the authenticating
+  tenant: a registration call carrying a valid bearer token maps the
+  client under the caller's tenant (bearer auth on `/oauth2/register` is
+  now authenticated opportunistically); anonymous registrations stay
+  under the system tenant.
+- The public-route rate limiter is keyed per client_id (Basic auth,
+  query, or form body) with a shared fallback bucket instead of one
+  global bucket. A retry storm from a single client can no longer starve
+  the auth plane — the amplifier that turned the SSO-015 resolution
+  failures into gateway-wide 429s and a Matrix mass sign-out.
+
 ## [2026.07.24] - 2026-07-27
 
 ### Added
