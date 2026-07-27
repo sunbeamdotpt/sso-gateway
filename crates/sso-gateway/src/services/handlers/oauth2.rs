@@ -372,6 +372,26 @@ async fn authorize(
     } else {
         Some(joined)
     };
+    // Guardrail replacing the DCR ceiling that Matrix `*` registrations drop:
+    // a Matrix-shaped authorize request may carry only plain-OIDC scopes and
+    // `urn:matrix:client:`-prefixed scopes, so anonymous DCR clients cannot
+    // consent-phish admin scopes through their `*` registration. Stateless
+    // and client-agnostic; non-Matrix requests are unaffected.
+    if let Some(offending) = params
+        .get("scope")
+        .and_then(|scope| disallowed_matrix_scope(scope))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_scope",
+                "error_description": format!(
+                    "scope '{offending}' is not allowed alongside {MATRIX_CLIENT_SCOPE_PREFIX}* scopes"
+                ),
+            })),
+        )
+            .into_response();
+    }
     let client_id = params.get("client_id").cloned().unwrap_or_default();
     let ory_id = match resolve_public_client_for_authorize(&state, &client_id).await {
         Ok(id) => id,
@@ -650,6 +670,18 @@ async fn register(
             grant_types.push("refresh_token".to_string());
         }
     }
+    // Hydra exact-matches requested scopes against the registered scope (no
+    // wildcards), and Matrix 1.19 clients request a per-login
+    // `urn:matrix:client:device:<id>` scope that can never be pre-registered —
+    // so a Matrix client's registered scope must match everything. The legacy
+    // shared Matrix client uses `*` for the same reason. The authorize
+    // handler's Matrix scope guardrail replaces the ceiling this drops. The
+    // response echoes the effective registered scope, as RFC 7591 expects.
+    let registered_scope = if is_matrix {
+        "*".to_string()
+    } else {
+        scope.join(" ")
+    };
     let token_endpoint_auth_method = body["token_endpoint_auth_method"]
         .as_str()
         .unwrap_or("")
@@ -686,7 +718,7 @@ async fn register(
         "redirect_uris": redirect_uris,
         "grant_types": grant_types.clone(),
         "response_types": if response_types.is_empty() { vec!["code".to_string()] } else { response_types.clone() },
-        "scope": scope.join(" "),
+        "scope": registered_scope.clone(),
         "token_endpoint_auth_method": token_endpoint_auth_method,
     });
 
@@ -736,7 +768,7 @@ async fn register(
         "redirect_uris": redirect_uris,
         "grant_types": grant_types,
         "response_types": response_types,
-        "scope": scope.join(" "),
+        "scope": registered_scope,
         "token_endpoint_auth_method": token_endpoint_auth_method,
     });
     json_response(response)
@@ -918,6 +950,26 @@ async fn introspect(
 /// which identifies Matrix-issued tokens — including per-device DCR clients
 /// that no static client-id list could enumerate.
 const MATRIX_CLIENT_SCOPE_PREFIX: &str = "urn:matrix:client:";
+
+/// Guardrail for Matrix-shaped authorize requests (see `authorize`): when any
+/// requested scope carries the MSC2965 prefix, every requested scope must be
+/// plain-OIDC or Matrix-prefixed. Returns the first offending scope.
+fn disallowed_matrix_scope(scope: &str) -> Option<String> {
+    let scopes: Vec<&str> = scope.split_whitespace().collect();
+    if !scopes
+        .iter()
+        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
+    {
+        return None;
+    }
+    scopes
+        .iter()
+        .find(|s| {
+            !matches!(**s, "openid" | "profile" | "email" | "offline_access")
+                && !s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
+        })
+        .map(|s| s.to_string())
+}
 
 /// Append `offline_access` to an authorize-request scope string when it
 /// carries a Matrix (MSC2965) scope and the feature is enabled. An absent or
@@ -1968,6 +2020,7 @@ mod tests {
         token_calls: Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Option<(String, String)>)>>>,
         device_calls:
             Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>, Option<(String, String)>)>>>,
+        create_calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     #[async_trait]
@@ -2048,8 +2101,9 @@ mod tests {
 
         async fn create_oauth2_client(
             &self,
-            _payload: serde_json::Value,
+            payload: serde_json::Value,
         ) -> Result<serde_json::Value, OryClientError> {
+            self.create_calls.lock().unwrap().push(payload);
             Ok(json!({
                 "client_id": "ory-client-1",
                 "client_secret": "ory-secret-1",
@@ -2629,6 +2683,82 @@ mod tests {
         let calls = hydra.authorize_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].iter().all(|(k, _)| k != "scope"));
+    }
+
+    /// Guardrail: a Matrix-shaped authorize request may not smuggle
+    /// non-OIDC/non-Matrix scopes (e.g. admin scopes) through the client's
+    /// wildcard `*` registration.
+    #[tokio::test]
+    async fn authorize_rejects_admin_scope_alongside_matrix_scope() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:* tenant:admin".to_string(),
+            ),
+        ]);
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"], "invalid_scope");
+        assert!(value["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("tenant:admin"));
+        assert!(
+            hydra.authorize_calls.lock().unwrap().is_empty(),
+            "rejected requests must not reach Hydra"
+        );
+    }
+
+    /// The guardrail does not constrain non-Matrix authorize requests.
+    #[tokio::test]
+    async fn authorize_ignores_admin_scope_without_matrix_scope() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            ("scope".to_string(), "openid tenant:admin".to_string()),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(&"openid tenant:admin".to_string())
+        );
+    }
+
+    /// A fully valid Matrix scope set — including a per-login device scope
+    /// and offline_access — passes the guardrail untouched.
+    #[tokio::test]
+    async fn authorize_passes_valid_matrix_scopes_with_device_and_offline_access() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:* urn:matrix:client:device:TESTDEV offline_access"
+                    .to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(
+                &"openid urn:matrix:client:api:* urn:matrix:client:device:TESTDEV offline_access"
+                    .to_string()
+            )
+        );
     }
 
     #[tokio::test]
@@ -3724,6 +3854,31 @@ mod tests {
         (state, mappings)
     }
 
+    fn register_recording_state() -> (
+        Arc<Oauth2State>,
+        Arc<RecordingHydra>,
+        Arc<RecordingMappingStore>,
+    ) {
+        let hydra = Arc::new(RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        });
+        let mappings = Arc::new(RecordingMappingStore::default());
+        let state = Arc::new(Oauth2State {
+            hydra: hydra.clone(),
+            mappings: mappings.clone(),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
+        });
+        (state, hydra, mappings)
+    }
+
     /// RFC 7591 registration is open: no credentials are required, and the
     /// client mapping is stored under the system tenant.
     #[tokio::test]
@@ -3884,25 +4039,25 @@ mod tests {
         assert_eq!(value["scope"], "openid email offline_access");
     }
 
-    /// MSC2965: Matrix scopes survive the DCR ceiling and, with the feature
-    /// on, the registration gains `offline_access` and the refresh-token
-    /// grant. Non-Matrix scopes are still ceiling-filtered.
+    /// MSC2965: a Matrix-shaped registration is registered in Hydra with
+    /// scope `*` — Hydra exact-matches scopes and per-login
+    /// `urn:matrix:client:device:<id>` scopes can't be pre-registered — and
+    /// the refresh-token grant is added. The response echoes the effective
+    /// registered scope, as RFC 7591 expects. Non-Matrix scopes are still
+    /// ceiling-filtered out of the shape check.
     #[tokio::test]
-    async fn register_matrix_client_preserves_scopes_and_gains_refresh_grant() {
-        let (state, _) = register_state();
+    async fn register_matrix_client_registers_wildcard_scope() {
+        let (state, hydra, _) = register_recording_state();
         let body = json!({
             "client_name": "element-x-device",
             "redirect_uris": ["https://example.com/callback"],
-            "scope": "openid urn:matrix:client:api:* urn:matrix:client:device:ABC tenant:admin",
+            "scope": "openid urn:matrix:client:api:* tenant:admin",
         });
         let resp = register(State(state), None, Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-        assert_eq!(
-            value["scope"],
-            "openid urn:matrix:client:api:* urn:matrix:client:device:ABC offline_access"
-        );
+        assert_eq!(value["scope"], "*");
         let grant_types: Vec<&str> = value["grant_types"]
             .as_array()
             .unwrap()
@@ -3911,13 +4066,24 @@ mod tests {
             .collect();
         assert!(grant_types.contains(&"authorization_code"));
         assert!(grant_types.contains(&"refresh_token"));
+        let creates = hydra.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0]["scope"], "*");
+        let payload_grants: Vec<&str> = creates[0]["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(payload_grants.contains(&"refresh_token"));
     }
 
-    /// With the feature off, Matrix scopes are still preserved but no
-    /// `offline_access` scope or refresh-token grant is added.
+    /// With the offline-access feature off, a Matrix registration still gets
+    /// scope `*` (per-login device scopes can't be pre-registered either way)
+    /// but no refresh-token grant.
     #[tokio::test]
     async fn register_matrix_client_without_offline_access_feature() {
-        let (state, _) = register_state();
+        let (state, hydra, _) = register_recording_state();
         let state = Arc::new(Oauth2State {
             matrix_offline_access_enabled: false,
             ..(*state).clone()
@@ -3931,8 +4097,32 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-        assert_eq!(value["scope"], "openid urn:matrix:client:api:*");
+        assert_eq!(value["scope"], "*");
         assert_eq!(value["grant_types"], json!(["authorization_code"]));
+        let creates = hydra.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0]["scope"], "*");
+        assert_eq!(creates[0]["grant_types"], json!(["authorization_code"]));
+    }
+
+    /// Non-Matrix registrations keep the enumerated scope ceiling; no
+    /// wildcard is registered.
+    #[tokio::test]
+    async fn register_non_matrix_client_keeps_enumerated_scope() {
+        let (state, hydra, _) = register_recording_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "openid tenant:admin email",
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(value["scope"], "openid email");
+        let creates = hydra.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0]["scope"], "openid email");
     }
 
     #[tokio::test]

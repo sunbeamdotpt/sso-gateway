@@ -303,17 +303,20 @@ async fn oauth2_authorize_rejects_unknown_client() {
 const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
 
 /// MSC2965 end-to-end: a Matrix-style DCR client that never requests
-/// `offline_access` still receives a usable refresh token. The gateway
-/// preserves the Matrix scopes and adds the refresh-token grant at DCR time,
-/// and appends `offline_access` to the Matrix-shaped authorize request before
-/// proxying to Hydra, so consent grants it and fosite issues the token.
+/// `offline_access` still receives a usable refresh token, and the per-login
+/// `urn:matrix:client:device:<id>` scope round-trips into the issued token
+/// (zendrite extracts the device id from the granted scope). The gateway
+/// registers Matrix clients with scope `*` (Hydra exact-matches scopes, so
+/// the device scope could never be pre-registered), adds the refresh-token
+/// grant at DCR time, and appends `offline_access` to the Matrix-shaped
+/// authorize request before proxying to Hydra.
 #[tokio::test]
 async fn matrix_dcr_client_receives_usable_refresh_token() {
     let gateway = Gateway::start().await;
 
     // 1. Register a Matrix-style client through public DCR, exactly as
     //    Element X does: openid + a urn:matrix:client: scope, no
-    //    offline_access anywhere.
+    //    offline_access, no device scope (it is per-login).
     let registration: serde_json::Value = gateway
         .http
         .post(format!("{}/oauth2/register", gateway.base_url))
@@ -331,18 +334,9 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         .json()
         .await
         .expect("DCR response should be json");
-    let registered_scope: Vec<&str> = registration["scope"]
-        .as_str()
-        .expect("registered scope")
-        .split_whitespace()
-        .collect();
-    assert!(
-        registered_scope.contains(&"urn:matrix:client:api:*"),
-        "Matrix scope must survive DCR: {registered_scope:?}"
-    );
-    assert!(
-        registered_scope.contains(&"offline_access"),
-        "offline_access must be added at DCR: {registered_scope:?}"
+    assert_eq!(
+        registration["scope"], "*",
+        "Matrix clients must be registered with wildcard scope"
     );
     let registered_grants: Vec<&str> = registration["grant_types"]
         .as_array()
@@ -363,9 +357,10 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         .expect("client_secret")
         .to_string();
 
-    // 2. Run the authorization-code flow requesting only what Element
-    //    requests (no offline_access). Consent grants whatever Hydra
-    //    requested, which includes the gateway-injected offline_access.
+    // 2. Run the authorization-code flow requesting what Element requests at
+    //    login: the api scope plus the per-login device scope (no
+    //    offline_access — the gateway injects it). Consent grants whatever
+    //    Hydra requested.
     let subject = ulid::Ulid::new().to_string();
     let result = gateway
         .authorization_code_flow_for_client(
@@ -376,7 +371,11 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
             &client_id,
             REDIRECT_URI,
             &["code"],
-            &["openid", "urn:matrix:client:api:*"],
+            &[
+                "openid",
+                "urn:matrix:client:api:*",
+                "urn:matrix:client:device:TESTDEV",
+            ],
             None,
             true,
             None,
@@ -386,6 +385,19 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         result.token["access_token"].as_str().is_some_and(|t| !t.is_empty()),
         "token response must contain an access token: {}",
         result.token
+    );
+    // The device scope must round-trip into the granted token scope —
+    // zendrite extracts the device id from it.
+    let token_scope = result.token["scope"].as_str().unwrap_or_default();
+    assert!(
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "urn:matrix:client:device:TESTDEV"),
+        "token scope must carry the device scope: {token_scope}"
+    );
+    assert!(
+        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        "token scope must carry offline_access: {token_scope}"
     );
     let refresh_token = result.token["refresh_token"]
         .as_str()
