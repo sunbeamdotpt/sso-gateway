@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    extract::{Extension, Form, Json, Path, Query, State},
+    extract::{Extension, Form, Json, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -50,6 +51,11 @@ pub trait HydraOperations: Send + Sync + 'static {
     ) -> Result<serde_json::Value, OryClientError>;
     async fn userinfo(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
     async fn introspect_token(&self, token: &str) -> Result<serde_json::Value, OryClientError>;
+    async fn verify_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<bool, OryClientError>;
     async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError>;
     async fn create_oauth2_client(
         &self,
@@ -108,6 +114,15 @@ impl HydraOperations for HydraClient {
         self.introspect_token(token).await
     }
 
+    async fn verify_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<bool, OryClientError> {
+        self.verify_client_credentials(client_id, client_secret)
+            .await
+    }
+
     async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError> {
         self.revoke(form).await
     }
@@ -135,6 +150,8 @@ pub struct Oauth2State {
     pub(crate) mappings: Arc<dyn IdMappingStore>,
     pub(crate) public_base_url: String,
     pub(crate) token_cache: Option<Arc<dyn TokenIntrospectionCache>>,
+    /// Tenant under which publicly registered (RFC 7591) clients are mapped.
+    pub(crate) system_tenant_id: String,
 }
 
 impl Oauth2State {
@@ -144,11 +161,17 @@ impl Oauth2State {
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             public_base_url,
             token_cache: None,
+            system_tenant_id: String::new(),
         }
     }
 
     pub fn with_token_cache(mut self, cache: Arc<dyn TokenIntrospectionCache>) -> Self {
         self.token_cache = Some(cache);
+        self
+    }
+
+    pub fn with_system_tenant_id(mut self, system_tenant_id: String) -> Self {
+        self.system_tenant_id = system_tenant_id;
         self
     }
 }
@@ -169,7 +192,39 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/oauth2/register", post(register))
         .route("/oauth2/introspect", post(introspect))
         .route("/oauth2/revoke", post(revoke))
+        .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(state)
+}
+
+/// Minimal CORS handling for the public OAuth2/OIDC surface.
+///
+/// Browser clients (e.g. Matrix Element) preflight dynamic client
+/// registration and the token endpoints; without an answer the browser kills
+/// the request before it ever reaches Hydra. Hand-rolled to avoid pulling in
+/// tower-http for a single fixed policy.
+async fn cors_middleware(request: Request, next: Next) -> Response {
+    use axum::http::header;
+    if request.method() == axum::http::Method::OPTIONS {
+        return (
+            StatusCode::NO_CONTENT,
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+                (
+                    header::ACCESS_CONTROL_ALLOW_HEADERS,
+                    "authorization, content-type",
+                ),
+                (header::ACCESS_CONTROL_MAX_AGE, "7200"),
+            ],
+        )
+            .into_response();
+    }
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response
 }
 
 fn base_url(public_base_url: &str) -> String {
@@ -199,10 +254,13 @@ async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl Int
         "device_authorization_endpoint": format!("{base}/oauth2/device/auth"),
         "userinfo_endpoint": format!("{base}/oauth2/userinfo"),
         "jwks_uri": format!("{base}/.well-known/jwks.json"),
+        "registration_endpoint": format!("{base}/oauth2/register"),
+        "introspection_endpoint": format!("{base}/oauth2/introspect"),
         "revocation_endpoint": format!("{base}/oauth2/revoke"),
         "response_types_supported": ["code", "token", "id_token", "code token", "code id_token", "token id_token", "code token id_token"],
         "grant_types_supported": ["authorization_code", "implicit", "client_credentials", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
+        "code_challenge_methods_supported": ["S256"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
@@ -457,26 +515,31 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
     json_response(value)
 }
 
+/// Scopes a publicly registered (RFC 7591) client may hold. Registration is
+/// open — there is no way to distinguish e.g. a Matrix client from anyone
+/// else at DCR time — so the ceiling keeps anonymous clients inside the
+/// plain OIDC surface.
+const DCR_ALLOWED_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
 async fn register(
     State(state): State<Arc<Oauth2State>>,
-    Extension(auth): Extension<AuthContext>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if !auth.scopes.iter().any(|s| s == SCOPE_APPLICATION_ADMIN) {
-        return forbidden();
-    }
-
     let redirect_uris = json_string_array(&body["redirect_uris"]);
     let grant_types = json_string_array(&body["grant_types"]);
     let response_types = json_string_array(&body["response_types"]);
-    let scope = body["scope"]
+    let mut scope = body["scope"]
         .as_str()
         .map(|s| {
             s.split_whitespace()
+                .filter(|s| DCR_ALLOWED_SCOPES.contains(s))
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if scope.is_empty() {
+        scope.push("openid".to_string());
+    }
     let token_endpoint_auth_method = body["token_endpoint_auth_method"]
         .as_str()
         .unwrap_or("")
@@ -522,13 +585,13 @@ async fn register(
 
     match state
         .mappings
-        .create(&auth.tenant_id, BACKEND_HYDRA, &public_id, ory_id)
+        .create(&state.system_tenant_id, BACKEND_HYDRA, &public_id, ory_id)
         .await
     {
         Ok(_) => {}
         Err(err) => {
             warn!(
-                tenant_id = %auth.tenant_id,
+                tenant_id = %state.system_tenant_id,
                 public_id = %public_id,
                 "failed to store client mapping: {}",
                 err
@@ -627,25 +690,54 @@ async fn revoke(
 
 async fn introspect(
     State(state): State<Arc<Oauth2State>>,
-    Extension(auth): Extension<AuthContext>,
+    auth: Option<Extension<AuthContext>>,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !auth
-        .scopes
-        .iter()
-        .any(|s| s == SCOPE_TENANT_ADMIN || s == SCOPE_APPLICATION_ADMIN)
-    {
-        return forbidden();
-    }
-
     let token = match form.get("token") {
-        Some(t) => t,
+        Some(t) => t.clone(),
         None => return bad_request("missing token"),
     };
 
-    let mut value = match state.hydra.introspect_token(token).await {
-        Ok(value) => value,
-        Err(err) => return map_ory_error(err, "/oauth2/introspect", None),
+    let mut value = if let Some((client_id, secret)) = basic_auth_credentials(&headers) {
+        // Client-authenticated introspection (RFC 7662). Hydra serves
+        // introspection on its admin port only, so the gateway verifies the
+        // client credentials itself before using the admin endpoint.
+        let ory_id = match resolve_public_client(&state, &client_id).await {
+            Ok(id) => id,
+            Err(err) => return *err,
+        };
+        match state
+            .hydra
+            .verify_client_credentials(&ory_id, &secret)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return invalid_client(),
+            Err(err) => return map_ory_error(err, "/oauth2/introspect", Some(&client_id)),
+        }
+        match state.hydra.introspect_token(&token).await {
+            Ok(value) => value,
+            Err(err) => return map_ory_error(err, "/oauth2/introspect", Some(&client_id)),
+        }
+    } else {
+        // Bearer-authenticated admin introspection keeps using the Hydra
+        // admin endpoint behind a scope check.
+        let Extension(auth) = match auth {
+            Some(auth) => auth,
+            None => return unauthorized(),
+        };
+        if !auth
+            .scopes
+            .iter()
+            .any(|s| s == SCOPE_TENANT_ADMIN || s == SCOPE_APPLICATION_ADMIN)
+        {
+            return forbidden();
+        }
+        match state.hydra.introspect_token(&token).await {
+            Ok(value) => value,
+            Err(err) => return map_ory_error(err, "/oauth2/introspect", None),
+        }
     };
 
     if !value
@@ -780,6 +872,14 @@ fn unauthorized() -> Response<Body> {
         .into_response()
 }
 
+fn invalid_client() -> Response<Body> {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({"error": "invalid_client"})),
+    )
+        .into_response()
+}
+
 fn forbidden() -> Response<Body> {
     (
         StatusCode::FORBIDDEN,
@@ -859,6 +959,7 @@ mod tests {
     use crate::auth::SubjectType;
     use super::*;
     use axum::http::HeaderValue;
+    use tower::ServiceExt;
 
     #[derive(Default)]
     struct StubHydra;
@@ -907,6 +1008,14 @@ mod tests {
             _token: &str,
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!("stub introspect_token not configured")
+        }
+
+        async fn verify_client_credentials(
+            &self,
+            _client_id: &str,
+            _client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            unimplemented!("stub verify_client_credentials not configured")
         }
 
         async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
@@ -1096,6 +1205,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         }
     }
 
@@ -1105,6 +1215,7 @@ mod tests {
             mappings: Arc::new(StubMappingStore::with_ory_by_public_id(ory_result)),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         }
     }
 
@@ -1478,6 +1589,14 @@ mod tests {
             Ok(self.response.clone())
         }
 
+        async fn verify_client_credentials(
+            &self,
+            _client_id: &str,
+            client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            Ok(client_secret == "secret")
+        }
+
         async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
             Ok(())
         }
@@ -1578,6 +1697,14 @@ mod tests {
             Ok(self.response.clone())
         }
 
+        async fn verify_client_credentials(
+            &self,
+            _client_id: &str,
+            client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            Ok(client_secret == "secret")
+        }
+
         async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
             Ok(())
         }
@@ -1618,6 +1745,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         }
     }
 
@@ -1697,6 +1825,16 @@ mod tests {
             self.inner.introspect_token(token).await
         }
 
+        async fn verify_client_credentials(
+            &self,
+            client_id: &str,
+            client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            self.inner
+                .verify_client_credentials(client_id, client_secret)
+                .await
+        }
+
         async fn revoke(&self, form: Vec<(String, String)>) -> Result<(), OryClientError> {
             self.inner.revoke(form).await
         }
@@ -1739,6 +1877,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         }
     }
 
@@ -2025,6 +2164,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         (state, hydra)
     }
@@ -2136,6 +2276,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -2234,7 +2375,24 @@ mod tests {
                 .unwrap()
                 .contains(&json!("code"))
         );
-        assert!(value.get("introspection_endpoint").is_none());
+        assert_eq!(
+            value["registration_endpoint"],
+            "https://gateway.example.com/oauth2/register"
+        );
+        assert_eq!(
+            value["introspection_endpoint"],
+            "https://gateway.example.com/oauth2/introspect"
+        );
+        assert_eq!(
+            value["code_challenge_methods_supported"],
+            json!(["S256"])
+        );
+        assert!(
+            value["token_endpoint_auth_methods_supported"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("none"))
+        );
     }
 
     fn hydra_err() -> OryClientError {
@@ -2294,6 +2452,14 @@ mod tests {
             Err(hydra_err())
         }
 
+        async fn verify_client_credentials(
+            &self,
+            _client_id: &str,
+            _client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            Err(hydra_err())
+        }
+
         async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
             Err(hydra_err())
         }
@@ -2329,6 +2495,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         }
     }
 
@@ -2407,6 +2574,13 @@ mod tests {
         assert!(client.token(vec![], None).await.is_err());
         assert!(client.device("auth", vec![], None).await.is_err());
         assert!(client.userinfo("token").await.is_err());
+        assert!(client.introspect_token("token").await.is_err());
+        assert!(
+            client
+                .verify_client_credentials("id", "secret")
+                .await
+                .is_err()
+        );
         assert!(client.revoke(vec![]).await.is_err());
         assert!(
             client
@@ -2452,7 +2626,7 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Extension(auth), Form(form))
+        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2480,6 +2654,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2491,7 +2666,7 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Extension(auth), Form(form))
+        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2520,6 +2695,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2531,7 +2707,7 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Extension(auth), Form(form))
+        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2564,6 +2740,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2575,7 +2752,7 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Extension(auth), Form(form))
+        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2585,6 +2762,146 @@ mod tests {
         assert_eq!(value["sub"], "gateway-public-1");
         assert_eq!(value["client_id"], "gateway-public-1");
         assert_eq!(value["tenant_id"], "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn introspect_succeeds_with_client_basic_credentials() {
+        let hydra = Arc::new(AlwaysOkHydra {
+            response: json!({
+                "active": true,
+                "sub": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+        });
+        let state = Arc::new(Oauth2State {
+            hydra,
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "tenant-1".to_string(),
+                ))))),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "hydra-client-id-1".to_string(),
+                ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["active"], true);
+        assert_eq!(value["tenant_id"], "tenant-1");
+        assert_eq!(value["sub"], "gateway-public-1");
+    }
+
+    #[tokio::test]
+    async fn introspect_rejects_wrong_client_secret() {
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(AlwaysOkHydra {
+                response: json!({"active": true, "sub": "hydra-client-id-1"}),
+            }),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "hydra-client-id-1".to_string(),
+                ))))),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(None)),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "wrong-secret"),
+        );
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+    }
+
+    #[tokio::test]
+    async fn introspect_rejects_unknown_client_basic_credentials() {
+        let state = Arc::new(resolve_state(Ok(None)));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("unknown-client", "secret"));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+    }
+
+    #[tokio::test]
+    async fn introspect_returns_unauthorized_without_any_credentials() {
+        let state = Arc::new(ok_state(None));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, HeaderMap::new(), Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_returns_204_with_headers() {
+        let (state, _) = register_state();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::options("/oauth2/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let headers = resp.headers();
+        assert_eq!(headers[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            headers[axum::http::header::ACCESS_CONTROL_ALLOW_METHODS],
+            "GET, POST, OPTIONS"
+        );
+        assert_eq!(
+            headers[axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization, content-type"
+        );
+        assert_eq!(headers[axum::http::header::ACCESS_CONTROL_MAX_AGE], "7200");
+    }
+
+    #[tokio::test]
+    async fn cors_adds_allow_origin_to_regular_responses() {
+        let (state, _) = register_state();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -2662,68 +2979,25 @@ mod tests {
         }
     }
 
-    fn register_state() -> Arc<Oauth2State> {
-        Arc::new(Oauth2State {
+    fn register_state() -> (Arc<Oauth2State>, Arc<RecordingMappingStore>) {
+        let mappings = Arc::new(RecordingMappingStore::default());
+        let state = Arc::new(Oauth2State {
             hydra: Arc::new(AlwaysOkHydra {
                 response: json!({"status": "ok"}),
             }),
-            mappings: Arc::new(RecordingMappingStore::default()),
+            mappings: mappings.clone(),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
-        })
-    }
-
-    fn register_auth(scopes: Vec<String>) -> AuthContext {
-        AuthContext {
-            tenant_id: "tenant-1".into(),
-            subject: "admin".into(),
-            subject_type: SubjectType::User,
-            actor: None,
-            scopes,
-            token_hash: "hash".into(),
-            authentication_methods: vec![],
-        }
-    }
-
-    #[tokio::test]
-    async fn register_returns_forbidden_without_application_admin_scope() {
-        let state = register_state();
-        let body = json!({
-            "client_name": "test-client",
-            "redirect_uris": ["https://example.com/callback"],
+            system_tenant_id: "system-tenant-1".to_string(),
         });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec!["tenant:read".into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        (state, mappings)
     }
 
+    /// RFC 7591 registration is open: no credentials are required, and the
+    /// client mapping is stored under the system tenant.
     #[tokio::test]
-    async fn register_returns_bad_request_for_invalid_redirect_uri() {
-        let state = register_state();
-        let body = json!({
-            "client_name": "test-client",
-            "redirect_uris": ["not-a-url"],
-        });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body_str = body_to_string(resp).await;
-        assert!(body_str.contains("invalid_request"));
-    }
-
-    #[tokio::test]
-    async fn register_creates_client_and_mapping() {
-        let state = register_state();
+    async fn register_succeeds_without_credentials_and_maps_under_system_tenant() {
+        let (state, mappings) = register_state();
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
@@ -2732,13 +3006,7 @@ mod tests {
             "scope": "openid profile",
             "token_endpoint_auth_method": "client_secret_basic",
         });
-        let resp = register(
-            State(state.clone()),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
+        let resp = register(State(state), Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -2746,6 +3014,57 @@ mod tests {
         assert_eq!(value["client_secret"], "ory-secret-1");
         assert_eq!(value["client_secret_expires_at"], 0);
         assert_eq!(value["scope"], "openid profile");
+
+        let created = mappings.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "system-tenant-1");
+        assert_eq!(created[0].1, "hydra");
+        assert_eq!(created[0].3, "ory-client-1");
+    }
+
+    #[tokio::test]
+    async fn register_returns_bad_request_for_invalid_redirect_uri() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["not-a-url"],
+        });
+        let resp = register(State(state), Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_str = body_to_string(resp).await;
+        assert!(body_str.contains("invalid_request"));
+    }
+
+    /// Public registration enforces a scope ceiling: anything outside the
+    /// plain OIDC surface is dropped.
+    #[tokio::test]
+    async fn register_drops_scopes_outside_the_dcr_ceiling() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "openid tenant:admin email offline_access bogus:scope",
+        });
+        let resp = register(State(state), Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(value["scope"], "openid email offline_access");
+    }
+
+    #[tokio::test]
+    async fn register_defaults_scope_to_openid_when_ceiling_empties_it() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "tenant:admin",
+        });
+        let resp = register(State(state), Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(value["scope"], "openid");
     }
 
     #[tokio::test]
@@ -2755,36 +3074,25 @@ mod tests {
             mappings: Arc::new(RecordingMappingStore::default()),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
+        let resp = register(State(state), Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn register_returns_bad_request_for_invalid_token_endpoint_auth_method() {
-        let state = register_state();
+        let (state, _) = register_state();
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
             "token_endpoint_auth_method": "invalid_method",
         });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
+        let resp = register(State(state), Json(body)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -2833,6 +3141,13 @@ mod tests {
         ) -> Result<serde_json::Value, OryClientError> {
             unimplemented!()
         }
+        async fn verify_client_credentials(
+            &self,
+            _client_id: &str,
+            _client_secret: &str,
+        ) -> Result<bool, OryClientError> {
+            unimplemented!()
+        }
         async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
             unimplemented!()
         }
@@ -2857,18 +3172,15 @@ mod tests {
             mappings: Arc::new(RecordingMappingStore::default()),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
+        let resp = register(State(state), Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -2940,18 +3252,15 @@ mod tests {
             mappings: Arc::new(FailingCreateMappingStore),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(
-            State(state),
-            Extension(register_auth(vec![SCOPE_APPLICATION_ADMIN.into()])),
-            Json(body),
-        )
-        .await
-        .into_response();
+        let resp = register(State(state), Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -2998,6 +3307,13 @@ mod tests {
             ) -> Result<serde_json::Value, OryClientError> {
                 unimplemented!()
             }
+            async fn verify_client_credentials(
+                &self,
+                _client_id: &str,
+                _client_secret: &str,
+            ) -> Result<bool, OryClientError> {
+                unimplemented!()
+            }
             async fn revoke(&self, _form: Vec<(String, String)>) -> Result<(), OryClientError> {
                 unimplemented!()
             }
@@ -3027,6 +3343,7 @@ mod tests {
             }),
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

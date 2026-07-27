@@ -377,6 +377,53 @@ impl HydraClient {
         handle_response(response).await
     }
 
+    /// Verify a client's credentials against Hydra's public `/oauth2/token`
+    /// endpoint.
+    ///
+    /// Hydra serves token introspection on its admin API only and never
+    /// returns the plaintext secret from `GET /admin/clients/{id}`, so there
+    /// is no direct credential check. This piggybacks on the token endpoint's
+    /// authentication order instead: a deliberately ungrantable
+    /// `client_credentials` request is answered 401 `invalid_client` when the
+    /// credentials are wrong, and 400 `invalid_scope` when they are right —
+    /// no token is issued either way.
+    #[instrument(skip(self, client_secret), fields(public_url = %self.public_url))]
+    pub async fn verify_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<bool, OryClientError> {
+        let url = self
+            .public_url
+            .join("oauth2/token")
+            .map_err(OryClientError::Url)?;
+        debug!(%url, "verifying client credentials");
+        let form = [
+            ("grant_type", "client_credentials"),
+            ("scope", "urn:sso-gateway:credential-check"),
+        ];
+        let response = self
+            .client
+            .post(url)
+            .form(&form)
+            .header("accept", "application/json")
+            .basic_auth(client_id, Some(client_secret))
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        match response.status().as_u16() {
+            401 => Ok(false),
+            // 400 invalid_scope proves authentication succeeded; 200 would
+            // mean a client was actually granted the sentinel scope, which
+            // also proves the credentials.
+            400 | 200 => Ok(true),
+            status => Err(OryClientError::Ory {
+                status,
+                message: response.text().await.unwrap_or_default(),
+            }),
+        }
+    }
+
     /// Call Hydra's public `/userinfo` endpoint.
     #[instrument(skip(self))]
     pub async fn userinfo(&self, token: &str) -> Result<Value, OryClientError> {

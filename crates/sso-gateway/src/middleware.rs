@@ -93,6 +93,10 @@ fn is_public_path(path: &str) -> bool {
         "/oauth2/auth" | "/oauth2/token" | "/oauth2/revoke" | "/oauth2/userinfo" | "/userinfo" => {
             true
         }
+        // RFC 7591 dynamic client registration is open (with a scope ceiling
+        // enforced by the handler); introspection authenticates either with
+        // client credentials (handled inside) or an opportunistic bearer.
+        "/oauth2/register" | "/oauth2/introspect" => true,
         "/saml/metadata" | "/saml/acs" | "/saml/sso" => true,
         "/callbacks/oidc" | "/callbacks/oauth2" => true,
         "/scim/v2/ServiceProviderConfig" | "/scim/v2/ResourceTypes" | "/scim/v2/Schemas" => true,
@@ -125,7 +129,15 @@ pub async fn auth_middleware(
     let is_browser_path = self_service_paths
         .as_ref()
         .is_some_and(|Extension(paths)| paths.is_browser_path(path));
-    if is_public_path(path) || is_browser_path {
+    if is_browser_path {
+        return next.run(request).await;
+    }
+    // Public paths are reachable anonymously (their handlers do protocol-level
+    // authentication), but a presented Bearer token is still authenticated:
+    // admin/bearer flows share routes with the anonymous ones (e.g. OAuth2
+    // introspection), and an invalid token must reject rather than fall
+    // through as anonymous.
+    if is_public_path(path) && bearer_token(request.headers()).is_none() {
         return next.run(request).await;
     }
 
@@ -656,6 +668,8 @@ mod tests {
             .route("/ctx", get(ctx_handler))
             .route("/.well-known/openid-configuration", get(ok_handler))
             .route("/oauth2/auth", get(ok_handler))
+            .route("/oauth2/register", get(ok_handler))
+            .route("/oauth2/introspect", get(ctx_handler))
             .layer(from_fn(auth_middleware))
             .layer(Extension(introspector))
             .layer(Extension(SessionTokenSigner::new(
@@ -681,7 +695,8 @@ mod tests {
         assert!(is_public_path("/oauth2/token"));
         assert!(is_public_path("/oauth2/device/auth"));
         assert!(is_public_path("/oauth2/revoke"));
-        assert!(!is_public_path("/oauth2/introspect"));
+        assert!(is_public_path("/oauth2/register"));
+        assert!(is_public_path("/oauth2/introspect"));
         assert!(is_public_path("/oauth2/userinfo"));
         assert!(is_public_path("/userinfo"));
         assert!(is_public_path("/saml/metadata"));
@@ -761,6 +776,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_register_path_bypasses_auth_when_anonymous() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            no_mappings(),
+        );
+        let response = router
+            .oneshot(Request::get("/oauth2/register").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A Bearer token on a public path is authenticated opportunistically: a
+    /// valid token authenticates and the handler sees the AuthContext.
+    #[tokio::test]
+    async fn public_path_with_valid_bearer_authenticates_opportunistically() {
+        let router = test_router(
+            active_introspector("hydra-client-1"),
+            hydra_mappings("tenant-1"),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/introspect")
+                    .header("Authorization", "Bearer some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "pub-sub-1|client|");
+    }
+
+    /// An invalid Bearer token on a public path rejects instead of falling
+    /// through as an anonymous request.
+    #[tokio::test]
+    async fn public_path_with_invalid_bearer_rejects() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(None))),
+            no_mappings(),
+        );
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/introspect")
+                    .header("Authorization", "Bearer bad-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

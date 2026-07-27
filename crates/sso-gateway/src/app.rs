@@ -393,11 +393,14 @@ pub async fn build_app_with_upstream(
         config.kratos_default_schema_id.clone(),
     ));
 
-    let oauth_state = Arc::new(Oauth2State::new(
-        hydra.clone(),
-        oauth_mappings,
-        config.public_base_url.clone(),
-    ));
+    let oauth_state = Arc::new(
+        Oauth2State::new(
+            hydra.clone(),
+            oauth_mappings,
+            config.public_base_url.clone(),
+        )
+        .with_system_tenant_id(config.system_tenant_ulid.clone()),
+    );
     let self_service_state = Arc::new(SelfServiceState::new(
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),

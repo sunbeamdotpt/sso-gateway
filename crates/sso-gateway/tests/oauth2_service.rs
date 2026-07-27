@@ -460,3 +460,240 @@ async fn oauth2_missing_client_id_is_rejected() {
     let _ = shutdown_tx.send(());
     handle.await.expect("server task should finish");
 }
+
+/// SSO-013: RFC 7591 dynamic client registration is public (Matrix Element
+/// registers anonymously), the CORS preflight never dies in the auth
+/// middleware, and a registered client can introspect with its own
+/// client_secret_basic credentials.
+#[tokio::test]
+async fn oauth2_dynamic_client_registration_is_public() {
+    let (_pg, database_url) = support::start_postgres()
+        .await
+        .expect("postgres should start");
+
+    let (listener, addr) = bind_random_port("127.0.0.1")
+        .await
+        .expect("random port should bind");
+    let base = format!("http://{addr}");
+
+    let (_hydra, hydra_admin_url, hydra_public_url) = support::start_hydra_with_issuer(&base)
+        .await
+        .expect("hydra should start");
+
+    let pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+
+    let system_tenant_ulid = ulid::Ulid::new().to_string();
+    bootstrap_system_tenant(&pool, &system_tenant_ulid)
+        .await
+        .expect("system tenant should bootstrap");
+    support::bootstrap_test_subject_mapping(&pool, &system_tenant_ulid).await;
+
+    let hydra = Arc::new(
+        HydraClient::new(&hydra_admin_url, &hydra_public_url).expect("hydra client should build"),
+    );
+    let mappings = IdMappingRepo::new(pool.clone());
+
+    let oauth_state = Arc::new(
+        Oauth2State::new(hydra, mappings.clone(), base.clone())
+            .with_system_tenant_id(system_tenant_ulid.clone()),
+    );
+
+    let connect_router: ConnectRouter = ConnectRouter::new();
+    let service_router = ServiceRouter::from_router(connect_router);
+
+    let server = ServerBuilder::new()
+        .with_router(service_router)
+        .with_health(HealthRouter::new())
+        .build_axum()
+        .expect("server should build");
+
+    let kratos = Arc::new(
+        KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
+            .expect("fake kratos client should build"),
+    );
+
+    let app = server
+        .app()
+        .merge(oauth2_router(oauth_state))
+        .layer(from_fn(auth_middleware))
+        .layer(Extension(SessionTokenSigner::new(
+            "test-secret-that-is-at-least-32-bytes-long",
+            3600,
+            "https://gateway.example.com",
+        )))
+        .layer(Extension(support::test_introspector()))
+        .layer(Extension(support::test_session_store()))
+        .layer(Extension(kratos))
+        .layer(Extension(
+            Arc::new(mappings.clone()) as Arc<dyn IdMappingStore>
+        ));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server should run");
+    });
+
+    let client = reqwest::Client::new();
+
+    // The browser preflight must not hit the auth middleware.
+    let preflight_resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/oauth2/register"),
+        )
+        .header("origin", "https://app.element.io")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .expect("preflight request should complete");
+    assert_eq!(
+        preflight_resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "OPTIONS preflight must return 204"
+    );
+    assert_eq!(
+        preflight_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    assert_eq!(
+        preflight_resp
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok()),
+        Some("GET, POST, OPTIONS")
+    );
+
+    // Unauthenticated DCR succeeds; out-of-ceiling scopes are dropped.
+    let register_resp = client
+        .post(format!("{base}/oauth2/register"))
+        .json(&json!({
+            "client_name": "element-web",
+            "redirect_uris": ["https://app.element.io/callback"],
+            "grant_types": ["client_credentials"],
+            "response_types": ["token"],
+            "scope": "openid offline_access tenant:admin",
+            "token_endpoint_auth_method": "client_secret_basic"
+        }))
+        .send()
+        .await
+        .expect("register request should complete");
+    assert_eq!(
+        register_resp.status(),
+        reqwest::StatusCode::OK,
+        "public DCR failed: {}",
+        register_resp.text().await.unwrap_or_default()
+    );
+    let registered: serde_json::Value = register_resp
+        .json()
+        .await
+        .expect("register response should be json");
+    let client_id = registered["client_id"]
+        .as_str()
+        .expect("client_id should exist")
+        .to_string();
+    let client_secret = registered["client_secret"]
+        .as_str()
+        .expect("client_secret should exist")
+        .to_string();
+    assert_eq!(registered["scope"], "openid offline_access");
+
+    // The discovery document advertises registration and PKCE.
+    let discovery_resp = client
+        .get(format!("{base}/.well-known/openid-configuration"))
+        .send()
+        .await
+        .expect("discovery request should succeed");
+    let discovery: serde_json::Value = discovery_resp
+        .json()
+        .await
+        .expect("discovery should be json");
+    assert_eq!(
+        discovery["registration_endpoint"],
+        format!("{base}/oauth2/register")
+    );
+    assert_eq!(
+        discovery["introspection_endpoint"],
+        format!("{base}/oauth2/introspect")
+    );
+    assert_eq!(
+        discovery["code_challenge_methods_supported"],
+        json!(["S256"])
+    );
+
+    // The registered client can get a token with the honored scopes.
+    let token_resp = client
+        .post(format!("{base}/oauth2/token"))
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[("grant_type", "client_credentials"), ("scope", "openid")])
+        .send()
+        .await
+        .expect("token request should complete");
+    assert_eq!(
+        token_resp.status(),
+        reqwest::StatusCode::OK,
+        "token request failed: {}",
+        token_resp.text().await.unwrap_or_default()
+    );
+    let token: serde_json::Value = token_resp.json().await.expect("token should be json");
+    let access_token = token["access_token"]
+        .as_str()
+        .expect("access_token should exist");
+
+    // ... and introspect it with its own client_secret_basic credentials,
+    // no bearer token involved.
+    let introspect_resp = client
+        .post(format!("{base}/oauth2/introspect"))
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[("token", access_token)])
+        .send()
+        .await
+        .expect("introspect request should complete");
+    assert_eq!(
+        introspect_resp.status(),
+        reqwest::StatusCode::OK,
+        "client-basic introspect failed: {}",
+        introspect_resp.text().await.unwrap_or_default()
+    );
+    let introspect: serde_json::Value = introspect_resp
+        .json()
+        .await
+        .expect("introspect should be json");
+    assert_eq!(introspect["active"], true);
+    assert_eq!(
+        introspect["tenant_id"].as_str(),
+        Some(system_tenant_ulid.as_str()),
+        "client-basic introspection must resolve the system tenant"
+    );
+    assert_eq!(
+        introspect["client_id"].as_str(),
+        Some(client_id.as_str()),
+        "client_id must be translated back to the public ULID"
+    );
+
+    // Bad client credentials are rejected by Hydra and relayed as 401.
+    let bad_auth_resp = client
+        .post(format!("{base}/oauth2/introspect"))
+        .basic_auth(&client_id, Some("wrong-secret"))
+        .form(&[("token", access_token)])
+        .send()
+        .await
+        .expect("bad-auth introspect request should complete");
+    assert_eq!(
+        bad_auth_resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "bad client secret must yield 401"
+    );
+
+    let _ = shutdown_tx.send(());
+    handle.await.expect("server task should finish");
+}
