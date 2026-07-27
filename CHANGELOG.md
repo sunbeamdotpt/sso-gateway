@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Fixed
+
+- The SSO-018 wildcard registration now fires for real Element clients.
+  Element Web/Desktop sends no `urn:matrix:client:*` scopes in its DCR
+  request, so the registration-time Matrix discriminator never matched
+  and authorize still failed with `invalid_scope`. The authorize handler
+  now self-heals: when a request carries a Matrix scope and the client's
+  registered scope doesn't cover the effective request, the gateway
+  expands the client to scope `*` in Hydra (plus the `refresh_token`
+  grant when `ENABLE_MATRIX_OFFLINE_ACCESS` is on). A conformance test
+  reproduces the exact production Element shape — DCR with scope
+  `openid` only — through the full flow. (SSO-018)
+
 ## [2026.07.27] - 2026-07-27
 
 ### Fixed
