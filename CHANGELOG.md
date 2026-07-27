@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Added
+
+- `ENABLE_MATRIX_OFFLINE_ACCESS` config option (default `true`): Matrix
+  sessions now outlive the 1h access-token TTL. The authorize proxy
+  appends `offline_access` to the requested scope when the request
+  carries a `urn:matrix:client:*` scope (MSC2965 clients never request it
+  themselves), and Matrix-shaped DCR registrations keep their
+  `urn:matrix:*` scopes and gain `offline_access` plus the
+  `refresh_token` grant. The DCR half is load-bearing: Hydra enforces the
+  registered-scope ceiling at authorize time (proven by a new conformance
+  test). Note that Matrix clients registered before this change lack the
+  scopes in their registered ceiling and must re-register — Element does
+  this per device on login. (SSO-016)
+
+### Fixed
+
+- Dynamic client registration accepts RFC 8252 custom-scheme redirect
+  URIs (`io.element.android:/`) for public clients
+  (`token_endpoint_auth_method: none`), unblocking Element X Android
+  native login. Confidential clients keep the https-only web rules.
+  (SSO-017)
+
 ## [2026.07.25] - 2026-07-27
 
 ### Fixed
