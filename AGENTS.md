@@ -93,3 +93,17 @@ consistency) must stay reachable through the gateway API.
 - Keep docs in `docs/` so the sunbeam docs-server discovers them.
 - Root-level `.md` files other than `README.md` are ignored by the docs-server.
 - Use YAML frontmatter with at least `title` and `description`.
+
+## Releases
+
+- CalVer `YYYY.M.N`, where `N` is a **release counter within the month**,
+  not the day of the month: `2026.7.23` is the 23rd release of July 2026,
+  whenever in the month it ships. Check the latest tag (`git tag`) and
+  increment the counter; do not derive it from the date.
+- Cargo version in the workspace `Cargo.toml` is unpadded (`2026.7.23`);
+  git tags are zero-padded (`v2026.07.23`).
+- Cutting a release: add the `CHANGELOG.md` section (Keep a Changelog,
+  dated with the actual ship date), bump the workspace `Cargo.toml`
+  version, commit as `chore(release): bump version to <Y.M.N>`, tag
+  `v<YYYY.MM.N>`. Pushing the tag triggers `.github/workflows/release.yml`,
+  which builds and pushes the multi-arch GHCR image.

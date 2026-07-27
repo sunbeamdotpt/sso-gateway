@@ -5342,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "sso-gateway"
-version = "2026.7.22"
+version = "2026.7.23"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -5393,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "sso-openfga-client"
-version = "2026.7.22"
+version = "2026.7.23"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -5407,7 +5407,7 @@ dependencies = [
 
 [[package]]
 name = "sso-ory-client"
-version = "2026.7.22"
+version = "2026.7.23"
 dependencies = [
  "axum",
  "rand 0.8.6",

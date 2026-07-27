@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.23] - 2026-07-27
+
+### Added
+
+- Public dynamic client registration (RFC 7591). `POST /oauth2/register`
+  is no longer admin-gated: unauthenticated clients can self-register with
+  a scope ceiling (`openid`, `profile`, `email`, `offline_access`) and new
+  clients are mapped under the system tenant. The oauth2 router answers
+  CORS preflights and emits `Access-Control-Allow-Origin` on responses,
+  and `POST /oauth2/introspect` additionally accepts `client_secret_basic`
+  from registered clients. The discovery document now advertises
+  `registration_endpoint`, `introspection_endpoint`,
+  `code_challenge_methods_supported: ["S256"]`, and the `none` token
+  endpoint auth method. This unblocks Matrix MSC2965 native OIDC login
+  (Element Web/Desktop), which requires unauthenticated DCR, CORS
+  preflight support, and PKCE. (SSO-013)
+
+- `ENABLE_DYNAMIC_CLIENT_REGISTRATION` config option (default `true`) to
+  opt out of public DCR. When disabled, `POST /oauth2/register` returns
+  `403 access_denied` before touching Hydra and the discovery document
+  omits `registration_endpoint`.
+
+- `identity_id` id_token claim bridging the two identity ID spaces.
+  id_token `sub` remains the backend (Kratos) identity UUID; consent
+  accept now injects the iam identity ULID as an `identity_id` claim, so
+  services can join the signed-in OIDC user to iam.v1 identity records
+  without an out-of-band email lookup. Caller-supplied values win;
+  unmapped subjects proceed without the claim. The claim mapping
+  (id_token `sub` vs `identity_id` vs userinfo `sub`) is documented in
+  the API reference. (SSO-011)
+
+- `FORCE_EMAIL_CLAIM_CLIENT_IDS` config option (comma-separated public
+  client ULIDs). For listed clients, consent accept force-includes the
+  subject's base-identity email claim in the id_token session regardless
+  of the requested scope — a deliberate per-client exception to
+  spec-correct scope gating, needed because Matrix MSC2965 clients never
+  request the `email` scope and the homeserver derives user localparts
+  from email. (SSO-014)
+
+### Testing
+
+- Strict id_token well-formedness assertions across the conformance and
+  grant-type suites (whitespace-free, strict-base64url segments,
+  plausible RSA signature length), including on refresh_token grant
+  responses. Added while investigating a production report of a
+  newline-corrupted id_token (SSO-010) — traced to the expected ~683-char
+  signature segment of the 4096-bit RSA signing keys plus client-side
+  capture artifacts, not gateway corruption; the token path is a verified
+  verbatim passthrough.
+
 ## [2026.07.22] - 2026-07-24
 
 ### Fixed
