@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Fixed
+
+- Matrix email claims now travel the channel zendrite actually reads. The
+  2026.07.23 consent-time id_token injection (SSO-014) never reached the
+  homeserver: zendrite validates via `/oauth2/introspect` (userinfo
+  fallback) and Hydra's userinfo scope-filters claims. Active
+  introspection responses now carry a top-level `email` field, resolved
+  from Kratos via the raw subject, when the token's client is listed in
+  `FORCE_EMAIL_CLAIM_CLIENT_IDS` (raw or translated id) or the token
+  carries a `urn:matrix:client:*` scope — the MSC2965 signal, which also
+  covers per-device DCR-registered Element clients that a static client
+  list cannot match. Lookup failures never fail the introspection.
+  (SSO-014)
+
 ## [2026.07.23] - 2026-07-27
 
 ### Added
