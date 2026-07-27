@@ -22,9 +22,9 @@ use crate::proto::iam::v1::{
 };
 
 use super::oauth2_consent_mapper::{
-    accept_consent_request_to_json, accept_logout_request_to_json, ory_consent_request_to_proto,
-    ory_consent_response_to_proto, ory_logout_request_to_proto, ory_logout_response_to_proto,
-    reject_consent_request_to_json, reject_logout_request_to_json,
+    accept_consent_request_to_json, accept_logout_request_to_json, inject_identity_id_claim,
+    ory_consent_request_to_proto, ory_consent_response_to_proto, ory_logout_request_to_proto,
+    ory_logout_response_to_proto, reject_consent_request_to_json, reject_logout_request_to_json,
 };
 
 const BACKEND_HYDRA: &str = "hydra";
@@ -386,6 +386,31 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
             ServiceError::Unauthenticated("missing authentication context".into())
         })?;
         let is_tenant_admin = auth.scopes.iter().any(|s| s == SCOPE_TENANT_ADMIN);
+        // Resolve the public identity id for the id_token `identity_id` claim
+        // without backfilling. This must run before `public_subject`, which
+        // mints a mapping for unmapped subjects; an unmapped subject never
+        // fails consent — the claim is skipped with a warning and userinfo
+        // stays the documented fallback.
+        let identity_claim = if consent.subject.is_empty() {
+            None
+        } else {
+            match self
+                .mappings
+                .get_public_id(&tenant_id, BACKEND_KRATOS, &consent.subject)
+                .await
+            {
+                Ok(public_id) => Some(public_id),
+                Err(DbError::MappingNotFound) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        subject = %consent.subject,
+                        "consent subject has no identity mapping; id_token issued without identity_id claim"
+                    );
+                    None
+                }
+                Err(err) => return Err(map_db_error(err).into()),
+            }
+        };
         let public_subject = self.public_subject(&tenant_id, &consent.subject).await?;
         if auth.subject != public_subject && !is_tenant_admin {
             return Err(ServiceError::PermissionDenied(
@@ -394,7 +419,13 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
             .into());
         }
 
-        let body = accept_consent_request_to_json(&req);
+        let mut body = accept_consent_request_to_json(&req);
+        // Stamp the public iam identity id into the id_token claims so callers
+        // can join the signed-in user to iam records; `sub` stays the backend
+        // identity UUID. A caller-supplied `identity_id` wins.
+        if let Some(identity_id) = &identity_claim {
+            inject_identity_id_claim(&mut body, identity_id);
+        }
         let value = self
             .hydra
             .accept_consent_request(&ory_challenge, body)
@@ -550,6 +581,7 @@ mod tests {
     struct MockConsentHydra {
         results: Arc<Mutex<VecDeque<Result<Value, OryClientError>>>>,
         calls: Arc<Mutex<Vec<Call>>>,
+        accept_bodies: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockConsentHydra {
@@ -568,6 +600,10 @@ mod tests {
         fn take_calls(&self) -> Vec<Call> {
             std::mem::take(&mut *self.calls.lock().unwrap())
         }
+
+        fn take_accept_bodies(&self) -> Vec<Value> {
+            std::mem::take(&mut *self.accept_bodies.lock().unwrap())
+        }
     }
 
     #[async_trait::async_trait]
@@ -583,12 +619,13 @@ mod tests {
         async fn accept_consent_request(
             &self,
             challenge: &str,
-            _body: Value,
+            body: Value,
         ) -> Result<Value, OryClientError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(Call::AcceptConsent(challenge.to_string()));
+            self.accept_bodies.lock().unwrap().push(body);
             self.take_result()
         }
 
@@ -1172,6 +1209,124 @@ mod tests {
             calls.as_slice(),
             [Call::GetConsent(_), Call::AcceptConsent(c)] if c == "consent-challenge-2"
         ));
+    }
+
+    #[tokio::test]
+    async fn accept_consent_injects_identity_id_claim() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["identity_id"],
+            "subject-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_preserves_caller_supplied_identity_id() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        let session: buffa_types::google::protobuf::Struct = serde_json::from_value(json!({
+            "id_token": { "identity_id": "caller-supplied", "email": "a@example.com" }
+        }))
+        .unwrap();
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                session: session.into(),
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["identity_id"],
+            "caller-supplied"
+        );
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["email"],
+            "a@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_succeeds_for_unmapped_subject() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-unmapped-subject",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let svc = service(mock.clone());
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        // An unmapped subject must not fail consent; the claim is skipped
+        // (with a warning) and userinfo stays the fallback.
+        let ctx = {
+            let mut ctx = auth_context(&[SCOPE_TENANT_ADMIN]);
+            let existing = ctx.extensions().get::<AuthContext>().unwrap().clone();
+            ctx.extensions_mut().insert(AuthContext {
+                subject: "subject-1".into(),
+                ..existing
+            });
+            ctx
+        };
+        svc.accept_consent(ctx, req).await.unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].pointer("/session/id_token/identity_id").is_none(),
+            "no identity_id claim for unmapped subject: {}",
+            bodies[0]
+        );
     }
 
     #[tokio::test]

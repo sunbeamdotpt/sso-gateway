@@ -222,3 +222,27 @@ OAuth 2.0 Device Authorization Grant (RFC 8628) over Connect-RPC.
 | `/scim/v2/Schemas` | SCIM schemas | Public |
 | `/scim/v2/Users` | SCIM user provisioning | Bearer token |
 | `/scim/v2/Groups` | SCIM group provisioning | Bearer token |
+
+## Token claims and iam identity mapping
+
+Gateway-owned identity ids are ULIDs (the `id` fields on `iam.v1` identity
+records), while the OIDC `sub` claim minted by the backend authorization
+server is the backend identity UUID. The two representations of the signed-in
+user surface as follows:
+
+- **id_token `sub`** — backend identity UUID (unchanged from the backend).
+- **id_token `identity_id`** — iam identity ULID. The gateway injects this
+  claim into the `session.id_token` claims when a consent request is accepted
+  via `AcceptConsent`, so it is present on id_tokens issued through the
+  consent flow (including the device authorization flow, which completes
+  through consent). A caller-supplied `identity_id` in the accept session is
+  preserved. If the subject has no gateway identity mapping the claim is
+  omitted (a warning is logged) and consent still succeeds — use userinfo as
+  the fallback in that case.
+- **`GET /oauth2/userinfo` `sub`** — iam identity ULID (the gateway rewrites
+  `sub` to the public identity id).
+
+Clients that need to join the signed-in OIDC user to `iam.v1` identity
+records should use the `identity_id` claim, or fall back to userinfo `sub`
+when the token was not issued through consent. Do not join on the id_token
+`sub` claim.

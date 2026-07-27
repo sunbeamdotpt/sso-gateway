@@ -113,6 +113,35 @@ pub fn accept_consent_request_to_json(req: &AcceptConsentRequest) -> Value {
     Value::Object(body)
 }
 
+/// Inject the gateway's public identity id as an `identity_id` claim into the
+/// accept body's `session.id_token` claims. Hydra's id_token `sub` is the
+/// backend identity UUID; the extra claim lets callers join the signed-in OIDC
+/// user to iam identity records without an out-of-band email lookup. A
+/// caller-supplied `identity_id` wins; an empty subject injects nothing.
+pub fn inject_identity_id_claim(body: &mut Value, public_subject: &str) {
+    if public_subject.is_empty() {
+        return;
+    }
+    let Some(body_obj) = body.as_object_mut() else {
+        return;
+    };
+    let session = body_obj
+        .entry("session")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(session_obj) = session.as_object_mut() else {
+        return;
+    };
+    let id_token = session_obj
+        .entry("id_token")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(claims) = id_token.as_object_mut() else {
+        return;
+    };
+    claims
+        .entry("identity_id")
+        .or_insert_with(|| Value::String(public_subject.to_string()));
+}
+
 pub fn reject_consent_request_to_json(req: &RejectConsentRequest) -> Value {
     let mut body = Map::new();
     if !req.error.is_empty() {
@@ -261,6 +290,48 @@ mod tests {
         assert_eq!(value["grant_access_token_audience"], json![["aud"]]);
         assert_eq!(value["remember"], true);
         assert_eq!(value["remember_for"], 3600);
+    }
+
+    #[test]
+    fn inject_identity_id_claim_creates_session_when_absent() {
+        let mut body = json!({ "grant_scope": ["openid"] });
+        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        assert_eq!(
+            body["session"]["id_token"]["identity_id"],
+            "01KWF0KYZ0FRNR23ZXAWJZV43T"
+        );
+    }
+
+    #[test]
+    fn inject_identity_id_claim_merges_into_existing_claims() {
+        let mut body = json!({
+            "session": { "id_token": { "email": "a@example.com" } }
+        });
+        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        assert_eq!(
+            body["session"]["id_token"]["identity_id"],
+            "01KWF0KYZ0FRNR23ZXAWJZV43T"
+        );
+        assert_eq!(body["session"]["id_token"]["email"], "a@example.com");
+    }
+
+    #[test]
+    fn inject_identity_id_claim_preserves_caller_supplied_value() {
+        let mut body = json!({
+            "session": { "id_token": { "identity_id": "caller-supplied" } }
+        });
+        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        assert_eq!(
+            body["session"]["id_token"]["identity_id"],
+            "caller-supplied"
+        );
+    }
+
+    #[test]
+    fn inject_identity_id_claim_skips_empty_subject() {
+        let mut body = json!({ "grant_scope": ["openid"] });
+        inject_identity_id_claim(&mut body, "");
+        assert!(body.get("session").is_none());
     }
 
     #[test]
