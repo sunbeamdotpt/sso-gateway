@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Fixed
+
+- Native Matrix login no longer dies at authorize with `invalid_scope`.
+  Hydra exact-matches requested scopes against the registered scope, and
+  the Matrix 1.19 per-login `urn:matrix:client:device:<id>` scope can
+  never be pre-registered — but zendrite reads the device ID from the
+  token's granted scope, so it must round-trip. Matrix-shaped DCR
+  registrations now get scope `*` in Hydra (the legacy shared client's
+  approach), and the authorize handler rejects requests that mix
+  `urn:matrix:client:*` scopes with anything outside
+  openid/profile/email/offline_access, replacing the ceiling the wildcard
+  drops. Matrix clients registered before this change must re-register
+  (Element does so per device on login). (SSO-018)
+
 ## [2026.07.26] - 2026-07-27
 
 ### Added
