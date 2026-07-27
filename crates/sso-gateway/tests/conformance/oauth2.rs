@@ -506,3 +506,113 @@ async fn hydra_authorize_enforces_registered_scope_ceiling() {
 
     gateway.shutdown().await;
 }
+
+/// The REAL Element Web/Desktop shape (SSO-018 prod evidence): the DCR
+/// request carries NO Matrix scopes, so the client registers as plain
+/// `openid` and the registration-time wildcard rule never fires. The
+/// authorize-time self-heal must expand the client to scope `*` (plus the
+/// refresh-token grant) when the first Matrix-shaped authorize arrives.
+#[tokio::test]
+async fn matrix_dcr_client_without_matrix_scopes_self_heals() {
+    let gateway = Gateway::start().await;
+
+    // 1. Register exactly like Element Web/Desktop: openid only.
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "element-web",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid",
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    assert_eq!(registration["scope"], "openid");
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+    let client_secret = registration["client_secret"]
+        .as_str()
+        .expect("client_secret")
+        .to_string();
+
+    // 2. Run the full flow with the Matrix 1.19 login scopes. Without the
+    //    self-heal this dies at authorize with invalid_scope (see
+    //    hydra_authorize_enforces_registered_scope_ceiling).
+    let subject = ulid::Ulid::new().to_string();
+    let result = gateway
+        .authorization_code_flow_for_client(
+            &subject,
+            &client_id,
+            &client_secret,
+            &client_id,
+            REDIRECT_URI,
+            &["code"],
+            &[
+                "openid",
+                "urn:matrix:client:api:*",
+                "urn:matrix:client:device:TESTDEV",
+            ],
+            None,
+            true,
+            None,
+        )
+        .await;
+    let token_scope = result.token["scope"].as_str().unwrap_or_default();
+    assert!(
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "urn:matrix:client:device:TESTDEV"),
+        "token scope must carry the device scope: {token_scope}"
+    );
+    assert!(
+        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        "token scope must carry offline_access: {token_scope}"
+    );
+    let refresh_token = result.token["refresh_token"]
+        .as_str()
+        .expect("self-healed Matrix flow must yield a refresh token");
+    assert!(!refresh_token.is_empty());
+
+    // 3. The heal persisted: the Hydra client now has scope `*` and the
+    //    refresh-token grant.
+    let healed: serde_json::Value = gateway
+        .http
+        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .send()
+        .await
+        .expect("hydra client fetch should succeed")
+        .json()
+        .await
+        .expect("hydra client should be json");
+    assert_eq!(healed["scope"], "*");
+    let healed_grants: Vec<&str> = healed["grant_types"]
+        .as_array()
+        .expect("grant_types")
+        .iter()
+        .map(|v| v.as_str().expect("grant type should be a string"))
+        .collect();
+    assert!(
+        healed_grants.contains(&"refresh_token"),
+        "healed client must hold the refresh_token grant: {healed_grants:?}"
+    );
+
+    // 4. And the refresh grant works end to end.
+    let refreshed = gateway
+        .refresh_token_flow(refresh_token, &client_id, &client_secret)
+        .await;
+    assert!(
+        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "refresh grant must return a new access token: {refreshed}"
+    );
+
+    gateway.shutdown().await;
+}

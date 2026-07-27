@@ -63,6 +63,18 @@ pub trait HydraOperations: Send + Sync + 'static {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, OryClientError>;
     async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
+    /// Full-replacement client update (Hydra PUT). Only used by the
+    /// authorize-time Matrix scope self-heal, which treats any failure as
+    /// warn-and-proceed, so stubs may keep the default.
+    async fn update_oauth2_client(
+        &self,
+        _id: &str,
+        _payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError> {
+        Err(OryClientError::InvalidResponse(
+            "update_oauth2_client not supported".into(),
+        ))
+    }
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError>;
     fn public_url(&self) -> &reqwest::Url;
 }
@@ -138,6 +150,14 @@ impl HydraOperations for HydraClient {
 
     async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
         self.get_oauth2_client(id).await
+    }
+
+    async fn update_oauth2_client(
+        &self,
+        id: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OryClientError> {
+        self.update_oauth2_client(id, payload).await
     }
 
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -398,6 +418,21 @@ async fn authorize(
         Err(err) => return *err,
     };
 
+    // Self-heal Matrix clients whose registration predates the wildcard DCR
+    // rule (e.g. Element Web/Desktop, whose DCR request carries no Matrix
+    // scopes at all) before the scope is checked by Hydra. Coverage is
+    // measured against the effective scope, including the offline_access
+    // appended below.
+    let scope = params.get("scope").cloned().unwrap_or_default();
+    let effective_scope = with_matrix_offline_access(&state, &scope);
+    let requested: Vec<&str> = effective_scope.split_whitespace().collect();
+    if requested
+        .iter()
+        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
+    {
+        maybe_expand_matrix_client_scope(&state, &ory_id, &requested).await;
+    }
+
     let query = params
         .into_iter()
         .map(|(k, v)| {
@@ -410,7 +445,7 @@ async fn authorize(
                 // Matrix-shaped authorize request gets `offline_access`
                 // appended here, making the scope legitimately requested so
                 // consent grants it naturally and Hydra issues a refresh token.
-                (k, with_matrix_offline_access(&state, &v))
+                (k, effective_scope.clone())
             } else {
                 (k, v)
             }
@@ -969,6 +1004,73 @@ fn disallowed_matrix_scope(scope: &str) -> Option<String> {
                 && !s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
         })
         .map(|s| s.to_string())
+}
+
+/// Self-heal for Matrix (MSC2965) clients whose Hydra registration predates
+/// the wildcard DCR rule — notably Element Web/Desktop, whose DCR request
+/// carries no `urn:matrix:client:` scopes, so the client registered as plain
+/// `openid` and every Matrix-shaped authorize dies with `invalid_scope`
+/// (Hydra exact-matches scopes). When the registered scope does not cover the
+/// requested set, the client is expanded to scope `*` (same as the legacy
+/// shared Matrix client and the DCR-time rule) and, when offline access is
+/// enabled, gains the `refresh_token` grant — those clients registered with
+/// only `authorization_code`, and fosite checks grants separately at the
+/// token endpoint. Hydra's client PUT is full-replacement, so the update
+/// merges against the fetched client. Every failure is warn-and-proceed:
+/// Hydra's `invalid_scope` is the same failure the request had without the
+/// heal. Already-covering clients (e.g. scope `*`) skip the write entirely.
+async fn maybe_expand_matrix_client_scope(
+    state: &Oauth2State,
+    ory_id: &str,
+    requested_scopes: &[&str],
+) {
+    let client = match state.hydra.get_oauth2_client(ory_id).await {
+        Ok(client) => client,
+        Err(err) => {
+            // Includes the raw pass-through case from
+            // resolve_public_client_for_authorize, where the client may not
+            // exist in Hydra at all.
+            warn!(
+                client_id = %ory_id,
+                "matrix scope self-heal: failed to fetch client; proxying unhealed: {err}"
+            );
+            return;
+        }
+    };
+    let registered: Vec<&str> = client["scope"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    let covered = registered.contains(&"*")
+        || requested_scopes.iter().all(|s| registered.contains(s));
+    if covered {
+        return;
+    }
+
+    let mut payload = client.clone();
+    payload["scope"] = json!("*");
+    if state.matrix_offline_access_enabled {
+        let mut grant_types: Vec<String> = client["grant_types"]
+            .as_array()
+            .map(|grants| {
+                grants
+                    .iter()
+                    .filter_map(|g| g.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !grant_types.iter().any(|g| g == "refresh_token") {
+            grant_types.push("refresh_token".to_string());
+            payload["grant_types"] = json!(grant_types);
+        }
+    }
+    if let Err(err) = state.hydra.update_oauth2_client(ory_id, payload).await {
+        warn!(
+            client_id = %ory_id,
+            "matrix scope self-heal: failed to expand client; proxying unhealed: {err}"
+        );
+    }
 }
 
 /// Append `offline_access` to an authorize-request scope string when it
@@ -2021,6 +2123,9 @@ mod tests {
         device_calls:
             Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>, Option<(String, String)>)>>>,
         create_calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        get_client_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        update_calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        fail_update: bool,
     }
 
     #[async_trait]
@@ -2112,9 +2217,28 @@ mod tests {
 
         async fn get_oauth2_client(
             &self,
-            _id: &str,
+            id: &str,
         ) -> Result<serde_json::Value, OryClientError> {
+            self.get_client_calls.lock().unwrap().push(id.to_string());
             Ok(self.response.clone())
+        }
+
+        async fn update_oauth2_client(
+            &self,
+            id: &str,
+            payload: serde_json::Value,
+        ) -> Result<serde_json::Value, OryClientError> {
+            self.update_calls
+                .lock()
+                .unwrap()
+                .push((id.to_string(), payload.clone()));
+            if self.fail_update {
+                return Err(OryClientError::Ory {
+                    status: 500,
+                    message: "update failed".into(),
+                });
+            }
+            Ok(payload)
         }
 
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -2557,8 +2681,14 @@ mod tests {
     }
 
     fn recording_state() -> (Arc<Oauth2State>, Arc<RecordingHydra>) {
+        recording_state_with_response(json!({"status": "ok"}))
+    }
+
+    fn recording_state_with_response(
+        response: serde_json::Value,
+    ) -> (Arc<Oauth2State>, Arc<RecordingHydra>) {
         let hydra = Arc::new(RecordingHydra {
-            response: json!({"status": "ok"}),
+            response,
             ..Default::default()
         });
         let state = Arc::new(Oauth2State {
@@ -2759,6 +2889,143 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    fn under_scoped_matrix_client() -> serde_json::Value {
+        json!({
+            "client_id": "hydra-client-id-1",
+            "client_name": "element-web",
+            "scope": "openid",
+            "grant_types": ["authorization_code"],
+        })
+    }
+
+    /// Self-heal: a client registered as plain `openid` (the real Element
+    /// Web/Desktop DCR shape) is expanded to scope `*` and gains the
+    /// refresh-token grant before the request is proxied.
+    #[tokio::test]
+    async fn authorize_expands_under_scoped_matrix_client() {
+        let (state, hydra) = recording_state_with_response(under_scoped_matrix_client());
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:* urn:matrix:client:device:TESTDEV".to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let updates = hydra.update_calls.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, "hydra-client-id-1");
+        assert_eq!(updates[0].1["scope"], "*");
+        // The update merges against the fetched client (Hydra PUT is
+        // full-replacement): existing fields and grants are preserved.
+        assert_eq!(updates[0].1["client_name"], "element-web");
+        let grants: Vec<&str> = updates[0].1["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(grants.contains(&"authorization_code"));
+        assert!(grants.contains(&"refresh_token"));
+        assert_eq!(hydra.authorize_calls.lock().unwrap().len(), 1);
+    }
+
+    /// A client whose registered scope already covers the request (wildcard)
+    /// is not rewritten — no write on the hot path.
+    #[tokio::test]
+    async fn authorize_skips_expand_when_client_scope_covers() {
+        let (state, hydra) = recording_state_with_response(json!({
+            "client_id": "hydra-client-id-1",
+            "scope": "*",
+            "grant_types": ["authorization_code", "refresh_token"],
+        }));
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:*".to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(hydra.get_client_calls.lock().unwrap().len(), 1);
+        assert!(hydra.update_calls.lock().unwrap().is_empty());
+        assert_eq!(hydra.authorize_calls.lock().unwrap().len(), 1);
+    }
+
+    /// A failing update never blocks the request: Hydra's own invalid_scope
+    /// is the same failure the request had without the heal.
+    #[tokio::test]
+    async fn authorize_expand_failure_still_proxies() {
+        let (state, hydra) = recording_state_with_response(under_scoped_matrix_client());
+        let hydra = Arc::new(RecordingHydra {
+            fail_update: true,
+            ..(*hydra).clone()
+        });
+        let state = Arc::new(Oauth2State {
+            hydra: hydra.clone(),
+            ..(*state).clone()
+        });
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:*".to_string(),
+            ),
+        ]);
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hydra.update_calls.lock().unwrap().len(), 1);
+        assert_eq!(hydra.authorize_calls.lock().unwrap().len(), 1);
+    }
+
+    /// With offline access disabled the scope still expands to `*`, but the
+    /// grant list is left untouched.
+    #[tokio::test]
+    async fn authorize_expand_omits_refresh_grant_when_offline_access_disabled() {
+        let (state, hydra) = recording_state_with_response(under_scoped_matrix_client());
+        let state = Arc::new(Oauth2State {
+            matrix_offline_access_enabled: false,
+            ..(*state).clone()
+        });
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:*".to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let updates = hydra.update_calls.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1["scope"], "*");
+        assert_eq!(updates[0].1["grant_types"], json!(["authorization_code"]));
+    }
+
+    /// Non-Matrix authorize requests never fetch the client — the hot path
+    /// is unchanged.
+    #[tokio::test]
+    async fn authorize_non_matrix_does_not_fetch_client() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            ("scope".to_string(), "openid profile".to_string()),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert!(hydra.get_client_calls.lock().unwrap().is_empty());
+        assert!(hydra.update_calls.lock().unwrap().is_empty());
+        assert_eq!(hydra.authorize_calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
