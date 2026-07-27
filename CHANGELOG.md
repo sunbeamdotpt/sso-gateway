@@ -7,6 +7,12 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ## [Unreleased]
 
+### Added
+
+- `ENABLE_MATRIX_EMAIL_CLAIM` config option (default `true`) gating the
+  MSC2965 scope-based introspection email injection, independent of
+  `FORCE_EMAIL_CLAIM_CLIENT_IDS`. (SSO-014)
+
 ### Fixed
 
 - Matrix email claims now travel the channel zendrite actually reads. The
@@ -15,11 +21,11 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   fallback) and Hydra's userinfo scope-filters claims. Active
   introspection responses now carry a top-level `email` field, resolved
   from Kratos via the raw subject, when the token's client is listed in
-  `FORCE_EMAIL_CLAIM_CLIENT_IDS` (raw or translated id) or the token
-  carries a `urn:matrix:client:*` scope — the MSC2965 signal, which also
-  covers per-device DCR-registered Element clients that a static client
-  list cannot match. Lookup failures never fail the introspection.
-  (SSO-014)
+  `FORCE_EMAIL_CLAIM_CLIENT_IDS` (raw or translated id) or — gated by
+  `ENABLE_MATRIX_EMAIL_CLAIM` — the token carries a
+  `urn:matrix:client:*` scope, which covers per-device DCR-registered
+  Element clients that a static client list cannot match. Lookup failures
+  never fail the introspection. (SSO-014)
 
 ## [2026.07.23] - 2026-07-27
 
