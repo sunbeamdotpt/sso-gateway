@@ -388,6 +388,49 @@ fn assert_token_response(token: &serde_json::Value, expect_id_token: bool) {
     }
 }
 
+/// Assert the id_token is a well-formed compact JWS: no whitespace, exactly
+/// three non-empty strict-base64url segments, and an RSA-sized signature.
+/// Guards against regressions where the gateway token passthrough introduces
+/// whitespace or otherwise corrupts the Hydra-issued token.
+///
+/// The harness parses the token response as JSON, so this checks the parsed
+/// string value; because serde_json would have unescaped any `\n`/`\t`
+/// escapes into literal characters, the whitespace check below catches
+/// corruption present either literally or escaped in the raw response.
+fn assert_id_token_well_formed(id_token: &str) {
+    assert!(!id_token.is_empty(), "id_token must not be empty");
+    assert!(
+        !id_token.chars().any(char::is_whitespace),
+        "id_token must not contain whitespace: {id_token:?}"
+    );
+    assert!(
+        id_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+        "id_token must match /^[A-Za-z0-9_\\-\\.]+$/: {id_token:?}"
+    );
+
+    let parts: Vec<&str> = id_token.split('.').collect();
+    assert_eq!(parts.len(), 3, "id_token must be a JWT with three segments");
+    for (idx, part) in parts.iter().enumerate() {
+        assert!(!part.is_empty(), "id_token segment {idx} must not be empty");
+        // URL_SAFE_NO_PAD rejects padding, whitespace, and any character
+        // outside the base64url alphabet.
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap_or_else(|e| panic!("id_token segment {idx} must be strict base64url: {e}"));
+    }
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .expect("id_token signature should be base64url encoded");
+    assert!(
+        matches!(signature.len(), 256 | 512),
+        "id_token signature must be a plausible RSA size (256 or 512 bytes), got {} bytes",
+        signature.len()
+    );
+}
+
 fn assert_id_token(
     gateway: &Gateway,
     id_token: &str,
@@ -395,6 +438,7 @@ fn assert_id_token(
     ory_client_id: &str,
     expected_nonce: Option<&str>,
 ) {
+    assert_id_token_well_formed(id_token);
     let claims = decode_jwt_payload(id_token);
 
     assert_eq!(
