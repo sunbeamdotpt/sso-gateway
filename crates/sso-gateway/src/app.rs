@@ -402,7 +402,9 @@ pub async fn build_app_with_upstream(
             config.public_base_url.clone(),
         )
         .with_system_tenant_id(config.system_tenant_ulid.clone())
-        .with_dynamic_client_registration_enabled(config.dynamic_client_registration_enabled),
+        .with_dynamic_client_registration_enabled(config.dynamic_client_registration_enabled)
+        .with_kratos(kratos.clone())
+        .with_force_email_claim_client_ids(config.force_email_claim_client_ids.clone()),
     );
     let self_service_state = Arc::new(SelfServiceState::new(
         config.kratos_public_url.clone(),

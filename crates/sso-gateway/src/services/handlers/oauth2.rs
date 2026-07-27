@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::json;
-use sso_ory_client::{error::OryClientError, hydra::HydraClient};
+use sso_ory_client::{error::OryClientError, hydra::HydraClient, kratos::KratosClient};
 use tracing::{instrument, warn};
 use ulid::Ulid;
 
@@ -143,6 +143,22 @@ impl HydraOperations for HydraClient {
     }
 }
 
+/// Kratos operations used by the public OAuth2/OIDC handlers.
+///
+/// Separate from the consent service's `ConsentKratos` seam: introspection
+/// only needs identity traits for the Matrix email injection.
+#[async_trait]
+pub trait IntrospectKratos: Send + Sync + 'static {
+    async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError>;
+}
+
+#[async_trait]
+impl IntrospectKratos for KratosClient {
+    async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+        self.get_identity(id).await
+    }
+}
+
 /// State shared by the OAuth2/OIDC HTTP handlers.
 #[derive(Clone)]
 pub struct Oauth2State {
@@ -154,6 +170,10 @@ pub struct Oauth2State {
     pub(crate) system_tenant_id: String,
     /// Whether public dynamic client registration (RFC 7591) is enabled.
     pub(crate) dynamic_client_registration_enabled: bool,
+    /// Kratos access for the introspection email injection (Matrix).
+    pub(crate) kratos: Option<Arc<dyn IntrospectKratos>>,
+    /// Clients whose introspection responses always carry the user's email.
+    pub(crate) force_email_claim_client_ids: Vec<String>,
 }
 
 impl Oauth2State {
@@ -165,6 +185,8 @@ impl Oauth2State {
             token_cache: None,
             system_tenant_id: String::new(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -180,6 +202,16 @@ impl Oauth2State {
 
     pub fn with_dynamic_client_registration_enabled(mut self, enabled: bool) -> Self {
         self.dynamic_client_registration_enabled = enabled;
+        self
+    }
+
+    pub fn with_kratos(mut self, kratos: Arc<KratosClient>) -> Self {
+        self.kratos = Some(kratos as Arc<dyn IntrospectKratos>);
+        self
+    }
+
+    pub fn with_force_email_claim_client_ids(mut self, client_ids: Vec<String>) -> Self {
+        self.force_email_claim_client_ids = client_ids;
         self
     }
 }
@@ -776,6 +808,12 @@ async fn introspect(
 
     match resolve_tenant_from_subject(state.mappings.as_ref(), &subject).await {
         Ok(tenant_id) => {
+            // Capture the raw Hydra client_id before translation: the email
+            // force-list match accepts both the raw and the public form.
+            let raw_client_id = value
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("tenant_id".to_string(), json!(tenant_id));
                 if let Some(public_id) = translate_ory_id_to_public_id(&state, &subject).await {
@@ -787,6 +825,8 @@ async fn introspect(
                     obj.insert("client_id".to_string(), json!(public_id));
                 }
             }
+            maybe_inject_introspection_email(&state, &subject, raw_client_id.as_deref(), &mut value)
+                .await;
             json_response(value)
         }
         Err(crate::auth::AuthError::UnknownSubject) => {
@@ -798,6 +838,74 @@ async fn introspect(
             internal_error()
         }
     }
+}
+
+/// MSC2965 Matrix client scope family. Matrix OIDC tokens always carry a
+/// `urn:matrix:client:`-prefixed scope (e.g. `urn:matrix:client:api:*`),
+/// which identifies Matrix-issued tokens — including per-device DCR clients
+/// that no static client-id list could enumerate.
+const MATRIX_CLIENT_SCOPE_PREFIX: &str = "urn:matrix:client:";
+
+/// Inject the user's email into an active introspection response.
+///
+/// Matrix homeservers (zendrite) never read the id_token; they validate
+/// tokens through this introspection response, so the email must ride here.
+/// Injection happens for Matrix-shaped tokens (MSC2965 scope family) and for
+/// clients on the configured force list, matched against both the raw Hydra
+/// client id and its translated public ULID. Failures never fail the
+/// introspection: a machine-client subject (no Kratos identity), a Kratos
+/// error, or a missing `traits.email` all yield the response without the
+/// claim.
+async fn maybe_inject_introspection_email(
+    state: &Oauth2State,
+    raw_sub: &str,
+    raw_client_id: Option<&str>,
+    value: &mut serde_json::Value,
+) {
+    let Some(kratos) = &state.kratos else {
+        return;
+    };
+    let scope = value
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let is_matrix_token = scope
+        .split_whitespace()
+        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
+    let translated_client_id = value.get("client_id").and_then(|v| v.as_str());
+    let is_force_listed = state.force_email_claim_client_ids.iter().any(|id| {
+        Some(id.as_str()) == raw_client_id || Some(id.as_str()) == translated_client_id
+    });
+    if !is_matrix_token && !is_force_listed {
+        return;
+    }
+    match kratos.get_identity(raw_sub).await {
+        Ok(identity) => match identity_email(&identity) {
+            Some(email) => {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("email".to_string(), json!(email));
+                }
+            }
+            None => tracing::debug!(
+                subject = %raw_sub,
+                "introspected subject has no email trait; response returned without it"
+            ),
+        },
+        Err(err) => warn!(
+            subject = %raw_sub,
+            "failed to fetch identity for introspection email injection; response returned without it: {err}"
+        ),
+    }
+}
+
+/// Extract the base identity email from a Kratos identity payload. Email is
+/// the Kratos identifier, so it always lives in `traits.email`.
+fn identity_email(identity: &serde_json::Value) -> Option<String> {
+    identity
+        .get("traits")?
+        .get("email")?
+        .as_str()
+        .map(str::to_string)
 }
 
 async fn resolve_public_client(
@@ -1228,6 +1336,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -1239,6 +1349,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -1770,6 +1882,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -1903,6 +2017,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -2191,6 +2307,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         (state, hydra)
     }
@@ -2304,6 +2422,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -2524,6 +2644,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         }
     }
 
@@ -2684,6 +2806,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2726,6 +2850,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2772,6 +2898,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2821,6 +2949,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
@@ -2853,6 +2983,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2890,6 +3022,196 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[derive(Clone, Default)]
+    struct StubKratos {
+        result: Arc<std::sync::Mutex<Option<Result<serde_json::Value, OryClientError>>>>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl StubKratos {
+        fn with_identity(identity: serde_json::Value) -> Self {
+            Self {
+                result: Arc::new(std::sync::Mutex::new(Some(Ok(identity)))),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                result: Arc::new(std::sync::Mutex::new(Some(Err(hydra_err())))),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IntrospectKratos for StubKratos {
+        async fn get_identity(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
+            self.calls.lock().unwrap().push(id.to_string());
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(OryClientError::MissingTenant))
+        }
+    }
+
+    fn introspect_email_state(
+        hydra_response: serde_json::Value,
+        kratos: StubKratos,
+        force_ids: Vec<String>,
+    ) -> Arc<Oauth2State> {
+        Arc::new(Oauth2State {
+            hydra: Arc::new(AlwaysOkHydra {
+                response: hydra_response,
+            }),
+            mappings: Arc::new(StubMappingStore {
+                tenant_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "tenant-1".to_string(),
+                ))))),
+                ory_by_public_id: Arc::new(std::sync::Mutex::new(None)),
+                public_id_by_ory_id: Arc::new(std::sync::Mutex::new(Some(Ok(Some(
+                    "gateway-public-1".to_string(),
+                ))))),
+            }),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
+            kratos: Some(Arc::new(kratos)),
+            force_email_claim_client_ids: force_ids,
+        })
+    }
+
+    fn admin_auth() -> AuthContext {
+        AuthContext {
+            tenant_id: "tenant-1".into(),
+            subject: "admin".into(),
+            subject_type: SubjectType::User,
+            actor: None,
+            scopes: vec![SCOPE_TENANT_ADMIN.into()],
+            token_hash: "hash".into(),
+            authentication_methods: vec![],
+        }
+    }
+
+    async fn introspect_admin(state: Arc<Oauth2State>) -> serde_json::Value {
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(
+            State(state),
+            Some(Extension(admin_auth())),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn introspect_injects_email_for_force_listed_raw_client_id() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let calls = kratos.calls.clone();
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+            kratos,
+            vec!["hydra-client-id-1".to_string()],
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["active"], true);
+        assert_eq!(value["email"], "m@example.com");
+        assert_eq!(*calls.lock().unwrap(), vec!["kratos-identity-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn introspect_injects_email_for_force_listed_public_client_id() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid",
+            }),
+            kratos,
+            vec!["gateway-public-1".to_string()],
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["email"], "m@example.com");
+    }
+
+    #[tokio::test]
+    async fn introspect_injects_email_for_matrix_scope_without_config() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid urn:matrix:client:api:*",
+            }),
+            kratos,
+            Vec::new(),
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["email"], "m@example.com");
+    }
+
+    #[tokio::test]
+    async fn introspect_skips_email_for_non_matching_token() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let calls = kratos.calls.clone();
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid profile",
+            }),
+            kratos,
+            Vec::new(),
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["active"], true);
+        assert!(value.get("email").is_none());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn introspect_returns_active_response_when_kratos_fails() {
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid urn:matrix:client:api:*",
+            }),
+            StubKratos::failing(),
+            Vec::new(),
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["active"], true);
+        assert_eq!(value["tenant_id"], "tenant-1");
+        assert!(value.get("email").is_none());
+    }
+
+    #[tokio::test]
+    async fn introspect_inactive_response_is_not_touched() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let calls = kratos.calls.clone();
+        let state = introspect_email_state(json!({"active": false}), kratos, Vec::new());
+        let value = introspect_admin(state).await;
+        assert_eq!(value, json!({"active": false}));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3023,6 +3345,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         (state, mappings)
     }
@@ -3150,6 +3474,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let body = json!({
             "client_name": "test-client",
@@ -3249,6 +3575,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let body = json!({
             "client_name": "test-client",
@@ -3330,6 +3658,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let body = json!({
             "client_name": "test-client",
@@ -3422,6 +3752,8 @@ mod tests {
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
             dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
