@@ -133,11 +133,16 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
     // Public paths are reachable anonymously (their handlers do protocol-level
-    // authentication), but a presented Bearer token is still authenticated:
-    // admin/bearer flows share routes with the anonymous ones (e.g. OAuth2
-    // introspection), and an invalid token must reject rather than fall
-    // through as anonymous.
-    if is_public_path(path) && bearer_token(request.headers()).is_none() {
+    // authentication). OAuth2 introspection is the one public path that also
+    // serves bearer-authenticated admin callers, so a presented Bearer token
+    // is authenticated there and an invalid one rejects rather than falling
+    // through as anonymous. On every other public path the bearer token is
+    // the protocol credential itself (e.g. userinfo) and must reach the
+    // handler untouched — middleware subject resolution would reject valid
+    // tokens whose subjects have no gateway mapping.
+    if is_public_path(path)
+        && (path != "/oauth2/introspect" || bearer_token(request.headers()).is_none())
+    {
         return next.run(request).await;
     }
 
@@ -833,6 +838,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// On every other public path the bearer token is the protocol
+    /// credential itself (e.g. userinfo) and must reach the handler
+    /// untouched — even when its subject has no gateway mapping, which the
+    /// middleware's subject resolution would otherwise reject with a 401.
+    #[tokio::test]
+    async fn public_path_with_unmapped_bearer_passes_through() {
+        let router = test_router(active_introspector("unmapped-subject"), no_mappings());
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/auth")
+                    .header("Authorization", "Bearer protocol-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
