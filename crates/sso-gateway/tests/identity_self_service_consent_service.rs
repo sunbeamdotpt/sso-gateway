@@ -556,8 +556,10 @@ async fn self_service_and_consent_round_trip() {
     ));
     let consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),
+        kratos.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        Vec::new(),
     ));
 
     let connect_router: ConnectRouter = self_service.register(ConnectRouter::new());

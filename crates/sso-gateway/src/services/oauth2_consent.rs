@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use serde_json::Value;
-use sso_ory_client::{error::OryClientError, hydra::HydraClient};
+use sso_ory_client::{error::OryClientError, hydra::HydraClient, kratos::KratosClient};
 use sunbeam_g2v::error::ServiceError;
 use tracing::instrument;
 use ulid::Ulid;
@@ -22,7 +22,7 @@ use crate::proto::iam::v1::{
 };
 
 use super::oauth2_consent_mapper::{
-    accept_consent_request_to_json, accept_logout_request_to_json, inject_identity_id_claim,
+    accept_consent_request_to_json, accept_logout_request_to_json, inject_id_token_claim,
     ory_consent_request_to_proto, ory_consent_response_to_proto, ory_logout_request_to_proto,
     ory_logout_response_to_proto, reject_consent_request_to_json, reject_logout_request_to_json,
 };
@@ -111,23 +111,42 @@ impl ConsentHydra for HydraClient {
     }
 }
 
+/// Kratos operations used by the OAuth2 consent service.
+#[async_trait]
+pub trait ConsentKratos: Send + Sync {
+    async fn get_identity(&self, id: &str) -> Result<Value, OryClientError>;
+}
+
+#[async_trait]
+impl ConsentKratos for KratosClient {
+    async fn get_identity(&self, id: &str) -> Result<Value, OryClientError> {
+        self.get_identity(id).await
+    }
+}
+
 #[derive(Clone)]
 pub struct OAuth2ConsentServiceImpl {
     hydra: Arc<dyn ConsentHydra>,
+    kratos: Arc<dyn ConsentKratos>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
+    force_email_claim_client_ids: Vec<String>,
 }
 
 impl OAuth2ConsentServiceImpl {
     pub fn new(
         hydra: Arc<HydraClient>,
+        kratos: Arc<KratosClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
+        force_email_claim_client_ids: Vec<String>,
     ) -> Self {
         Self {
             hydra: hydra as Arc<dyn ConsentHydra>,
+            kratos: kratos as Arc<dyn ConsentKratos>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            force_email_claim_client_ids,
         }
     }
 }
@@ -259,6 +278,36 @@ impl OAuth2ConsentServiceImpl {
             .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
             .await
             .map_err(map_db_error)
+    }
+
+    /// Whether the consent client's id_token should carry a force-included
+    /// `email` claim. Matches both the raw Hydra client id (gateway DCR sets
+    /// the Hydra client_id to the public ULID) and its public-ULID
+    /// translation (clients registered before DCR existed, whose Hydra id
+    /// differs). Translation misses and lookup errors never fail consent —
+    /// they simply do not match.
+    async fn force_email_claim(&self, tenant_id: &str, ory_client_id: &str) -> bool {
+        if ory_client_id.is_empty() || self.force_email_claim_client_ids.is_empty() {
+            return false;
+        }
+        if self
+            .force_email_claim_client_ids
+            .iter()
+            .any(|id| id == ory_client_id)
+        {
+            return true;
+        }
+        match self
+            .mappings
+            .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
+            .await
+        {
+            Ok(public_id) => self
+                .force_email_claim_client_ids
+                .iter()
+                .any(|id| id == &public_id),
+            Err(_) => false,
+        }
     }
 
     async fn public_subject(
@@ -424,7 +473,29 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         // can join the signed-in user to iam records; `sub` stays the backend
         // identity UUID. A caller-supplied `identity_id` wins.
         if let Some(identity_id) = &identity_claim {
-            inject_identity_id_claim(&mut body, identity_id);
+            inject_id_token_claim(&mut body, "identity_id", identity_id);
+        }
+        // Deliberate per-client exception to spec-correct scope gating:
+        // Matrix native-OIDC clients (MSC2965) request only `openid` and
+        // `urn:matrix:client:*` scopes, but the homeserver derives user
+        // localparts from the email claim, so configured clients always
+        // receive it. Lookup failures never fail consent.
+        if self.force_email_claim(&tenant_id, &consent.client_id).await {
+            match self.kratos.get_identity(&consent.subject).await {
+                Ok(identity) => match identity_email(&identity) {
+                    Some(email) => inject_id_token_claim(&mut body, "email", &email),
+                    None => tracing::warn!(
+                        tenant_id = %tenant_id,
+                        subject = %consent.subject,
+                        "consent subject has no email trait; id_token issued without email claim"
+                    ),
+                },
+                Err(err) => tracing::warn!(
+                    tenant_id = %tenant_id,
+                    subject = %consent.subject,
+                    "failed to fetch identity for email claim; id_token issued without it: {err}"
+                ),
+            }
         }
         let value = self
             .hydra
@@ -515,6 +586,16 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
     }
 }
 
+/// Extract the base identity email from a Kratos identity payload. Email is
+/// the Kratos identifier, so it always lives in `traits.email`.
+fn identity_email(identity: &Value) -> Option<String> {
+    identity
+        .get("traits")?
+        .get("email")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn map_ory_error(err: OryClientError) -> ServiceError {
     use sso_ory_client::error::OryClientError;
     match err {
@@ -550,7 +631,7 @@ mod tests {
     use connectrpc::{ErrorCode, RequestContext, ServiceRequest};
     use http::HeaderMap;
     use serde_json::{Value, json};
-    use sso_ory_client::{error::OryClientError, hydra::HydraClient};
+    use sso_ory_client::{error::OryClientError, hydra::HydraClient, kratos::KratosClient};
     use sunbeam_g2v::error::ServiceError;
     use ulid::Ulid;
 
@@ -565,7 +646,7 @@ mod tests {
         RejectConsentRequest, RejectLogoutRequest,
     };
 
-    use super::{ConsentHydra, OAuth2ConsentServiceImpl, map_ory_error};
+    use super::{ConsentHydra, ConsentKratos, OAuth2ConsentServiceImpl, map_ory_error};
 
     #[derive(Debug, Clone)]
     enum Call {
@@ -671,6 +752,35 @@ mod tests {
                 .unwrap()
                 .push(Call::RejectLogout(challenge.to_string()));
             self.take_result()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockConsentKratos {
+        result: Arc<Mutex<Option<Result<Value, OryClientError>>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockConsentKratos {
+        fn with_identity(&self, identity: Value) -> Self {
+            *self.result.lock().unwrap() = Some(Ok(identity));
+            self.clone()
+        }
+
+        fn take_calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConsentKratos for MockConsentKratos {
+        async fn get_identity(&self, id: &str) -> Result<Value, OryClientError> {
+            self.calls.lock().unwrap().push(id.to_string());
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(OryClientError::MissingTenant))
         }
     }
 
@@ -970,10 +1080,20 @@ mod tests {
     }
 
     fn service(hydra: Arc<dyn ConsentHydra>) -> OAuth2ConsentServiceImpl {
+        service_with_email_config(hydra, MockConsentKratos::default(), Vec::new())
+    }
+
+    fn service_with_email_config(
+        hydra: Arc<dyn ConsentHydra>,
+        kratos: MockConsentKratos,
+        force_email_claim_client_ids: Vec<String>,
+    ) -> OAuth2ConsentServiceImpl {
         OAuth2ConsentServiceImpl {
             hydra,
+            kratos: Arc::new(kratos),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            force_email_claim_client_ids,
         }
     }
 
@@ -1063,10 +1183,13 @@ mod tests {
     async fn oauth2_consent_service_impl_new_stores_hydra() {
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost:5432/unused").unwrap();
         let hydra = Arc::new(HydraClient::new("http://localhost:1", "http://localhost:1").unwrap());
+        let kratos = Arc::new(KratosClient::new("http://localhost:1").unwrap());
         let service = OAuth2ConsentServiceImpl::new(
             hydra,
+            kratos,
             TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool),
+            Vec::new(),
         );
         let _cloned = service.clone();
     }
@@ -1326,6 +1449,226 @@ mod tests {
             bodies[0].pointer("/session/id_token/identity_id").is_none(),
             "no identity_id claim for unmapped subject: {}",
             bodies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_force_includes_email_for_configured_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid", "urn:matrix:client:api"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let kratos = MockConsentKratos::default().with_identity(serde_json::json!({
+            "id": "ory-subject-1",
+            "traits": { "email": "user@example.com" },
+        }));
+        // Matches via the public-ULID translation of the Hydra client id.
+        let svc = service_with_email_config(
+            mock.clone(),
+            kratos.clone(),
+            vec!["pub-client-1".to_string()],
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into(), "urn:matrix:client:api".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        assert_eq!(kratos.take_calls(), vec!["ory-subject-1".to_string()]);
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["email"],
+            "user@example.com"
+        );
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["identity_id"],
+            "subject-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_matches_configured_client_by_raw_hydra_id() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let kratos = MockConsentKratos::default().with_identity(serde_json::json!({
+            "id": "ory-subject-1",
+            "traits": { "email": "user@example.com" },
+        }));
+        let svc = service_with_email_config(
+            mock.clone(),
+            kratos,
+            vec!["client-1".to_string()],
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["email"],
+            "user@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_skips_email_for_unconfigured_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let kratos = MockConsentKratos::default();
+        let svc = service_with_email_config(
+            mock.clone(),
+            kratos.clone(),
+            vec!["some-other-client".to_string()],
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        assert!(
+            kratos.take_calls().is_empty(),
+            "kratos must not be queried for unconfigured clients"
+        );
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].pointer("/session/id_token/email").is_none(),
+            "no email claim for unconfigured client: {}",
+            bodies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_preserves_caller_supplied_email() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let kratos = MockConsentKratos::default().with_identity(serde_json::json!({
+            "id": "ory-subject-1",
+            "traits": { "email": "user@example.com" },
+        }));
+        let svc = service_with_email_config(
+            mock.clone(),
+            kratos,
+            vec!["pub-client-1".to_string()],
+        );
+        let session: buffa_types::google::protobuf::Struct = serde_json::from_value(json!({
+            "id_token": { "email": "caller@example.com" }
+        }))
+        .unwrap();
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                session: session.into(),
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["email"],
+            "caller@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_consent_email_lookup_failure_still_succeeds() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        // Default mock result is an error; consent must still succeed.
+        let kratos = MockConsentKratos::default();
+        let svc = service_with_email_config(
+            mock.clone(),
+            kratos,
+            vec!["pub-client-1".to_string()],
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].pointer("/session/id_token/email").is_none(),
+            "no email claim when the lookup fails: {}",
+            bodies[0]
+        );
+        // identity_id is unaffected by the email lookup failure.
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["identity_id"],
+            "subject-1"
         );
     }
 

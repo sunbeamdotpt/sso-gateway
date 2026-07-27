@@ -147,6 +147,7 @@ impl CallbackHarness {
             saml_require_signed_responses: false,
             registration_enabled: false,
             allowed_return_to_hosts: vec!["app.example.com".to_string()],
+            force_email_claim_client_ids: Vec::new(),
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
             system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
             state_cookie_secret: "callback-test-secret-key-at-least-32-bytes-long".into(),

@@ -113,13 +113,14 @@ pub fn accept_consent_request_to_json(req: &AcceptConsentRequest) -> Value {
     Value::Object(body)
 }
 
-/// Inject the gateway's public identity id as an `identity_id` claim into the
-/// accept body's `session.id_token` claims. Hydra's id_token `sub` is the
-/// backend identity UUID; the extra claim lets callers join the signed-in OIDC
-/// user to iam identity records without an out-of-band email lookup. A
-/// caller-supplied `identity_id` wins; an empty subject injects nothing.
-pub fn inject_identity_id_claim(body: &mut Value, public_subject: &str) {
-    if public_subject.is_empty() {
+/// Inject a claim into the accept body's `session.id_token` claims. Used to
+/// stamp the gateway's public identity id (`identity_id`) and, for configured
+/// clients, the user's `email` — Hydra's id_token `sub` is the backend
+/// identity UUID, so these claims let callers join the signed-in OIDC user to
+/// iam identity records without an out-of-band lookup. A caller-supplied value
+/// for the same claim wins; an empty value injects nothing.
+pub fn inject_id_token_claim(body: &mut Value, claim: &str, value: &str) {
+    if value.is_empty() {
         return;
     }
     let Some(body_obj) = body.as_object_mut() else {
@@ -138,8 +139,8 @@ pub fn inject_identity_id_claim(body: &mut Value, public_subject: &str) {
         return;
     };
     claims
-        .entry("identity_id")
-        .or_insert_with(|| Value::String(public_subject.to_string()));
+        .entry(claim.to_string())
+        .or_insert_with(|| Value::String(value.to_string()));
 }
 
 pub fn reject_consent_request_to_json(req: &RejectConsentRequest) -> Value {
@@ -293,9 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn inject_identity_id_claim_creates_session_when_absent() {
+    fn inject_id_token_claim_creates_session_when_absent() {
         let mut body = json!({ "grant_scope": ["openid"] });
-        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        inject_id_token_claim(&mut body, "identity_id", "01KWF0KYZ0FRNR23ZXAWJZV43T");
         assert_eq!(
             body["session"]["id_token"]["identity_id"],
             "01KWF0KYZ0FRNR23ZXAWJZV43T"
@@ -303,11 +304,11 @@ mod tests {
     }
 
     #[test]
-    fn inject_identity_id_claim_merges_into_existing_claims() {
+    fn inject_id_token_claim_merges_into_existing_claims() {
         let mut body = json!({
             "session": { "id_token": { "email": "a@example.com" } }
         });
-        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        inject_id_token_claim(&mut body, "identity_id", "01KWF0KYZ0FRNR23ZXAWJZV43T");
         assert_eq!(
             body["session"]["id_token"]["identity_id"],
             "01KWF0KYZ0FRNR23ZXAWJZV43T"
@@ -316,11 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn inject_identity_id_claim_preserves_caller_supplied_value() {
+    fn inject_id_token_claim_preserves_caller_supplied_value() {
         let mut body = json!({
             "session": { "id_token": { "identity_id": "caller-supplied" } }
         });
-        inject_identity_id_claim(&mut body, "01KWF0KYZ0FRNR23ZXAWJZV43T");
+        inject_id_token_claim(&mut body, "identity_id", "01KWF0KYZ0FRNR23ZXAWJZV43T");
         assert_eq!(
             body["session"]["id_token"]["identity_id"],
             "caller-supplied"
@@ -328,9 +329,9 @@ mod tests {
     }
 
     #[test]
-    fn inject_identity_id_claim_skips_empty_subject() {
+    fn inject_id_token_claim_skips_empty_value() {
         let mut body = json!({ "grant_scope": ["openid"] });
-        inject_identity_id_claim(&mut body, "");
+        inject_id_token_claim(&mut body, "identity_id", "");
         assert!(body.get("session").is_none());
     }
 

@@ -48,6 +48,7 @@ All configuration is read from environment variables.
 | `TENANT_CONNECTION_ENCRYPTION_KEY` | — | Base64-encoded key (≥32 bytes) for encrypting upstream connection secrets at rest. |
 | `REGISTRATION_ENABLED` | `false` | Allow public self-service registration flows. |
 | `ALLOWED_RETURN_TO_HOSTS` | host from `PUBLIC_BASE_URL` if valid | Comma-separated list of trusted hosts for `return_to` URLs (e.g. `example.com,app.example.com`). Only exact hosts are allowed; subdomains must be listed explicitly. At least one host is required. |
+| `FORCE_EMAIL_CLAIM_CLIENT_IDS` | — | Comma-separated list of OAuth2 client ids (public ULIDs) whose id_tokens always carry the user's `email` claim at consent accept, even when the `email` scope was not requested or granted. Intended for Matrix native-OIDC clients (MSC2965), whose homeserver derives user localparts from the email claim. Lookup failures are logged and never fail consent. |
 | `COOKIE_SECURE` | `true` if `PUBLIC_BASE_URL` is HTTPS | Sets the `Secure` attribute on the session cookie. Must be `true` because the cookie uses the `__Host-` prefix. |
 | `COOKIE_SAMESITE` | `Lax` | `SameSite` policy for the session cookie (`Strict`, `Lax`, or `None`). |
 | `SESSION_TTL_SECONDS` | `86400` | Lifetime of browser session cookies. |

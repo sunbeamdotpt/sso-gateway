@@ -319,8 +319,10 @@ pub async fn build_app_with_upstream(
     ));
     let oauth2_consent_service = Arc::new(OAuth2ConsentServiceImpl::new(
         hydra.clone(),
+        kratos.clone(),
         transient.clone(),
         mappings.clone(),
+        config.force_email_claim_client_ids.clone(),
     ));
     let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(
         hydra.clone(),
@@ -722,6 +724,7 @@ mod tests {
             saml_require_signed_responses: false,
             registration_enabled: false,
             allowed_return_to_hosts: vec!["example.com".to_string()],
+            force_email_claim_client_ids: Vec::new(),
             system_bootstrap_client_id: None,
             system_bootstrap_client_secret: None,
             state_cookie_secret: "test-secret-key-for-cookies-at-least-32-bytes-long".into(),

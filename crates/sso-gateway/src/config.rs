@@ -26,6 +26,7 @@ pub struct Config {
     pub saml_require_signed_responses: bool,
     pub registration_enabled: bool,
     pub allowed_return_to_hosts: Vec<String>,
+    pub force_email_claim_client_ids: Vec<String>,
     pub system_bootstrap_client_id: Option<String>,
     pub system_bootstrap_client_secret: Option<String>,
     pub state_cookie_secret: Vec<u8>,
@@ -86,6 +87,10 @@ impl std::fmt::Debug for Config {
             )
             .field("registration_enabled", &self.registration_enabled)
             .field("allowed_return_to_hosts", &self.allowed_return_to_hosts)
+            .field(
+                "force_email_claim_client_ids",
+                &self.force_email_claim_client_ids,
+            )
             .field(
                 "system_bootstrap_client_id",
                 &self.system_bootstrap_client_id,
@@ -501,6 +506,15 @@ impl Config {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             allowed_return_to_hosts,
+            force_email_claim_client_ids: std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|id| id.trim().to_string())
+                        .filter(|id| !id.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             system_bootstrap_client_id: std::env::var("SYSTEM_BOOTSTRAP_CLIENT_ID").ok(),
             system_bootstrap_client_secret,
             state_cookie_secret,
