@@ -152,6 +152,8 @@ pub struct Oauth2State {
     pub(crate) token_cache: Option<Arc<dyn TokenIntrospectionCache>>,
     /// Tenant under which publicly registered (RFC 7591) clients are mapped.
     pub(crate) system_tenant_id: String,
+    /// Whether public dynamic client registration (RFC 7591) is enabled.
+    pub(crate) dynamic_client_registration_enabled: bool,
 }
 
 impl Oauth2State {
@@ -162,6 +164,7 @@ impl Oauth2State {
             public_base_url,
             token_cache: None,
             system_tenant_id: String::new(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -172,6 +175,11 @@ impl Oauth2State {
 
     pub fn with_system_tenant_id(mut self, system_tenant_id: String) -> Self {
         self.system_tenant_id = system_tenant_id;
+        self
+    }
+
+    pub fn with_dynamic_client_registration_enabled(mut self, enabled: bool) -> Self {
+        self.dynamic_client_registration_enabled = enabled;
         self
     }
 }
@@ -247,14 +255,13 @@ fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 
 async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl IntoResponse {
     let base = base_url(&state.public_base_url);
-    let body = json!({
+    let mut body = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth2/auth"),
         "token_endpoint": format!("{base}/oauth2/token"),
         "device_authorization_endpoint": format!("{base}/oauth2/device/auth"),
         "userinfo_endpoint": format!("{base}/oauth2/userinfo"),
         "jwks_uri": format!("{base}/.well-known/jwks.json"),
-        "registration_endpoint": format!("{base}/oauth2/register"),
         "introspection_endpoint": format!("{base}/oauth2/introspect"),
         "revocation_endpoint": format!("{base}/oauth2/revoke"),
         "response_types_supported": ["code", "token", "id_token", "code token", "code id_token", "token id_token", "code token id_token"],
@@ -265,6 +272,9 @@ async fn openid_configuration(State(state): State<Arc<Oauth2State>>) -> impl Int
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
     });
+    if state.dynamic_client_registration_enabled {
+        body["registration_endpoint"] = json!(format!("{base}/oauth2/register"));
+    }
     json_response(body)
 }
 
@@ -525,6 +535,17 @@ async fn register(
     State(state): State<Arc<Oauth2State>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !state.dynamic_client_registration_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "error": "access_denied",
+                "error_description": "dynamic client registration is disabled",
+            })),
+        )
+            .into_response();
+    }
+
     let redirect_uris = json_string_array(&body["redirect_uris"]);
     let grant_types = json_string_array(&body["grant_types"]);
     let response_types = json_string_array(&body["response_types"]);
@@ -1206,6 +1227,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -1216,6 +1238,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -1746,6 +1769,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -1878,6 +1902,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -2165,6 +2190,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         (state, hydra)
     }
@@ -2277,6 +2303,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -2496,6 +2523,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         }
     }
 
@@ -2655,6 +2683,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2696,6 +2725,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2741,6 +2771,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -2789,6 +2820,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
@@ -2820,6 +2852,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2989,6 +3022,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         (state, mappings)
     }
@@ -3020,6 +3054,46 @@ mod tests {
         assert_eq!(created[0].0, "system-tenant-1");
         assert_eq!(created[0].1, "hydra");
         assert_eq!(created[0].3, "ory-client-1");
+    }
+
+    /// When dynamic client registration is disabled the endpoint refuses
+    /// with an OAuth2-style 403 instead of creating a client.
+    #[tokio::test]
+    async fn register_returns_forbidden_when_dcr_disabled() {
+        let (state, mappings) = register_state();
+        let state = Arc::new(Oauth2State {
+            dynamic_client_registration_enabled: false,
+            ..(*state).clone()
+        });
+        let body = json!({
+            "client_name": "test-client",
+            "redirect_uris": ["https://example.com/callback"],
+        });
+        let resp = register(State(state), Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body_str = body_to_string(resp).await;
+        assert!(body_str.contains("access_denied"));
+        assert!(mappings.created.lock().unwrap().is_empty());
+    }
+
+    /// The discovery document only advertises the registration endpoint
+    /// while dynamic client registration is enabled.
+    #[tokio::test]
+    async fn openid_configuration_omits_registration_endpoint_when_dcr_disabled() {
+        let (state, _) = register_state();
+        let state = Arc::new(Oauth2State {
+            dynamic_client_registration_enabled: false,
+            ..(*state).clone()
+        });
+        let resp = openid_configuration(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(value.get("registration_endpoint").is_none());
+        assert_eq!(
+            value["introspection_endpoint"],
+            "https://gateway.example.com/oauth2/introspect"
+        );
     }
 
     #[tokio::test]
@@ -3075,6 +3149,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3173,6 +3248,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3253,6 +3329,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let body = json!({
             "client_name": "test-client",
@@ -3344,6 +3421,7 @@ mod tests {
             public_base_url: "https://gateway.example.com".to_string(),
             token_cache: None,
             system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

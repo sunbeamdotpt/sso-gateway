@@ -25,6 +25,7 @@ pub struct Config {
     pub saml_require_signed_assertions: bool,
     pub saml_require_signed_responses: bool,
     pub registration_enabled: bool,
+    pub dynamic_client_registration_enabled: bool,
     pub allowed_return_to_hosts: Vec<String>,
     pub force_email_claim_client_ids: Vec<String>,
     pub system_bootstrap_client_id: Option<String>,
@@ -86,6 +87,10 @@ impl std::fmt::Debug for Config {
                 &self.saml_require_signed_responses,
             )
             .field("registration_enabled", &self.registration_enabled)
+            .field(
+                "dynamic_client_registration_enabled",
+                &self.dynamic_client_registration_enabled,
+            )
             .field("allowed_return_to_hosts", &self.allowed_return_to_hosts)
             .field(
                 "force_email_claim_client_ids",
@@ -505,6 +510,13 @@ impl Config {
             registration_enabled: std::env::var("REGISTRATION_ENABLED")
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // RFC 7591 public dynamic client registration is an opt-out:
+            // browser/native OIDC clients (e.g. Matrix Element) rely on it.
+            dynamic_client_registration_enabled: std::env::var(
+                "ENABLE_DYNAMIC_CLIENT_REGISTRATION",
+            )
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(true),
             allowed_return_to_hosts,
             force_email_claim_client_ids: std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS")
                 .ok()
@@ -678,6 +690,7 @@ mod tests {
         clear_env("SAML_REQUIRE_SIGNED_ASSERTIONS");
         clear_env("SAML_REQUIRE_SIGNED_RESPONSES");
         clear_env("REGISTRATION_ENABLED");
+        clear_env("ENABLE_DYNAMIC_CLIENT_REGISTRATION");
         clear_env("ALLOWED_RETURN_TO_HOSTS");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_ID");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_SECRET");
@@ -755,6 +768,7 @@ mod tests {
         assert!(config.saml_require_signed_assertions);
         assert!(!config.saml_require_signed_responses);
         assert!(!config.registration_enabled);
+        assert!(config.dynamic_client_registration_enabled);
         assert_eq!(
             config.allowed_return_to_hosts,
             vec!["example.com".to_string()]
@@ -779,6 +793,26 @@ mod tests {
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
         assert_eq!(config.kratos_default_schema_id, "employee");
+    }
+
+    #[test]
+    fn config_dynamic_client_registration_can_be_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("ENABLE_DYNAMIC_CLIENT_REGISTRATION", "false");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert!(!config.dynamic_client_registration_enabled);
     }
 
     #[cfg(feature = "openfga")]

@@ -49,6 +49,7 @@ All configuration is read from environment variables.
 | `REGISTRATION_ENABLED` | `false` | Allow public self-service registration flows. |
 | `ALLOWED_RETURN_TO_HOSTS` | host from `PUBLIC_BASE_URL` if valid | Comma-separated list of trusted hosts for `return_to` URLs (e.g. `example.com,app.example.com`). Only exact hosts are allowed; subdomains must be listed explicitly. At least one host is required. |
 | `FORCE_EMAIL_CLAIM_CLIENT_IDS` | — | Comma-separated list of OAuth2 client ids (public ULIDs) whose id_tokens always carry the user's `email` claim at consent accept, even when the `email` scope was not requested or granted. Intended for Matrix native-OIDC clients (MSC2965), whose homeserver derives user localparts from the email claim. Lookup failures are logged and never fail consent. |
+| `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | `true` | Allow public RFC 7591 dynamic client registration at `POST /oauth2/register` (required by browser/native OIDC clients such as Matrix Element). Registered clients are capped to the plain OIDC scopes (`openid profile email offline_access`) and mapped under the system tenant. When disabled, registration returns 403 and the discovery document omits `registration_endpoint`. |
 | `COOKIE_SECURE` | `true` if `PUBLIC_BASE_URL` is HTTPS | Sets the `Secure` attribute on the session cookie. Must be `true` because the cookie uses the `__Host-` prefix. |
 | `COOKIE_SAMESITE` | `Lax` | `SameSite` policy for the session cookie (`Strict`, `Lax`, or `None`). |
 | `SESSION_TTL_SECONDS` | `86400` | Lifetime of browser session cookies. |
