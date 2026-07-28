@@ -16,6 +16,9 @@ visibility: public
 
 # SSO Gateway
 
+[![Matrix](https://img.shields.io/badge/chat-%23hello%3Asunbeam.pt-0dbd8b?logo=matrix)](https://matrix.to/#/#hello:sunbeam.pt)
+[![License](https://img.shields.io/github/license/sunbeamdotpt/sso-gateway)](LICENSE)
+
 The **SSO Gateway** is a backend-only unified identity and access management service. It exposes a vendor-neutral [Connect-RPC](https://connectrpc.com/) API and standard protocol endpoints, while using [Ory Hydra](https://www.ory.sh/hydra/), [Ory Kratos](https://www.ory.sh/kratos/), and [Ory Keto](https://www.ory.sh/keto/) as implementation details behind the facade.
 
 ## What it does

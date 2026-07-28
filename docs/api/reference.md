@@ -8,6 +8,7 @@ tags:
 category: api
 order: 1
 nav_order: 1
+updated_at: "2026-07-28"
 ---
 
 # API Reference
@@ -142,7 +143,7 @@ act-tokens are opaque, introspectable, and instantly revocable. Protected by
 
 ### `iam.v1.IdentitySelfService`
 
-Browser-facing Kratos self-service flows. See [`self-service-api.md`](./self-service-api.md) for flow details and cookie handling.
+Browser-facing Kratos self-service flows. See [`self-service-api.md`](../self-service-api.md) for flow details and cookie handling.
 
 | Method | Description |
 |---|---|
@@ -172,7 +173,7 @@ Browser-facing Kratos self-service flows. See [`self-service-api.md`](./self-ser
 
 ### `iam.v1.OAuth2ConsentService`
 
-Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-service-api.md`](./self-service-api.md).
+Hydra consent and OIDC logout request handling over Connect-RPC. See [`self-service-api.md`](../self-service-api.md).
 
 | Method | Description |
 |---|---|
