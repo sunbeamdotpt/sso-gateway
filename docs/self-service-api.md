@@ -11,6 +11,7 @@ tags:
 category: api
 order: 2
 nav_order: 2
+updated_at: "2026-07-28"
 ---
 
 # Self-Service API
@@ -350,5 +351,5 @@ vendor-neutral boundary.
 
 ## See also
 
-- [`docs/api/reference.md`](./reference.md) — full Connect-RPC service listing.
+- [`docs/api/reference.md`](./api/reference.md) — full Connect-RPC service listing.
 - [`design/self-service-api.md`](https://github.com/sunbeamdotpt/sso-gateway/blob/mainline/design/self-service-api.md) — original design rationale.
