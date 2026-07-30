@@ -4,6 +4,7 @@ use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
 use sso_gateway::session_token::SessionTokenSigner;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
     db::{ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
     middleware::auth_middleware,
@@ -54,12 +55,14 @@ async fn oauth2_public_endpoints_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let application_repo = ApplicationRepo::new(pool.clone());
     let application_service = Arc::new(ApplicationServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
         application_repo,
+        entitlements(),
         system_tenant_ulid.clone(),
     ));
 
@@ -388,12 +391,14 @@ async fn oauth2_missing_client_id_is_rejected() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let application_repo = ApplicationRepo::new(pool.clone());
     let application_service = Arc::new(ApplicationServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
         application_repo,
+        entitlements(),
         system_tenant_ulid.clone(),
     ));
 

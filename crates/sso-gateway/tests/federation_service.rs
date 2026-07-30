@@ -19,6 +19,7 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -192,6 +193,7 @@ async fn federation_saml_login_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
@@ -465,6 +467,7 @@ async fn federation_saml_signed_login_is_idempotent() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),

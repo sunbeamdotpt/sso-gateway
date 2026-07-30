@@ -13,6 +13,7 @@ use sso_gateway::{
     services::{identity::IdentityServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -87,6 +88,7 @@ async fn identity_service_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),
@@ -532,6 +534,7 @@ async fn identity_service_gateway_owned_traits_diverge_from_kratos() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),

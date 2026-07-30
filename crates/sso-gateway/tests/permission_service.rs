@@ -15,6 +15,7 @@ use sso_gateway::{
     services::{permission::PermissionServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{KetoClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -51,6 +52,7 @@ async fn permission_service_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(
         keto,
@@ -310,6 +312,7 @@ async fn permission_service_keto_namespace_metadata() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(
         keto,

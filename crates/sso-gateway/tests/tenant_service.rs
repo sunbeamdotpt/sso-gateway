@@ -10,6 +10,7 @@ use sso_gateway::{
     services::tenant::TenantServiceImpl,
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -41,7 +42,11 @@ async fn tenant_service_round_trip() {
         KratosClient::new_with_public("http://localhost:1", "http://localhost:1")
             .expect("fake kratos client should build"),
     );
-    let tenant_service = Arc::new(TenantServiceImpl::new(repo, system_tenant_ulid.clone()));
+    let tenant_service = Arc::new(TenantServiceImpl::new(
+        repo,
+        system_tenant_ulid.clone(),
+        entitlements(),
+    ));
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
     let service_router = ServiceRouter::from_router(connect_router);
 

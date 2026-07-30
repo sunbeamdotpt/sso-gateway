@@ -16,6 +16,7 @@ use sso_gateway::{
     services::scim::ScimServiceImpl,
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
 use tokio::net::TcpListener;
 
@@ -51,6 +52,7 @@ fn scim_app(pool: DbPool, hydra: Arc<HydraClient>) -> Router {
         mappings_repo,
         schemas,
         groups,
+        entitlements(),
     ));
     let state = Arc::new(ScimState::new(service));
     let introspector: Arc<dyn TokenIntrospector> = Arc::new(HydraTokenIntrospector::new(hydra));

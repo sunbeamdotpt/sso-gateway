@@ -23,6 +23,7 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_openfga_client::OpenFgaClient;
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
@@ -74,12 +75,14 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let application_repo = ApplicationRepo::new(pool.clone());
     let application_service = Arc::new(ApplicationServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
         application_repo,
+        entitlements(),
         system_tenant_ulid.clone(),
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
@@ -97,6 +100,7 @@ async fn scim_users_and_groups_round_trip_with_openfga() {
         mappings.clone(),
         schemas.clone(),
         groups.clone(),
+        entitlements(),
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());

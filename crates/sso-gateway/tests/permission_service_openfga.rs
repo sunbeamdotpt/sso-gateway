@@ -21,6 +21,7 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_openfga_client::OpenFgaClient;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
@@ -74,6 +75,7 @@ async fn permission_service_openfga_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(
         openfga,
@@ -201,6 +203,7 @@ async fn permission_service_openfga_namespace_lifecycle() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let permission_service = Arc::new(PermissionServiceImpl::new(
         openfga,

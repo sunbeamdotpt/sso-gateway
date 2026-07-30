@@ -19,6 +19,7 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -547,6 +548,7 @@ async fn self_service_and_consent_round_trip() {
         mappings.clone(),
         sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
         sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        entitlements(),
         true,
         kratos_url.clone(),
         hydra_url.clone(),
@@ -559,6 +561,7 @@ async fn self_service_and_consent_round_trip() {
         kratos.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        entitlements(),
         Vec::new(),
     ));
 
@@ -1281,6 +1284,7 @@ async fn submit_login_flow_wrong_password_error_scrubs_raw_flow_id() {
         mappings.clone(),
         sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
         sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
+        entitlements(),
         true,
         kratos_url.clone(),
         hydra_url.clone(),

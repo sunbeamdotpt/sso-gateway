@@ -10,6 +10,7 @@ use sso_gateway::{
     services::{client_credential::ClientCredentialServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -50,6 +51,7 @@ async fn client_credential_service_round_trip() {
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         system_tenant_ulid.clone(),
+        entitlements(),
     ));
     let client_credential_service =
         Arc::new(ClientCredentialServiceImpl::new(hydra, mappings.clone()));
