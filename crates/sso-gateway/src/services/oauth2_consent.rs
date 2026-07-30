@@ -14,6 +14,7 @@ use crate::db::{
     DbError, IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE,
     TOKEN_TYPE_LOGOUT_CHALLENGE, TransientTokenRepo, TransientTokenStore,
 };
+use crate::services::entitlement::EntitlementService;
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     AcceptConsentRequest, AcceptLogoutRequest, ConsentRequest, ConsentResponse,
@@ -130,6 +131,7 @@ pub struct OAuth2ConsentServiceImpl {
     kratos: Arc<dyn ConsentKratos>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
+    entitlements: Arc<dyn EntitlementService>,
     force_email_claim_client_ids: Vec<String>,
 }
 
@@ -139,6 +141,7 @@ impl OAuth2ConsentServiceImpl {
         kratos: Arc<KratosClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
+        entitlements: Arc<dyn EntitlementService>,
         force_email_claim_client_ids: Vec<String>,
     ) -> Self {
         Self {
@@ -146,6 +149,7 @@ impl OAuth2ConsentServiceImpl {
             kratos: kratos as Arc<dyn ConsentKratos>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            entitlements,
             force_email_claim_client_ids,
         }
     }
@@ -468,6 +472,84 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
             .into());
         }
 
+        // Enforce the per-user OAuth2 scope ceiling derived from the user's
+        // entitlement on the gateway application object.
+        let ceiling = self
+            .entitlements
+            .effective_scope_ceiling(&tenant_id, &public_subject)
+            .await;
+        let ceiling_set: HashSet<_> = ceiling.iter().cloned().collect();
+        let out_of_ceiling: Vec<_> = req
+            .grant_scope
+            .iter()
+            .filter(|s| !ceiling_set.contains(*s))
+            .cloned()
+            .collect();
+        if !out_of_ceiling.is_empty() {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                action = "entitlement.scope_denied",
+                outcome = "denied",
+                scopes = ?out_of_ceiling,
+                "requested scopes exceed entitlement ceiling"
+            );
+            return Err(ServiceError::PermissionDenied(
+                "requested scopes exceed entitlement ceiling".into(),
+            )
+            .into());
+        }
+
+        // Resolve the application and re-check that the user is entitled to it.
+        let app_public_id = self.public_client_id(&tenant_id, &consent.client_id).await;
+        if let Ok(app_public_id) = &app_public_id {
+            match self
+                .entitlements
+                .is_member(&tenant_id, &public_subject, app_public_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        target: "sso_gateway::audit",
+                        tenant_id = tenant_id,
+                        actor = public_subject,
+                        application = app_public_id,
+                        action = "entitlement.consent_denied",
+                        outcome = "denied",
+                        "user is not entitled to this application"
+                    );
+                    return Err(ServiceError::PermissionDenied(
+                        "user is not entitled to this application".into(),
+                    )
+                    .into());
+                }
+                Err(err) => {
+                    tracing::info!(
+                        target: "sso_gateway::audit",
+                        tenant_id = tenant_id,
+                        actor = public_subject,
+                        application = app_public_id,
+                        action = "entitlement.consent_denied",
+                        outcome = "error",
+                        error = ?err,
+                        "entitlement check failed; refusing consent"
+                    );
+                    return Err(ServiceError::PermissionDenied(
+                        "user is not entitled to this application".into(),
+                    )
+                    .into());
+                }
+            }
+        } else {
+            tracing::debug!(
+                tenant_id = %tenant_id,
+                client_id = %consent.client_id,
+                "consent client has no application mapping; skipping app entitlement check"
+            );
+        }
+
         let mut body = accept_consent_request_to_json(&req);
         // Stamp the public iam identity id into the id_token claims so callers
         // can join the signed-in user to iam records; `sub` stays the backend
@@ -497,6 +579,33 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
                 ),
             }
         }
+
+        // Mint the per-application entitlement claim into the id_token. The
+        // claim is skipped when the client has no gateway application mapping.
+        if let Ok(app_public_id) = &app_public_id {
+            let claim = self
+                .entitlements
+                .mint_claim(&tenant_id, &public_subject, app_public_id)
+                .await;
+            if let Some(obj) = claim.as_object()
+                && let Some(body_obj) = body.as_object_mut()
+            {
+                let session = body_obj
+                    .entry("session")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(session_obj) = session.as_object_mut() {
+                    let id_token = session_obj
+                        .entry("id_token")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(claims) = id_token.as_object_mut() {
+                        for (k, v) in obj {
+                            claims.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         let value = self
             .hydra
             .accept_consent_request(&ory_challenge, body)
@@ -647,6 +756,7 @@ mod tests {
     };
 
     use super::{ConsentHydra, ConsentKratos, OAuth2ConsentServiceImpl, map_ory_error};
+    use crate::services::entitlement::test_helpers::{ConfigurableEntitlementService, entitlements};
 
     #[derive(Debug, Clone)]
     enum Call {
@@ -1088,11 +1198,26 @@ mod tests {
         kratos: MockConsentKratos,
         force_email_claim_client_ids: Vec<String>,
     ) -> OAuth2ConsentServiceImpl {
+        service_with_email_and_entitlements(
+            hydra,
+            kratos,
+            force_email_claim_client_ids,
+            entitlements(),
+        )
+    }
+
+    fn service_with_email_and_entitlements(
+        hydra: Arc<dyn ConsentHydra>,
+        kratos: MockConsentKratos,
+        force_email_claim_client_ids: Vec<String>,
+        entitlements: Arc<dyn crate::services::entitlement::EntitlementService>,
+    ) -> OAuth2ConsentServiceImpl {
         OAuth2ConsentServiceImpl {
             hydra,
             kratos: Arc::new(kratos),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            entitlements,
             force_email_claim_client_ids,
         }
     }
@@ -1189,6 +1314,7 @@ mod tests {
             kratos,
             TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool),
+            entitlements(),
             Vec::new(),
         );
         let _cloned = service.clone();
@@ -1469,10 +1595,17 @@ mod tests {
             "traits": { "email": "user@example.com" },
         }));
         // Matches via the public-ULID translation of the Hydra client id.
-        let svc = service_with_email_config(
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec![
+            "openid".to_string(),
+            "urn:matrix:client:api".to_string(),
+        ]);
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        let svc = service_with_email_and_entitlements(
             mock.clone(),
             kratos.clone(),
             vec!["pub-client-1".to_string()],
+            entitlements,
         );
         svc_req!(
             req,
@@ -2195,6 +2328,117 @@ mod tests {
             calls.as_slice(),
             [Call::RejectLogout(c)] if c == "raw-logout-reject"
         ));
+    }
+
+    fn service_with_entitlements(
+        hydra: Arc<dyn ConsentHydra>,
+        entitlements: Arc<dyn crate::services::entitlement::EntitlementService>,
+    ) -> OAuth2ConsentServiceImpl {
+        OAuth2ConsentServiceImpl {
+            hydra,
+            kratos: Arc::new(MockConsentKratos::default()),
+            transient: Arc::new(default_transient_store()),
+            mappings: Arc::new(default_mapping_store()),
+            entitlements,
+            force_email_claim_client_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_consent_denies_scope_above_entitlement_ceiling() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid", "tenant:admin"],
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        let svc = service_with_entitlements(mock.clone(), entitlements);
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into(), "tenant:admin".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn accept_consent_denies_when_not_entitled_to_application() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.deny("tenant-1", "subject-1", "pub-client-1");
+        let svc = service_with_entitlements(mock.clone(), entitlements);
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn accept_consent_mints_entitlement_claim() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        entitlements.set_claim(json!({ "entitlements": { "pub-client-1": ["member"] } }));
+        let svc = service_with_entitlements(mock.clone(), entitlements);
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["entitlements"]["pub-client-1"],
+            json!(["member"])
+        );
     }
 
     #[tokio::test]

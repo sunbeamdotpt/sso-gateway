@@ -210,6 +210,8 @@ namespaces:
     name: app
   - id: 1
     name: scim_group
+  - id: 2
+    name: entitlements
 
 serve:
   read:

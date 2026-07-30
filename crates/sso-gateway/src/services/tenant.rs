@@ -10,6 +10,7 @@ use crate::proto::iam::v1::{
     CreateTenantRequest, GetTenantRequest, ListTenantsRequest, ListTenantsResponse, Tenant,
     TenantService,
 };
+use crate::services::entitlement::EntitlementService;
 use sunbeam_g2v::error::ServiceError;
 
 #[derive(Clone)]
@@ -17,16 +18,18 @@ pub struct TenantServiceImpl {
     repo: Arc<dyn TenantStore>,
     #[allow(dead_code)]
     system_tenant_ulid: String,
+    entitlements: Arc<dyn EntitlementService>,
 }
 
 impl TenantServiceImpl {
-    pub fn new<R>(repo: R, system_tenant_ulid: String) -> Self
+    pub fn new<R>(repo: R, system_tenant_ulid: String, entitlements: Arc<dyn EntitlementService>) -> Self
     where
         R: TenantStore + 'static,
     {
         Self {
             repo: Arc::new(repo) as Arc<dyn TenantStore>,
             system_tenant_ulid,
+            entitlements,
         }
     }
 
@@ -65,6 +68,7 @@ impl TenantService for TenantServiceImpl {
             .repo
             .create(&req.slug, &req.display_name, settings)
             .await?;
+        self.entitlements.ensure_namespace(&row.id).await?;
         Ok(Response::new(row.into_proto()))
     }
 
@@ -170,10 +174,189 @@ mod tests {
     use buffa::Message;
     use buffa::bytes::Bytes;
     use buffa::view::MessageView;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::db::DbError;
-    use serde_json::json;
+    use crate::services::entitlement::{EntitlementLevel, EntitlementService};
+
+    #[derive(Default, Clone)]
+    struct NoopEntitlementService;
+
+    #[async_trait]
+    impl EntitlementService for NoopEntitlementService {
+        async fn ensure_namespace(&self, _tenant_id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn seed_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+            _groups: &[String],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn remove_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn check(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _relation: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+
+        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+            vec![]
+        }
+
+        async fn grant(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn revoke(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn set_group_membership(
+            &self,
+            _tenant_id: &str,
+            _group_name: &str,
+            _identity_id: &str,
+            _member: bool,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn remove_all_for_identity(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+            Value::Null
+        }
+    }
+
+    fn entitlements() -> Arc<dyn EntitlementService> {
+        Arc::new(NoopEntitlementService)
+    }
+
+    #[derive(Default, Clone)]
+    struct RecordingEntitlementService {
+        ensured: Arc<Mutex<Vec<String>>>,
+        seeded: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl EntitlementService for RecordingEntitlementService {
+        async fn ensure_namespace(&self, tenant_id: &str) -> Result<(), ServiceError> {
+            self.ensured.lock().unwrap().push(tenant_id.to_string());
+            Ok(())
+        }
+
+        async fn seed_application(
+            &self,
+            tenant_id: &str,
+            app_public_id: &str,
+            _groups: &[String],
+        ) -> Result<(), ServiceError> {
+            self.seeded
+                .lock()
+                .unwrap()
+                .push((tenant_id.to_string(), app_public_id.to_string()));
+            Ok(())
+        }
+
+        async fn remove_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn check(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _relation: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+
+        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+            vec![]
+        }
+
+        async fn grant(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn revoke(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn set_group_membership(
+            &self,
+            _tenant_id: &str,
+            _group_name: &str,
+            _identity_id: &str,
+            _member: bool,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn remove_all_for_identity(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+            Value::Null
+        }
+    }
 
     macro_rules! svc_req {
         ($id:ident, $req:expr, $ty:ty) => {
@@ -430,6 +613,7 @@ mod tests {
                 settings: json!({"domain": "acme.com"}),
             }),
             "system".into(),
+            entitlements(),
         );
         let ctx = admin_ctx("system");
         let req_msg = CreateTenantRequest {
@@ -447,8 +631,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_tenant_ensures_entitlement_namespace() {
+        let entitlements = Arc::new(RecordingEntitlementService::default());
+        let service = TenantServiceImpl::new(
+            StubTenantStore::with_create(TenantRow {
+                id: "tenant-1".into(),
+                slug: "acme".into(),
+                display_name: "Acme Corp".into(),
+                is_system: false,
+                settings: json!({}),
+            }),
+            "system".into(),
+            entitlements.clone(),
+        );
+        let ctx = admin_ctx("system");
+        let req_msg = CreateTenantRequest {
+            slug: "acme".into(),
+            display_name: "Acme".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req_msg, CreateTenantRequest);
+        service.create_tenant(ctx, request).await.unwrap();
+        assert_eq!(entitlements.ensured.lock().unwrap().as_slice(), &["tenant-1"]);
+    }
+
+    #[tokio::test]
     async fn create_tenant_requires_admin_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
@@ -466,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = CreateTenantRequest::default();
         svc_req!(request, req_msg, CreateTenantRequest);
@@ -483,6 +692,7 @@ mod tests {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_create_err(DbError::TenantNotFound),
             "system".into(),
+            entitlements(),
         );
         let ctx = admin_ctx("system");
         let req_msg = CreateTenantRequest {
@@ -510,6 +720,7 @@ mod tests {
                 settings: json!({}),
             }),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("tenant-1");
         let req_msg = GetTenantRequest {
@@ -523,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = GetTenantRequest::default();
         svc_req!(request, req_msg, GetTenantRequest);
@@ -536,6 +747,7 @@ mod tests {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_get_err(DbError::TenantNotFound),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("system");
         let req_msg = GetTenantRequest {
@@ -558,6 +770,7 @@ mod tests {
                 settings: json!({}),
             }]),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("tenant-1");
         let req_msg = ListTenantsRequest::default();
@@ -569,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tenants_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = ListTenantsRequest::default();
         svc_req!(request, req_msg, ListTenantsRequest);
@@ -582,6 +795,7 @@ mod tests {
         let service = TenantServiceImpl::new(
             StubTenantStore::with_list_err(DbError::Sqlx(sqlx::Error::PoolTimedOut)),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("tenant-1");
         let req_msg = ListTenantsRequest::default();
@@ -592,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_tenant_rejects_non_system_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = admin_ctx("tenant-1");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
@@ -619,6 +833,7 @@ mod tests {
                 settings: json!({}),
             }),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("tenant-1");
         let req_msg = GetTenantRequest {
@@ -641,6 +856,7 @@ mod tests {
                 settings: json!({}),
             }),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("system");
         let req_msg = GetTenantRequest {
@@ -672,6 +888,7 @@ mod tests {
                 },
             ]),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("tenant-1");
         let req_msg = ListTenantsRequest::default();
@@ -701,6 +918,7 @@ mod tests {
                 },
             ]),
             "system".into(),
+            entitlements(),
         );
         let ctx = tenant_ctx("system");
         let req_msg = ListTenantsRequest::default();
@@ -711,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_tenant_requires_read_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = GetTenantRequest {
             id: "tenant-1".into(),
@@ -724,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tenants_requires_read_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into());
+        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = ListTenantsRequest::default();
         svc_req!(request, req_msg, ListTenantsRequest);

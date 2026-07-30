@@ -18,6 +18,7 @@ use crate::{
         GetApplicationRequest, ListApplicationsRequest, ListApplicationsResponse,
         RotateSecretRequest, UpdateApplicationRequest,
     },
+    services::entitlement::EntitlementService,
 };
 
 pub(crate) const BACKEND_HYDRA: &str = "hydra";
@@ -65,6 +66,7 @@ pub struct ApplicationServiceImpl {
     hydra: Arc<dyn ApplicationHydra>,
     mappings: Arc<dyn IdMappingStore>,
     applications: Arc<dyn ApplicationStore>,
+    entitlements: Arc<dyn EntitlementService>,
     system_tenant_ulid: String,
     allow_http_redirect_uris: bool,
 }
@@ -74,12 +76,14 @@ impl ApplicationServiceImpl {
         hydra: Arc<HydraClient>,
         mappings: IdMappingRepo,
         applications: ApplicationRepo,
+        entitlements: Arc<dyn EntitlementService>,
         system_tenant_ulid: String,
     ) -> Self {
         Self {
             hydra: hydra as Arc<dyn ApplicationHydra>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             applications: Arc::new(applications) as Arc<dyn ApplicationStore>,
+            entitlements,
             system_tenant_ulid,
             allow_http_redirect_uris: false,
         }
@@ -141,6 +145,9 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .await?;
         self.applications
             .create(&tenant_id, &public_id, req.cross_tenant)
+            .await?;
+        self.entitlements
+            .seed_application(&tenant_id, &public_id, &["employees".to_string()])
             .await?;
 
         let mut app = hydra_to_application(&created, &tenant_id, &public_id, req.cross_tenant);
@@ -581,15 +588,177 @@ mod tests {
     use crate::auth::SubjectType;
     use crate::db::{DbError, IdMappingRow, MemoryApplicationStore};
     use crate::proto::iam::v1::ApplicationService;
+    use crate::services::entitlement::{EntitlementLevel, EntitlementService};
+    use async_trait::async_trait;
     use buffa::bytes::Bytes;
     use buffa::view::MessageView;
     use buffa::{HasMessageView, Message};
     use buffa_types::google::protobuf::BoolValue;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    #[derive(Default, Clone)]
+    struct NoopEntitlementService;
+
+    #[async_trait]
+    impl EntitlementService for NoopEntitlementService {
+        async fn ensure_namespace(&self, _tenant_id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn seed_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+            _groups: &[String],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn remove_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn check(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _relation: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+            vec![]
+        }
+        async fn grant(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn revoke(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_group_membership(
+            &self,
+            _tenant_id: &str,
+            _group_name: &str,
+            _identity_id: &str,
+            _member: bool,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn remove_all_for_identity(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+            Value::Null
+        }
+    }
+
+    fn entitlements() -> Arc<dyn EntitlementService> {
+        Arc::new(NoopEntitlementService)
+    }
+
+    #[derive(Default, Clone)]
+    #[allow(clippy::type_complexity)]
+    struct RecordingEntitlementService {
+        seeded: Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
+    }
+
+    #[async_trait]
+    impl EntitlementService for RecordingEntitlementService {
+        async fn ensure_namespace(&self, _tenant_id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn seed_application(
+            &self,
+            tenant_id: &str,
+            app_public_id: &str,
+            groups: &[String],
+        ) -> Result<(), ServiceError> {
+            self.seeded.lock().unwrap().push((
+                tenant_id.to_string(),
+                app_public_id.to_string(),
+                groups.to_vec(),
+            ));
+            Ok(())
+        }
+        async fn remove_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn check(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _relation: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+            vec![]
+        }
+        async fn grant(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn revoke(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_group_membership(
+            &self,
+            _tenant_id: &str,
+            _group_name: &str,
+            _identity_id: &str,
+            _member: bool,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn remove_all_for_identity(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+            Value::Null
+        }
+    }
 
     macro_rules! svc_req {
         ($id:ident, $req:expr, $ty:ty) => {
@@ -797,10 +966,19 @@ mod tests {
     }
 
     fn build_service(hydra: StubHydra, mappings: StubMappings) -> ApplicationServiceImpl {
+        build_service_with_entitlements(hydra, mappings, entitlements())
+    }
+
+    fn build_service_with_entitlements(
+        hydra: StubHydra,
+        mappings: StubMappings,
+        entitlements: Arc<dyn EntitlementService>,
+    ) -> ApplicationServiceImpl {
         ApplicationServiceImpl {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
             applications: Arc::new(MemoryApplicationStore::default()),
+            entitlements,
             system_tenant_ulid: "system-tenant".to_string(),
             allow_http_redirect_uris: false,
         }
@@ -814,6 +992,7 @@ mod tests {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
             applications: Arc::new(MemoryApplicationStore::default()),
+            entitlements: entitlements(),
             system_tenant_ulid: "system-tenant".to_string(),
             allow_http_redirect_uris: true,
         }
@@ -829,6 +1008,7 @@ mod tests {
             hydra: Arc::new(hydra),
             mappings: Arc::new(mappings),
             applications: Arc::new(applications),
+            entitlements: entitlements(),
             system_tenant_ulid: system_tenant_ulid.to_string(),
             allow_http_redirect_uris: false,
         }
@@ -877,6 +1057,48 @@ mod tests {
         assert_eq!(resp.client_secret, "secret-123");
         assert_eq!(resp.scope, vec!["openid", "profile"]);
         assert!(!resp.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_application_seeds_entitlements() {
+        let hydra = StubHydra {
+            create_result: Mutex::new(Some(Ok(hydra_client_response()))),
+            ..Default::default()
+        };
+        let mappings = StubMappings {
+            create_result: Mutex::new(Some(Ok(mapping_row(
+                "tenant-1",
+                BACKEND_HYDRA,
+                "pub-1",
+                "ory-123",
+            )))),
+            ..Default::default()
+        };
+        let entitlements = Arc::new(RecordingEntitlementService::default());
+        let service = build_service_with_entitlements(hydra, mappings, entitlements.clone());
+
+        let req = CreateApplicationRequest {
+            name: "test-app".into(),
+            redirect_uris: vec!["https://a/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            scope: vec!["openid".into()],
+            token_endpoint_auth_method: "none".into(),
+            ..Default::default()
+        };
+        svc_req!(request, req, CreateApplicationRequest);
+
+        let resp = service
+            .create_application(admin_context("tenant-1"), request)
+            .await
+            .unwrap()
+            .body;
+
+        let seeded = entitlements.seeded.lock().unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].0, "tenant-1");
+        assert_eq!(seeded[0].1, resp.id);
+        assert_eq!(seeded[0].2, vec!["employees"]);
     }
 
     #[tokio::test]

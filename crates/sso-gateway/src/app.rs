@@ -31,6 +31,7 @@ use crate::{
         agent::AgentServiceImpl,
         application::ApplicationServiceImpl,
         client_credential::ClientCredentialServiceImpl,
+        entitlement::{EntitlementServiceImpl, GATEWAY_APP_OBJECT},
         federation::FederationServiceImpl,
         handlers::{
             callback::{CallbackState, router as callback_router},
@@ -119,20 +120,6 @@ pub async fn build_app_with_upstream(
     let mappings = IdMappingRepo::new(pool.clone());
     let application_repo = ApplicationRepo::new(pool.clone());
 
-    if let (Some(client_id), Some(client_secret)) = (
-        config.system_bootstrap_client_id.as_deref(),
-        config.system_bootstrap_client_secret.as_deref(),
-    ) {
-        bootstrap_system_client(
-            hydra.as_ref(),
-            &mappings,
-            &application_repo,
-            &config.system_tenant_ulid,
-            client_id,
-            client_secret,
-        )
-        .await?;
-    }
     let kratos = Arc::new(
         KratosClient::new_with_public(&config.kratos_admin_url, &config.kratos_public_url)
             .map_err(|e| sunbeam_g2v::error::ServiceError::Configuration(e.to_string()))?,
@@ -165,8 +152,6 @@ pub async fn build_app_with_upstream(
             ));
         }
     };
-
-    let mappings = IdMappingRepo::new(pool.clone());
     let schemas = IdentitySchemaRepo::new(pool.clone());
     let tuples = PermissionTupleRepo::new(pool.clone());
     let providers = SamlProviderRepo::new(pool.clone());
@@ -181,6 +166,43 @@ pub async fn build_app_with_upstream(
     let tenant_repo = TenantRepo::new(pool.clone());
     let application_store: Arc<dyn crate::db::ApplicationStore> =
         Arc::new(application_repo.clone());
+
+    let entitlements: Arc<dyn crate::services::entitlement::EntitlementService> =
+        Arc::new(EntitlementServiceImpl::new(
+            backend.clone(),
+            application_store.clone(),
+        ));
+
+    if let (Some(client_id), Some(client_secret)) = (
+        config.system_bootstrap_client_id.as_deref(),
+        config.system_bootstrap_client_secret.as_deref(),
+    ) {
+        bootstrap_system_client(
+            hydra.as_ref(),
+            &mappings,
+            &application_repo,
+            &config.system_tenant_ulid,
+            client_id,
+            client_secret,
+        )
+        .await?;
+
+        // Seed the system tenant's entitlement namespace and link the gateway
+        // application object to the default employees group. The bootstrap
+        // credential is a machine client, so there is no human admin identity
+        // to grant here.
+        entitlements
+            .ensure_namespace(&config.system_tenant_ulid)
+            .await?;
+        entitlements
+            .seed_application(
+                &config.system_tenant_ulid,
+                GATEWAY_APP_OBJECT,
+                &["employees".to_string()],
+            )
+            .await?;
+    }
+
     let connections = TenantConnectionRepo::new(pool.clone());
     let domains = TenantDomainRepo::new(pool.clone());
     let login_state = LoginStateRepo::new(pool.clone());
@@ -268,11 +290,13 @@ pub async fn build_app_with_upstream(
     let tenant_service = Arc::new(TenantServiceImpl::new(
         tenant_repo,
         config.system_tenant_ulid.clone(),
+        entitlements.clone(),
     ));
     let application_service = Arc::new(ApplicationServiceImpl::new(
         hydra.clone(),
         mappings.clone(),
         application_repo,
+        entitlements.clone(),
         config.system_tenant_ulid.clone(),
     ));
     let client_credential_service = Arc::new(ClientCredentialServiceImpl::new(
@@ -300,6 +324,7 @@ pub async fn build_app_with_upstream(
         mappings.clone(),
         schemas.clone(),
         scim_groups,
+        entitlements.clone(),
     ));
     let oauth_mappings = mappings.clone();
     let consent_enabled = !config.hydra_admin_url.is_empty();
@@ -310,6 +335,7 @@ pub async fn build_app_with_upstream(
         mappings.clone(),
         schemas.clone(),
         memberships.clone(),
+        entitlements.clone(),
         consent_enabled,
         config.kratos_public_url.clone(),
         config.hydra_public_url.clone(),
@@ -322,6 +348,7 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         transient.clone(),
         mappings.clone(),
+        entitlements.clone(),
         config.force_email_claim_client_ids.clone(),
     ));
     let oauth2_device_service = Arc::new(OAuth2DeviceServiceImpl::new(

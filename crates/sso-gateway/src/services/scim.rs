@@ -31,6 +31,7 @@ use crate::{
     },
     services::permission::PermissionBackend,
 };
+use crate::services::entitlement::EntitlementService;
 
 const BACKEND_KRATOS: &str = "kratos";
 const SCIM_GROUP_NAMESPACE: &str = "scim_group";
@@ -86,6 +87,7 @@ pub struct ScimServiceImpl {
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
     groups: Arc<dyn ScimGroupStore>,
+    entitlements: Arc<dyn EntitlementService>,
 }
 
 impl ScimServiceImpl {
@@ -95,6 +97,7 @@ impl ScimServiceImpl {
         mappings: IdMappingRepo,
         schemas: IdentitySchemaRepo,
         groups: ScimGroupRepo,
+        entitlements: Arc<dyn EntitlementService>,
     ) -> Self {
         Self {
             kratos: kratos as Arc<dyn ScimKratos>,
@@ -102,6 +105,7 @@ impl ScimServiceImpl {
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
             groups: Arc::new(groups) as Arc<dyn ScimGroupStore>,
+            entitlements,
         }
     }
 }
@@ -114,6 +118,7 @@ impl ScimServiceImpl {
         mappings: Arc<dyn IdMappingStore>,
         schemas: Arc<dyn IdentitySchemaStore>,
         groups: Arc<dyn ScimGroupStore>,
+        entitlements: Arc<dyn EntitlementService>,
     ) -> Self {
         Self {
             kratos,
@@ -121,6 +126,7 @@ impl ScimServiceImpl {
             mappings,
             schemas,
             groups,
+            entitlements,
         }
     }
 }
@@ -242,7 +248,13 @@ impl ScimService for ScimServiceImpl {
 
         // Replace group memberships when the groups field is populated.
         if !input.groups.is_empty() {
+            let old_groups = self.groups.list_user_groups(&req.id).await?;
             self.groups.remove_user_from_all_groups(&req.id).await?;
+            for group_id in &old_groups {
+                self.entitlements
+                    .set_group_membership(&tenant_id, group_id, &req.id, false)
+                    .await?;
+            }
             for group_id in &input.groups {
                 self.add_user_to_group(&tenant_id, &req.id, group_id)
                     .await?;
@@ -267,6 +279,12 @@ impl ScimService for ScimServiceImpl {
             .get_ory_id(&tenant_id, BACKEND_KRATOS, &req.id)
             .await?;
 
+        let group_ids = self.groups.list_user_groups(&req.id).await?;
+        for group_id in group_ids {
+            self.entitlements
+                .set_group_membership(&tenant_id, &group_id, &req.id, false)
+                .await?;
+        }
         self.groups.remove_user_from_all_groups(&req.id).await?;
         self.kratos
             .delete_identity(&ory_id)
@@ -371,6 +389,9 @@ impl ScimService for ScimServiceImpl {
             self.groups
                 .remove_member(&tenant_id, &req.id, user_id)
                 .await?;
+            self.entitlements
+                .set_group_membership(&tenant_id, &req.id, user_id, false)
+                .await?;
             let _ = self
                 .backend
                 .delete_relation_tuple(
@@ -412,6 +433,9 @@ impl ScimService for ScimServiceImpl {
             .await?;
         let members = self.groups.list_members(&req.id).await?;
         for user_id in members {
+            self.entitlements
+                .set_group_membership(&tenant_id, &req.id, &user_id, false)
+                .await?;
             let _ = self
                 .backend
                 .delete_relation_tuple(
@@ -560,6 +584,9 @@ impl ScimServiceImpl {
                 SCIM_GROUP_RELATION,
                 user_id,
             )
+            .await?;
+        self.entitlements
+            .set_group_membership(tenant_id, group_id, user_id, true)
             .await?;
         Ok(())
     }
@@ -784,6 +811,8 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use crate::auth::SubjectType;
+    use crate::services::entitlement::EntitlementLevel;
+    use crate::services::entitlement::test_helpers::entitlements;
     use super::*;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
@@ -795,13 +824,112 @@ mod tests {
     }
 
     fn make_service() -> ScimServiceImpl {
+        make_service_with_entitlements(entitlements())
+    }
+
+    fn make_service_with_entitlements(
+        entitlements: Arc<dyn EntitlementService>,
+    ) -> ScimServiceImpl {
         ScimServiceImpl::new_for_test(
             Arc::new(StubKratos::default()),
             Arc::new(StubPermissionBackend::default()),
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::valid()),
             Arc::new(StubGroups::default()),
+            entitlements,
         )
+    }
+
+    #[derive(Clone, Default)]
+    #[allow(clippy::type_complexity)]
+    struct RecordingEntitlementService {
+        group_memberships: Arc<Mutex<Vec<(String, String, String, bool)>>>,
+    }
+
+    #[async_trait]
+    impl EntitlementService for RecordingEntitlementService {
+        async fn ensure_namespace(&self, _tenant_id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn seed_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+            _groups: &[String],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn remove_application(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn check(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _relation: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn effective_scope_ceiling(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Vec<String> {
+            vec![]
+        }
+        async fn grant(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn revoke(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+            _level: EntitlementLevel,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_group_membership(
+            &self,
+            tenant_id: &str,
+            group_name: &str,
+            identity_id: &str,
+            member: bool,
+        ) -> Result<(), ServiceError> {
+            self.group_memberships.lock().await.push((
+                tenant_id.to_string(),
+                group_name.to_string(),
+                identity_id.to_string(),
+                member,
+            ));
+            Ok(())
+        }
+        async fn remove_all_for_identity(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn mint_claim(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+        ) -> Value {
+            Value::Null
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1514,7 +1642,7 @@ mod tests {
         let mappings = IdMappingRepo::new(pool.clone());
         let schemas = IdentitySchemaRepo::new(pool.clone());
         let groups = ScimGroupRepo::new(pool);
-        let service = ScimServiceImpl::new(kratos, backend, mappings, schemas, groups);
+        let service = ScimServiceImpl::new(kratos, backend, mappings, schemas, groups, entitlements());
         // Exercise Clone to ensure the struct fields are consistent.
         let _cloned = service.clone();
     }
@@ -1585,6 +1713,7 @@ mod tests {
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::invalid()),
             Arc::new(StubGroups::default()),
+            entitlements(),
         );
         let user = ScimUser {
             user_name: "alice".into(),
@@ -1609,6 +1738,7 @@ mod tests {
             Arc::new(StubMappings::default()),
             Arc::new(StubSchemas::valid()),
             Arc::new(StubGroups::default()),
+            entitlements(),
         );
         let user = ScimUser {
             user_name: "alice".into(),
@@ -1799,6 +1929,41 @@ mod tests {
         assert_eq!(group.display_name, "admins");
         assert_eq!(group.members.len(), 1);
         assert_eq!(group.members[0].value, user.id);
+    }
+
+    #[tokio::test]
+    async fn create_group_syncs_entitlement_membership() {
+        let entitlements = Arc::new(RecordingEntitlementService::default());
+        let service = make_service_with_entitlements(entitlements.clone());
+        let user = ScimUser {
+            user_name: "alice".into(),
+            emails: vec![email_field("alice@example.com")],
+            ..Default::default()
+        };
+        let user = service
+            .create_user_http("tenant-1".into(), user)
+            .await
+            .unwrap()
+            .body;
+
+        let mut group = ScimGroup {
+            display_name: "admins".into(),
+            ..Default::default()
+        };
+        group.members.push(ScimMember {
+            value: user.id.clone(),
+            ..Default::default()
+        });
+        let group = service
+            .create_group_http("tenant-1".into(), group)
+            .await
+            .unwrap()
+            .body;
+
+        let calls = entitlements.group_memberships.lock().await;
+        assert!(calls.iter().any(|(t, g, u, m)| {
+            t == "tenant-1" && *g == group.id && *u == user.id && *m
+        }));
     }
 
     #[tokio::test]

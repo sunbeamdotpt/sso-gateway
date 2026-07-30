@@ -28,6 +28,7 @@ use crate::proto::iam::v1::{
     SubmitRecoveryTokenResponse, SubmitVerificationTokenRequest, SubmitVerificationTokenResponse,
     TenantCapabilities, ToSessionRequest, WebAuthnJsResponse,
 };
+use crate::services::entitlement::EntitlementService;
 use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 use buffa_types::google::protobuf::Empty;
 
@@ -439,6 +440,7 @@ pub struct IdentitySelfServiceImpl {
     mappings: Arc<dyn IdMappingStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
     memberships: Arc<dyn TenantMembershipStore>,
+    entitlements: Arc<dyn EntitlementService>,
     consent_enabled: bool,
     kratos_public_url: String,
     hydra_public_url: String,
@@ -490,6 +492,7 @@ impl IdentitySelfServiceImpl {
         mappings: IdMappingRepo,
         schemas: IdentitySchemaRepo,
         memberships: TenantMembershipRepo,
+        entitlements: Arc<dyn EntitlementService>,
         consent_enabled: bool,
         kratos_public_url: String,
         hydra_public_url: String,
@@ -504,6 +507,7 @@ impl IdentitySelfServiceImpl {
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
             memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
+            entitlements,
             consent_enabled,
             kratos_public_url,
             hydra_public_url,
@@ -906,6 +910,7 @@ impl IdentitySelfServiceImpl {
     /// session to accept with.
     async fn accept_skippable_login(
         &self,
+        tenant_id: &str,
         ory_challenge: &str,
         cookie: Option<&str>,
     ) -> Result<Option<SelfServiceFlow>, ServiceError> {
@@ -947,6 +952,72 @@ impl IdentitySelfServiceImpl {
                 "session AAL insufficient; creating login flow for step-up"
             );
             return Ok(None);
+        }
+
+        // Resolve the OAuth2 client to the public application id and enforce
+        // the application-entitlement gate before any session/token exists.
+        let ory_client_id = login_request
+            .pointer("/client/client_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !ory_client_id.is_empty() {
+            match self
+                .mappings
+                .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
+                .await
+            {
+                Ok(app_public_id) => {
+                    let public_subject = self
+                        .mappings
+                        .get_public_id(tenant_id, BACKEND_KRATOS, subject)
+                        .await
+                        .unwrap_or_else(|_| subject.to_string());
+                    match self
+                        .entitlements
+                        .is_member(tenant_id, &public_subject, &app_public_id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(
+                                target: "sso_gateway::audit",
+                                tenant_id = tenant_id,
+                                actor = public_subject,
+                                application = app_public_id,
+                                action = "entitlement.login_denied",
+                                outcome = "denied",
+                                "user is not entitled to this application"
+                            );
+                            return Err(ServiceError::PermissionDenied(
+                                "user is not entitled to this application".into(),
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::info!(
+                                target: "sso_gateway::audit",
+                                tenant_id = tenant_id,
+                                actor = public_subject,
+                                application = app_public_id,
+                                action = "entitlement.login_denied",
+                                outcome = "error",
+                                error = ?err,
+                                "entitlement check failed; refusing login"
+                            );
+                            return Err(ServiceError::PermissionDenied(
+                                "user is not entitled to this application".into(),
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        tenant_id,
+                        ory_client_id,
+                        ?err,
+                        "unable to resolve application for login entitlement check"
+                    );
+                }
+            }
         }
 
         let amr: Vec<String> = session
@@ -1567,7 +1638,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
                 resolve_login_challenge(self.transient.as_ref(), &tenant_id, &req.login_challenge)
                     .await?;
             if let Some(flow) = self
-                .accept_skippable_login(&ory_challenge, cookie.as_deref())
+                .accept_skippable_login(&tenant_id, &ory_challenge, cookie.as_deref())
                 .await?
             {
                 return Ok(Response::new(flow));
@@ -2019,6 +2090,7 @@ mod tests {
         BACKEND_HYDRA, BACKEND_KRATOS, IdentitySelfServiceImpl, KratosSelfService, LoginHydra,
         cookie_from_context, csrf_token_from_context, map_ory_error, tenant_from_context,
     };
+    use crate::services::entitlement::{EntitlementService, test_helpers::{ConfigurableEntitlementService, entitlements}};
 
     fn request_context_with_cookie(cookie: &str) -> RequestContext {
         let mut headers = HeaderMap::new();
@@ -3107,6 +3179,14 @@ mod tests {
     }
 
     fn service_with_hydra(kratos: FakeKratos, hydra: FakeHydra) -> IdentitySelfServiceImpl {
+        service_with_hydra_and_entitlements(kratos, hydra, entitlements())
+    }
+
+    fn service_with_hydra_and_entitlements(
+        kratos: FakeKratos,
+        hydra: FakeHydra,
+        entitlements: Arc<dyn EntitlementService>,
+    ) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
             hydra: Arc::new(hydra),
@@ -3114,6 +3194,7 @@ mod tests {
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(default_membership_store()),
+            entitlements,
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -3140,7 +3221,8 @@ mod tests {
             crate::db::TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool.clone()),
             crate::db::IdentitySchemaRepo::new(pool.clone()),
-            crate::db::TenantMembershipRepo::new(pool),
+            crate::db::TenantMembershipRepo::new(pool.clone()),
+            entitlements(),
             true,
             "http://kratos.example.com".to_string(),
             "https://hydra.example.com".to_string(),
@@ -3216,6 +3298,7 @@ mod tests {
                 updated_at: time::OffsetDateTime::now_utc(),
             })),
             memberships: Arc::new(default_membership_store()),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -3241,6 +3324,7 @@ mod tests {
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(StubSchemaStore::with_default_error(DbError::SchemaNotFound)),
             memberships: Arc::new(default_membership_store()),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -4199,6 +4283,113 @@ mod tests {
         assert!(hydra.calls().is_empty());
     }
 
+    // RFC 0001: a user without application:<app>#member must be refused at
+    // login-time, before any session/token is minted for the OAuth2 client.
+    #[tokio::test]
+    async fn create_login_flow_denies_unentitled_user() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal1",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [{ "method": "password", "aal": "aal1" }]
+            }))))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true,
+                "client": { "client_id": "client-1" }
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        let entitlements = ConfigurableEntitlementService::default();
+        entitlements.deny("tenant-1", "pub-identity-1", "pub-client-1");
+        let svc = service_with_hydra_and_entitlements(
+            fake.clone(),
+            hydra.clone(),
+            Arc::new(entitlements),
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut().insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not entitled"),
+            "unexpected error message: {err:?}"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request")),
+            "login must not be accepted for unentitled user"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_login_flow_accepts_entitled_user() {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal1",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [{ "method": "password", "aal": "aal1" }]
+            }))))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true,
+                "client": { "client_id": "client-1" }
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        let entitlements = ConfigurableEntitlementService::default();
+        entitlements.allow("tenant-1", "pub-identity-1", "pub-client-1");
+        let svc = service_with_hydra_and_entitlements(
+            fake.clone(),
+            hydra.clone(),
+            Arc::new(entitlements),
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut().insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            resp.body.redirect_browser_to,
+            "https://gateway.example.com/oauth2/auth?login_verifier=v1"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1")),
+            "login should be accepted for entitled user"
+        );
+    }
 
     #[tokio::test]
     async fn create_logout_flow_happy_path() {
@@ -4922,6 +5113,7 @@ mod tests {
             mappings: Arc::new(default_mapping_store()),
             schemas: Arc::new(default_schema_store()),
             memberships: memberships.clone(),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -4994,6 +5186,7 @@ mod tests {
                 created_at: time::OffsetDateTime::now_utc(),
                 updated_at: time::OffsetDateTime::now_utc(),
             })),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -5354,6 +5547,7 @@ mod tests {
             mappings: Arc::new(mappings),
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(memberships),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
