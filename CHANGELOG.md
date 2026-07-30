@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.29] - 2026-07-30
+
+### Added
+
+- RFC 0001 application entitlements. A new per-tenant `entitlements`
+  namespace decides whether a user may use an application at all and at
+  what level (`member` or `admin`). The namespace and a gateway-wide
+  `sso-gateway` object are seeded at tenant creation; each registered
+  application is seeded as an object with default group links.
+- Login-time entitlement enforcement: when a user with a valid Kratos
+  session hits the login flow with an OAuth2 challenge, the gateway
+  refuses to accept the login unless the user has `application:<app>#member`.
+  Refusals are emitted as `sso_gateway::audit` events with action
+  `entitlement.login_denied`.
+- OAuth2 consent and device-code scope grants are intersected with the
+  user's entitlement-derived scope ceiling. Users with the gateway admin
+  entitlement receive the full administrative scope ceiling; gateway
+  members receive read-only scopes; everyone else receives only OIDC
+  scopes.
+- Per-client entitlement claim minted into access tokens and ID tokens.
+  The claim is audience-restricted to the requesting client and contains
+  only that application's levels, e.g. `{"entitlements":{"kanban":["member"]}}`.
+- Admin and SCIM group-membership changes write entitlement tuples
+  synchronously; the request fails if the entitlement backend rejects the
+  write. Grant and revoke operations emit `sso_gateway::audit` events.
+
+### Fixed
+
+- `EntitlementService::seed_application` now writes tuples into the
+  `entitlements` namespace instead of the object type `application`.
+
 ## [2026.07.28] - 2026-07-27
 
 ### Fixed
