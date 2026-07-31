@@ -15,32 +15,34 @@ use super::proto_util::{
 };
 
 pub fn ory_consent_request_to_proto(value: &Value) -> ConsentRequest {
-    let client = value.get("client").cloned().unwrap_or_default();
+    let client = match value.get("client") {
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
     ConsentRequest {
         challenge: json_str(value, "challenge"),
         client_id: json_str(&client, "client_id"),
         client_name: json_str(&client, "client_name"),
         subject: json_str(value, "subject"),
         skip: json_bool(value, "skip"),
-        requested_scope: json_array_to_strings(
-            value.get("requested_scope").unwrap_or(&Value::Null),
-        ),
+        requested_scope: json_array_to_strings(match value.get("requested_scope") {
+            Some(v) => v,
+            None => &Value::Null,
+        }),
         requested_access_token_audience: json_array_to_strings(
-            value
-                .get("requested_access_token_audience")
-                .unwrap_or(&Value::Null),
+            match value.get("requested_access_token_audience") {
+                Some(v) => v,
+                None => &Value::Null,
+            },
         ),
-        oidc_context: value
-            .get("oidc_context")
-            .cloned()
-            .and_then(json_to_struct)
-            .map(Into::into)
-            .unwrap_or_default(),
-        client: client
-            .as_object()
-            .map(|_| OAuth2Client::from(&client))
-            .map(Into::into)
-            .unwrap_or_default(),
+        oidc_context: match value.get("oidc_context").cloned().and_then(json_to_struct) {
+            Some(v) => v.into(),
+            None => Default::default(),
+        },
+        client: match client.as_object() {
+            Some(_) => OAuth2Client::from(&client).into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }
@@ -52,25 +54,28 @@ impl From<&Value> for OAuth2Client {
             client_name: json_str(value, "client_name"),
             client_uri: json_str(value, "client_uri"),
             logo_uri: json_str(value, "logo_uri"),
-            redirect_uris: json_array_to_strings(
-                value.get("redirect_uris").unwrap_or(&Value::Null),
-            ),
+            redirect_uris: json_array_to_strings(match value.get("redirect_uris") {
+                Some(v) => v,
+                None => &Value::Null,
+            }),
             skip_consent: json_bool(value, "skip_consent"),
             skip_logout_consent: json_bool(value, "skip_logout_consent"),
-            grant_types: json_array_to_strings(value.get("grant_types").unwrap_or(&Value::Null)),
-            response_types: json_array_to_strings(
-                value.get("response_types").unwrap_or(&Value::Null),
-            ),
+            grant_types: json_array_to_strings(match value.get("grant_types") {
+                Some(v) => v,
+                None => &Value::Null,
+            }),
+            response_types: json_array_to_strings(match value.get("response_types") {
+                Some(v) => v,
+                None => &Value::Null,
+            }),
             scope: json_str(value, "scope"),
             policy_uri: json_str(value, "policy_uri"),
             tos_uri: json_str(value, "tos_uri"),
             jwks_uri: json_str(value, "jwks_uri"),
-            metadata: value
-                .get("metadata")
-                .cloned()
-                .and_then(json_to_struct)
-                .map(Into::into)
-                .unwrap_or_default(),
+            metadata: match value.get("metadata").cloned().and_then(json_to_struct) {
+                Some(v) => v.into(),
+                None => Default::default(),
+            },
             ..Default::default()
         }
     }
@@ -105,10 +110,14 @@ pub fn accept_consent_request_to_json(req: &AcceptConsentRequest) -> Value {
         );
     }
     if let Some(session) = req.session.as_option() {
-        body.insert(
-            "session".to_string(),
-            serde_json::to_value(session).unwrap_or_default(),
-        );
+        let session_value = match serde_json::to_value(session) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("failed to serialize consent session to JSON: {}", err);
+                Value::Null
+            }
+        };
+        body.insert("session".to_string(), session_value);
     }
     Value::Object(body)
 }
@@ -170,7 +179,10 @@ pub fn reject_consent_request_to_json(req: &RejectConsentRequest) -> Value {
 }
 
 pub fn ory_logout_request_to_proto(value: &Value) -> LogoutRequest {
-    let client = value.get("client").cloned().unwrap_or_default();
+    let client = match value.get("client") {
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
     let client_id = if client.is_object() {
         json_str(&client, "client_id")
     } else if client.is_null() {
@@ -184,11 +196,10 @@ pub fn ory_logout_request_to_proto(value: &Value) -> LogoutRequest {
         client_id,
         request_url: json_str(value, "request_url"),
         post_logout_redirect_uri: json_str(value, "post_logout_redirect_uri"),
-        client: client
-            .as_object()
-            .map(|_| OAuth2Client::from(&client))
-            .map(Into::into)
-            .unwrap_or_default(),
+        client: match client.as_object() {
+            Some(_) => OAuth2Client::from(&client).into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }

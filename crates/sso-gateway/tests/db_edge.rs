@@ -1,3 +1,6 @@
+// SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+
 use sso_gateway::db::{
     DbError, IdMappingRepo, IdentitySchemaRepo, PermissionTupleRepo, ScimGroupRepo, TenantRepo,
     bootstrap_system_tenant, create_pool,

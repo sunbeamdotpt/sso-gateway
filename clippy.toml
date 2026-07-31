@@ -1,0 +1,23 @@
+# SSO-027: ban silent-default and panic-on-error paths in production code.
+#
+# These methods fabricate a default (or panic) where a failure should be
+# handled: match, `?`, or an explicit `unwrap_or_else` that logs when a real
+# failure is being swallowed. `unwrap_or`/`unwrap_or_else` remain allowed.
+#
+# The known violation inside the connectrpc-generated view code cannot be
+# fixed by this lint (generated code); that call site needs a patch to the
+# connectrpc-build generator upstream and is suppressed in src/proto.rs.
+disallowed-methods = [
+    { path = "core::result::Result::unwrap_or_default", reason = "swallows the error — match, ?, or an explicit logged fallback" },
+    { path = "core::result::Result::expect_or_default", reason = "same — no fabricated defaults from Err", allow-invalid = true },
+    { path = "core::option::Option::unwrap_or_default", reason = "no fabricated defaults — spell the fallback out with match/if-let" },
+    { path = "core::option::Option::or_default", reason = "same as unwrap_or_default", allow-invalid = true },
+    { path = "core::option::Option::unwrap_or", reason = "no combinator fallbacks — spell the fallback out with match/if-let" },
+    { path = "core::option::Option::unwrap_or_else", reason = "no combinator fallbacks — spell the fallback out with match/if-let" },
+    { path = "core::option::Option::map_or", reason = "no combinator fallbacks — spell the fallback out with match/if-let" },
+    { path = "core::option::Option::map_or_else", reason = "no combinator fallbacks — spell the fallback out with match/if-let" },
+    { path = "core::result::Result::unwrap_or", reason = "swallows the error — match, ?, or an explicit logged fallback" },
+    { path = "core::result::Result::unwrap_or_else", reason = "swallows the error — match, ?, or an explicit logged fallback" },
+    { path = "core::result::Result::map_or", reason = "swallows the error — match, ?, or an explicit logged fallback" },
+    { path = "core::result::Result::map_or_else", reason = "swallows the error — match, ?, or an explicit logged fallback" },
+]

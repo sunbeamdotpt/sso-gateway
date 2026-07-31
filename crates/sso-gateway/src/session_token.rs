@@ -85,6 +85,10 @@ impl SessionTokenSigner {
     ///
     /// Panics if `secret` is shorter than 32 bytes. The caller is expected to
     /// validate this at config load time.
+    // Panicking here is deliberate: `Config::from_env` rejects secrets shorter
+    // than 32 bytes, so by the time a signer is constructed the invariant
+    // holds. Making this fallible would change the constructor's public API.
+    #[allow(clippy::expect_used)]
     pub fn new(secret: impl AsRef<[u8]>, ttl_seconds: i64, issuer: impl Into<String>) -> Self {
         Self {
             signer: CookieSigner::new(secret)

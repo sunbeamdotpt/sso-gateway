@@ -60,7 +60,10 @@ impl RateLimiter {
     pub fn check(&self, key: &str) -> bool {
         let max = self.max as f64;
         let refill_rate = self.max as f64 / self.per.as_secs_f64();
-        let mut buckets = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buckets = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if !buckets.contains_key(key) && buckets.len() >= MAX_RATE_LIMIT_KEYS {
             // Evict buckets that have drifted back to full; if everything is
             // saturated, start over rather than growing without bound.
@@ -141,10 +144,13 @@ pub async fn rate_limit_middleware(
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
-    let key = basic_auth_client_id(&parts.headers)
+    let key = match basic_auth_client_id(&parts.headers)
         .or_else(|| query_client_id(&parts.uri))
         .or_else(|| form_body_client_id(&parts.headers, &body))
-        .unwrap_or_else(|| "global".to_string());
+    {
+        Some(client_id) => client_id,
+        None => "global".to_string(),
+    };
     let request = Request::from_parts(parts, Body::from(body));
     if limiter.check(&key) {
         next.run(request).await

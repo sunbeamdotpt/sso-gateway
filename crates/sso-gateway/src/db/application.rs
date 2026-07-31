@@ -225,7 +225,10 @@ impl ApplicationStore for MemoryApplicationStore {
         public_id: &str,
         cross_tenant: bool,
     ) -> Result<ApplicationRow, DbError> {
-        let mut lock = self.records.lock().unwrap();
+        let mut lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if lock.contains_key(public_id) {
             return Err(DbError::ApplicationNotFound);
         }
@@ -246,7 +249,10 @@ impl ApplicationStore for MemoryApplicationStore {
         tenant_id: &str,
         public_id: &str,
     ) -> Result<ApplicationRow, DbError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         lock.get(public_id)
             .filter(|r| r.tenant_id == tenant_id)
             .cloned()
@@ -254,12 +260,18 @@ impl ApplicationStore for MemoryApplicationStore {
     }
 
     async fn get_by_public_id(&self, public_id: &str) -> Result<ApplicationRow, DbError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         lock.get(public_id).cloned().ok_or(DbError::ApplicationNotFound)
     }
 
     async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<ApplicationRow>, DbError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         let mut rows: Vec<_> = lock
             .values()
             .filter(|r| r.tenant_id == tenant_id)
@@ -275,7 +287,10 @@ impl ApplicationStore for MemoryApplicationStore {
         public_id: &str,
         cross_tenant: bool,
     ) -> Result<ApplicationRow, DbError> {
-        let mut lock = self.records.lock().unwrap();
+        let mut lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         let row = lock
             .get_mut(public_id)
             .filter(|r| r.tenant_id == tenant_id)
@@ -286,7 +301,10 @@ impl ApplicationStore for MemoryApplicationStore {
     }
 
     async fn delete(&self, tenant_id: &str, public_id: &str) -> Result<(), DbError> {
-        let mut lock = self.records.lock().unwrap();
+        let mut lock = match self.records.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if lock
             .get(public_id)
             .filter(|r| r.tenant_id == tenant_id)

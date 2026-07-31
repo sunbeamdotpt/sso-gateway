@@ -325,7 +325,10 @@ async fn saml_acs_callback(
         .get("SAMLResponse")
         .cloned()
         .ok_or(CallbackError::Configuration("missing SAMLResponse".into()))?;
-    let relay_state = form.get("RelayState").cloned().unwrap_or_default();
+    let relay_state = match form.get("RelayState") {
+        Some(s) => s.clone(),
+        None => String::new(),
+    };
 
     let identity = saml
         .process_saml_assertion_http(&encoded_assertion, &relay_state)
@@ -344,11 +347,14 @@ async fn provision_identity(
     tenant_id: &str,
     userinfo: &serde_json::Value,
 ) -> Result<ProvisionedIdentity, CallbackError> {
-    let schema_id = userinfo["schema_id"].as_str().unwrap_or("default");
+    let schema_id = match userinfo["schema_id"].as_str() {
+        Some(id) => id.to_owned(),
+        None => "default".to_owned(),
+    };
 
     state
         .identity_provisioner
-        .provision(tenant_id, schema_id, userinfo)
+        .provision(tenant_id, &schema_id, userinfo)
         .await
         .map_err(|e| {
             warn!("identity provisioning failed: {e}");
@@ -370,9 +376,13 @@ async fn build_session_redirect(
             CallbackError::Session
         })?;
 
-    let expires_at = time::OffsetDateTime::from_unix_timestamp(claims.exp).unwrap_or_else(|_| {
-        time::OffsetDateTime::now_utc() + time::Duration::seconds(COOKIE_MAX_AGE_SECONDS)
-    });
+    let expires_at = match time::OffsetDateTime::from_unix_timestamp(claims.exp) {
+        Ok(exp) => exp,
+        Err(err) => {
+            warn!("session claims exp out of range; falling back to cookie max-age: {err}");
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(COOKIE_MAX_AGE_SECONDS)
+        }
+    };
     state
         .session_store
         .create(&claims.sid, &claims.sub, &claims.tenant_id, amr, expires_at)
@@ -412,7 +422,11 @@ fn validate_return_to(
     local_dev_mode: bool,
     return_to: &str,
 ) -> Result<(), CallbackError> {
-    if allowed_hosts.is_empty() && tenant_allowed_hosts.map(|h| h.is_empty()).unwrap_or(true) {
+    let tenant_hosts_empty = match tenant_allowed_hosts {
+        Some(hosts) => hosts.is_empty(),
+        None => true,
+    };
+    if allowed_hosts.is_empty() && tenant_hosts_empty {
         return Err(CallbackError::InvalidReturnTo);
     }
 

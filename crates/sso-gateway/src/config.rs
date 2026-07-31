@@ -260,11 +260,14 @@ impl SelfServicePaths {
     }
 
     fn env_or(var: &str, default: &str) -> String {
-        std::env::var(var)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| default.to_string())
+        let value = match std::env::var(var) {
+            Ok(value) => value.trim().to_string(),
+            Err(_) => return default.to_string(),
+        };
+        if value.is_empty() {
+            return default.to_string();
+        }
+        value
     }
 
     /// Every `(env var, configured path)` pair, in a stable order.
@@ -339,6 +342,32 @@ pub(crate) fn default_permissions_backend() -> PermissionsBackend {
     }
 }
 
+/// Read a string environment variable, falling back to `default` when unset.
+pub(crate) fn env_var_or(var: &str, default: &str) -> String {
+    match std::env::var(var) {
+        Ok(value) => value,
+        Err(_) => default.to_string(),
+    }
+}
+
+/// Read a boolean environment variable ("1" or "true", case-insensitive),
+/// falling back to `default` when unset.
+pub(crate) fn env_flag_or(var: &str, default: bool) -> bool {
+    match std::env::var(var) {
+        Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        Err(_) => default,
+    }
+}
+
+/// Read a numeric environment variable, falling back to `default` when unset
+/// or unparseable.
+pub(crate) fn env_parse_or<T: std::str::FromStr>(var: &str, default: T) -> T {
+    match std::env::var(var).ok().and_then(|s| s.parse().ok()) {
+        Some(value) => value,
+        None => default,
+    }
+}
+
 impl std::str::FromStr for PermissionsBackend {
     type Err = ConfigError;
 
@@ -380,21 +409,19 @@ impl Config {
             return Err(ConfigError::InvalidSystemTenantUlid(system_tenant_ulid));
         }
 
-        let public_base_url = std::env::var("PUBLIC_BASE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        let public_base_url = env_var_or("PUBLIC_BASE_URL", "http://127.0.0.1:8080");
 
-        let ui_public_url =
-            std::env::var("UI_PUBLIC_URL").unwrap_or_else(|_| public_base_url.clone());
+        let ui_public_url = env_var_or("UI_PUBLIC_URL", &public_base_url);
 
-        let mut allowed_return_to_hosts: Vec<String> = std::env::var("ALLOWED_RETURN_TO_HOSTS")
-            .ok()
-            .map(|s| {
-                s.split(',')
+        let mut allowed_return_to_hosts: Vec<String> =
+            match std::env::var("ALLOWED_RETURN_TO_HOSTS").ok() {
+                Some(s) => s
+                    .split(',')
                     .map(|h| h.trim().to_string())
                     .filter(|h| !h.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect(),
+                None => Vec::new(),
+            };
 
         if allowed_return_to_hosts.is_empty()
             && let Some(host) = Self::default_return_to_host(&public_base_url)
@@ -424,10 +451,10 @@ impl Config {
             system_bootstrap_client_secret.as_deref(),
         )?;
 
-        let cookie_secure = std::env::var("COOKIE_SECURE")
-            .ok()
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-            .unwrap_or_else(|| public_base_url.starts_with("https://"));
+        let cookie_secure = match std::env::var("COOKIE_SECURE") {
+            Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+            Err(_) => public_base_url.starts_with("https://"),
+        };
 
         // The gateway session cookie uses the __Host- prefix, which requires the
         // Secure attribute.
@@ -441,9 +468,7 @@ impl Config {
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| ConfigError::MissingVar("DATABASE_URL".to_string()))?;
-        let database_ssl_required = std::env::var("DATABASE_SSL_REQUIRED")
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
+        let database_ssl_required = env_flag_or("DATABASE_SSL_REQUIRED", true);
         if database_ssl_required && database_url.contains("sslmode=disable") {
             return Err(ConfigError::InvalidConfig(
                 "DATABASE_URL uses sslmode=disable but DATABASE_SSL_REQUIRED is true".to_string(),
@@ -455,10 +480,13 @@ impl Config {
         let tenant_connection_encryption_key =
             Self::parse_optional_base64_key("TENANT_CONNECTION_ENCRYPTION_KEY")?;
 
-        let permissions_backend = std::env::var("PERMISSIONS_BACKEND")
+        let permissions_backend = match std::env::var("PERMISSIONS_BACKEND")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(default_permissions_backend);
+        {
+            Some(backend) => backend,
+            None => default_permissions_backend(),
+        };
 
         match permissions_backend {
             PermissionsBackend::Keto => {
@@ -475,29 +503,20 @@ impl Config {
             }
         }
 
-        let keto_read_url =
-            std::env::var("KETO_READ_URL").unwrap_or_else(|_| "http://127.0.0.1:4466".to_string());
-        let keto_write_url =
-            std::env::var("KETO_WRITE_URL").unwrap_or_else(|_| "http://127.0.0.1:4467".to_string());
-        let openfga_url =
-            std::env::var("OPENFGA_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
+        let keto_read_url = env_var_or("KETO_READ_URL", "http://127.0.0.1:4466");
+        let keto_write_url = env_var_or("KETO_WRITE_URL", "http://127.0.0.1:4467");
+        let openfga_url = env_var_or("OPENFGA_URL", "http://127.0.0.1:8081");
 
         Ok(Self {
-            bind_addr: std::env::var("BIND_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+            bind_addr: env_var_or("BIND_ADDR", "127.0.0.1:8080")
                 .parse()?,
             system_tenant_ulid,
             database_url,
-            hydra_admin_url: std::env::var("HYDRA_ADMIN_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4445".to_string()),
-            hydra_public_url: std::env::var("HYDRA_PUBLIC_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4444".to_string()),
-            kratos_admin_url: std::env::var("KRATOS_ADMIN_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4434".to_string()),
-            kratos_public_url: std::env::var("KRATOS_PUBLIC_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4433".to_string()),
-            kratos_default_schema_id: std::env::var("KRATOS_DEFAULT_SCHEMA_ID")
-                .unwrap_or_else(|_| "default".to_string()),
+            hydra_admin_url: env_var_or("HYDRA_ADMIN_URL", "http://127.0.0.1:4445"),
+            hydra_public_url: env_var_or("HYDRA_PUBLIC_URL", "http://127.0.0.1:4444"),
+            kratos_admin_url: env_var_or("KRATOS_ADMIN_URL", "http://127.0.0.1:4434"),
+            kratos_public_url: env_var_or("KRATOS_PUBLIC_URL", "http://127.0.0.1:4433"),
+            kratos_default_schema_id: env_var_or("KRATOS_DEFAULT_SCHEMA_ID", "default"),
             permissions_backend,
             keto_read_url,
             keto_write_url,
@@ -507,102 +526,53 @@ impl Config {
             saml_sp_private_key_pem_path: std::env::var("SAML_SP_PRIVATE_KEY_PEM_PATH").ok(),
             saml_sp_certificate_pem_path: std::env::var("SAML_SP_CERTIFICATE_PEM_PATH").ok(),
             saml_idp_entity_id: std::env::var("SAML_IDP_ENTITY_ID").ok(),
-            saml_request_ttl_seconds: std::env::var("SAML_REQUEST_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(900),
-            saml_require_signed_assertions: std::env::var("SAML_REQUIRE_SIGNED_ASSERTIONS")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
-            saml_require_signed_responses: std::env::var("SAML_REQUIRE_SIGNED_RESPONSES")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-            registration_enabled: std::env::var("REGISTRATION_ENABLED")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            saml_request_ttl_seconds: env_parse_or("SAML_REQUEST_TTL_SECONDS", 900),
+            saml_require_signed_assertions: env_flag_or("SAML_REQUIRE_SIGNED_ASSERTIONS", true),
+            saml_require_signed_responses: env_flag_or("SAML_REQUIRE_SIGNED_RESPONSES", false),
+            registration_enabled: env_flag_or("REGISTRATION_ENABLED", false),
             // RFC 7591 public dynamic client registration is an opt-out:
             // browser/native OIDC clients (e.g. Matrix Element) rely on it.
-            dynamic_client_registration_enabled: std::env::var(
-                "ENABLE_DYNAMIC_CLIENT_REGISTRATION",
-            )
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-            .unwrap_or(true),
+            dynamic_client_registration_enabled: env_flag_or("ENABLE_DYNAMIC_CLIENT_REGISTRATION", true),
             // Matrix (MSC2965) introspection email injection is an opt-out:
             // zendrite deployments rely on it out of the box.
-            matrix_email_claim_enabled: std::env::var("ENABLE_MATRIX_EMAIL_CLAIM")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+            matrix_email_claim_enabled: env_flag_or("ENABLE_MATRIX_EMAIL_CLAIM", true),
             // Matrix offline-access injection (authorize-time scope append and
             // DCR grant hygiene) is an opt-out: Matrix native clients never
             // request `offline_access` but need refresh tokens.
-            matrix_offline_access_enabled: std::env::var("ENABLE_MATRIX_OFFLINE_ACCESS")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+            matrix_offline_access_enabled: env_flag_or("ENABLE_MATRIX_OFFLINE_ACCESS", true),
             allowed_return_to_hosts,
-            force_email_claim_client_ids: std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS")
-                .ok()
-                .map(|s| {
-                    s.split(',')
-                        .map(|id| id.trim().to_string())
-                        .filter(|id| !id.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            force_email_claim_client_ids: match std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS").ok()
+            {
+                Some(s) => s
+                    .split(',')
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            },
             system_bootstrap_client_id: std::env::var("SYSTEM_BOOTSTRAP_CLIENT_ID").ok(),
             system_bootstrap_client_secret,
             state_cookie_secret,
             cookie_secure,
-            cookie_samesite: std::env::var("COOKIE_SAMESITE").unwrap_or_else(|_| "Lax".to_string()),
+            cookie_samesite: env_var_or("COOKIE_SAMESITE", "Lax"),
             saml_idp_key_encryption_key,
             tenant_connection_encryption_key,
             database_ssl_required,
-            database_max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(25),
-            database_acquire_timeout_seconds: std::env::var("DATABASE_ACQUIRE_TIMEOUT_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
-            database_idle_timeout_seconds: std::env::var("DATABASE_IDLE_TIMEOUT_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(600),
-            database_max_lifetime_seconds: std::env::var("DATABASE_MAX_LIFETIME_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1800),
-            database_statement_timeout_seconds: std::env::var("DATABASE_STATEMENT_TIMEOUT_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-            token_introspection_cache_ttl_seconds: std::env::var(
+            database_max_connections: env_parse_or("DATABASE_MAX_CONNECTIONS", 25),
+            database_acquire_timeout_seconds: env_parse_or("DATABASE_ACQUIRE_TIMEOUT_SECONDS", 10),
+            database_idle_timeout_seconds: env_parse_or("DATABASE_IDLE_TIMEOUT_SECONDS", 600),
+            database_max_lifetime_seconds: env_parse_or("DATABASE_MAX_LIFETIME_SECONDS", 1800),
+            database_statement_timeout_seconds: env_parse_or("DATABASE_STATEMENT_TIMEOUT_SECONDS", 30),
+            token_introspection_cache_ttl_seconds: env_parse_or(
                 "TOKEN_INTROSPECTION_CACHE_TTL_SECONDS",
-            )
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30),
-            session_ttl_seconds: std::env::var("SESSION_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(86400),
+                30,
+            ),
+            session_ttl_seconds: env_parse_or("SESSION_TTL_SECONDS", 86400),
             nats_url: std::env::var("NATS_URL").ok(),
-            agent_act_token_ttl_seconds: std::env::var("AGENT_ACT_TOKEN_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3600),
-            agent_cache_ttl_seconds: std::env::var("AGENT_CACHE_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5),
-            public_rate_limit_requests: std::env::var("PUBLIC_RATE_LIMIT_REQUESTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100),
-            public_rate_limit_window_seconds: std::env::var("PUBLIC_RATE_LIMIT_WINDOW_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60),
+            agent_act_token_ttl_seconds: env_parse_or("AGENT_ACT_TOKEN_TTL_SECONDS", 3600),
+            agent_cache_ttl_seconds: env_parse_or("AGENT_CACHE_TTL_SECONDS", 5),
+            public_rate_limit_requests: env_parse_or("PUBLIC_RATE_LIMIT_REQUESTS", 100),
+            public_rate_limit_window_seconds: env_parse_or("PUBLIC_RATE_LIMIT_WINDOW_SECONDS", 60),
             self_service_paths: SelfServicePaths::from_env()?,
         })
     }

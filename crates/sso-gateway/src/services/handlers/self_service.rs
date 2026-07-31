@@ -31,11 +31,14 @@ impl SelfServiceState {
         paths: SelfServicePaths,
     ) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            {
+                Ok(client) => client,
+                Err(_) => reqwest::Client::new(),
+            },
             kratos_public_url,
             gateway_public_url,
             paths,
@@ -232,8 +235,13 @@ async fn proxy_request(
         }
     };
 
-    let status = StatusCode::from_u16(upstream_response.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = match StatusCode::from_u16(upstream_response.status().as_u16()) {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!(%err, "upstream status not representable; responding 502");
+            StatusCode::BAD_GATEWAY
+        }
+    };
     // Preserve every upstream header value, including repeated header names.
     // `HeaderMap::insert` overwrites earlier values for the same name, which
     // silently drops all but the last `Set-Cookie` (e.g. losing the Kratos

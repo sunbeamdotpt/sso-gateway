@@ -98,10 +98,10 @@ impl ApplicationServiceImpl {
     }
 
     fn is_system_tenant(&self, ctx: &RequestContext) -> bool {
-        ctx.extensions()
-            .get::<AuthContext>()
-            .map(|a| a.tenant_id == self.system_tenant_ulid)
-            .unwrap_or(false)
+        match ctx.extensions().get::<AuthContext>() {
+            Some(a) => a.tenant_id == self.system_tenant_ulid,
+            None => false,
+        }
     }
 }
 
@@ -138,7 +138,10 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
         let ory_id = created["client_id"]
             .as_str()
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_id".into()))?;
-        let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
+        let client_secret = match created["client_secret"].as_str() {
+            Some(s) => s.to_string(),
+            None => String::new(),
+        };
 
         self.mappings
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
@@ -179,7 +182,10 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             &client,
             &tenant_id,
             &req.id,
-            app_row.map(|r| r.cross_tenant).unwrap_or(false),
+            match app_row {
+                Some(r) => r.cross_tenant,
+                None => false,
+            },
         )))
     }
 
@@ -196,11 +202,9 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .list_public_ids(&tenant_id, BACKEND_HYDRA)
             .await?;
 
-        let app_rows = self
-            .applications
-            .list_by_tenant(&tenant_id)
-            .await
-            .unwrap_or_default();
+        // A failed application lookup must not silently drop cross-tenant
+        // flags; propagate the database error (SSO-027).
+        let app_rows = self.applications.list_by_tenant(&tenant_id).await?;
         let cross_tenant_by_id: std::collections::HashMap<String, bool> = app_rows
             .into_iter()
             .map(|r| (r.public_id, r.cross_tenant))
@@ -215,7 +219,10 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             {
                 Ok(ory_id) => match self.hydra.get_oauth2_client(&ory_id).await {
                     Ok(client) => {
-                        let cross_tenant = cross_tenant_by_id.get(&public_id).copied().unwrap_or(false);
+                        let cross_tenant = match cross_tenant_by_id.get(&public_id) {
+                            Some(v) => *v,
+                            None => false,
+                        };
                         applications.push(hydra_to_application(
                             &client,
                             &tenant_id,
@@ -288,7 +295,10 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             &updated,
             &tenant_id,
             &req.id,
-            app_row.map(|r| r.cross_tenant).unwrap_or(false),
+            match app_row {
+                Some(r) => r.cross_tenant,
+                None => false,
+            },
         )))
     }
 
@@ -376,14 +386,14 @@ fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), Servic
 }
 
 fn is_loopback_host(parsed: &reqwest::Url) -> bool {
-    parsed
-        .host()
-        .map(|host| match host {
+    match parsed.host() {
+        Some(host) => match host {
             url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
             url::Host::Ipv4(ip) => ip.is_loopback(),
             url::Host::Ipv6(ip) => ip.is_loopback(),
-        })
-        .unwrap_or(false)
+        },
+        None => false,
+    }
 }
 
 pub fn validate_redirect_uris(uris: &[String], allow_http: bool) -> Result<(), ServiceError> {
@@ -523,7 +533,7 @@ fn build_hydra_update_payload(
     };
     let skip_consent = match req.skip_consent.as_option() {
         Some(v) => v.value,
-        None => existing["skip_consent"].as_bool().unwrap_or(false),
+        None => matches!(existing["skip_consent"].as_bool(), Some(true)),
     };
     serde_json::json!({
         "client_id": ory_id,
@@ -546,38 +556,38 @@ fn hydra_to_application(
     public_id: &str,
     cross_tenant: bool,
 ) -> Application {
-    let scope_string = client["scope"].as_str().unwrap_or("");
     Application {
         id: public_id.to_string(),
         tenant_id: tenant_id.to_string(),
-        name: client["client_name"].as_str().unwrap_or("").to_string(),
+        name: match client["client_name"].as_str() {
+            Some(s) => s.to_string(),
+            None => String::new(),
+        },
         redirect_uris: json_string_array(&client["redirect_uris"]),
         grant_types: json_string_array(&client["grant_types"]),
         response_types: json_string_array(&client["response_types"]),
-        scope: if scope_string.is_empty() {
-            Vec::new()
-        } else {
-            scope_string.split(' ').map(|s| s.to_string()).collect()
+        scope: match client["scope"].as_str() {
+            Some(s) if !s.is_empty() => s.split(' ').map(|s| s.to_string()).collect(),
+            _ => Vec::new(),
         },
-        token_endpoint_auth_method: client["token_endpoint_auth_method"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        token_endpoint_auth_method: match client["token_endpoint_auth_method"].as_str() {
+            Some(s) => s.to_string(),
+            None => String::new(),
+        },
         cross_tenant,
-        skip_consent: client["skip_consent"].as_bool().unwrap_or(false),
+        skip_consent: matches!(client["skip_consent"].as_bool(), Some(true)),
         ..Default::default()
     }
 }
 
 fn json_string_array(value: &serde_json::Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+    match value.as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]

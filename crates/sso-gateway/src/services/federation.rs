@@ -26,7 +26,7 @@ use rand::RngCore;
 use sha2::Digest;
 use sso_ory_client::kratos::KratosClient;
 use sunbeam_g2v::error::ServiceError;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
 use crate::db::{
@@ -194,10 +194,16 @@ impl FederationServiceImpl {
             hydra_public_url,
             public_base_url,
             http: Arc::new(
-                reqwest::Client::builder()
+                match reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
-                    .unwrap_or_else(|_| reqwest::Client::new()),
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        warn!(%err, "failed to build federation HTTP client with timeout; falling back to default client");
+                        reqwest::Client::new()
+                    }
+                },
             ) as Arc<dyn FederationHydra>,
             saml_signer,
             sp_certificate_pem,
@@ -426,11 +432,10 @@ impl FederationService for FederationServiceImpl {
 
         let value: serde_json::Value = self.http.fetch_jwks(&jwks_url).await?;
 
-        let keys = value
-            .get("keys")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let keys = match value.get("keys").and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => Vec::new(),
+        };
 
         let keys = keys.into_iter().map(json_web_key_to_proto).collect();
         Ok(Response::new(JSONWebKeySet {
@@ -655,14 +660,16 @@ impl FederationServiceImpl {
             .await?;
 
         let name_id = result.name_id.clone();
-        let email = result
+        let email = match result
             .attributes
             .iter()
             .find(|a| a.name == "email")
             .and_then(|a| a.values.first())
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| name_id.clone());
+        {
+            Some(s) => s.to_string(),
+            None => name_id.clone(),
+        };
 
         self.provision_saml_identity(tenant_id, provider, &name_id, &email)
             .await
@@ -1030,32 +1037,26 @@ fn map_ory_error(err: sso_ory_client::error::OryClientError) -> ServiceError {
 }
 
 fn json_str(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    match value.get(key).and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => String::new(),
+    }
 }
 
 fn json_str_array(value: &serde_json::Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+    match value.get(key).and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn json_web_key_to_proto(value: serde_json::Value) -> JSONWebKey {
-    let str_field = |key: &str| {
-        value
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+    let str_field = |key: &str| match value.get(key).and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => String::new(),
     };
     JSONWebKey {
         kty: str_field("kty"),

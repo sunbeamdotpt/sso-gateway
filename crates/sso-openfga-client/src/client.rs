@@ -280,10 +280,10 @@ impl OpenFgaClient {
 
         if response.status().is_success() {
             let body: Value = response.json().await.map_err(OpenFgaClientError::Http)?;
-            Ok(body
-                .get("allowed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false))
+            Ok(matches!(
+                body.get("allowed").and_then(|v| v.as_bool()),
+                Some(true)
+            ))
         } else {
             Err(openfga_error(response).await)
         }
@@ -355,15 +355,13 @@ impl OpenFgaClient {
             .map_err(OpenFgaClientError::Http)?;
 
         let body = handle_response(response).await?;
-        let objects = body
-            .get("objects")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let objects = match body.get("objects").and_then(|v| v.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(objects)
     }
 
@@ -413,11 +411,10 @@ impl OpenFgaClient {
             .map_err(OpenFgaClientError::Http)?;
 
         let body = handle_response(response).await?;
-        let users = body
-            .get("users")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().map(canonical_user).collect())
-            .unwrap_or_default();
+        let users = match body.get("users").and_then(|v| v.as_array()) {
+            Some(arr) => arr.iter().map(canonical_user).collect(),
+            None => Vec::new(),
+        };
         Ok(users)
     }
 }
@@ -459,7 +456,10 @@ impl TupleKey {
         if let Some(name) = &self.condition_name {
             key["condition"] = serde_json::json!({
                 "name": name,
-                "context": self.condition_context.clone().unwrap_or(Value::Null),
+                "context": match &self.condition_context {
+                    Some(ctx) => ctx.clone(),
+                    None => Value::Null,
+                },
             });
         }
         key
@@ -524,22 +524,26 @@ pub fn flat_model(namespace: &str, relations: &[String]) -> Value {
 /// Canonicalize a list-users response entry into `type:id`,
 /// `type:id#relation`, or `type:*`. Unknown shapes fall back to raw JSON.
 fn canonical_user(entry: &Value) -> String {
+    fn str_field(value: &Value, key: &str) -> String {
+        match value.get(key).and_then(|v| v.as_str()) {
+            Some(s) => s.to_owned(),
+            None => String::new(),
+        }
+    }
+
     if let Some(object) = entry.get("object") {
-        let ty = object.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let id = object.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let ty = str_field(object, "type");
+        let id = str_field(object, "id");
         return format!("{ty}:{id}");
     }
     if let Some(userset) = entry.get("userset") {
-        let ty = userset.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let id = userset.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let relation = userset
-            .get("relation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let ty = str_field(userset, "type");
+        let id = str_field(userset, "id");
+        let relation = str_field(userset, "relation");
         return format!("{ty}:{id}#{relation}");
     }
     if let Some(wildcard) = entry.get("wildcard") {
-        let ty = wildcard.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let ty = str_field(wildcard, "type");
         return format!("{ty}:*");
     }
     entry.to_string()
@@ -566,10 +570,13 @@ async fn handle_response(response: reqwest::Response) -> Result<Value, OpenFgaCl
 
 async fn openfga_error(response: reqwest::Response) -> OpenFgaClientError {
     let status = response.status().as_u16();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let message = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to read openfga error body; falling back to placeholder");
+            "<unreadable body>".to_string()
+        }
+    };
     OpenFgaClientError::OpenFga { status, message }
 }
 

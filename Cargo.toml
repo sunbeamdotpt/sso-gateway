@@ -44,3 +44,14 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# SSO-027: failures must be handled (match/`?`/logged fallback), never
+# panicked through or silently defaulted. priority = -1 keeps targeted
+# `#[allow(...)]` overrides (justified invariant unwraps) effective.
+[workspace.lints.clippy]
+unwrap_used = { level = "deny", priority = -1 }
+expect_used = { level = "deny", priority = -1 }
+disallowed_methods = { level = "deny", priority = -1 }
+# Also deny the pattern lint: no constructing defaults through unwrap_or*
+# either — fallbacks must be spelled out as match/map_or_else (SSO-027).
+unwrap_or_default = { level = "deny", priority = -1 }

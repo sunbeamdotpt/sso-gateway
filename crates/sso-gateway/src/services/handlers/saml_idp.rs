@@ -163,10 +163,10 @@ struct RedirectRequest<'a> {
 
 impl<'a> RedirectRequest<'a> {
     fn from_url(url: &'a str) -> Self {
-        let params = url
-            .split_once('?')
-            .map(|(_, query)| parse_query_params(query))
-            .unwrap_or_default();
+        let params = match url.split_once('?') {
+            Some((_, query)) => parse_query_params(query),
+            None => HashMap::new(),
+        };
         Self { url, params }
     }
 }
@@ -207,8 +207,11 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
-            let value = parts.next().unwrap_or("");
-            Some((key.to_string(), value.to_string()))
+            let value = match parts.next() {
+                Some(v) => v.to_owned(),
+                None => String::new(),
+            };
+            Some((key.to_string(), value))
         })
         .collect()
 }
@@ -376,11 +379,14 @@ async fn sso(
             "session missing identity id",
         )))
     })?;
-    let email = identity
+    let email = match identity
         .get("traits")
         .and_then(|t| t.get("email"))
         .and_then(|v| v.as_str())
-        .unwrap_or(identity_id);
+    {
+        Some(email) => email,
+        None => identity_id,
+    };
 
     let idp_key = state.idp_keys.get_active(&sp_client.tenant_id).await?;
     let mut key_manager =
@@ -453,7 +459,10 @@ async fn sso(
     })?;
 
     let saml_response_b64 = base64::engine::general_purpose::STANDARD.encode(signed_xml.as_bytes());
-    let relay_state = decoded.relay_state.unwrap_or_default();
+    let relay_state = match decoded.relay_state.as_deref() {
+        Some(state) => state.to_owned(),
+        None => String::new(),
+    };
     let html = format!(
         r#"<!DOCTYPE html>
 <html><body onload="document.forms[0].submit()">
@@ -531,11 +540,13 @@ fn split_certificate_pem_blocks(pem: &str) -> Vec<&str> {
 /// session's `authentication_methods` array. Falls back to the password
 /// context when no methods are present.
 fn authn_context_class_from_session(session: &Value) -> String {
-    let methods = session
+    let methods = match session
         .get("authentication_methods")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    {
+        Some(arr) => arr.clone(),
+        None => Vec::new(),
+    };
 
     let mut has_webauthn = false;
     let mut has_totp = false;
@@ -571,13 +582,16 @@ async fn resolve_pairwise_name_id(
     identity_id: &str,
 ) -> String {
     if let Some(store) = nameid_mappings {
-        store
+        match store
             .get_or_create(tenant_id, sp_entity_id, identity_id)
             .await
-            .unwrap_or_else(|e| {
+        {
+            Ok(name_id) => name_id,
+            Err(e) => {
                 warn!("saml nameid mapping lookup failed: {e}; falling back to computed nameid");
                 compute_pairwise_name_id(tenant_id, sp_entity_id, identity_id)
-            })
+            }
+        }
     } else {
         compute_pairwise_name_id(tenant_id, sp_entity_id, identity_id)
     }

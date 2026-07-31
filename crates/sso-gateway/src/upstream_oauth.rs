@@ -151,7 +151,12 @@ async fn validate_resolved_ips_for_url(url_str: &str) -> Result<(), UpstreamOAut
     let host = url
         .host_str()
         .ok_or_else(|| UpstreamOAuthError::InvalidUrl("upstream URL is missing a host".into()))?;
-    let port = url.port_or_known_default().unwrap_or(443);
+    // An unknown scheme is assumed to be TLS.
+    let default_port = 443;
+    let port = match url.port_or_known_default() {
+        Some(p) => p,
+        None => default_port,
+    };
 
     let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
         UpstreamOAuthError::InvalidUrl(format!("DNS resolution failed for '{host}': {e}"))
@@ -199,11 +204,20 @@ impl ReqwestUpstreamOAuthClient {
     }
 
     pub fn default_client() -> reqwest::Client {
-        reqwest::Client::builder()
+        match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .dns_resolver(Arc::new(SafeDnsResolver))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to build upstream OAuth HTTP client; falling back to default client"
+                );
+                reqwest::Client::new()
+            }
+        }
     }
 }
 
@@ -249,7 +263,13 @@ impl UpstreamOAuthClient for ReqwestUpstreamOAuthClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read upstream token error response body");
+                    String::new()
+                }
+            };
             return Err(UpstreamOAuthError::TokenExchange(format!(
                 "upstream returned {status}: {body}"
             )));
@@ -260,7 +280,10 @@ impl UpstreamOAuthClient for ReqwestUpstreamOAuthClient {
             .as_str()
             .ok_or_else(|| UpstreamOAuthError::TokenExchange("missing access_token".into()))?
             .to_string();
-        let token_type = raw["token_type"].as_str().unwrap_or("Bearer").to_string();
+        let token_type = match raw["token_type"].as_str() {
+            Some(t) => t.to_string(),
+            None => "Bearer".to_string(),
+        };
         let id_token = raw["id_token"].as_str().map(String::from);
 
         Ok(UpstreamTokenResponse {
@@ -302,7 +325,13 @@ impl UpstreamOAuthClient for ReqwestUpstreamOAuthClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read upstream userinfo error response body");
+                    String::new()
+                }
+            };
             return Err(UpstreamOAuthError::Userinfo(format!(
                 "upstream returned {status}: {body}"
             )));

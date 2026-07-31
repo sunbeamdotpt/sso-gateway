@@ -34,10 +34,10 @@ impl TenantServiceImpl {
     }
 
     fn is_system_tenant(&self, ctx: &RequestContext) -> bool {
-        ctx.extensions()
-            .get::<AuthContext>()
-            .map(|a| a.tenant_id == self.system_tenant_ulid)
-            .unwrap_or(false)
+        match ctx.extensions().get::<AuthContext>() {
+            Some(auth) => auth.tenant_id == self.system_tenant_ulid,
+            None => false,
+        }
     }
 }
 
@@ -119,21 +119,19 @@ impl TenantRow {
             id: self.id,
             slug: self.slug,
             display_name: self.display_name,
-            settings: self
-                .settings
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| {
-                            let s = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                _ => v.to_string(),
-                            };
-                            (k.clone(), s)
-                        })
-                        .collect::<std::collections::HashMap<_, _>>()
-                })
-                .unwrap_or_default(),
+            settings: match self.settings.as_object() {
+                Some(m) => m
+                    .iter()
+                    .map(|(k, v)| {
+                        let s = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        (k.clone(), s)
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+                None => std::collections::HashMap::new(),
+            },
             ..Default::default()
         }
     }

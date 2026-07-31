@@ -29,32 +29,31 @@ pub fn json_to_struct(value: Value) -> Option<ProtoStruct> {
 /// Convert a JSON array into a Vec<String>, falling back to the JSON display
 /// form for non-string items.
 pub fn json_array_to_strings(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|arr| arr.iter().map(json_value_to_string).collect::<Vec<_>>())
-        .unwrap_or_default()
+    match value.as_array() {
+        Some(arr) => arr.iter().map(json_value_to_string).collect::<Vec<_>>(),
+        None => Vec::new(),
+    }
 }
 
 /// Best-effort string extraction from a JSON value.
 pub fn json_value_to_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| value.to_string())
+    match value.as_str() {
+        Some(s) => String::from(s),
+        None => value.to_string(),
+    }
 }
 
 /// Extract a string field from a JSON object.
 pub fn json_str(value: &Value, field: &str) -> String {
-    value
-        .get(field)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    match value.get(field).and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => String::new(),
+    }
 }
 
 /// Extract a bool field from a JSON object, defaulting to false.
 pub fn json_bool(value: &Value, field: &str) -> bool {
-    value.get(field).and_then(|v| v.as_bool()).unwrap_or(false)
+    matches!(value.get(field).and_then(|v| v.as_bool()), Some(true))
 }
 
 /// Extract an i32 field from a JSON object, defaulting to zero.
@@ -63,12 +62,13 @@ pub fn json_i32(value: &Value, field: &str) -> i32 {
         .get(field)
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())
-        .unwrap_or(0)
+        .into_iter()
+        .sum()
 }
 
 /// Extract an i64 field from a JSON object, defaulting to zero.
 pub fn json_i64(value: &Value, field: &str) -> i64 {
-    value.get(field).and_then(|v| v.as_i64()).unwrap_or(0)
+    value.get(field).and_then(|v| v.as_i64()).into_iter().sum()
 }
 
 #[cfg(test)]

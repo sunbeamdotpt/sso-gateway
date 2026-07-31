@@ -146,8 +146,14 @@ impl AgentService for AgentServiceImpl {
                 return Err(map_ory_error(err).into());
             }
         };
-        let ory_id = created["client_id"].as_str().unwrap_or(&agent.id).to_string();
-        let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
+        let ory_id = match created["client_id"].as_str() {
+            Some(id) => id.to_string(),
+            None => agent.id.clone(),
+        };
+        let client_secret = match created["client_secret"].as_str() {
+            Some(secret) => secret.to_string(),
+            None => String::new(),
+        };
 
         if let Err(err) = self
             .mappings
@@ -536,7 +542,10 @@ fn agent_to_proto(row: &AgentRow) -> Agent {
         id: row.id.clone(),
         tenant_id: row.tenant_id.clone(),
         name: row.name.clone(),
-        owner_identity_id: row.owner_identity_id.clone().unwrap_or_default(),
+        owner_identity_id: match row.owner_identity_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        },
         status: row.status.clone(),
         created_at: timestamp(row.created_at),
         updated_at: timestamp(row.updated_at),
@@ -663,8 +672,10 @@ fn next_page_token(
     limit: u32,
 ) -> String {
     if page_len == limit as usize {
-        last.map(|(created_at, id)| encode_page_token(created_at, id))
-            .unwrap_or_default()
+        match last {
+            Some((created_at, id)) => encode_page_token(created_at, id),
+            None => String::new(),
+        }
     } else {
         String::new()
     }

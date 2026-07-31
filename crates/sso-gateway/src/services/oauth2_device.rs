@@ -388,15 +388,17 @@ fn ory_token_to_proto(value: &Value) -> DeviceTokenResponse {
 }
 
 fn json_str(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string()
+    match value.get(key).and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => String::new(),
+    }
 }
 
 fn json_i32(value: &Value, key: &str) -> i32 {
-    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
+    match value.get(key).and_then(|v| v.as_i64()) {
+        Some(n) => n as i32,
+        None => 0,
+    }
 }
 
 fn map_ory_error(err: OryClientError) -> ServiceError {

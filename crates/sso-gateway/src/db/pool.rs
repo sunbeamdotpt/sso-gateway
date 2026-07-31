@@ -19,10 +19,14 @@ pub type DbPool = Pool<Postgres>;
 /// true, a URL containing `sslmode=disable` is rejected so the gateway cannot
 /// silently connect without TLS in production.
 pub async fn create_pool(database_url: &str, ssl_required: bool) -> Result<DbPool, sqlx::Error> {
-    if !Postgres::database_exists(database_url)
-        .await
-        .unwrap_or(false)
-    {
+    let database_exists = match Postgres::database_exists(database_url).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            tracing::warn!(%err, "database existence check failed; assuming it does not exist");
+            false
+        }
+    };
+    if !database_exists {
         Postgres::create_database(database_url).await?;
     }
 
@@ -65,26 +69,11 @@ fn pool_options(database_url: &str, ssl_required: bool) -> Result<PoolOptions, s
 
     let connect_options = PgConnectOptions::from_str(database_url)?;
 
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
-    let acquire_timeout_seconds = std::env::var("DATABASE_ACQUIRE_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let idle_timeout_seconds = std::env::var("DATABASE_IDLE_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(600);
-    let max_lifetime_seconds = std::env::var("DATABASE_MAX_LIFETIME_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
-    let statement_timeout_seconds = std::env::var("DATABASE_STATEMENT_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+    let max_connections = crate::config::env_parse_or("DATABASE_MAX_CONNECTIONS", 25);
+    let acquire_timeout_seconds = crate::config::env_parse_or("DATABASE_ACQUIRE_TIMEOUT_SECONDS", 10);
+    let idle_timeout_seconds = crate::config::env_parse_or("DATABASE_IDLE_TIMEOUT_SECONDS", 600);
+    let max_lifetime_seconds = crate::config::env_parse_or("DATABASE_MAX_LIFETIME_SECONDS", 1800);
+    let statement_timeout_seconds = crate::config::env_parse_or("DATABASE_STATEMENT_TIMEOUT_SECONDS", 30);
 
     Ok(PoolOptions {
         connect_options,

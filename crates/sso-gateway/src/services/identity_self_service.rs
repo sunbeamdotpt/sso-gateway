@@ -928,23 +928,27 @@ impl IdentitySelfServiceImpl {
             Ok(session) => session,
             Err(_) => return Ok(None),
         };
-        let subject = session
+        let Some(subject) = session
             .pointer("/identity/id")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        if subject.is_empty() {
+            .filter(|s| !s.is_empty())
+        else {
             return Ok(None);
-        }
+        };
 
         // Enforce the AAL required by the login request. If Hydra (or the
         // client) is asking for aal2/aal3, an aal1 session must not be accepted
         // here; fall through so Kratos renders the step-up flow.
         let required_aal = aal_level_from_login_request(&login_request);
-        let session_aal = session
+        let session_aal = match session
             .get("authenticator_assurance_level")
             .and_then(Value::as_str)
             .and_then(parse_aal_level)
-            .unwrap_or(1);
+        {
+            // Absent or unparseable AAL means a first-factor session.
+            Some(aal) => aal.max(1),
+            None => 1,
+        };
         if session_aal < required_aal {
             tracing::debug!(
                 required_aal,
@@ -956,22 +960,31 @@ impl IdentitySelfServiceImpl {
 
         // Resolve the OAuth2 client to the public application id and enforce
         // the application-entitlement gate before any session/token exists.
-        let ory_client_id = login_request
+        if let Some(ory_client_id) = login_request
             .pointer("/client/client_id")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        if !ory_client_id.is_empty() {
+            .filter(|id| !id.is_empty())
+        {
             match self
                 .mappings
                 .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
                 .await
             {
                 Ok(app_public_id) => {
-                    let public_subject = self
+                    let public_subject = match self
                         .mappings
                         .get_public_id(tenant_id, BACKEND_KRATOS, subject)
                         .await
-                        .unwrap_or_else(|_| subject.to_string());
+                    {
+                        Ok(public_id) => public_id,
+                        Err(err) => {
+                            tracing::warn!(
+                                "identity mapping lookup failed; falling back to raw kratos subject: {}",
+                                err
+                            );
+                            subject.to_string()
+                        }
+                    };
                     match self
                         .entitlements
                         .is_member(tenant_id, &public_subject, &app_public_id)
@@ -1020,21 +1033,21 @@ impl IdentitySelfServiceImpl {
             }
         }
 
-        let amr: Vec<String> = session
+        let amr: Vec<String> = match session
             .get("authentication_methods")
             .and_then(Value::as_array)
-            .map(|methods| {
-                methods
-                    .iter()
-                    .filter_map(|method| {
-                        method
-                            .get("method")
-                            .and_then(Value::as_str)
-                            .map(String::from)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        {
+            Some(methods) => methods
+                .iter()
+                .filter_map(|method| {
+                    method
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let mut accept_body = serde_json::json!({
             "subject": subject,
             "amr": amr,
@@ -1047,11 +1060,10 @@ impl IdentitySelfServiceImpl {
             .accept_login_request(ory_challenge, accept_body)
             .await
             .map_err(map_ory_error)?;
-        let redirect_to = accept
-            .get("redirect_to")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let redirect_to = match accept.get("redirect_to").and_then(Value::as_str) {
+            Some(url) => url.to_string(),
+            None => String::new(),
+        };
         if redirect_to.is_empty() {
             return Err(ServiceError::Internal(
                 "hydra accept login response missing redirect_to".into(),
@@ -1182,7 +1194,16 @@ impl IdentitySelfServiceImpl {
                 }
             }
         }
-        let message = serde_json::to_string(&body).unwrap_or_default();
+        // Serialization only fails on a non-string map key, which a scrubbed
+        // Kratos error body never contains; fall back to an empty message
+        // rather than re-leaking the raw (unscrubbed) body.
+        let message = match serde_json::to_string(&body) {
+            Ok(message) => message,
+            Err(err) => {
+                tracing::warn!("failed to re-serialize scrubbed kratos error body: {}", err);
+                String::new()
+            }
+        };
         OryClientError::Ory { status, message }
     }
 
@@ -1208,15 +1229,15 @@ impl IdentitySelfServiceImpl {
             .to_session(cookie, None)
             .await
             .map_err(map_ory_error)?;
-        let ory_identity_id = session
+        let Some(ory_identity_id) = session
             .get("identity")
             .and_then(|i| i["id"].as_str())
-            .unwrap_or("");
-        if ory_identity_id.is_empty() {
+            .filter(|id| !id.is_empty())
+        else {
             return Err(ServiceError::Unauthenticated(
                 "settings flow has no authenticated identity".into(),
             ));
-        }
+        };
         let public_id = self
             .mappings
             .get_public_id(tenant_id, BACKEND_KRATOS, ory_identity_id)
@@ -1228,11 +1249,13 @@ impl IdentitySelfServiceImpl {
                 // Pre-migration identity: backfill a membership from the session under the
                 // tenant's default gateway schema so this write becomes authoritative.
                 let schema = self.schemas.get_default(tenant_id).await?;
-                let email = session
+                let email = match session
                     .get("identity")
                     .and_then(|i| i["traits"]["email"].as_str())
-                    .unwrap_or("")
-                    .to_string();
+                {
+                    Some(email) => email.to_string(),
+                    None => String::new(),
+                };
                 self.memberships
                     .upsert(
                         tenant_id,
@@ -1256,12 +1279,10 @@ impl IdentitySelfServiceImpl {
         validate_traits(&schema.schema_json, &submitted)?;
         let new_email = extract_email(&submitted)?;
 
-        let current_email = membership
-            .traits
-            .get("email")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let current_email = match membership.traits.get("email").and_then(|v| v.as_str()) {
+            Some(email) => email.to_string(),
+            None => String::new(),
+        };
         if !current_email.is_empty() && new_email != current_email {
             return Err(ServiceError::InvalidArgument("email is immutable".into()));
         }
@@ -1315,10 +1336,10 @@ fn csrf_token_from_context(ctx: &RequestContext) -> Option<String> {
 }
 
 fn tenant_from_context(ctx: &RequestContext) -> String {
-    ctx.extensions()
-        .get::<TenantId>()
-        .map(|t| t.0.clone())
-        .unwrap_or_default()
+    match ctx.extensions().get::<TenantId>() {
+        Some(t) => t.0.clone(),
+        None => String::new(),
+    }
 }
 
 fn attach_set_cookies<T>(response: &mut Response<T>, headers: &http::HeaderMap) {
@@ -1364,8 +1385,7 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
         let tenant_id = tenant_from_context(&ctx);
         proto.tenant_id = tenant_id.clone();
         if !tenant_id.is_empty() {
-            let ory_session_id = session["id"].as_str().unwrap_or("");
-            if !ory_session_id.is_empty() {
+            if let Some(ory_session_id) = session["id"].as_str().filter(|id| !id.is_empty()) {
                 proto.id = self
                     .transient
                     .create(
@@ -1377,11 +1397,11 @@ impl IdentitySelfService for IdentitySelfServiceImpl {
                     )
                     .await?;
             }
-            let ory_identity_id = session
+            if let Some(ory_identity_id) = session
                 .get("identity")
                 .and_then(|i| i["id"].as_str())
-                .unwrap_or("");
-            if !ory_identity_id.is_empty() {
+                .filter(|id| !id.is_empty())
+            {
                 proto.identity_id = self
                     .mappings
                     .get_public_id(&tenant_id, BACKEND_KRATOS, ory_identity_id)
@@ -5083,7 +5103,7 @@ mod tests {
     }
 
     fn proto_struct(value: serde_json::Value) -> buffa_types::google::protobuf::Struct {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value).expect("test value must convert to proto Struct")
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - **RPC**: Anthropic `connect-rust` / Connect-RPC, generated via `connectrpc-build` in `build.rs`.
 - **HTTP stack**: `axum` (as re-exported / depended on by `sunbeam-g2v`). Do **not** introduce separate `tower` or `tonic` dependencies. Keto is accessed over HTTP, not gRPC.
 - **Error handling**: Custom errors use `thiserror`. `anyhow` is not used in gateway code. Convert everything into `sunbeam_g2v::error::ServiceError` at service boundaries.
+- **No silent defaults or panics in production code (SSO-027)**: banned by `clippy.toml` + workspace lints (CI gates with `-D warnings`): `unwrap`/`expect` (panics), and the fallback combinators `unwrap_or`, `unwrap_or_else`, `map_or`, `map_or_else`, and every `*_or_default`. Spell fallbacks out with `match`/`if let`/`let ... else`; a swallowed `Err` must be logged in the fallback arm. `.ok_or`/`.ok_or_else`/`.or_else` remain fine. Clippy's style lints (`manual_unwrap_or*`) reject bare-arm matches, so pair a `Some` arm that does real work (clone/parse/collect) with the default arm, use `matches!` for booleans, and pass fallbacks as helper-function parameters (see `env_var_or`/`env_flag_or`/`env_parse_or` in `config.rs`). Test code is exempt via the crate-root `cfg_attr(test, allow(...))`. Genuine invariants may keep a targeted `#[allow(clippy::unwrap_used)]` with a justification comment.
 - **Identifiers**: All gateway-level identifiers are ULIDs (`ulid` crate). Do **not** use UUIDs for primary keys.
 - **Tenancy**: Protected endpoints require an `Authorization: Bearer <token>` header. The shared auth middleware introspects the token via Hydra and resolves the tenant from the token subject. The system tenant ULID is configured via `SYSTEM_TENANT_ULID`; a system bootstrap OAuth2 client is created on startup.
 - **Identity model (gateway-owned traits)**: Kratos persists only the minimal base identity — `{email}` plus credentials — bound to the base schema id set via `KRATOS_DEFAULT_SCHEMA_ID` (dev `default`, prod `employee`). The gateway owns the full trait set and the per-tenant schema binding. Reads assemble the caller-facing identity from `tenant_memberships`; writes validate against the tenant's versioned schema in `tenant_identity_schemas` and persist only the base email to Kratos. Email is the Kratos identifier, so it is normalized (lowercase + trim) and immutable. A single base identity may belong to many tenants via `tenant_memberships` (invites/SCIM add membership); superset schemas may add traits and enable extra methods (SAML/SCIM/OIDC) that Kratos never sees.
@@ -53,7 +54,7 @@ cargo test -p sso-gateway --all-targets --all-features
 cargo test -p sso-ory-client --all-targets --all-features
 
 # Linting
-cargo clippy -p sso-gateway --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Protobuf linting
 buf lint

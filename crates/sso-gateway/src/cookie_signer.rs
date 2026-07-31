@@ -41,6 +41,9 @@ impl CookieSigner {
     ///
     /// Returns an error if `key` is shorter than 32 bytes. The caller is
     /// expected to validate this at config load time.
+    // HKDF-SHA256 rejects only expansions above 255 * 32 bytes; a 32-byte
+    // expansion can never fail.
+    #[allow(clippy::expect_used)]
     pub fn new(key: impl AsRef<[u8]>) -> Result<Self, CookieError> {
         let key_material = key.as_ref();
         if key_material.len() < 32 {
@@ -94,6 +97,9 @@ impl CookieSigner {
         Ok(payload)
     }
 
+    // `Hmac::new_from_slice` only fails for invalid key lengths, and HMAC
+    // accepts keys of any size.
+    #[allow(clippy::expect_used)]
     fn signature(&self, payload: &str) -> Vec<u8> {
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key size");

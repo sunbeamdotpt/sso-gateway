@@ -52,10 +52,10 @@ impl KetoClient {
         let status = response.status();
         if status.is_success() {
             let body: Value = response.json().await.map_err(OryClientError::Http)?;
-            Ok(body
-                .get("allowed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false))
+            Ok(matches!(
+                body.get("allowed").and_then(|v| v.as_bool()),
+                Some(true)
+            ))
         } else if status.as_u16() == 403 {
             // Keto returns 403 when the permission is denied.
             Ok(false)
@@ -230,10 +230,13 @@ async fn handle_response(response: reqwest::Response) -> Result<Value, OryClient
 
 async fn ory_error(response: reqwest::Response) -> OryClientError {
     let status = response.status().as_u16();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let message = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to read keto error body; falling back to placeholder");
+            "<unreadable body>".to_string()
+        }
+    };
     OryClientError::Ory { status, message }
 }
 

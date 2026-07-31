@@ -111,12 +111,12 @@ pub struct IntrospectionResult {
 
 impl IntrospectionResult {
     fn from_hydra(value: &Value) -> Self {
-        let active = value["active"].as_bool().unwrap_or(false);
+        let active = matches!(value["active"].as_bool(), Some(true));
         let sub = value["sub"].as_str().map(String::from);
-        let scope = value["scope"]
-            .as_str()
-            .map(|s| s.split(' ').map(String::from).collect())
-            .unwrap_or_default();
+        let scope = match value["scope"].as_str() {
+            Some(s) => s.split(' ').map(String::from).collect(),
+            None => Vec::new(),
+        };
         let exp = value["exp"]
             .as_i64()
             .and_then(|ts| time::OffsetDateTime::from_unix_timestamp(ts).ok());
@@ -234,10 +234,10 @@ impl TokenIntrospector for CachedTokenIntrospector {
             return Ok(IntrospectionResult {
                 active: row.active,
                 sub: row.sub,
-                scope: row
-                    .scope
-                    .map(|s| s.split(' ').map(String::from).collect())
-                    .unwrap_or_default(),
+                scope: match row.scope {
+                    Some(s) => s.split(' ').map(String::from).collect(),
+                    None => Vec::new(),
+                },
                 exp: row.exp,
                 // The cache schema does not store AMR; callers that need
                 // stepped-up assurance should bypass the cache or accept empty.

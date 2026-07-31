@@ -166,10 +166,10 @@ fn require_tenant(ctx: &RequestContext) -> Result<String, ServiceError> {
 /// unauthenticated. Used only as the fallback tenant for raw-challenge
 /// passthrough; mapped challenges resolve their tenant from the mapping row.
 fn tenant_from_ctx(ctx: &RequestContext) -> String {
-    ctx.extensions()
-        .get::<TenantId>()
-        .map(|t| t.0.clone())
-        .unwrap_or_default()
+    match ctx.extensions().get::<TenantId>() {
+        Some(t) => t.0.clone(),
+        None => String::new(),
+    }
 }
 
 fn require_consent_admin(ctx: &RequestContext) -> Result<(), ServiceError> {

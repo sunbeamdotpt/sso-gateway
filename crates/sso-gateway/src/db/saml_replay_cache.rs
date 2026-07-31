@@ -39,10 +39,16 @@ impl SamlReplayCache {
         id: &str,
         expiry: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, DbError> {
-        let expires_at = time::OffsetDateTime::from_unix_timestamp(expiry.timestamp())
-            .unwrap_or_else(|_| {
+        let expires_at = match time::OffsetDateTime::from_unix_timestamp(expiry.timestamp()) {
+            Ok(ts) => ts,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "invalid SAML assertion expiry timestamp; falling back to now + 1 hour"
+                );
                 time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(3600)
-            });
+            }
+        };
 
         let result = sqlx::query(
             "INSERT INTO saml_assertion_ids (id, expires_at) VALUES ($1, $2) \
@@ -122,9 +128,15 @@ impl gamlastan::security::ReplayCache for GamlastanReplayAdapter {
         let cache = self.0.clone();
         let id = id.to_string();
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle
-                .block_on(async move { cache.check_and_insert(&id, expiry).await })
-                .unwrap_or(false),
+            Ok(handle) => {
+                match handle.block_on(async move { cache.check_and_insert(&id, expiry).await }) {
+                    Ok(inserted) => inserted,
+                    Err(err) => {
+                        tracing::warn!(%err, "SAML replay cache check failed; treating as replay");
+                        false
+                    }
+                }
+            }
             Err(_) => {
                 tracing::warn!("no Tokio runtime available for SAML replay cache check");
                 false

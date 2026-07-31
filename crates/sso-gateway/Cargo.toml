@@ -51,6 +51,9 @@ moka = { version = "0.12", features = ["future"] }
 futures-util = "0.3"
 bytes = "1"
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 rsa = "0.9"
 rcgen = "0.13"

@@ -533,7 +533,10 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         tenant_id: &str,
         namespace: &str,
     ) -> Result<Option<NamespaceRecord>, PermissionBackendError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         Ok(lock.get(&(tenant_id.to_string(), namespace.to_string())).cloned())
     }
 
@@ -542,7 +545,10 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         tenant_id: &str,
         object_type: &str,
     ) -> Result<Option<NamespaceRecord>, PermissionBackendError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let by_type = lock
             .iter()
             .find(|((t, _), record)| t == tenant_id && record.types.iter().any(|ty| ty == object_type))
@@ -558,7 +564,10 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         tenant_id: &str,
         record: &NamespaceRecord,
     ) -> Result<NamespaceRecord, PermissionBackendError> {
-        let mut lock = self.records.lock().unwrap();
+        let mut lock = match self.records.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         // A type may be owned by exactly one namespace per tenant.
         for ((t, ns), existing) in lock.iter() {
             if t == tenant_id && ns != &record.namespace {
@@ -591,7 +600,10 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
     }
 
     async fn list(&self, tenant_id: &str) -> Result<Vec<NamespaceRecord>, PermissionBackendError> {
-        let lock = self.records.lock().unwrap();
+        let lock = match self.records.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut records: Vec<NamespaceRecord> = lock
             .iter()
             .filter(|((t, _), _)| t == tenant_id)
@@ -602,7 +614,10 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
     }
 
     async fn delete(&self, tenant_id: &str, namespace: &str) -> Result<(), PermissionBackendError> {
-        let mut lock = self.records.lock().unwrap();
+        let mut lock = match self.records.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         lock.remove(&(tenant_id.to_string(), namespace.to_string()));
         Ok(())
     }
@@ -713,15 +728,13 @@ fn typed_user(subject_id: &str) -> String {
 
 /// Extract the sorted object type names defined by an authorization model.
 fn model_type_names(model: &Value) -> Vec<String> {
-    let mut types: Vec<String> = model
-        .get("type_definitions")
-        .and_then(|v| v.as_array())
-        .map(|defs| {
-            defs.iter()
-                .filter_map(|def| def.get("type").and_then(|t| t.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut types: Vec<String> = match model.get("type_definitions").and_then(|v| v.as_array()) {
+        Some(defs) => defs
+            .iter()
+            .filter_map(|def| def.get("type").and_then(|t| t.as_str()).map(String::from))
+            .collect(),
+        None => Vec::new(),
+    };
     types.sort();
     types
 }
@@ -771,9 +784,15 @@ impl OpenFgaPermissionBackend {
                     "tenant {tenant_id} namespace {namespace} has no OpenFGA store/model"
                 ))
             })?;
-        if record.store_id.as_deref().unwrap_or("").is_empty()
-            || record.model_id.as_deref().unwrap_or("").is_empty()
-        {
+        let store_id = match record.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        let model_id = match record.model_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        if store_id.is_empty() || model_id.is_empty() {
             return Err(PermissionBackendError::NamespaceNotConfigured(format!(
                 "tenant {tenant_id} namespace {namespace} has no OpenFGA store/model"
             )));
@@ -822,11 +841,19 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         opts: &QueryOptions,
     ) -> Result<bool, PermissionBackendError> {
         let mapping = self.resolve_mapping(tenant_id, namespace).await?;
+        let store_id = match mapping.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        let model_id = match mapping.model_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         Ok(self
             .client
             .check(
-                mapping.store_id.as_deref().unwrap_or(""),
-                mapping.model_id.as_deref().unwrap_or(""),
+                &store_id,
+                &model_id,
                 namespace,
                 object,
                 relation,
@@ -902,28 +929,43 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         }
         for key in writes {
             let record = &records[&key.namespace];
-            grouped
-                .entry(record.store_id.clone().unwrap_or_default())
-                .or_default()
-                .0
-                .push(client_tuple_key(key));
+            let store_key = match record.store_id.as_deref() {
+                Some(id) => id.to_owned(),
+                None => String::new(),
+            };
+            let group = match grouped.entry(store_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((Vec::new(), Vec::new()))
+                }
+            };
+            group.0.push(client_tuple_key(key));
         }
         for key in deletes {
             let record = &records[&key.namespace];
-            grouped
-                .entry(record.store_id.clone().unwrap_or_default())
-                .or_default()
-                .1
-                .push(client_tuple_key(key));
+            let store_key = match record.store_id.as_deref() {
+                Some(id) => id.to_owned(),
+                None => String::new(),
+            };
+            let group = match grouped.entry(store_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((Vec::new(), Vec::new()))
+                }
+            };
+            group.1.push(client_tuple_key(key));
         }
 
         for (store_id, (store_writes, store_deletes)) in grouped {
             // Every key in a store shares its current model id.
-            let model_id = records
+            let model_id = match records
                 .values()
                 .find(|r| r.store_id.as_deref() == Some(&store_id))
-                .and_then(|r| r.model_id.clone())
-                .unwrap_or_default();
+                .and_then(|r| r.model_id.as_deref())
+            {
+                Some(id) => id.to_owned(),
+                None => String::new(),
+            };
             self.client
                 .write_tuples(&store_id, &model_id, &store_writes, &store_deletes)
                 .await?;
@@ -940,11 +982,19 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         opts: &QueryOptions,
     ) -> Result<Value, PermissionBackendError> {
         let mapping = self.resolve_mapping(tenant_id, namespace).await?;
+        let store_id = match mapping.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        let model_id = match mapping.model_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         Ok(self
             .client
             .expand(
-                mapping.store_id.as_deref().unwrap_or(""),
-                mapping.model_id.as_deref().unwrap_or(""),
+                &store_id,
+                &model_id,
                 namespace,
                 object,
                 relation,
@@ -973,11 +1023,19 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         })?;
         let mapping = self.resolve_mapping(tenant_id, namespace).await?;
         let typed = typed_user(user);
+        let store_id = match mapping.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        let model_id = match mapping.model_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         let objects = self
             .client
             .list_objects(
-                mapping.store_id.as_deref().unwrap_or(""),
-                mapping.model_id.as_deref().unwrap_or(""),
+                &store_id,
+                &model_id,
                 namespace,
                 relation,
                 &typed,
@@ -1006,11 +1064,19 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         opts: &QueryOptions,
     ) -> Result<Vec<String>, PermissionBackendError> {
         let mapping = self.resolve_mapping(tenant_id, namespace).await?;
+        let store_id = match mapping.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        let model_id = match mapping.model_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         Ok(self
             .client
             .list_users(
-                mapping.store_id.as_deref().unwrap_or(""),
-                mapping.model_id.as_deref().unwrap_or(""),
+                &store_id,
+                &model_id,
                 namespace,
                 object,
                 relation,
@@ -1039,14 +1105,20 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         let existing = self.mappings.get(tenant_id, namespace).await?;
 
         if let Some(record) = existing {
-            let provisioned = !record.store_id.as_deref().unwrap_or("").is_empty();
+            let provisioned = match record.store_id.as_deref() {
+                Some(id) => !id.is_empty(),
+                None => false,
+            };
             if provisioned {
                 if record.model == *model {
                     return Ok(());
                 }
                 // Model changed: publish a new version into the same store.
                 // Tuples are never touched.
-                let store_id = record.store_id.clone().unwrap_or_default();
+                let store_id = match record.store_id.as_deref() {
+                    Some(id) => id.to_owned(),
+                    None => String::new(),
+                };
                 let model_id = self.client.write_model(&store_id, model).await?;
                 return self
                     .persist_record(tenant_id, namespace, model, store_id, model_id)
@@ -1069,7 +1141,10 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         let Some(record) = self.mappings.get(tenant_id, namespace).await? else {
             return Ok(());
         };
-        let store_id = record.store_id.unwrap_or_default();
+        let store_id = match record.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         if store_id.is_empty() {
             return Ok(());
         }
@@ -1218,7 +1293,8 @@ impl PermissionService for PermissionServiceImpl {
             .await?;
 
         let sanitized = sanitize_expand_tree(&expanded, &tenant_id, &self.mappings).await?;
-        let tree = serde_json::to_string(&sanitized).unwrap_or_default();
+        let tree = serde_json::to_string(&sanitized)
+            .map_err(|err| ServiceError::Internal(format!("failed to serialize expand tree: {err}")))?;
         Ok(Response::new(ExpandPermissionsResponse {
             tree,
             ..Default::default()
@@ -1257,19 +1333,17 @@ impl PermissionService for PermissionServiceImpl {
 
         let sanitized = sanitize_expand_tree(&expanded, &tenant_id, &self.mappings).await?;
 
-        let objects = sanitized
-            .get("relation_tuples")
-            .and_then(|v| v.as_array())
-            .map(|tuples| {
-                tuples
-                    .iter()
-                    .filter_map(|tuple| tuple.get("object").and_then(|o| o.as_str()))
-                    .map(|object| object.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let objects = match sanitized.get("relation_tuples").and_then(|v| v.as_array()) {
+            Some(tuples) => tuples
+                .iter()
+                .filter_map(|tuple| tuple.get("object").and_then(|o| o.as_str()))
+                .map(|object| object.to_string())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
 
-        let tree = serde_json::to_string(&sanitized).unwrap_or_default();
+        let tree = serde_json::to_string(&sanitized)
+            .map_err(|err| ServiceError::Internal(format!("failed to serialize expand tree: {err}")))?;
         Ok(Response::new(ExpandObjectsResponse {
             objects,
             tree,
@@ -1288,11 +1362,11 @@ impl PermissionService for PermissionServiceImpl {
         let req = request.to_owned_message();
 
         let page = req.page.as_option();
-        let page_size = page
-            .map(|p| p.page_size)
-            .filter(|&size| size > 0)
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .min(MAX_PAGE_SIZE);
+        let page_size = match page.map(|p| p.page_size).filter(|&size| size > 0) {
+            Some(size) => size,
+            None => DEFAULT_PAGE_SIZE,
+        }
+        .min(MAX_PAGE_SIZE);
         let after = page
             .map(|p| p.page_token.as_str())
             .filter(|token| !token.is_empty())
@@ -1312,9 +1386,10 @@ impl PermissionService for PermissionServiceImpl {
             .await?;
 
         let next_page_token = if rows.len() as u32 == page_size {
-            rows.last()
-                .map(|row| encode_page_token(row.created_at, &row.id))
-                .unwrap_or_default()
+            match rows.last() {
+                Some(row) => encode_page_token(row.created_at, &row.id),
+                None => String::new(),
+            }
         } else {
             String::new()
         };
@@ -1324,7 +1399,7 @@ impl PermissionService for PermissionServiceImpl {
             tuples,
             page: crate::proto::iam::v1::PageResponse {
                 next_page_token,
-                total_size: u32::try_from(total).unwrap_or(u32::MAX),
+                total_size: total.clamp(0, i64::from(u32::MAX)) as u32,
                 ..Default::default()
             }
             .into(),
@@ -1346,7 +1421,9 @@ impl PermissionService for PermissionServiceImpl {
         let model_json = req
             .model
             .as_option()
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| ServiceError::InvalidArgument(format!("invalid model: {err}")))?
             .ok_or_else(|| ServiceError::InvalidArgument("model is required".into()))?;
         let model = validate_and_normalize_model(model_json)?;
 
@@ -1418,7 +1495,7 @@ impl PermissionService for PermissionServiceImpl {
         Ok(Response::new(ListPermissionNamespacesResponse {
             namespaces,
             page: crate::proto::iam::v1::PageResponse {
-                total_size: u32::try_from(total).unwrap_or(u32::MAX),
+                total_size: total.min(u32::MAX as usize) as u32,
                 ..Default::default()
             }
             .into(),
@@ -1608,9 +1685,10 @@ fn sanitize_object_value(
     tenant_id: &str,
 ) -> Result<serde_json::Value, ServiceError> {
     match value.as_str() {
-        Some(s) => Ok(strip_tenant_object_prefix(tenant_id, s)
-            .map(serde_json::Value::String)
-            .unwrap_or_else(|| serde_json::Value::String(s.to_string()))),
+        Some(s) => Ok(match strip_tenant_object_prefix(tenant_id, s) {
+            Some(stripped) => serde_json::Value::String(stripped),
+            None => serde_json::Value::String(s.to_string()),
+        }),
         None => Ok(value.clone()),
     }
 }
@@ -1649,7 +1727,10 @@ fn strip_subject_set_prefix(subject: &str, tenant_id: &str) -> String {
     // may be "tenant_id:gateway_object_id".
     let prefix = format!("{tenant_id}:");
     if let Some((left, relation)) = subject.split_once('#') {
-        let stripped = left.strip_prefix(&prefix).unwrap_or(left);
+        let stripped = match left.strip_prefix(&prefix) {
+            Some(rest) => rest,
+            None => left,
+        };
         format!("{stripped}#{relation}")
     } else {
         subject.to_string()
@@ -1773,9 +1854,15 @@ fn validate_and_normalize_model(mut model: Value) -> Result<Value, ServiceError>
         }
     }
     defs.sort_by(|a, b| {
-        let ta = a.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-        let tb = b.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-        ta.cmp(tb)
+        let ta = match a.get("type").and_then(|t| t.as_str()) {
+            Some(ty) => ty.to_owned(),
+            None => String::new(),
+        };
+        let tb = match b.get("type").and_then(|t| t.as_str()) {
+            Some(ty) => ty.to_owned(),
+            None => String::new(),
+        };
+        ta.cmp(&tb)
     });
     Ok(model)
 }
@@ -1799,7 +1886,9 @@ fn tuple_key_from_proto(key: ProtoRelationTupleKey) -> Result<RelationTupleKey, 
     let condition_context = key
         .condition_context
         .as_option()
-        .map(|s| serde_json::to_value(s).unwrap_or_default());
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|err| ServiceError::InvalidArgument(format!("invalid condition context: {err}")))?;
     Ok(RelationTupleKey {
         namespace: key.namespace,
         object: key.object,
@@ -1831,7 +1920,10 @@ fn query_options_from(
         .map(tuple_key_from_proto)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(QueryOptions {
-        context: context.map(|s| serde_json::to_value(s).unwrap_or_default()),
+        context: context
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| ServiceError::InvalidArgument(format!("invalid context: {err}")))?,
         contextual_tuples,
         consistency,
     })

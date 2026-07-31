@@ -19,7 +19,10 @@ use super::proto_util::{
 };
 
 pub fn ory_session_to_proto(value: &Value) -> BrowserSession {
-    let identity = value.get("identity").cloned().unwrap_or_default();
+    let identity = match value.get("identity") {
+        Some(identity) => identity.clone(),
+        None => Value::Null,
+    };
     BrowserSession {
         id: json_str(value, "id"),
         identity_id: json_str(&identity, "id"),
@@ -29,18 +32,19 @@ pub fn ory_session_to_proto(value: &Value) -> BrowserSession {
         authenticated_at: parse_timestamp_opt(value.get("authenticated_at")),
         issued_at: parse_timestamp_opt(value.get("issued_at")),
         authenticator_assurance_level: json_str(value, "authenticator_assurance_level"),
-        identity_traits: value
+        identity_traits: match value
             .get("identity")
             .and_then(|identity| identity.get("traits"))
             .cloned()
             .and_then(json_to_struct)
-            .map(Into::into)
-            .unwrap_or_default(),
-        identity: value
-            .get("identity")
-            .map(ory_identity_to_proto)
-            .map(Into::into)
-            .unwrap_or_default(),
+        {
+            Some(traits) => traits.into(),
+            None => Default::default(),
+        },
+        identity: match value.get("identity").map(ory_identity_to_proto) {
+            Some(identity) => identity.into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }
@@ -48,22 +52,19 @@ pub fn ory_session_to_proto(value: &Value) -> BrowserSession {
 pub fn ory_identity_to_proto(value: &Value) -> BrowserIdentity {
     BrowserIdentity {
         id: json_str(value, "id"),
-        traits: value
-            .get("traits")
-            .cloned()
-            .and_then(json_to_struct)
-            .map(Into::into)
-            .unwrap_or_default(),
-        verifiable_addresses: value
-            .get("verifiable_addresses")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().map(ory_verifiable_address_to_proto).collect())
-            .unwrap_or_default(),
-        recovery_addresses: value
-            .get("recovery_addresses")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().map(ory_recovery_address_to_proto).collect())
-            .unwrap_or_default(),
+        traits: match value.get("traits").cloned().and_then(json_to_struct) {
+            Some(traits) => traits.into(),
+            None => Default::default(),
+        },
+        verifiable_addresses: match value.get("verifiable_addresses").and_then(|v| v.as_array())
+        {
+            Some(arr) => arr.iter().map(ory_verifiable_address_to_proto).collect(),
+            None => Vec::new(),
+        },
+        recovery_addresses: match value.get("recovery_addresses").and_then(|v| v.as_array()) {
+            Some(arr) => arr.iter().map(ory_recovery_address_to_proto).collect(),
+            None => Vec::new(),
+        },
         created_at: parse_timestamp_opt(value.get("created_at")),
         updated_at: parse_timestamp_opt(value.get("updated_at")),
         schema_id: json_str(value, "schema_id"),
@@ -107,16 +108,17 @@ pub fn ory_flow_to_proto(value: &Value) -> SelfServiceFlow {
         request_url: json_str(value, "request_url"),
         active_method: json_str(value, "active"),
         identity_schema_id: json_str(value, "identity_schema_id"),
-        oauth2_login_request: value
+        oauth2_login_request: match value
             .get("oauth2_login_request")
             .map(ory_oauth2_login_request_to_proto)
-            .map(Into::into)
-            .unwrap_or_default(),
-        ui: value
-            .get("ui")
-            .map(ory_ui_container_to_proto)
-            .map(Into::into)
-            .unwrap_or_default(),
+        {
+            Some(request) => request.into(),
+            None => Default::default(),
+        },
+        ui: match value.get("ui").map(ory_ui_container_to_proto) {
+            Some(ui) => ui.into(),
+            None => Default::default(),
+        },
         refresh: json_bool(value, "refresh"),
         requested_aal: json_str(value, "requested_aal"),
         ..Default::default()
@@ -127,28 +129,29 @@ pub fn ory_ui_container_to_proto(value: &Value) -> UiContainer {
     UiContainer {
         action: json_str(value, "action"),
         method: json_str(value, "method"),
-        nodes: value
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .map(|arr| arr.iter().map(ory_ui_node_to_proto).collect())
-            .unwrap_or_default(),
-        messages: value
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|arr| arr.iter().map(ory_ui_message_to_proto).collect())
-            .unwrap_or_default(),
+        nodes: match value.get("nodes").and_then(|n| n.as_array()) {
+            Some(arr) => arr.iter().map(ory_ui_node_to_proto).collect(),
+            None => Vec::new(),
+        },
+        messages: match value.get("messages").and_then(|m| m.as_array()) {
+            Some(arr) => arr.iter().map(ory_ui_message_to_proto).collect(),
+            None => Vec::new(),
+        },
         ..Default::default()
     }
 }
 
 pub fn ory_ui_node_to_proto(value: &Value) -> UiNode {
-    let node_type = value
+    let node_type = match value
         .get("attributes")
         .and_then(|a| a.get("node_type"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+    {
+        Some(node_type) => node_type.to_owned(),
+        None => String::new(),
+    };
 
-    let attributes = match node_type {
+    let attributes = match node_type.as_str() {
         "input" => value
             .get("attributes")
             .map(ory_ui_node_input_attributes_to_proto)
@@ -175,29 +178,29 @@ pub fn ory_ui_node_to_proto(value: &Value) -> UiNode {
     UiNode {
         r#type: json_str(value, "type"),
         group: json_str(value, "group"),
-        messages: value
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|arr| arr.iter().map(ory_ui_message_to_proto).collect())
-            .unwrap_or_default(),
-        meta: value
-            .get("meta")
-            .map(ory_ui_node_meta_to_proto)
-            .map(Into::into)
-            .unwrap_or_default(),
+        messages: match value.get("messages").and_then(|m| m.as_array()) {
+            Some(arr) => arr.iter().map(ory_ui_message_to_proto).collect(),
+            None => Vec::new(),
+        },
+        meta: match value.get("meta").map(ory_ui_node_meta_to_proto) {
+            Some(meta) => meta.into(),
+            None => Default::default(),
+        },
         attributes,
         ..Default::default()
     }
 }
 
 pub fn ory_ui_node_meta_to_proto(value: &Value) -> UiNodeMeta {
-    let label = value.get("label").cloned().unwrap_or_default();
+    let label = match value.get("label") {
+        Some(label) => label.clone(),
+        None => Value::Null,
+    };
     UiNodeMeta {
-        label: label
-            .as_object()
-            .map(|_| ory_ui_text_to_proto(&label))
-            .map(Into::into)
-            .unwrap_or_default(),
+        label: match label.as_object() {
+            Some(_) => ory_ui_text_to_proto(&label).into(),
+            None => Default::default(),
+        },
         label_id: json_str(&label, "id"),
         label_text: json_str(&label, "text"),
         brand: json_str(value, "brand"),
@@ -212,12 +215,10 @@ pub fn ory_ui_text_to_proto(value: &Value) -> UiText {
         id: json_str(value, "id"),
         text: json_str(value, "text"),
         r#type: json_str(value, "type"),
-        context: value
-            .get("context")
-            .cloned()
-            .and_then(json_to_struct)
-            .map(Into::into)
-            .unwrap_or_default(),
+        context: match value.get("context").cloned().and_then(json_to_struct) {
+            Some(context) => context.into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }
@@ -287,16 +288,18 @@ pub fn ory_ui_node_input_attributes_to_proto(value: &Value) -> UiNodeInputAttrib
     UiNodeInputAttributes {
         name: json_str(value, "name"),
         r#type: json_str(value, "type"),
-        value: input_value_to_string(value.get("value").unwrap_or(&Value::Null)),
+        value: input_value_to_string(match value.get("value") {
+            Some(v) => v,
+            None => &Value::Null,
+        }),
         required: json_bool(value, "required"),
         disabled: json_bool(value, "disabled"),
         autocomplete: json_str(value, "autocomplete"),
         node_type: json_str(value, "node_type"),
-        label: value
-            .get("label")
-            .map(ory_ui_text_to_proto)
-            .map(Into::into)
-            .unwrap_or_default(),
+        label: match value.get("label").map(ory_ui_text_to_proto) {
+            Some(label) => label.into(),
+            None => Default::default(),
+        },
         pattern: json_str(value, "pattern"),
         maxlength: json_i64(value, "maxlength"),
         minlength: json_i64(value, "minlength"),
@@ -309,20 +312,29 @@ pub fn ory_ui_node_input_attributes_to_proto(value: &Value) -> UiNodeInputAttrib
         r#async: json_bool(value, "async"),
         referrerpolicy: json_str(value, "referrerpolicy"),
         multiple: json_bool(value, "multiple"),
-        step: json_value_to_string(value.get("step").unwrap_or(&Value::Null)),
+        step: json_value_to_string(match value.get("step") {
+            Some(v) => v,
+            None => &Value::Null,
+        }),
         ..Default::default()
     }
 }
 
 pub fn ory_ui_node_text_attributes_to_proto(value: &Value) -> UiNodeTextAttributes {
-    let text = value.get("text").cloned().unwrap_or_default();
+    let text = match value.get("text") {
+        Some(text) => text.clone(),
+        None => Value::Null,
+    };
     UiNodeTextAttributes {
         node_type: json_str(value, "node_type"),
         text: if text.is_object() {
             Some(ory_ui_text_to_proto(&text)).into()
         } else {
             Some(UiText {
-                text: text.as_str().unwrap_or("").to_string(),
+                text: match text.as_str() {
+                    Some(s) => s.to_string(),
+                    None => String::new(),
+                },
                 ..Default::default()
             })
             .into()
@@ -372,37 +384,39 @@ pub fn ory_ui_message_to_proto(value: &Value) -> UiMessage {
         id: json_str(value, "id"),
         text: json_str(value, "text"),
         r#type: json_str(value, "type"),
-        context: value
-            .get("context")
-            .cloned()
-            .and_then(json_to_struct)
-            .map(Into::into)
-            .unwrap_or_default(),
+        context: match value.get("context").cloned().and_then(json_to_struct) {
+            Some(context) => context.into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }
 
 pub fn ory_oauth2_login_request_to_proto(value: &Value) -> OAuth2LoginRequest {
-    let client = value.get("client").cloned().unwrap_or_default();
+    let client = match value.get("client") {
+        Some(client) => client.clone(),
+        None => Value::Null,
+    };
     OAuth2LoginRequest {
         challenge: json_str(value, "challenge"),
         client_id: json_str(&client, "client_id"),
         client_name: json_str(&client, "client_name"),
-        requested_scope: json_array_to_strings(
-            value.get("requested_scope").unwrap_or(&Value::Null),
-        ),
+        requested_scope: json_array_to_strings(match value.get("requested_scope") {
+            Some(v) => v,
+            None => &Value::Null,
+        }),
         requested_access_token_audience: json_array_to_strings(
-            value
-                .get("requested_access_token_audience")
-                .unwrap_or(&Value::Null),
+            match value.get("requested_access_token_audience") {
+                Some(v) => v,
+                None => &Value::Null,
+            },
         ),
         subject: json_str(value, "subject"),
         skip: json_bool(value, "skip"),
-        client: client
-            .as_object()
-            .map(|_| OAuth2Client::from(&client))
-            .map(Into::into)
-            .unwrap_or_default(),
+        client: match client.as_object() {
+            Some(_) => OAuth2Client::from(&client).into(),
+            None => Default::default(),
+        },
         ..Default::default()
     }
 }
@@ -419,10 +433,10 @@ pub fn ory_logout_flow_to_proto(value: &Value) -> LogoutFlow {
 pub fn ory_flow_error_to_proto(value: &Value) -> FlowError {
     FlowError {
         id: json_str(value, "id"),
-        error: value
-            .get("error")
-            .map(json_value_to_string)
-            .unwrap_or_default(),
+        error: match value.get("error") {
+            Some(error) => json_value_to_string(error),
+            None => String::new(),
+        },
         created_at: parse_timestamp_opt(value.get("created_at")),
         expires_at: parse_timestamp_opt(value.get("expires_at")),
         ..Default::default()
@@ -438,20 +452,26 @@ pub fn ory_webauthn_js_to_proto(content: &str) -> crate::proto::iam::v1::WebAuth
 
 /// Convert a gateway protobuf Struct into a serde JSON Value for submission.
 pub fn proto_struct_to_json(value: Option<&ProtoStruct>) -> Value {
-    value
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    match value {
+        Some(s) => match serde_json::to_value(s) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("failed to serialize protobuf Struct to JSON: {}", err);
+                Value::Object(serde_json::Map::new())
+            }
+        },
+        None => Value::Object(serde_json::Map::new()),
+    }
 }
 
 fn parse_timestamp_opt<T>(value: Option<&Value>) -> T
 where
     T: From<buffa_types::google::protobuf::Timestamp> + Default,
 {
-    value
-        .and_then(|v| v.as_str())
-        .and_then(parse_timestamp)
-        .map(Into::into)
-        .unwrap_or_default()
+    match value.and_then(|v| v.as_str()).and_then(parse_timestamp) {
+        Some(ts) => ts.into(),
+        None => T::default(),
+    }
 }
 
 #[cfg(test)]

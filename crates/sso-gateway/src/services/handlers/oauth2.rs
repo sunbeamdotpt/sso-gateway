@@ -412,7 +412,10 @@ async fn authorize(
         )
             .into_response();
     }
-    let client_id = params.get("client_id").cloned().unwrap_or_default();
+    let client_id = match params.get("client_id") {
+        Some(s) => s.clone(),
+        None => String::new(),
+    };
     let ory_id = match resolve_public_client_for_authorize(&state, &client_id).await {
         Ok(id) => id,
         Err(err) => return *err,
@@ -423,7 +426,10 @@ async fn authorize(
     // scopes at all) before the scope is checked by Hydra. Coverage is
     // measured against the effective scope, including the offline_access
     // appended below.
-    let scope = params.get("scope").cloned().unwrap_or_default();
+    let scope = match params.get("scope") {
+        Some(s) => s.clone(),
+        None => String::new(),
+    };
     let effective_scope = with_matrix_offline_access(&state, &scope);
     let requested: Vec<&str> = effective_scope.split_whitespace().collect();
     if requested
@@ -491,11 +497,14 @@ async fn token(
         None
     };
 
-    let client_id = client_credentials
+    let client_id = match client_credentials
         .as_ref()
-        .map(|(id, _)| id.clone())
-        .or_else(|| form.get("client_id").cloned())
-        .unwrap_or_default();
+        .map(|(id, _)| id.as_str())
+        .or_else(|| form.get("client_id").map(String::as_str))
+    {
+        Some(id) => id.to_owned(),
+        None => String::new(),
+    };
     if client_id.is_empty() {
         return bad_request("missing client_id");
     }
@@ -531,11 +540,14 @@ async fn device(
         None
     };
 
-    let client_id = client_credentials
+    let client_id = match client_credentials
         .as_ref()
-        .map(|(id, _)| id.clone())
-        .or_else(|| form.get("client_id").cloned())
-        .unwrap_or_default();
+        .map(|(id, _)| id.as_str())
+        .or_else(|| form.get("client_id").map(String::as_str))
+    {
+        Some(id) => id.to_owned(),
+        None => String::new(),
+    };
     if client_id.is_empty() {
         return bad_request("missing client_id");
     }
@@ -677,17 +689,16 @@ async fn register(
     // `offline_access` scope and the `refresh_token` grant so Matrix sessions
     // can outlive the access-token TTL. Non-Matrix registrations keep the
     // plain-OIDC ceiling exactly.
-    let mut scope = body["scope"]
-        .as_str()
-        .map(|s| {
-            s.split_whitespace()
-                .filter(|s| {
-                    DCR_ALLOWED_SCOPES.contains(s) || s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
-                })
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut scope = match body["scope"].as_str() {
+        Some(s) => s
+            .split_whitespace()
+            .filter(|s| {
+                DCR_ALLOWED_SCOPES.contains(s) || s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
+            })
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
     if scope.is_empty() {
         scope.push("openid".to_string());
     }
@@ -717,10 +728,10 @@ async fn register(
     } else {
         scope.join(" ")
     };
-    let token_endpoint_auth_method = body["token_endpoint_auth_method"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let token_endpoint_auth_method = match body["token_endpoint_auth_method"].as_str() {
+        Some(method) => method.to_string(),
+        None => String::new(),
+    };
 
     if let Err(err) = validate_token_endpoint_auth_method(&token_endpoint_auth_method) {
         return (
@@ -745,7 +756,10 @@ async fn register(
             .into_response();
     }
 
-    let client_name = body["client_name"].as_str().unwrap_or("").to_string();
+    let client_name = match body["client_name"].as_str() {
+        Some(name) => name.to_string(),
+        None => String::new(),
+    };
     let public_id = Ulid::new().to_string();
     let payload = json!({
         "client_id": public_id,
@@ -766,15 +780,18 @@ async fn register(
         Some(id) => id,
         None => return internal_error(),
     };
-    let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
+    let client_secret = match created["client_secret"].as_str() {
+        Some(secret) => secret.to_string(),
+        None => String::new(),
+    };
 
     // An authenticated caller (opportunistic bearer on the public route)
     // owns the mapping under its own tenant; anonymous DCR clients map under
     // the system tenant.
-    let tenant_id = auth
-        .as_ref()
-        .map(|Extension(a)| a.tenant_id.clone())
-        .unwrap_or_else(|| state.system_tenant_id.clone());
+    let tenant_id = match auth.as_ref() {
+        Some(Extension(a)) => a.tenant_id.clone(),
+        None => state.system_tenant_id.clone(),
+    };
 
     match state
         .mappings
@@ -810,14 +827,13 @@ async fn register(
 }
 
 fn json_string_array(value: &serde_json::Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    match value.as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 async fn revoke(
@@ -835,11 +851,14 @@ async fn revoke(
         None
     };
 
-    let client_id = client_credentials
+    let client_id = match client_credentials
         .as_ref()
-        .map(|(id, _)| id.clone())
-        .or_else(|| form.get("client_id").cloned())
-        .unwrap_or_default();
+        .map(|(id, _)| id.as_str())
+        .or_else(|| form.get("client_id").map(String::as_str))
+    {
+        Some(id) => id.to_owned(),
+        None => String::new(),
+    };
     if !client_id.is_empty() {
         match resolve_public_client(&state, &client_id).await {
             Ok(ory_id) => {
@@ -933,11 +952,8 @@ async fn introspect(
         }
     };
 
-    if !value
-        .get("active")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    let active = matches!(value.get("active").and_then(|v| v.as_bool()), Some(true));
+    if !active {
         return json_response(value);
     }
 
@@ -1037,11 +1053,10 @@ async fn maybe_expand_matrix_client_scope(
             return;
         }
     };
-    let registered: Vec<&str> = client["scope"]
-        .as_str()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect();
+    let registered: Vec<&str> = match client["scope"].as_str() {
+        Some(scope) => scope.split_whitespace().collect(),
+        None => Vec::new(),
+    };
     let covered = registered.contains(&"*")
         || requested_scopes.iter().all(|s| registered.contains(s));
     if covered {
@@ -1051,15 +1066,13 @@ async fn maybe_expand_matrix_client_scope(
     let mut payload = client.clone();
     payload["scope"] = json!("*");
     if state.matrix_offline_access_enabled {
-        let mut grant_types: Vec<String> = client["grant_types"]
-            .as_array()
-            .map(|grants| {
-                grants
-                    .iter()
-                    .filter_map(|g| g.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut grant_types: Vec<String> = match client["grant_types"].as_array() {
+            Some(grants) => grants
+                .iter()
+                .filter_map(|g| g.as_str().map(str::to_string))
+                .collect(),
+            None => Vec::new(),
+        };
         if !grant_types.iter().any(|g| g == "refresh_token") {
             grant_types.push("refresh_token".to_string());
             payload["grant_types"] = json!(grant_types);
@@ -1110,10 +1123,10 @@ async fn maybe_inject_introspection_email(
     let Some(kratos) = &state.kratos else {
         return;
     };
-    let scope = value
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let scope = match value.get("scope").and_then(|v| v.as_str()) {
+        Some(scope) => scope.to_owned(),
+        None => String::new(),
+    };
     let is_matrix_token = state.matrix_email_claim_enabled
         && scope
             .split_whitespace()
@@ -1200,10 +1213,10 @@ async fn heal_client_mapping(state: &Oauth2State, client_id: &str) -> Result<Str
             return Err(Box::new(internal_error()));
         }
     };
-    let ory_id = client["client_id"]
-        .as_str()
-        .unwrap_or(client_id)
-        .to_string();
+    let ory_id = match client["client_id"].as_str() {
+        Some(id) => id.to_string(),
+        None => client_id.to_string(),
+    };
     if let Err(err) = state
         .mappings
         .create(&state.system_tenant_id, BACKEND_HYDRA, client_id, &ory_id)
@@ -1339,10 +1352,14 @@ fn map_ory_error(err: OryClientError, path: &str, client_id: Option<&str>) -> Re
             (StatusCode::INTERNAL_SERVER_ERROR, server_error_body())
         }
     };
+    let client_id = match client_id {
+        Some(id) => id.to_owned(),
+        None => String::new(),
+    };
     warn!(
         ?err,
         %path,
-        client_id = client_id.unwrap_or_default(),
+        client_id,
         "ory backend error"
     );
     (status, axum::Json(body)).into_response()

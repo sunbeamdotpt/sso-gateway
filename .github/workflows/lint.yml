@@ -1,0 +1,33 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - mainline
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # SSO-027: deny panics (unwrap/expect) and silent-default combinators
+      # (*_or_default, unwrap_or*, map_or*) in production code; gate with
+      # -D warnings so no new lint debt slips in.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

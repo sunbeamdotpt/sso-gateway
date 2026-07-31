@@ -104,7 +104,10 @@ impl ClientCredentialService for ClientCredentialServiceImpl {
         let ory_id = created["client_id"]
             .as_str()
             .ok_or_else(|| ServiceError::Internal("hydra response missing client_id".into()))?;
-        let client_secret = created["client_secret"].as_str().unwrap_or("").to_string();
+        let client_secret = match created["client_secret"].as_str() {
+            Some(secret) => secret.to_string(),
+            None => String::new(),
+        };
 
         self.mappings
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
@@ -369,20 +372,23 @@ fn hydra_to_client_credential(
     tenant_id: &str,
     public_id: &str,
 ) -> ClientCredential {
-    let scope_string = client["scope"].as_str().unwrap_or("");
     ClientCredential {
         id: public_id.to_string(),
         tenant_id: tenant_id.to_string(),
-        name: client["client_name"].as_str().unwrap_or("").to_string(),
-        scope: if scope_string.is_empty() {
-            Vec::new()
-        } else {
-            scope_string.split(' ').map(|s| s.to_string()).collect()
+        name: match client["client_name"].as_str() {
+            Some(name) => name.to_string(),
+            None => String::new(),
         },
-        token_endpoint_auth_method: client["token_endpoint_auth_method"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        scope: match client["scope"].as_str() {
+            Some(scope) if !scope.is_empty() => {
+                scope.split(' ').map(|s| s.to_string()).collect()
+            }
+            _ => Vec::new(),
+        },
+        token_endpoint_auth_method: match client["token_endpoint_auth_method"].as_str() {
+            Some(method) => method.to_string(),
+            None => String::new(),
+        },
         ..Default::default()
     }
 }

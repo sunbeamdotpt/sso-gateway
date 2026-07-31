@@ -326,12 +326,14 @@ impl HydraClient {
         let response = request.send().await.map_err(OryClientError::Http)?;
 
         if response.status().is_redirection() {
-            let location = response
+            let location = match response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|h| h.to_str().ok())
-                .map(String::from)
-                .unwrap_or_default();
+            {
+                Some(location) => String::from(location),
+                None => String::new(),
+            };
             let set_cookies = response
                 .headers()
                 .get_all(reqwest::header::SET_COOKIE)
@@ -419,7 +421,15 @@ impl HydraClient {
             400 | 200 => Ok(true),
             status => Err(OryClientError::Ory {
                 status,
-                message: response.text().await.unwrap_or_default(),
+                // Best-effort diagnostics: an unreadable error body yields
+                // an empty message, never a swallowed error.
+                message: match response.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to read hydra error body; falling back to empty message");
+                        String::new()
+                    }
+                },
             }),
         }
     }
@@ -491,12 +501,14 @@ impl HydraClient {
         let response = request.send().await.map_err(OryClientError::Http)?;
 
         if response.status().is_redirection() {
-            let location = response
+            let location = match response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|h| h.to_str().ok())
-                .map(String::from)
-                .unwrap_or_default();
+            {
+                Some(location) => String::from(location),
+                None => String::new(),
+            };
             let set_cookies = response
                 .headers()
                 .get_all(reqwest::header::SET_COOKIE)
@@ -641,10 +653,13 @@ async fn handle_response(response: reqwest::Response) -> Result<Value, OryClient
 
 async fn ory_error(response: reqwest::Response) -> OryClientError {
     let status = response.status().as_u16();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let message = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to read hydra error body; falling back to placeholder");
+            "<unreadable body>".to_string()
+        }
+    };
     OryClientError::Ory { status, message }
 }
 

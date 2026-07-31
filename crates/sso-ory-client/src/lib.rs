@@ -1,3 +1,5 @@
+// SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
 //! Thin internal clients for Ory Hydra, Kratos, and Keto.
 
 pub mod error;

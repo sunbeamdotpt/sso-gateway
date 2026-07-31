@@ -1,3 +1,6 @@
+// SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+
 //! End-to-end tests for the branded browser self-service surface, proxied
 //! through to a real Ory Kratos (v25.4) container. The unit tests in
 //! `services::handlers::self_service` pin the translation table against stub

@@ -545,7 +545,10 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<KratosResponse, OryClientError> {
-        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        let query = match return_to {
+            Some(r) => vec![("return_to", r)],
+            None => Vec::new(),
+        };
         self.create_browser_flow("verification", &query, cookie)
             .await
     }
@@ -578,7 +581,10 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<KratosResponse, OryClientError> {
-        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        let query = match return_to {
+            Some(r) => vec![("return_to", r)],
+            None => Vec::new(),
+        };
         self.create_browser_flow("settings", &query, cookie).await
     }
 
@@ -589,7 +595,10 @@ impl KratosClient {
         return_to: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<KratosResponse, OryClientError> {
-        let query = return_to.map(|r| [("return_to", r)]).unwrap_or_default();
+        let query = match return_to {
+            Some(r) => vec![("return_to", r)],
+            None => Vec::new(),
+        };
         self.create_browser_flow("recovery", &query, cookie).await
     }
 
@@ -796,10 +805,13 @@ async fn handle_response_with_headers(
 async fn browser_redirect_or_error(response: reqwest::Response) -> OryClientError {
     let headers = response.headers().clone();
     let status = response.status().as_u16();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let message = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to read kratos error body; falling back to placeholder");
+            "<unreadable body>".to_string()
+        }
+    };
     let body: Value = match serde_json::from_str(&message) {
         Ok(body) => body,
         Err(_) => return OryClientError::Ory { status, message },
@@ -812,11 +824,10 @@ async fn browser_redirect_or_error(response: reqwest::Response) -> OryClientErro
     if !is_browser_redirect {
         return OryClientError::Ory { status, message };
     }
-    let location = body
-        .get("redirect_browser_to")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let location = match body.get("redirect_browser_to").and_then(Value::as_str) {
+        Some(location) => location.to_string(),
+        None => String::new(),
+    };
     let set_cookies = headers
         .get_all(reqwest::header::SET_COOKIE)
         .iter()
@@ -831,10 +842,13 @@ async fn browser_redirect_or_error(response: reqwest::Response) -> OryClientErro
 
 async fn ory_error(response: reqwest::Response) -> OryClientError {
     let status = response.status().as_u16();
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    let message = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to read kratos error body; falling back to placeholder");
+            "<unreadable body>".to_string()
+        }
+    };
     OryClientError::Ory { status, message }
 }
 

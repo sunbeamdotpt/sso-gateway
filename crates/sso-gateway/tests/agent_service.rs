@@ -1,3 +1,6 @@
+// SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+
 //! End-to-end coverage for agent identities: the AgentService RPC surface
 //! (backed by a real Hydra and Postgres) and the middleware classification of
 //! agent client-credentials tokens and on-behalf-of act-tokens.

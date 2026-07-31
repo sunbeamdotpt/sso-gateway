@@ -236,11 +236,11 @@ impl IdentityService for IdentityServiceImpl {
         let req = request.to_owned_message();
 
         let schema = self.resolve_schema(&tenant_id, &req.schema_id).await?;
-        let mut traits_json = req
-            .traits
-            .as_option()
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let mut traits_json = match req.traits.as_option() {
+            Some(s) => serde_json::to_value(s)
+                .map_err(|e| ServiceError::InvalidArgument(format!("invalid traits: {e}")))?,
+            None => serde_json::json!({}),
+        };
         normalize_traits(&mut traits_json);
         validate_traits(&schema.schema_json, &traits_json)?;
         let email = extract_email(&traits_json)?;
@@ -355,22 +355,20 @@ impl IdentityService for IdentityServiceImpl {
         };
         let schema = self.resolve_schema(&tenant_id, &schema_id).await?;
 
-        let mut traits_json = req
-            .traits
-            .as_option()
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let mut traits_json = match req.traits.as_option() {
+            Some(s) => serde_json::to_value(s)
+                .map_err(|e| ServiceError::InvalidArgument(format!("invalid traits: {e}")))?,
+            None => serde_json::json!({}),
+        };
         normalize_traits(&mut traits_json);
         validate_traits(&schema.schema_json, &traits_json)?;
         let email = extract_email(&traits_json)?;
 
         // Email is the Kratos identifier and is immutable.
-        let current_email = current
-            .traits
-            .get("email")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !current_email.is_empty() && email != current_email {
+        if let Some(current_email) = current.traits.get("email").and_then(|v| v.as_str())
+            && !current_email.is_empty()
+            && email != current_email
+        {
             return Err(ServiceError::InvalidArgument("email is immutable".into()).into());
         }
 
@@ -435,11 +433,11 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
-        let schema_json = req
-            .schema_json
-            .as_option()
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let schema_json = match req.schema_json.as_option() {
+            Some(s) => serde_json::to_value(s)
+                .map_err(|e| ServiceError::InvalidArgument(format!("invalid schema: {e}")))?,
+            None => serde_json::json!({}),
+        };
         require_email_string_schema(&schema_json)?;
         let row = self
             .schemas
@@ -489,11 +487,11 @@ impl IdentityService for IdentityServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_scope(&ctx, SCOPE_IDENTITY_ADMIN)?;
         let req = request.to_owned_message();
-        let schema_json = req
-            .schema_json
-            .as_option()
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let schema_json = match req.schema_json.as_option() {
+            Some(s) => serde_json::to_value(s)
+                .map_err(|e| ServiceError::InvalidArgument(format!("invalid schema: {e}")))?,
+            None => serde_json::json!({}),
+        };
         require_email_string_schema(&schema_json)?;
         let row = self
             .schemas
@@ -637,10 +635,13 @@ impl IdentityService for IdentityServiceImpl {
             .await
             .map_err(map_ory_error)?;
 
-        let identity_id = session["identity_id"].as_str().unwrap_or("");
+        let identity_id = match session["identity_id"].as_str() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         let public_identity_id = self
             .mappings
-            .get_public_id(&tenant_id, BACKEND_KRATOS, identity_id)
+            .get_public_id(&tenant_id, BACKEND_KRATOS, &identity_id)
             .await?;
         let public_session_id = self.public_session(&tenant_id, &session).await?;
 
@@ -648,7 +649,7 @@ impl IdentityService for IdentityServiceImpl {
             id: public_session_id,
             identity_id: public_identity_id,
             tenant_id,
-            active: session["active"].as_bool().unwrap_or(false),
+            active: matches!(session["active"].as_bool(), Some(true)),
             ..Default::default()
         }))
     }
@@ -686,7 +687,7 @@ impl IdentityService for IdentityServiceImpl {
                     id: public_session_id,
                     identity_id: req.identity_id.clone(),
                     tenant_id: tenant_id.clone(),
-                    active: s["active"].as_bool().unwrap_or(false),
+                    active: matches!(s["active"].as_bool(), Some(true)),
                     ..Default::default()
                 });
             }
@@ -717,11 +718,14 @@ impl IdentityService for IdentityServiceImpl {
             .admin_get_session(&ory_session_id)
             .await
             .map_err(map_ory_error)?;
-        let identity_id = session["identity_id"].as_str().unwrap_or("");
+        let identity_id = match session["identity_id"].as_str() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
         // Verify the session belongs to an identity in the caller's tenant.
         let _ = self
             .mappings
-            .get_public_id(&tenant_id, BACKEND_KRATOS, identity_id)
+            .get_public_id(&tenant_id, BACKEND_KRATOS, &identity_id)
             .await?;
 
         self.kratos
@@ -768,11 +772,10 @@ impl IdentityService for IdentityServiceImpl {
                     "kratos response missing recovery_token and token query param".into(),
                 )
             })?;
-        let flow = recovery_url
-            .query_pairs()
-            .find(|(k, _)| k == "flow")
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default();
+        let flow = match recovery_url.query_pairs().find(|(k, _)| k == "flow") {
+            Some((_, v)) => v.into_owned(),
+            None => String::new(),
+        };
 
         let public_recovery_token = self
             .transient
@@ -820,8 +823,7 @@ impl IdentityService for IdentityServiceImpl {
             expires_at: response.body["expires_at"]
                 .as_str()
                 .and_then(parse_timestamp)
-                .map(Into::into)
-                .unwrap_or_default(),
+                .into(),
             ..Default::default()
         }))
     }
@@ -853,33 +855,33 @@ impl IdentityService for IdentityServiceImpl {
                 .find(|m| m["template_type"].as_str() == Some("verification"))
                 .or_else(|| messages.last())
         } else {
-            messages.iter().find(|m| {
-                m["id"]
-                    .as_str()
-                    .map(|id| id == req.message_id)
-                    .unwrap_or(false)
+            messages.iter().find(|m| match m["id"].as_str() {
+                Some(id) => id == req.message_id,
+                None => false,
             })
         }
         .ok_or_else(|| ServiceError::NotFound("verification message not found".into()))?;
 
-        let body = message["body"].as_str().unwrap_or("");
-        let (raw_token, raw_flow) = extract_first_self_service_link(body)
-            .and_then(|url| {
-                reqwest::Url::parse(&url).ok().map(|u| {
-                    let token = u
-                        .query_pairs()
-                        .find(|(k, _)| k == "token")
-                        .map(|(_, v)| v.into_owned())
-                        .unwrap_or_default();
-                    let flow = u
-                        .query_pairs()
-                        .find(|(k, _)| k == "flow")
-                        .map(|(_, v)| v.into_owned())
-                        .unwrap_or_default();
-                    (token, flow)
-                })
-            })
-            .unwrap_or_default();
+        let body = match message["body"].as_str() {
+            Some(body) => body.to_owned(),
+            None => String::new(),
+        };
+        let (raw_token, raw_flow) = match extract_first_self_service_link(&body)
+            .and_then(|url| reqwest::Url::parse(&url).ok())
+        {
+            Some(u) => {
+                let token = match u.query_pairs().find(|(k, _)| k == "token") {
+                    Some((_, v)) => v.into_owned(),
+                    None => String::new(),
+                };
+                let flow = match u.query_pairs().find(|(k, _)| k == "flow") {
+                    Some((_, v)) => v.into_owned(),
+                    None => String::new(),
+                };
+                (token, flow)
+            }
+            None => (String::new(), String::new()),
+        };
 
         let public_token = if raw_token.is_empty() {
             String::new()
@@ -926,17 +928,31 @@ impl IdentityService for IdentityServiceImpl {
         };
 
         Ok(Response::new(VerificationMessage {
-            id: message["id"].as_str().unwrap_or("").to_string(),
-            r#type: message["type"].as_str().unwrap_or("").to_string(),
-            subject: message["subject"].as_str().unwrap_or("").to_string(),
+            id: match message["id"].as_str() {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            r#type: match message["type"].as_str() {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            subject: match message["subject"].as_str() {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
             body: body.to_string(),
-            status: message["status"].as_str().unwrap_or("").to_string(),
-            recipient: message["recipient"].as_str().unwrap_or("").to_string(),
+            status: match message["status"].as_str() {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            recipient: match message["recipient"].as_str() {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
             sent_at: message["sent_at"]
                 .as_str()
                 .and_then(parse_timestamp)
-                .map(Into::into)
-                .unwrap_or_default(),
+                .into(),
             link,
             flow: public_flow,
             ..Default::default()
@@ -964,10 +980,10 @@ impl IdentityServiceImpl {
                     .get_identity(&ory_id)
                     .await
                     .map_err(map_ory_error)?;
-                let schema_id = identity["schema_id"]
-                    .as_str()
-                    .unwrap_or("default")
-                    .to_string();
+                let schema_id = match identity["schema_id"].as_str() {
+                    Some(v) => v.to_string(),
+                    None => "default".to_string(),
+                };
                 let traits = if identity["traits"].is_object() {
                     identity["traits"].clone()
                 } else {
@@ -988,10 +1004,9 @@ impl IdentityServiceImpl {
         tenant_id: &str,
         flow: &serde_json::Value,
     ) -> Result<String, ServiceError> {
-        let ory_flow_id = flow["id"].as_str().unwrap_or("");
-        if ory_flow_id.is_empty() {
+        let Some(ory_flow_id) = flow["id"].as_str().filter(|id| !id.is_empty()) else {
             return Ok(String::new());
-        }
+        };
         self.transient
             .create(
                 tenant_id,
@@ -1009,10 +1024,9 @@ impl IdentityServiceImpl {
         tenant_id: &str,
         flow: &serde_json::Value,
     ) -> Result<String, ServiceError> {
-        let ory_identity_id = flow["identity"]["id"].as_str().unwrap_or("");
-        if ory_identity_id.is_empty() {
+        let Some(ory_identity_id) = flow["identity"]["id"].as_str().filter(|id| !id.is_empty()) else {
             return Ok(String::new());
-        }
+        };
         self.mappings
             .get_public_id(tenant_id, BACKEND_KRATOS, ory_identity_id)
             .await
@@ -1024,10 +1038,9 @@ impl IdentityServiceImpl {
         tenant_id: &str,
         session: &serde_json::Value,
     ) -> Result<String, ServiceError> {
-        let ory_session_id = session["id"].as_str().unwrap_or("");
-        if ory_session_id.is_empty() {
+        let Some(ory_session_id) = session["id"].as_str().filter(|id| !id.is_empty()) else {
             return Ok(String::new());
-        }
+        };
         self.transient
             .create(
                 tenant_id,
@@ -1063,10 +1076,13 @@ const MAX_SCHEMA_SIZE_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 10;
 
 pub(crate) fn traits_subschema(schema_json: &serde_json::Value) -> &serde_json::Value {
-    schema_json
+    match schema_json
         .get("properties")
         .and_then(|p| p.get("traits"))
-        .unwrap_or(schema_json)
+    {
+        Some(traits) => traits,
+        None => schema_json,
+    }
 }
 
 /// Lowercase + trim `traits.email` so the Kratos identifier, the validated value, and
@@ -1136,9 +1152,13 @@ pub(crate) fn validate_traits(
 }
 
 fn validate_schema_size(schema: &serde_json::Value) -> Result<(), ServiceError> {
-    let size = serde_json::to_string(schema)
-        .map(|s| s.len())
-        .unwrap_or(usize::MAX);
+    let size = match serde_json::to_string(schema) {
+        Ok(serialized) => serialized.len(),
+        Err(err) => {
+            tracing::warn!("failed to serialize identity schema for size check: {}", err);
+            usize::MAX
+        }
+    };
     if size > MAX_SCHEMA_SIZE_BYTES {
         return Err(ServiceError::InvalidArgument(
             "identity schema exceeds maximum size of 64KiB".into(),
@@ -1301,13 +1321,19 @@ fn identity_from_traits(
         id: public_id.to_string(),
         tenant_id: tenant_id.to_string(),
         schema_id: schema_id.to_string(),
-        traits: traits_struct.map(Into::into).unwrap_or_default(),
+        traits: traits_struct.into(),
         ..Default::default()
     }
 }
 
 fn schema_row_to_proto(row: IdentitySchemaRow) -> IdentitySchema {
-    let schema_struct = serde_json::from_value::<ProtoStruct>(row.schema_json).unwrap_or_default();
+    let schema_struct = match serde_json::from_value::<ProtoStruct>(row.schema_json) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!("failed to decode identity schema JSON: {}", err);
+            ProtoStruct::default()
+        }
+    };
     IdentitySchema {
         id: row.id,
         tenant_id: row.tenant_id,
@@ -1326,17 +1352,25 @@ fn kratos_flow_to_flow(
     public_flow_id: &str,
     public_identity_id: &str,
 ) -> Flow {
-    let ui_struct = serde_json::from_value::<ProtoStruct>(flow["ui"].clone()).unwrap_or_default();
+    let ui_struct = match serde_json::from_value::<ProtoStruct>(flow["ui"].clone()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!("failed to decode flow UI JSON: {}", err);
+            ProtoStruct::default()
+        }
+    };
     Flow {
         id: public_flow_id.to_string(),
-        r#type: flow["type"].as_str().unwrap_or("").to_string(),
+        r#type: match flow["type"].as_str() {
+            Some(v) => v.to_string(),
+            None => String::new(),
+        },
         tenant_id: tenant_id.to_string(),
         identity_id: public_identity_id.to_string(),
         expires_at: flow["expires_at"]
             .as_str()
             .and_then(parse_timestamp)
-            .map(Into::into)
-            .unwrap_or_default(),
+            .into(),
         ui: Some(ui_struct).into(),
         __buffa_unknown_fields: Default::default(),
     }
@@ -1444,7 +1478,7 @@ mod tests {
     }
 
     fn proto_struct(value: serde_json::Value) -> ProtoStruct {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value).expect("test value must convert to proto Struct")
     }
 
     #[derive(Default)]

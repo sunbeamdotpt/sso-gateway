@@ -464,10 +464,10 @@ impl ScimServiceImpl {
             .get_ory_id(tenant_id, BACKEND_KRATOS, public_id)
             .await?;
         let schema_id = match self.kratos.get_identity(&ory_id).await {
-            Ok(identity) => identity["schema_id"]
-                .as_str()
-                .unwrap_or("default")
-                .to_string(),
+            Ok(identity) => match identity["schema_id"].as_str() {
+                Some(id) => id.to_string(),
+                None => "default".to_string(),
+            },
             Err(_) => "default".to_string(),
         };
         Ok((ory_id, schema_id))
@@ -500,7 +500,10 @@ impl ScimServiceImpl {
             .map_err(map_ory_error)?;
         let traits = &identity["traits"];
 
-        let email = traits["email"].as_str().unwrap_or("").to_string();
+        let email = match traits["email"].as_str() {
+            Some(email) => email.to_string(),
+            None => String::new(),
+        };
         let emails = if email.is_empty() {
             Vec::new()
         } else {
@@ -515,12 +518,13 @@ impl ScimServiceImpl {
 
         Ok(ScimUser {
             id: public_id.to_string(),
-            user_name: traits["userName"].as_str().unwrap_or(&email).to_string(),
-            name: proto_struct_opt(traits.get("name").cloned())
-                .map(Into::into)
-                .unwrap_or_default(),
+            user_name: match traits["userName"].as_str() {
+                Some(name) => name.to_string(),
+                None => email.clone(),
+            },
+            name: proto_struct_opt(traits.get("name").cloned()).into(),
             emails,
-            active: traits["active"].as_bool().unwrap_or(true),
+            active: !matches!(traits["active"].as_bool(), Some(false)),
             groups: group_ids,
             meta: Some(proto_struct(json!({"resourceType": "User"}))).into(),
             ..Default::default()
@@ -593,18 +597,25 @@ impl ScimServiceImpl {
 }
 
 fn scim_user_to_traits(user: &ScimUser) -> serde_json::Value {
-    let email = user
+    let email = match user
         .emails
         .first()
         .and_then(|e| e.fields.get("value"))
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let name_json = user
-        .name
-        .as_option()
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
-        .unwrap_or_default();
+    {
+        Some(email) => email.to_string(),
+        None => String::new(),
+    };
+    let name_json = match user.name.as_option() {
+        Some(s) => match serde_json::to_value(s) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(%err, "failed to serialize SCIM name struct; omitting name");
+                Value::Null
+            }
+        },
+        None => Value::Null,
+    };
     serde_json::json!({
         "userName": user.user_name,
         "email": email,
@@ -614,7 +625,13 @@ fn scim_user_to_traits(user: &ScimUser) -> serde_json::Value {
 }
 
 fn proto_struct(value: serde_json::Value) -> ProtoStruct {
-    serde_json::from_value(value).unwrap_or_default()
+    match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!("failed to decode SCIM JSON into proto Struct: {}", err);
+            ProtoStruct::default()
+        }
+    }
 }
 
 fn proto_struct_opt(value: Option<serde_json::Value>) -> Option<ProtoStruct> {

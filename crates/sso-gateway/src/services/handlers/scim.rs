@@ -274,8 +274,8 @@ async fn list_users(
         .body
         .users
         .into_iter()
-        .map(|u| serde_json::to_value(u).unwrap_or_default())
-        .collect();
+        .map(to_scim_value)
+        .collect::<Result<_, _>>()?;
     Ok(scim_json(list_response(users)))
 }
 
@@ -289,9 +289,7 @@ async fn create_user(
         .service
         .create_user_http(auth_ctx.tenant_id, user)
         .await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn get_user(
@@ -301,9 +299,7 @@ async fn get_user(
 ) -> Result<Response<Body>, ScimError> {
     require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
     let resp = state.service.get_user_http(auth_ctx.tenant_id, id).await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn update_user(
@@ -317,9 +313,7 @@ async fn update_user(
         .service
         .update_user_http(auth_ctx.tenant_id, id, user)
         .await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn delete_user(
@@ -346,8 +340,8 @@ async fn list_groups(
         .body
         .groups
         .into_iter()
-        .map(|g| serde_json::to_value(g).unwrap_or_default())
-        .collect();
+        .map(to_scim_value)
+        .collect::<Result<_, _>>()?;
     Ok(scim_json(list_response(groups)))
 }
 
@@ -361,9 +355,7 @@ async fn create_group(
         .service
         .create_group_http(auth_ctx.tenant_id, group)
         .await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn get_group(
@@ -373,9 +365,7 @@ async fn get_group(
 ) -> Result<Response<Body>, ScimError> {
     require_scope_any(&auth_ctx, &[SCOPE_SCIM_READ, SCOPE_SCIM_ADMIN])?;
     let resp = state.service.get_group_http(auth_ctx.tenant_id, id).await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn update_group(
@@ -389,9 +379,7 @@ async fn update_group(
         .service
         .update_group_http(auth_ctx.tenant_id, id, group)
         .await?;
-    Ok(scim_json(
-        serde_json::to_value(resp.body).unwrap_or_default(),
-    ))
+    Ok(scim_json(to_scim_value(resp.body)?))
 }
 
 async fn delete_group(
@@ -414,6 +402,15 @@ fn list_response(items: Vec<Value>) -> Value {
         "startIndex": 1,
         "itemsPerPage": items.len(),
         "Resources": items,
+    })
+}
+
+fn to_scim_value<T: serde::Serialize>(value: T) -> Result<Value, ScimError> {
+    serde_json::to_value(value).map_err(|err| {
+        ScimError::Response(Box::new(scim_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to serialize SCIM resource: {err}"),
+        )))
     })
 }
 

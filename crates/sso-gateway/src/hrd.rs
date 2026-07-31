@@ -127,7 +127,10 @@ impl Hrd {
         validate_email(email)?;
         validate_return_to(return_to)?;
 
-        let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+        let domain = match email.rsplit_once('@') {
+            Some((_, d)) => d,
+            None => "",
+        };
 
         // Only verified custom domains may be used for HRD.
         if !self.is_verified_domain(domain).await? {
@@ -186,7 +189,10 @@ fn validate_email(email: &str) -> Result<(), HrdError> {
     if email.chars().filter(|&c| c == '@').count() != 1 {
         return Err(HrdError::InvalidEmail);
     }
-    let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+    let domain = match email.rsplit_once('@') {
+        Some((_, d)) => d,
+        None => "",
+    };
     if domain.is_empty() {
         return Err(HrdError::InvalidEmail);
     }

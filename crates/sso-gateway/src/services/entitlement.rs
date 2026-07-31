@@ -307,18 +307,30 @@ impl EntitlementService for EntitlementServiceImpl {
     }
 
     async fn effective_scope_ceiling(&self, tenant_id: &str, identity_id: &str) -> Vec<String> {
-        let is_gateway_admin = self
+        let is_gateway_admin = match self
             .check(tenant_id, identity_id, GATEWAY_APP_OBJECT, ADMIN_REL)
             .await
-            .unwrap_or(false);
+        {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                warn!(tenant_id, identity_id, error = %err, "gateway admin entitlement check failed; treating as not admin");
+                false
+            }
+        };
         if is_gateway_admin {
             return admin_scope_ceiling();
         }
 
-        let is_gateway_member = self
+        let is_gateway_member = match self
             .check(tenant_id, identity_id, GATEWAY_APP_OBJECT, MEMBER_REL)
             .await
-            .unwrap_or(false);
+        {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                warn!(tenant_id, identity_id, error = %err, "gateway member entitlement check failed; treating as not member");
+                false
+            }
+        };
         if is_gateway_member {
             return read_scope_ceiling();
         }
@@ -483,18 +495,30 @@ impl EntitlementService for EntitlementServiceImpl {
         app_public_id: &str,
     ) -> Value {
         let mut levels = Vec::new();
-        if self
+        let is_member = match self
             .check(tenant_id, identity_id, app_public_id, MEMBER_REL)
             .await
-            .unwrap_or(false)
         {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                warn!(tenant_id, identity_id, error = %err, "entitlement member check failed; excluding from claim");
+                false
+            }
+        };
+        if is_member {
             levels.push("member");
         }
-        if self
+        let is_admin = match self
             .check(tenant_id, identity_id, app_public_id, ADMIN_REL)
             .await
-            .unwrap_or(false)
         {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                warn!(tenant_id, identity_id, error = %err, "entitlement admin check failed; excluding from claim");
+                false
+            }
+        };
+        if is_admin {
             levels.push("admin");
         }
 
@@ -749,25 +773,41 @@ pub mod test_helpers {
 
     impl ConfigurableEntitlementService {
         pub fn allow(&self, tenant_id: &str, identity_id: &str, app_public_id: &str) {
-            self.member_results.lock().unwrap().insert(
+            let mut results = match self.member_results.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            results.insert(
                 (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string()),
                 true,
             );
         }
 
         pub fn deny(&self, tenant_id: &str, identity_id: &str, app_public_id: &str) {
-            self.member_results.lock().unwrap().insert(
+            let mut results = match self.member_results.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            results.insert(
                 (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string()),
                 false,
             );
         }
 
         pub fn set_ceiling(&self, scopes: Vec<String>) {
-            *self.ceiling.lock().unwrap() = scopes;
+            let mut ceiling = match self.ceiling.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            *ceiling = scopes;
         }
 
         pub fn set_claim(&self, claim: Value) {
-            *self.claim.lock().unwrap() = claim;
+            let mut current = match self.claim.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            *current = claim;
         }
     }
 
@@ -802,7 +842,14 @@ pub mod test_helpers {
             _relation: &str,
         ) -> Result<bool, ServiceError> {
             let key = (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string());
-            Ok(*self.member_results.lock().unwrap().get(&key).unwrap_or(&false))
+            let results = match self.member_results.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            Ok(match results.get(&key) {
+                Some(v) => *v,
+                None => false,
+            })
         }
 
         async fn effective_scope_ceiling(
@@ -810,7 +857,11 @@ pub mod test_helpers {
             _tenant_id: &str,
             _identity_id: &str,
         ) -> Vec<String> {
-            self.ceiling.lock().unwrap().clone()
+            let ceiling = match self.ceiling.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            ceiling.clone()
         }
 
         async fn grant(
@@ -857,7 +908,11 @@ pub mod test_helpers {
             _identity_id: &str,
             _app_public_id: &str,
         ) -> Value {
-            self.claim.lock().unwrap().clone()
+            let claim = match self.claim.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            claim.clone()
         }
     }
 }

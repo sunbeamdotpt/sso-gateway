@@ -21,6 +21,9 @@ rand = "0.8"
 default = ["keto"]
 keto = []
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 testcontainers = "0.27.3"
 tokio = { workspace = true }

@@ -73,14 +73,17 @@ use sunbeam_g2v::{
     router::ServiceRouter,
     server::{ServerConfig, builder::ServerBuilder},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 async fn root_handler() -> &'static str {
     "sso-gateway"
 }
 
 fn resolve_idp_entity_id(idp_entity_id: Option<String>, public_base_url: String) -> String {
-    idp_entity_id.unwrap_or(public_base_url)
+    match idp_entity_id {
+        Some(id) => id,
+        None => public_base_url,
+    }
 }
 
 fn build_server_config(addr: SocketAddr, name: &str) -> ServerConfig {
@@ -229,16 +232,22 @@ pub async fn build_app_with_upstream(
             memberships.clone(),
             config.kratos_default_schema_id.clone(),
         ));
-    let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> = upstream_oauth
-        .unwrap_or_else(|| {
-            Arc::new(ReqwestUpstreamOAuthClient::new(
-                ReqwestUpstreamOAuthClient::default_client(),
-            ))
-        });
-    let jwks_client = reqwest::Client::builder()
+    let upstream_oauth: Arc<dyn crate::upstream_oauth::UpstreamOAuthClient> = match upstream_oauth {
+        Some(client) => client,
+        None => Arc::new(ReqwestUpstreamOAuthClient::new(
+            ReqwestUpstreamOAuthClient::default_client(),
+        )),
+    };
+    let jwks_client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(%err, "failed to build JWKS HTTP client with timeout; falling back to default client");
+            reqwest::Client::new()
+        }
+    };
     let jwks_service: Arc<dyn crate::jwks::JwksService> =
         Arc::new(ReqwestJwksService::new(jwks_client));
     let session_signer = SessionTokenSigner::new(
@@ -561,8 +570,7 @@ async fn bootstrap_system_client(
         // the scopes required for bootstrapping.
         match hydra.get_oauth2_client(client_id).await {
             Ok(existing) => {
-                let existing_scope = existing["scope"].as_str().unwrap_or("");
-                if existing_scope != BOOTSTRAP_CLIENT_SCOPE {
+                if existing["scope"].as_str() != Some(BOOTSTRAP_CLIENT_SCOPE) {
                     info!("updating system bootstrap OAuth2 client scopes");
                     let mut updated = existing;
                     updated["scope"] =
