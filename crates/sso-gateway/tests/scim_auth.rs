@@ -1,3 +1,6 @@
+// SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+
 #![cfg(feature = "keto")]
 
 use std::sync::Arc;
@@ -245,9 +248,10 @@ async fn scim_auth_error_branches() {
         scim_users_status(&broken_base, None).await,
         StatusCode::UNAUTHORIZED
     );
+    // An unreachable Hydra is an infra fault, not a bad token: 503 (SSO-024).
     assert_eq!(
         scim_users_status(&broken_base, Some("any-token")).await,
-        StatusCode::UNAUTHORIZED
+        StatusCode::SERVICE_UNAVAILABLE
     );
 
     let _ = broken_shutdown_tx.send(());
