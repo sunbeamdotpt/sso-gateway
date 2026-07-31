@@ -296,7 +296,7 @@ async fn resolve_target_tenant(
             ctx.tenant_id.clone()
         }
         Err(err) => {
-            tracing::debug!(
+            tracing::warn!(
                 %err,
                 subject = %ctx.subject,
                 header_value = %header_value,
@@ -344,7 +344,7 @@ async fn authenticate_session_cookie(
     cookie: String,
 ) -> Result<AuthContext, Box<Response>> {
     let claims = signer.verify(&cookie).map_err(|err| {
-        tracing::debug!(%err, "session cookie verification failed");
+        tracing::warn!(%err, "session cookie verification failed");
         Box::new(auth_error(StatusCode::UNAUTHORIZED))
     })?;
 
@@ -400,23 +400,37 @@ async fn authenticate_bearer_token(
         }
     }
 
+    // Infra faults (Hydra unreachable, cache/DB errors) must not impersonate
+    // bad tokens: surface them as 5xx so callers can retry and monitors can
+    // tell them apart from genuine rejections (SSO-024).
     let introspection = introspector.introspect(token).await.map_err(|err| {
-        tracing::debug!(%err, "token introspection failed");
-        Box::new(auth_error(StatusCode::UNAUTHORIZED))
+        tracing::warn!(%err, "token introspection failed");
+        match err {
+            crate::auth::AuthError::IntrospectionFailed(_) => {
+                Box::new(auth_error(StatusCode::SERVICE_UNAVAILABLE))
+            }
+            crate::auth::AuthError::Database(_) => {
+                Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR))
+            }
+            _ => Box::new(auth_error(StatusCode::UNAUTHORIZED)),
+        }
     })?;
 
     if !introspection.active {
+        tracing::warn!("introspected token is inactive");
         return Err(Box::new(auth_error(StatusCode::UNAUTHORIZED)));
     }
 
+    // An active introspection without a subject is a broken upstream
+    // response, not a bad token.
     let subject = introspection.sub.ok_or_else(|| {
-        tracing::debug!("introspection response missing subject");
-        Box::new(auth_error(StatusCode::UNAUTHORIZED))
+        tracing::warn!("introspection response missing subject");
+        Box::new(auth_error(StatusCode::INTERNAL_SERVER_ERROR))
     })?;
 
     let (tenant_id, public_subject, backend) =
         resolve_subject(mappings, &subject).await.map_err(|err| {
-            tracing::debug!(%err, "failed to resolve subject");
+            tracing::warn!(%err, "failed to resolve subject");
             match err {
                 crate::auth::AuthError::UnknownSubject => {
                     Box::new(auth_error(StatusCode::UNAUTHORIZED))
@@ -460,10 +474,10 @@ async fn authenticate_bearer_token(
 }
 
 pub fn auth_error(status: StatusCode) -> Response {
-    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-        "internal server error"
-    } else {
-        "unauthorized"
+    let message = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "internal server error",
+        StatusCode::SERVICE_UNAVAILABLE => "service unavailable",
+        _ => "unauthorized",
     };
     let body = Body::from(format!("{{\"error\":\"{}\"}}", message));
     (
@@ -957,6 +971,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Introspection error mapping (SSO-024): infra faults must surface as
+    // 5xx instead of impersonating bad tokens with a 401.
+    // -----------------------------------------------------------------------
+
+    fn bearer_request(path: &str) -> Request<Body> {
+        Request::get(path)
+            .header("Authorization", "Bearer some-token")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A Hydra fault surfaces as 503 so callers can retry.
+    #[tokio::test]
+    async fn introspection_hydra_fault_returns_503() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Err(
+                crate::auth::AuthError::IntrospectionFailed(
+                    sso_ory_client::error::OryClientError::Ory {
+                        status: 502,
+                        message: "bad gateway".into(),
+                    },
+                ),
+            ))))),
+            no_mappings(),
+        );
+        let response = router.oneshot(bearer_request("/protected")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A database fault during introspection surfaces as 500.
+    #[tokio::test]
+    async fn introspection_database_fault_returns_500() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Err(
+                crate::auth::AuthError::Database(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)),
+            ))))),
+            no_mappings(),
+        );
+        let response = router.oneshot(bearer_request("/protected")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A genuinely inactive token still returns 401.
+    #[tokio::test]
+    async fn inactive_token_returns_401() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(IntrospectionResult {
+                active: false,
+                sub: None,
+                scope: vec![],
+                exp: None,
+                authentication_methods: vec![],
+            }))))),
+            no_mappings(),
+        );
+        let response = router.oneshot(bearer_request("/protected")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// An active introspection without a subject is a broken upstream
+    /// response, not a bad token: 500.
+    #[tokio::test]
+    async fn active_introspection_missing_subject_returns_500() {
+        let router = test_router(
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(IntrospectionResult {
+                active: true,
+                sub: None,
+                scope: vec![],
+                exp: None,
+                authentication_methods: vec![],
+            }))))),
+            no_mappings(),
+        );
+        let response = router.oneshot(bearer_request("/protected")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // -----------------------------------------------------------------------
