@@ -258,7 +258,11 @@ impl TokenIntrospector for CachedTokenIntrospector {
         } else {
             Some(result.scope.join(" "))
         };
-        self.cache
+        // Cache writes are best-effort: the introspection result is already
+        // in hand, so a slow or failed cache store must not fail the request
+        // (SSO-024). Log and continue without caching.
+        if let Err(err) = self
+            .cache
             .put(
                 &token_hash,
                 result.active,
@@ -266,7 +270,10 @@ impl TokenIntrospector for CachedTokenIntrospector {
                 scope_str.as_deref(),
                 result.exp,
             )
-            .await?;
+            .await
+        {
+            warn!(%err, "token introspection cache write failed; continuing without caching");
+        }
         Ok(result)
     }
 }
@@ -448,7 +455,66 @@ pub fn require_amr(ctx: &RequestContext, method: &str) -> Result<(), ServiceErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::TokenIntrospectionRow;
     use axum::http::HeaderValue;
+
+    struct ActiveIntrospector;
+
+    #[async_trait]
+    impl TokenIntrospector for ActiveIntrospector {
+        async fn introspect(&self, _token: &str) -> Result<IntrospectionResult, AuthError> {
+            Ok(IntrospectionResult {
+                active: true,
+                sub: Some("subject-1".to_string()),
+                scope: vec!["openid".to_string()],
+                exp: None,
+                authentication_methods: vec![],
+            })
+        }
+    }
+
+    /// Cache stub whose writes always fail, as with a wedged database.
+    struct FailingWriteCache;
+
+    #[async_trait]
+    impl TokenIntrospectionCache for FailingWriteCache {
+        async fn get(
+            &self,
+            _token_hash: &str,
+            _max_age: time::Duration,
+        ) -> Result<Option<TokenIntrospectionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn put(
+            &self,
+            _token_hash: &str,
+            _active: bool,
+            _sub: Option<&str>,
+            _scope: Option<&str>,
+            _exp: Option<time::OffsetDateTime>,
+        ) -> Result<(), DbError> {
+            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
+        }
+
+        async fn remove(&self, _token_hash: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    /// A failed cache write must not fail authentication (SSO-024): the
+    /// introspection result is returned and the request proceeds uncached.
+    #[tokio::test]
+    async fn cached_introspector_fails_open_on_cache_write_error() {
+        let introspector = CachedTokenIntrospector::new(
+            Arc::new(ActiveIntrospector),
+            Arc::new(FailingWriteCache),
+            time::Duration::seconds(60),
+        );
+        let result = introspector.introspect("valid-token").await.unwrap();
+        assert!(result.active);
+        assert_eq!(result.sub, Some("subject-1".to_string()));
+    }
 
     #[test]
     fn hash_token_is_deterministic_and_hex() {
