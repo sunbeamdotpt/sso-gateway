@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.07.31] - 2026-07-31
+
+### Fixed
+
+- Token introspection cache writes no longer fail authentication: a slow
+  or wedged cache store is logged and the request proceeds uncached
+  instead of returning 401 for valid tokens (SSO-024).
+- Authentication failures no longer impersonate bad tokens: Hydra faults
+  return 503, database faults 500, and an active introspection missing
+  its subject 500; only genuinely invalid or inactive tokens return 401
+  (SSO-024, SSO-026).
+- All authentication failure paths in the middleware log at warn level
+  or above, making infrastructure faults visible in the log stream
+  (SSO-026).
+- Application listing propagates metadata-store errors instead of
+  silently dropping cross-tenant flags (SSO-027 triage).
+
+### Changed
+
+- Production code is barred from panics and silent-default combinators
+  (`unwrap`/`expect`, `unwrap_or(_else)`, `map_or(_else)`,
+  `*_or_default`) via `clippy.toml` disallowed-methods and workspace
+  lint denies; ~300 call sites rewritten to explicit `match`/`if let`
+  with logged fallbacks, and a new CI workflow gates
+  `cargo clippy --workspace --all-targets --all-features` with
+  `-D warnings` (SSO-027).
+
 ## [2026.07.30] - 2026-07-30
 
 ### Fixed
