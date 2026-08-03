@@ -20,8 +20,14 @@ async fn keto_urls() -> (String, String) {
     (read_url.clone(), write_url.clone())
 }
 
+/// Both tests share one Keto container and one `app` namespace; concurrent
+/// writes trip Keto's serialization ("concurrent update in another
+/// session"), so run them one at a time.
+static KETO_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn keto_relation_tuple_lifecycle() {
+    let _guard = KETO_WRITE_LOCK.lock().await;
     let (read_url, write_url) = keto_urls().await;
 
     let client = KetoClient::new(&read_url, &write_url).expect("client should build");
@@ -81,6 +87,7 @@ async fn keto_relation_tuple_lifecycle() {
 /// mechanism group-derived entitlements rely on.
 #[tokio::test]
 async fn keto_subject_set_tuple_is_traversed_by_check() {
+    let _guard = KETO_WRITE_LOCK.lock().await;
     let (read_url, write_url) = keto_urls().await;
 
     let client = KetoClient::new(&read_url, &write_url).expect("client should build");
