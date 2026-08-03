@@ -71,16 +71,30 @@ impl KetoClient {
         namespace: &str,
         object: &str,
         relation: &str,
-        subject_id: &str,
+        subject: TupleSubject<'_>,
     ) -> Result<Value, OryClientError> {
         let url = self.write_url.join("admin/relation-tuples")?;
         debug!(%url, %namespace, %object, %relation, "creating keto relation tuple");
-        let payload = serde_json::json!({
-            "namespace": namespace,
-            "object": object,
-            "relation": relation,
-            "subject_id": subject_id,
-        });
+        let payload = match subject {
+            TupleSubject::Id(subject_id) => serde_json::json!({
+                "namespace": namespace,
+                "object": object,
+                "relation": relation,
+                "subject_id": subject_id,
+            }),
+            TupleSubject::Set { namespace: s_ns, object: s_obj, relation: s_rel } => {
+                serde_json::json!({
+                    "namespace": namespace,
+                    "object": object,
+                    "relation": relation,
+                    "subject_set": {
+                        "namespace": s_ns,
+                        "object": s_obj,
+                        "relation": s_rel,
+                    },
+                })
+            }
+        };
         let patch = serde_json::json!([{
             "action": "insert",
             "relation_tuple": payload,
@@ -107,19 +121,27 @@ impl KetoClient {
         namespace: &str,
         object: &str,
         relation: &str,
-        subject_id: &str,
+        subject: TupleSubject<'_>,
     ) -> Result<(), OryClientError> {
         let url = self.write_url.join("admin/relation-tuples")?;
         debug!(%url, %namespace, %object, %relation, "deleting keto relation tuple");
+        let mut params: Vec<(&str, String)> = vec![
+            ("namespace", namespace.to_string()),
+            ("object", object.to_string()),
+            ("relation", relation.to_string()),
+        ];
+        match subject {
+            TupleSubject::Id(subject_id) => params.push(("subject_id", subject_id.to_string())),
+            TupleSubject::Set { namespace: s_ns, object: s_obj, relation: s_rel } => {
+                params.push(("subject_set.namespace", s_ns));
+                params.push(("subject_set.object", s_obj));
+                params.push(("subject_set.relation", s_rel));
+            }
+        }
         let response = self
             .client
             .delete(url)
-            .query(&[
-                ("namespace", namespace),
-                ("object", object),
-                ("relation", relation),
-                ("subject_id", subject_id),
-            ])
+            .query(&params)
             .send()
             .await
             .map_err(OryClientError::Http)?;
@@ -193,6 +215,24 @@ impl KetoClient {
             .map_err(OryClientError::Http)?;
         handle_response(response).await
     }
+}
+
+/// Subject of a relation tuple: either a plain subject id or a subject set
+/// reference (`namespace:object#relation`) that Keto traverses when
+/// evaluating checks.
+#[derive(Debug, Clone)]
+pub enum TupleSubject<'a> {
+    /// A plain subject identifier.
+    Id(&'a str),
+    /// A subject set reference.
+    Set {
+        /// Namespace of the subject set.
+        namespace: String,
+        /// Object of the subject set.
+        object: String,
+        /// Relation of the subject set.
+        relation: String,
+    },
 }
 
 /// Query parameters for [`KetoClient::expand_objects`].
@@ -379,13 +419,51 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = KetoClient::new(&url, &url).unwrap();
         let tuple = client
-            .create_relation_tuple("app", "doc-1", "read", "alice")
+            .create_relation_tuple("app", "doc-1", "read", TupleSubject::Id("alice"))
             .await
             .unwrap();
         assert_eq!(tuple["namespace"], "app");
         assert_eq!(tuple["object"], "doc-1");
+        assert_eq!(tuple["subject_id"], "alice");
+        assert!(tuple.get("subject_set").is_none());
         client
-            .delete_relation_tuple("app", "doc-1", "read", "alice")
+            .delete_relation_tuple("app", "doc-1", "read", TupleSubject::Id("alice"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_relation_tuple_with_subject_set_emits_set_payload() {
+        let (_handle, url) = start_server().await;
+        let client = KetoClient::new(&url, &url).unwrap();
+        let tuple = client
+            .create_relation_tuple(
+                "app",
+                "doc-1",
+                "read",
+                TupleSubject::Set {
+                    namespace: "Group".into(),
+                    object: "admins".into(),
+                    relation: "member".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(tuple.get("subject_id").is_none());
+        assert_eq!(tuple["subject_set"]["namespace"], "Group");
+        assert_eq!(tuple["subject_set"]["object"], "admins");
+        assert_eq!(tuple["subject_set"]["relation"], "member");
+        client
+            .delete_relation_tuple(
+                "app",
+                "doc-1",
+                "read",
+                TupleSubject::Set {
+                    namespace: "Group".into(),
+                    object: "admins".into(),
+                    relation: "member".into(),
+                },
+            )
             .await
             .unwrap();
     }
@@ -441,7 +519,7 @@ mod tests {
         });
         let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client
-            .create_relation_tuple("app", "doc-1", "read", "alice")
+            .create_relation_tuple("app", "doc-1", "read", TupleSubject::Id("alice"))
             .await
             .unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
@@ -457,7 +535,7 @@ mod tests {
         });
         let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
         let err = client
-            .delete_relation_tuple("app", "doc-1", "read", "alice")
+            .delete_relation_tuple("app", "doc-1", "read", TupleSubject::Id("alice"))
             .await
             .unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));

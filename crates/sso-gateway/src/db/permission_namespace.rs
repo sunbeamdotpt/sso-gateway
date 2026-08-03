@@ -12,12 +12,36 @@ pub struct PermissionNamespaceRow {
     pub tenant_id: String,
     pub namespace: String,
     pub model: Value,
-    /// Object types defined by the model, resolved from the type index.
+    /// Relation-bearing (object-capable) types defined by the model, resolved
+    /// from the type index. Bare subject types (e.g. `user`) are not indexed.
     pub types: Vec<String>,
     pub store_id: Option<String>,
     pub model_id: Option<String>,
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
+}
+
+/// Extract the sorted names of types that define at least one relation.
+///
+/// Only relation-bearing types can own objects (and therefore tuples), so the
+/// per-tenant type index and its uniqueness constraint cover just these.
+/// Bare subject types (virtually every model declares a bare `user`) may be
+/// shared by any number of namespaces of the same tenant.
+pub fn relation_bearing_type_names(model: &Value) -> Vec<String> {
+    let mut types: Vec<String> = match model.get("type_definitions").and_then(|v| v.as_array()) {
+        Some(defs) => defs
+            .iter()
+            .filter(|def| {
+                def.get("relations")
+                    .and_then(|r| r.as_object())
+                    .is_some_and(|relations| !relations.is_empty())
+            })
+            .filter_map(|def| def.get("type").and_then(|t| t.as_str()).map(String::from))
+            .collect(),
+        None => Vec::new(),
+    };
+    types.sort();
+    types
 }
 
 #[derive(Clone)]
@@ -92,19 +116,22 @@ impl PgPermissionNamespaceStore {
 
     /// Insert or update a namespace row and sync its type index.
     ///
+    /// The type index is derived from the model: only relation-bearing
+    /// (object-capable) types are indexed and checked for conflicts; bare
+    /// subject types such as `user` may be declared by many namespaces.
     /// `store_id`/`model_id` of `None` leave any previously provisioned ids
     /// untouched (COALESCE merge). Fails with
-    /// `DbError::NamespaceTypeConflict` when a type is owned by another
-    /// namespace of the same tenant.
+    /// `DbError::NamespaceTypeConflict` when a relation-bearing type is owned
+    /// by another namespace of the same tenant.
     pub async fn upsert(
         &self,
         tenant_id: &str,
         namespace: &str,
         model: &Value,
-        types: &[String],
         store_id: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<PermissionNamespaceRow, DbError> {
+        let index_types = relation_bearing_type_names(model);
         let mut tx = self.pool.begin().await?;
 
         let conflicts: Vec<String> = sqlx::query_scalar(
@@ -112,7 +139,7 @@ impl PgPermissionNamespaceStore {
              WHERE tenant_id = $1 AND type = ANY($2) AND namespace != $3",
         )
         .bind(tenant_id)
-        .bind(types)
+        .bind(&index_types)
         .bind(namespace)
         .fetch_all(&mut *tx)
         .await?;
@@ -143,7 +170,7 @@ impl PgPermissionNamespaceStore {
         )
         .bind(tenant_id)
         .bind(namespace)
-        .bind(types)
+        .bind(&index_types)
         .execute(&mut *tx)
         .await?;
 
@@ -154,7 +181,7 @@ impl PgPermissionNamespaceStore {
         )
         .bind(tenant_id)
         .bind(namespace)
-        .bind(types)
+        .bind(&index_types)
         .execute(&mut *tx)
         .await?;
 
@@ -212,9 +239,51 @@ mod tests {
         (PgPermissionNamespaceStore::new(pool.clone()), pool, tenant)
     }
 
+    /// A model whose non-`user` types are relation-bearing (a single `viewer`
+    /// relation), mirroring the shape real models take.
     fn model(types: &[&str]) -> Value {
+        let defs: Vec<Value> = types
+            .iter()
+            .map(|t| {
+                if *t == "user" {
+                    json!({ "type": "user" })
+                } else {
+                    json!({
+                        "type": t,
+                        "relations": { "viewer": { "this": {} } },
+                        "metadata": {
+                            "relations": {
+                                "viewer": { "directly_related_user_types": [{ "type": "user" }] }
+                            }
+                        }
+                    })
+                }
+            })
+            .collect();
+        json!({ "schema_version": "1.1", "type_definitions": defs })
+    }
+
+    /// A model of bare (relation-less) types only.
+    fn bare_model(types: &[&str]) -> Value {
         let defs: Vec<Value> = types.iter().map(|t| json!({ "type": t })).collect();
         json!({ "schema_version": "1.1", "type_definitions": defs })
+    }
+
+    #[test]
+    fn relation_bearing_type_names_filters_bare_types() {
+        let model = model(&["user", "KanbanProject", "KanbanCard"]);
+        assert_eq!(
+            relation_bearing_type_names(&model),
+            vec!["KanbanCard".to_string(), "KanbanProject".to_string()]
+        );
+        assert!(relation_bearing_type_names(&bare_model(&["user"])).is_empty());
+        // An explicitly empty relations object does not count either.
+        let empty_relations = json!({
+            "schema_version": "1.1",
+            "type_definitions": [{ "type": "thing", "relations": {} }]
+        });
+        assert!(relation_bearing_type_names(&empty_relations).is_empty());
+        assert!(relation_bearing_type_names(&json!({})).is_empty());
     }
 
     #[tokio::test]
@@ -228,7 +297,6 @@ mod tests {
                 &tenant,
                 "kanban",
                 &model(&["user", "KanbanProject"]),
-                &["user".into(), "KanbanProject".into()],
                 Some("store-1"),
                 Some("model-1"),
             )
@@ -236,7 +304,8 @@ mod tests {
             .unwrap();
         assert_eq!(row.store_id.as_deref(), Some("store-1"));
         assert_eq!(row.model_id.as_deref(), Some("model-1"));
-        assert_eq!(row.types, vec!["KanbanProject", "user"]);
+        // Only relation-bearing types are indexed; bare `user` is not.
+        assert_eq!(row.types, vec!["KanbanProject"]);
 
         // Merge semantics: model + types move forward, ids are preserved when
         // the caller passes None (metadata-only path used on Keto).
@@ -245,7 +314,6 @@ mod tests {
                 &tenant,
                 "kanban",
                 &model(&["user", "KanbanProject", "KanbanCard"]),
-                &["user".into(), "KanbanProject".into(), "KanbanCard".into()],
                 None,
                 None,
             )
@@ -253,7 +321,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.store_id.as_deref(), Some("store-1"));
         assert_eq!(updated.model_id.as_deref(), Some("model-1"));
-        assert_eq!(updated.types, vec!["KanbanCard", "KanbanProject", "user"]);
+        assert_eq!(updated.types, vec!["KanbanCard", "KanbanProject"]);
         assert!(updated.updated_at >= updated.created_at);
 
         // Provisioning later fills the ids.
@@ -262,7 +330,6 @@ mod tests {
                 &tenant,
                 "kanban",
                 &model(&["user", "KanbanProject", "KanbanCard"]),
-                &["user".into(), "KanbanProject".into(), "KanbanCard".into()],
                 Some("store-1"),
                 Some("model-2"),
             )
@@ -285,7 +352,6 @@ mod tests {
                 &tenant,
                 "kanban",
                 &model(&["user", "KanbanProject", "KanbanCard"]),
-                &["user".into(), "KanbanProject".into(), "KanbanCard".into()],
                 Some("store-1"),
                 Some("model-1"),
             )
@@ -297,7 +363,6 @@ mod tests {
                 &tenant,
                 "legacy",
                 &model(&["legacy_thing"]),
-                &["legacy_thing".into()],
                 Some("store-2"),
                 Some("model-3"),
             )
@@ -315,31 +380,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_rejects_type_owned_by_other_namespace() {
+    async fn upsert_rejects_relation_bearing_type_owned_by_other_namespace() {
         let (store, _pool, tenant) = store_and_tenant().await;
         store
-            .upsert(
-                &tenant,
-                "one",
-                &model(&["Shared"]),
-                &["Shared".into()],
-                None,
-                None,
-            )
+            .upsert(&tenant, "one", &model(&["Shared"]), None, None)
             .await
             .unwrap();
 
         let err = store
-            .upsert(&tenant, "two", &model(&["Shared"]), &["Shared".into()], None, None)
+            .upsert(&tenant, "two", &model(&["Shared"]), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NamespaceTypeConflict(t) if t == "Shared"));
 
         // Same namespace may re-register its own type.
         store
-            .upsert(&tenant, "one", &model(&["Shared"]), &["Shared".into()], None, None)
+            .upsert(&tenant, "one", &model(&["Shared"]), None, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upsert_allows_namespaces_sharing_bare_types() {
+        let (store, _pool, tenant) = store_and_tenant().await;
+        // Virtually every OpenFGA model declares a bare `user` type; that must
+        // not block a second namespace of the same tenant (SSO-030).
+        store
+            .upsert(
+                &tenant,
+                "scim_group",
+                &model(&["user", "scim_group"]),
+                Some("store-1"),
+                Some("model-1"),
+            )
+            .await
+            .unwrap();
+        let row = store
+            .upsert(
+                &tenant,
+                "entitlements",
+                &model(&["user", "entitlements"]),
+                Some("store-2"),
+                Some("model-2"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.types, vec!["entitlements"]);
+
+        // Pure bare-type models index nothing and never conflict.
+        store
+            .upsert(&tenant, "bare", &bare_model(&["user", "group"]), None, None)
+            .await
+            .unwrap();
+        let bare = store.get(&tenant, "bare").await.unwrap().unwrap();
+        assert!(bare.types.is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_upsert_removes_stale_index_rows() {
+        let (store, pool, tenant) = store_and_tenant().await;
+        store
+            .upsert(
+                &tenant,
+                "kanban",
+                &model(&["user", "KanbanProject", "KanbanCard"]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Re-upsert with a model that dropped KanbanCard and made
+        // KanbanProject bare: both must leave the index.
+        store
+            .upsert(
+                &tenant,
+                "kanban",
+                &json!({
+                    "schema_version": "1.1",
+                    "type_definitions": [
+                        { "type": "user" },
+                        { "type": "KanbanProject" },
+                        {
+                            "type": "KanbanBoard",
+                            "relations": { "viewer": { "this": {} } },
+                        }
+                    ]
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let indexed: Vec<String> = sqlx::query_scalar(
+            "SELECT type FROM permission_namespace_types WHERE tenant_id = $1 ORDER BY type",
+        )
+        .bind(&tenant)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed, vec!["KanbanBoard".to_string()]);
     }
 
     #[tokio::test]
@@ -350,7 +491,6 @@ mod tests {
                 &tenant,
                 "kanban",
                 &model(&["KanbanCard"]),
-                &["KanbanCard".into()],
                 Some("store-1"),
                 Some("model-1"),
             )

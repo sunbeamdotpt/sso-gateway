@@ -21,12 +21,8 @@ pub const ENTITLEMENT_NAMESPACE: &str = "entitlements";
 /// Well-known object name for the gateway's own API in the entitlement namespace.
 pub const GATEWAY_APP_OBJECT: &str = "sso-gateway";
 
-const GROUP_TYPE: &str = "group";
-const APPLICATION_TYPE: &str = "application";
-
 const MEMBER_REL: &str = "member";
 const ADMIN_REL: &str = "admin";
-const GROUP_REL: &str = "group";
 
 /// Levels at which a user may be entitled to an application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,30 +162,30 @@ impl EntitlementService for EntitlementServiceImpl {
     ) -> Result<(), ServiceError> {
         self.ensure_namespace(tenant_id).await?;
 
+        // Link each group to the application with userset subjects on the
+        // checked relations: members of `entitlements:<group>` become members
+        // and admins of the app (RFC 0001's "admin ⊇ group members"). The
+        // writes are idempotent because seeding re-runs on every boot.
         let mut writes = Vec::new();
-
-        // Ensure the application object exists. We do not need a tuple for the
-        // object itself; OpenFGA creates objects implicitly when tuples reference
-        // them, but writing a self-referential tuple makes existence observable.
-        writes.push(tuple_key(
-            ENTITLEMENT_NAMESPACE,
-            app_public_id,
-            GROUP_REL,
-            &format!("{APPLICATION_TYPE}:{app_public_id}"),
-        ));
-
         for group in groups {
+            let group_members = format!("{ENTITLEMENT_NAMESPACE}:{group}#{MEMBER_REL}");
             writes.push(tuple_key(
                 ENTITLEMENT_NAMESPACE,
                 app_public_id,
-                GROUP_REL,
-                &format!("{GROUP_TYPE}:{group}#{MEMBER_REL}"),
+                MEMBER_REL,
+                &group_members,
+            ));
+            writes.push(tuple_key(
+                ENTITLEMENT_NAMESPACE,
+                app_public_id,
+                ADMIN_REL,
+                &group_members,
             ));
         }
 
         if !writes.is_empty() {
             self.backend
-                .write_tuples(tenant_id, &writes, &[])
+                .ensure_tuples(tenant_id, &writes, &[])
                 .await
                 .map_err(map_backend_error)?;
         }
@@ -253,20 +249,11 @@ impl EntitlementService for EntitlementServiceImpl {
             })
             .collect();
 
-        // Also remove the group-link tuples.
-        deletes.push(RelationTupleKey {
-            namespace: ENTITLEMENT_NAMESPACE.to_string(),
-            object: app_public_id.to_string(),
-            relation: GROUP_REL.to_string(),
-            subject_id: format!("{APPLICATION_TYPE}:{app_public_id}#{GROUP_REL}"),
-            condition: None,
-            condition_context: None,
-        });
-
-        // Note: group links (application:app#group @ group:X#member) are not
-        // enumerated here because the gateway does not maintain a group registry
-        // for entitlements. They become dangling but harmless when the app is
-        // retired. See RFC 0001 open question #3.
+        // Note: group links (entitlements:app#{member,admin} @
+        // entitlements:X#member) are not enumerated here because the gateway
+        // does not maintain a group registry for entitlements. They become
+        // dangling but harmless when the app is retired. See RFC 0001 open
+        // question #3.
 
         // Deduplicate while preserving a deterministic order.
         deletes.sort_by(|a, b| {
@@ -276,7 +263,7 @@ impl EntitlementService for EntitlementServiceImpl {
         deletes.dedup();
 
         self.backend
-            .write_tuples(tenant_id, &[], &deletes)
+            .ensure_tuples(tenant_id, &[], &deletes)
             .await
             .map_err(map_backend_error)?;
 
@@ -355,7 +342,7 @@ impl EntitlementService for EntitlementServiceImpl {
             condition_context: None,
         }];
         self.backend
-            .write_tuples(tenant_id, &writes, &[])
+            .ensure_tuples(tenant_id, &writes, &[])
             .await
             .map_err(map_backend_error)?;
         info!(
@@ -387,7 +374,7 @@ impl EntitlementService for EntitlementServiceImpl {
             condition_context: None,
         }];
         self.backend
-            .write_tuples(tenant_id, &[], &deletes)
+            .ensure_tuples(tenant_id, &[], &deletes)
             .await
             .map_err(map_backend_error)?;
         info!(
@@ -421,12 +408,12 @@ impl EntitlementService for EntitlementServiceImpl {
         };
         if member {
             self.backend
-                .write_tuples(tenant_id, &[key], &[])
+                .ensure_tuples(tenant_id, &[key], &[])
                 .await
                 .map_err(map_backend_error)?;
         } else {
             self.backend
-                .write_tuples(tenant_id, &[], &[key])
+                .ensure_tuples(tenant_id, &[], &[key])
                 .await
                 .map_err(map_backend_error)?;
         }
@@ -480,7 +467,7 @@ impl EntitlementService for EntitlementServiceImpl {
 
         if !deletes.is_empty() {
             self.backend
-                .write_tuples(tenant_id, &[], &deletes)
+                .ensure_tuples(tenant_id, &[], &deletes)
                 .await
                 .map_err(map_backend_error)?;
         }
@@ -550,62 +537,40 @@ fn map_backend_error(err: PermissionBackendError) -> ServiceError {
 }
 
 fn entitlement_model() -> Value {
+    // A single object type carries both applications and groups: groups are
+    // `entitlements` objects whose `member` relation holds identities, and
+    // applications link to them with userset subjects
+    // (`entitlements:<group>#member`) on the checked relations. DSL:
+    //   type user
+    //   type entitlements
+    //     relations
+    //       define member: [user, entitlements#member]
+    //       define admin: [user, entitlements#member]
+    // Seeded group links grant group members both member and admin, keeping
+    // RFC 0001's "admin ⊇ group members" semantics.
     serde_json::json!({
         "schema_version": "1.1",
         "type_definitions": [
             {"type": "user"},
             {
-                "type": "group",
+                "type": "entitlements",
                 "relations": {
-                    "member": {"this": {}}
+                    "member": {"this": {}},
+                    "admin": {"this": {}}
                 },
                 "metadata": {
                     "relations": {
-                        "member": {"directly_related_user_types": [{"type": "user"}]}
-                    }
-                }
-            },
-            {
-                "type": "application",
-                "relations": {
-                    "group": {"this": {}},
-                    "member": {
-                        "union": {
-                            "child": [
-                                {"this": {}},
-                                {
-                                    "tuple_to_userset": {
-                                        "tupleset": {"relation": "group"},
-                                        "computed_userset": {"relation": "member"}
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    "admin": {
-                        "union": {
-                            "child": [
-                                {"this": {}},
-                                {
-                                    "tuple_to_userset": {
-                                        "tupleset": {"relation": "group"},
-                                        "computed_userset": {"relation": "member"}
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                },
-                "metadata": {
-                    "relations": {
-                        "group": {"directly_related_user_types": [{"type": "group"}]},
                         "member": {
-                            "directly_related_user_types": [{"type": "user"}],
-                            "allowed_usersets": [{"type": "group", "relation": "member"}]
+                            "directly_related_user_types": [
+                                {"type": "user"},
+                                {"type": "entitlements", "relation": "member"}
+                            ]
                         },
                         "admin": {
-                            "directly_related_user_types": [{"type": "user"}],
-                            "allowed_usersets": [{"type": "group", "relation": "member"}]
+                            "directly_related_user_types": [
+                                {"type": "user"},
+                                {"type": "entitlements", "relation": "member"}
+                            ]
                         }
                     }
                 }
@@ -930,6 +895,7 @@ mod tests {
     struct MockBackend {
         ensured: Mutex<Vec<(String, String)>>,
         writes: Mutex<Vec<(String, Vec<RelationTupleKey>, Vec<RelationTupleKey>)>>,
+        ensured_tuples: Mutex<Vec<(String, Vec<RelationTupleKey>, Vec<RelationTupleKey>)>>,
         checks: Mutex<Vec<(String, String, String, String, String)>>,
         check_results: Mutex<HashMap<(String, String, String, String), bool>>,
         list_users_results: Mutex<HashMap<(String, String, String, String), Vec<String>>>,
@@ -1028,6 +994,21 @@ mod tests {
                 deletes.to_vec(),
             ));
             Ok(())
+        }
+
+        async fn ensure_tuples(
+            &self,
+            tenant_id: &str,
+            writes: &[RelationTupleKey],
+            deletes: &[RelationTupleKey],
+        ) -> Result<(), PermissionBackendError> {
+            self.ensured_tuples.lock().unwrap().push((
+                tenant_id.to_string(),
+                writes.to_vec(),
+                deletes.to_vec(),
+            ));
+            // Mirror the default impl: delegate to the strict write path.
+            self.write_tuples(tenant_id, writes, deletes).await
         }
 
         async fn expand(
@@ -1171,10 +1152,34 @@ mod tests {
     }
 
     #[test]
-    fn entitlement_model_is_valid_json() {
+    fn entitlement_model_defines_user_and_entitlements_types() {
         let model = entitlement_model();
-        assert!(model.get("schema_version").is_some());
-        assert!(model.get("type_definitions").is_some());
+        assert_eq!(model["schema_version"], "1.1");
+        let defs = model["type_definitions"].as_array().unwrap();
+        let type_names: Vec<&str> = defs.iter().map(|d| d["type"].as_str().unwrap()).collect();
+        assert_eq!(type_names, ["user", "entitlements"]);
+
+        let entitlements = &defs[1];
+        let relations = entitlements["relations"].as_object().unwrap();
+        assert!(relations.contains_key("member"));
+        assert!(relations.contains_key("admin"));
+        assert_eq!(relations.len(), 2);
+
+        // Both relations accept direct users and group usersets; this is what
+        // lets a seeded `entitlements:<group>#member` subject resolve through
+        // userset expansion.
+        for relation in ["member", "admin"] {
+            let user_types = entitlements["metadata"]["relations"][relation]
+                ["directly_related_user_types"]
+                .as_array()
+                .unwrap();
+            assert!(user_types.iter().any(|t| t["type"] == "user"));
+            assert!(
+                user_types
+                    .iter()
+                    .any(|t| t["type"] == "entitlements" && t["relation"] == "member")
+            );
+        }
     }
 
     #[test]
@@ -1193,21 +1198,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_application_writes_group_links() {
+    async fn seed_application_writes_userset_group_links() {
         let (svc, backend, _) = service();
         svc.seed_application("tenant-1", "app-1", &["employees".to_string()])
             .await
             .unwrap();
-        let writes = backend.writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        let (_, writes, _) = &writes[0];
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].namespace, ENTITLEMENT_NAMESPACE);
-        assert_eq!(writes[0].object, "app-1");
-        assert_eq!(writes[0].relation, GROUP_REL);
-        assert_eq!(writes[1].namespace, ENTITLEMENT_NAMESPACE);
-        assert_eq!(writes[1].object, "app-1");
-        assert_eq!(writes[1].relation, GROUP_REL);
+
+        // Seeding goes through the idempotent ensure_tuples path.
+        let ensured = backend.ensured_tuples.lock().unwrap();
+        assert_eq!(ensured.len(), 1);
+        let (_, ensured_writes, ensured_deletes) = &ensured[0];
+        assert!(ensured_deletes.is_empty());
+        assert_eq!(ensured_writes.len(), 2);
+        for key in ensured_writes {
+            assert_eq!(key.namespace, ENTITLEMENT_NAMESPACE);
+            assert_eq!(key.object, "app-1");
+            assert_eq!(key.subject_id, "entitlements:employees#member");
+        }
+        let relations: Vec<&str> = ensured_writes.iter().map(|k| k.relation.as_str()).collect();
+        assert_eq!(relations, ["member", "admin"]);
+    }
+
+    #[tokio::test]
+    async fn seed_application_without_groups_writes_nothing() {
+        let (svc, backend, _) = service();
+        svc.seed_application("tenant-1", "app-1", &[]).await.unwrap();
+        assert!(backend.ensured_tuples.lock().unwrap().is_empty());
+        assert!(backend.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1287,6 +1304,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_revoke_and_membership_use_idempotent_writes() {
+        let (svc, backend, _) = service();
+        svc.grant("tenant-1", "user-1", "app-1", EntitlementLevel::Member)
+            .await
+            .unwrap();
+        svc.revoke("tenant-1", "user-1", "app-1", EntitlementLevel::Member)
+            .await
+            .unwrap();
+        svc.set_group_membership("tenant-1", "employees", "user-1", true)
+            .await
+            .unwrap();
+        svc.set_group_membership("tenant-1", "employees", "user-1", false)
+            .await
+            .unwrap();
+        // Every mutation path routes through ensure_tuples so repeated boots
+        // and SCIM retries never fail on duplicate writes.
+        assert_eq!(backend.ensured_tuples.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
     async fn mint_claim_returns_levels() {
         let (svc, backend, _) = service();
         backend.allow("tenant-1", "app-1", MEMBER_REL, "user-1");
@@ -1307,7 +1344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_application_deletes_member_admin_and_group_tuples() {
+    async fn remove_application_deletes_member_and_admin_tuples() {
         let (svc, backend, _) = service();
         backend.set_users("tenant-1", "app-1", MEMBER_REL, &["user-1".to_string(), "user-2".to_string()]);
         backend.set_users("tenant-1", "app-1", ADMIN_REL, &["user-3".to_string()]);
@@ -1316,8 +1353,8 @@ mod tests {
         let writes = backend.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         let (_, _, deletes) = &writes[0];
-        // Two deletes per user (member + admin) plus the self group-link tuple.
-        assert_eq!(deletes.len(), 7);
+        // Two deletes per listed subject (member + admin).
+        assert_eq!(deletes.len(), 6);
         for user in ["user-1", "user-2"] {
             assert!(deletes.iter().any(|k| {
                 k.relation == MEMBER_REL && k.subject_id == user && k.namespace == ENTITLEMENT_NAMESPACE
@@ -1332,9 +1369,9 @@ mod tests {
         assert!(deletes.iter().any(|k| {
             k.relation == ADMIN_REL && k.subject_id == "user-3" && k.namespace == ENTITLEMENT_NAMESPACE
         }));
-        assert!(deletes.iter().any(|k| {
-            k.relation == GROUP_REL && k.subject_id == format!("{APPLICATION_TYPE}:app-1#{GROUP_REL}")
-        }));
+        // The deletion is idempotent (ensure_tuples), so partially-removed
+        // applications can be retired again without error.
+        assert_eq!(backend.ensured_tuples.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

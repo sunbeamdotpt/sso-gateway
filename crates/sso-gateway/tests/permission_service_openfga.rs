@@ -359,8 +359,8 @@ async fn permission_service_openfga_namespace_lifecycle() {
     assert_eq!(body["namespace"], "kanban");
     assert_eq!(
         body["types"],
-        json!(["KanbanCard", "KanbanProject", "user"]),
-        "types should be normalized and sorted"
+        json!(["KanbanCard", "KanbanProject"]),
+        "only relation-bearing (object-capable) types are indexed; bare user is not"
     );
 
     // Get and list reflect the registration.

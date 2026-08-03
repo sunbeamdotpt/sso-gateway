@@ -213,6 +213,23 @@ pub trait PermissionBackend: Send + Sync + 'static {
         deletes: &[RelationTupleKey],
     ) -> Result<(), PermissionBackendError>;
 
+    /// Idempotent batch write: make the `writes` present and the `deletes`
+    /// absent without erroring when they already are.
+    ///
+    /// Used by internal seeding paths (entitlements) that re-run on every
+    /// boot and after partial failures; strict callers use
+    /// [`PermissionBackend::write_tuples`]. The default delegates to
+    /// `write_tuples`, which is already idempotent on backends that silently
+    /// deduplicate (Keto ignores duplicate inserts and missing deletes).
+    async fn ensure_tuples(
+        &self,
+        tenant_id: &str,
+        writes: &[RelationTupleKey],
+        deletes: &[RelationTupleKey],
+    ) -> Result<(), PermissionBackendError> {
+        self.write_tuples(tenant_id, writes, deletes).await
+    }
+
     async fn expand(
         &self,
         tenant_id: &str,
@@ -316,12 +333,13 @@ impl PermissionBackend for KetoClient {
         relation: &str,
         subject_id: &str,
     ) -> Result<Value, PermissionBackendError> {
+        let subject = keto_subject(tenant_id, subject_id);
         Ok(self
             .create_relation_tuple(
                 namespace,
                 &tenant_object(tenant_id, object),
                 relation,
-                subject_id,
+                subject,
             )
             .await?)
     }
@@ -334,12 +352,13 @@ impl PermissionBackend for KetoClient {
         relation: &str,
         subject_id: &str,
     ) -> Result<(), PermissionBackendError> {
+        let subject = keto_subject(tenant_id, subject_id);
         Ok(self
             .delete_relation_tuple(
                 namespace,
                 &tenant_object(tenant_id, object),
                 relation,
-                subject_id,
+                subject,
             )
             .await?)
     }
@@ -470,12 +489,36 @@ fn reject_unsupported_opts(opts: &QueryOptions) -> Result<(), PermissionBackendE
     ))
 }
 
+/// Map a gateway subject identifier onto a Keto tuple subject.
+///
+/// Canonical userset strings (`ns:obj#rel`) become real Keto subject sets so
+/// that checks traverse them (group-derived entitlements); everything else —
+/// bare ids and typed subjects like `user:x` — stays a plain subject id. The
+/// subject-set object is tenant-prefixed like any other Keto object.
+#[cfg(feature = "keto")]
+fn keto_subject<'a>(tenant_id: &str, subject_id: &'a str) -> sso_ory_client::keto::TupleSubject<'a> {
+    if let Some((left, relation)) = subject_id.split_once('#')
+        && let Some((namespace, object)) = left.split_once(':')
+        && !namespace.is_empty()
+        && !object.is_empty()
+        && !relation.is_empty()
+    {
+        return sso_ory_client::keto::TupleSubject::Set {
+            namespace: namespace.to_string(),
+            object: tenant_object(tenant_id, object),
+            relation: relation.to_string(),
+        };
+    }
+    sso_ory_client::keto::TupleSubject::Id(subject_id)
+}
+
 /// A registered tenant namespace and its provisioning state.
 ///
 /// `store_id`/`model_id` are `None` until the backend has provisioned a store
-/// (and stay `None` on Keto, which has no stores). `types` lists the object
-/// types defined by the current model; they index back to this namespace for
-/// tuple/check resolution.
+/// (and stay `None` on Keto, which has no stores). `types` lists the
+/// relation-bearing (object-capable) types of the current model; they index
+/// back to this namespace for tuple/check resolution. Bare subject types
+/// (e.g. `user`) are never indexed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NamespaceRecord {
     pub namespace: String,
@@ -568,10 +611,14 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // A type may be owned by exactly one namespace per tenant.
+        // Only relation-bearing (object-capable) types are indexed: bare
+        // subject types such as `user` may be shared by many namespaces of the
+        // same tenant, while a relation-bearing type may be owned by exactly
+        // one.
+        let index_types = crate::db::relation_bearing_type_names(&record.model);
         for ((t, ns), existing) in lock.iter() {
             if t == tenant_id && ns != &record.namespace {
-                for ty in &record.types {
+                for ty in &index_types {
                     if existing.types.iter().any(|ety| ety == ty) {
                         return Err(PermissionBackendError::Conflict(format!(
                             "type {ty} is already registered under namespace {ns}"
@@ -587,11 +634,13 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
                 store_id: record.store_id.clone().or_else(|| existing.store_id.clone()),
                 model_id: record.model_id.clone().or_else(|| existing.model_id.clone()),
                 updated_at: Some(now),
+                types: index_types,
                 ..record.clone()
             },
             None => NamespaceRecord {
                 created_at: Some(now),
                 updated_at: Some(now),
+                types: index_types,
                 ..record.clone()
             },
         };
@@ -656,7 +705,6 @@ impl NamespaceMappingRepo for crate::db::PgPermissionNamespaceStore {
             tenant_id,
             &record.namespace,
             &record.model,
-            &record.types,
             record.store_id.as_deref(),
             record.model_id.as_deref(),
         )
@@ -973,6 +1021,58 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         Ok(())
     }
 
+    async fn ensure_tuples(
+        &self,
+        tenant_id: &str,
+        writes: &[RelationTupleKey],
+        deletes: &[RelationTupleKey],
+    ) -> Result<(), PermissionBackendError> {
+        // OpenFGA rejects writing an existing tuple or deleting a missing one,
+        // so read each key first and write only the delta. Seeding paths call
+        // this on every boot; the extra reads are the price of idempotency.
+        let mut records: HashMap<String, NamespaceRecord> = HashMap::new();
+        for key in writes.iter().chain(deletes.iter()) {
+            if !records.contains_key(&key.namespace) {
+                let record = self.resolve_mapping(tenant_id, &key.namespace).await?;
+                records.insert(key.namespace.clone(), record);
+            }
+        }
+
+        let mut missing_writes: Vec<RelationTupleKey> = Vec::new();
+        for key in writes {
+            let record = &records[&key.namespace];
+            let store_id = match record.store_id.as_deref() {
+                Some(id) => id.to_owned(),
+                None => String::new(),
+            };
+            let existing = self
+                .client
+                .read_tuples(&store_id, &client_tuple_key(key))
+                .await?;
+            if existing.is_empty() {
+                missing_writes.push(key.clone());
+            }
+        }
+        let mut present_deletes: Vec<RelationTupleKey> = Vec::new();
+        for key in deletes {
+            let record = &records[&key.namespace];
+            let store_id = match record.store_id.as_deref() {
+                Some(id) => id.to_owned(),
+                None => String::new(),
+            };
+            let existing = self
+                .client
+                .read_tuples(&store_id, &client_tuple_key(key))
+                .await?;
+            if !existing.is_empty() {
+                present_deletes.push(key.clone());
+            }
+        }
+
+        self.write_tuples(tenant_id, &missing_writes, &present_deletes)
+            .await
+    }
+
     async fn expand(
         &self,
         tenant_id: &str,
@@ -1127,7 +1227,17 @@ impl PermissionBackend for OpenFgaPermissionBackend {
         }
 
         let store_name = format!("{tenant_id}-{namespace}");
-        let store_id = self.client.create_store(&store_name).await?;
+        // Adopt a store left behind by a crashed earlier attempt (e.g. one
+        // that failed between create_store and the registry upsert) instead of
+        // piling up orphans; write_model then publishes the current model into
+        // it as usual.
+        let store_id = match self.client.find_store_by_name(&store_name).await? {
+            Some(existing_id) => {
+                tracing::info!(tenant_id, namespace, store_id = %existing_id, "adopting existing OpenFGA store");
+                existing_id
+            }
+            None => self.client.create_store(&store_name).await?,
+        };
         let model_id = self.client.write_model(&store_id, model).await?;
         self.persist_record(tenant_id, namespace, model, store_id, model_id)
             .await
@@ -3977,7 +4087,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.body.namespace, "kanban");
         assert_eq!(resp.body.tenant_id, "tenant-1");
-        assert_eq!(resp.body.types, vec!["KanbanProject", "user"]);
+        // Only relation-bearing (object-capable) types are indexed; the bare
+        // `user` type is not.
+        assert_eq!(resp.body.types, vec!["KanbanProject"]);
 
         {
             let calls = backend.calls.lock().unwrap();
@@ -3989,7 +4101,7 @@ mod tests {
         }
 
         let record = namespaces.get("tenant-1", "kanban").await.unwrap().unwrap();
-        assert_eq!(record.types, vec!["KanbanProject", "user"]);
+        assert_eq!(record.types, vec!["KanbanProject"]);
         assert!(record.model.get("schema_version").is_some());
     }
 
@@ -4049,7 +4161,7 @@ mod tests {
             .ensure_permission_namespace(admin_ctx(), req)
             .await
             .unwrap();
-        assert_eq!(resp.body.types, vec!["KanbanCard", "KanbanProject", "user"]);
+        assert_eq!(resp.body.types, vec!["KanbanCard", "KanbanProject"]);
 
         let calls = backend.calls.lock().unwrap();
         let ensure_calls = calls
@@ -4239,7 +4351,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body.namespace, "kanban");
-        assert_eq!(resp.body.types, vec!["KanbanProject", "user"]);
+        assert_eq!(resp.body.types, vec!["KanbanProject"]);
 
         // List returns everything registered for the tenant.
         let owned =
@@ -4770,6 +4882,66 @@ mod tests {
         assert!(repo.get("tenant-1", "kanban").await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn memory_namespace_repo_allows_shared_bare_types() {
+        let repo = MemoryNamespaceMappingRepo::default();
+        // Both models declare the bare `user` type; that must not conflict
+        // (SSO-030). Only relation-bearing types are indexed and recorded.
+        repo.upsert(
+            "tenant-1",
+            &NamespaceRecord {
+                namespace: "scim_group".into(),
+                model: rich_model(&["user", "scim_group"]),
+                types: vec![],
+                store_id: None,
+                model_id: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let record = repo
+            .upsert(
+                "tenant-1",
+                &NamespaceRecord {
+                    namespace: "entitlements".into(),
+                    model: rich_model(&["user", "entitlements"]),
+                    types: vec![],
+                    store_id: None,
+                    model_id: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.types, vec!["entitlements"]);
+
+        // Type resolution still finds namespaces through their indexed types.
+        let found = repo.get_by_type("tenant-1", "scim_group").await.unwrap().unwrap();
+        assert_eq!(found.namespace, "scim_group");
+    }
+
+    #[tokio::test]
+    async fn memory_namespace_repo_rejects_relation_bearing_type_conflict() {
+        let repo = MemoryNamespaceMappingRepo::default();
+        let record = |namespace: &str| NamespaceRecord {
+            namespace: namespace.into(),
+            model: rich_model(&["user", "Shared"]),
+            types: vec![],
+            store_id: None,
+            model_id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        repo.upsert("tenant-1", &record("one")).await.unwrap();
+        let err = repo.upsert("tenant-1", &record("two")).await.unwrap_err();
+        assert!(matches!(err, PermissionBackendError::Conflict(_)));
+        // Re-upserting the owning namespace is fine.
+        repo.upsert("tenant-1", &record("one")).await.unwrap();
+    }
+
     // -------------------------------------------------------------------------
     // OpenFGA backend unit tests
     // -------------------------------------------------------------------------
@@ -4807,6 +4979,7 @@ mod tests {
                     get(get_model),
                 )
                 .route("/stores/{store_id}/write", post(write_tuple))
+                .route("/stores/{store_id}/read", post(read_tuples))
                 .route("/stores/{store_id}/check", post(check))
                 .route("/stores/{store_id}/expand", post(expand))
                 .route("/stores/{store_id}/list-objects", post(list_objects))
@@ -4930,6 +5103,37 @@ mod tests {
             Json(json!({ "allowed": allowed }))
         }
 
+        async fn read_tuples(
+            State(state): State<FakeOpenFgaState>,
+            Path(store_id): Path<String>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let key = body.get("tuple_key").cloned().unwrap_or_default();
+            let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
+            let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
+            let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
+            let tuples: Vec<Value> = state
+                .tuples
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| {
+                    t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
+                        && t.get("user").and_then(|v| v.as_str()) == Some(user)
+                        && t.get("relation").and_then(|v| v.as_str()) == Some(relation)
+                        && t.get("object").and_then(|v| v.as_str()) == Some(object)
+                })
+                .map(|t| {
+                    json!({ "key": {
+                        "user": t.get("user"),
+                        "relation": t.get("relation"),
+                        "object": t.get("object"),
+                    } })
+                })
+                .collect();
+            Json(json!({ "tuples": tuples, "continuation_token": "" }))
+        }
+
         async fn expand(Json(_): Json<Value>) -> Json<Value> {
             Json(json!({ "tree": { "root": {} } }))
         }
@@ -4956,21 +5160,24 @@ mod tests {
             Json(json!({ "objects": objects }))
         }
 
-        async fn start_fake_openfga() -> (tokio::task::JoinHandle<()>, String) {
+        async fn start_fake_openfga() -> (tokio::task::JoinHandle<()>, String, FakeOpenFgaState) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let state = FakeOpenFgaState::default();
-            let handle = tokio::spawn(async move {
-                axum::serve(listener, fake_openfga_app(state))
-                    .await
-                    .unwrap();
+            let handle = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    axum::serve(listener, fake_openfga_app(state))
+                        .await
+                        .unwrap();
+                }
             });
-            (handle, format!("http://{addr}"))
+            (handle, format!("http://{addr}"), state)
         }
 
         #[tokio::test]
         async fn openfga_backend_ensure_namespace_creates_store_and_model() {
-            let (_handle, url) = start_fake_openfga().await;
+            let (_handle, url, _state) = start_fake_openfga().await;
             let client = sso_openfga_client::OpenFgaClient::new(&url).unwrap();
             let mappings: Arc<dyn NamespaceMappingRepo> =
                 Arc::new(MemoryNamespaceMappingRepo::default());
@@ -5001,7 +5208,7 @@ mod tests {
 
         #[tokio::test]
         async fn openfga_backend_tuple_lifecycle() {
-            let (_handle, url) = start_fake_openfga().await;
+            let (_handle, url, _state) = start_fake_openfga().await;
             let client = sso_openfga_client::OpenFgaClient::new(&url).unwrap();
             let mappings: Arc<dyn NamespaceMappingRepo> =
                 Arc::new(MemoryNamespaceMappingRepo::default());
@@ -5065,7 +5272,7 @@ mod tests {
 
         #[tokio::test]
         async fn openfga_backend_unconfigured_namespace_returns_error() {
-            let (_handle, url) = start_fake_openfga().await;
+            let (_handle, url, _state) = start_fake_openfga().await;
             let client = sso_openfga_client::OpenFgaClient::new(&url).unwrap();
             let mappings: Arc<dyn NamespaceMappingRepo> =
                 Arc::new(MemoryNamespaceMappingRepo::default());
@@ -5086,6 +5293,85 @@ mod tests {
                 err,
                 PermissionBackendError::NamespaceNotConfigured(_)
             ));
+        }
+
+        #[tokio::test]
+        async fn openfga_backend_ensure_tuples_writes_only_the_delta() {
+            let (_handle, url, state) = start_fake_openfga().await;
+            let client = sso_openfga_client::OpenFgaClient::new(&url).unwrap();
+            let mappings: Arc<dyn NamespaceMappingRepo> =
+                Arc::new(MemoryNamespaceMappingRepo::default());
+            let backend = OpenFgaPermissionBackend::new(client, mappings);
+
+            backend
+                .ensure_namespace("tenant-1", "document", &["reader".into()])
+                .await
+                .unwrap();
+
+            let key = RelationTupleKey {
+                namespace: "document".into(),
+                object: "doc-1".into(),
+                relation: "reader".into(),
+                subject_id: "user:alice".into(),
+                condition: None,
+                condition_context: None,
+            };
+
+            // Seeding twice stores the tuple exactly once: the second call
+            // reads first and skips the already-present write.
+            backend.ensure_tuples("tenant-1", std::slice::from_ref(&key), &[]).await.unwrap();
+            backend.ensure_tuples("tenant-1", std::slice::from_ref(&key), &[]).await.unwrap();
+            let matches = {
+                let stored = state.tuples.lock().unwrap();
+                stored
+                    .iter()
+                    .filter(|t| {
+                        t.get("user").and_then(|v| v.as_str()) == Some("user:alice")
+                            && t.get("object").and_then(|v| v.as_str()) == Some("document:doc-1")
+                    })
+                    .count()
+            };
+            assert_eq!(matches, 1);
+
+            // Deleting an absent tuple is a no-op; deleting a present one
+            // removes it exactly once.
+            let absent = RelationTupleKey {
+                subject_id: "user:bob".into(),
+                ..key.clone()
+            };
+            backend.ensure_tuples("tenant-1", &[], &[absent]).await.unwrap();
+            backend.ensure_tuples("tenant-1", &[], std::slice::from_ref(&key)).await.unwrap();
+            assert!(state.tuples.lock().unwrap().is_empty());
+            // Already gone: still no error.
+            backend.ensure_tuples("tenant-1", &[], std::slice::from_ref(&key)).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn openfga_backend_ensure_model_adopts_orphan_store() {
+            let (_handle, url, state) = start_fake_openfga().await;
+            let client = sso_openfga_client::OpenFgaClient::new(&url).unwrap();
+            let mappings: Arc<dyn NamespaceMappingRepo> =
+                Arc::new(MemoryNamespaceMappingRepo::default());
+            let backend = OpenFgaPermissionBackend::new(client.clone(), mappings);
+
+            // Simulate the SSO-030 crash debris: a store exists (created
+            // before the registry upsert failed) but no record does.
+            let orphan_id = client.create_store("tenant-1-entitlements").await.unwrap();
+
+            backend
+                .ensure_namespace("tenant-1", "entitlements", &["member".into()])
+                .await
+                .unwrap();
+
+            // The orphan store is adopted: no second store is created and the
+            // record points at the pre-existing store id.
+            assert_eq!(state.stores.lock().unwrap().len(), 1);
+            let mapping = backend
+                .resolve_mapping("tenant-1", "entitlements")
+                .await
+                .unwrap();
+            assert_eq!(mapping.store_id.as_deref(), Some(orphan_id.as_str()));
+            assert!(mapping.model_id.as_deref().is_some_and(|id| !id.is_empty()));
         }
     }
 }

@@ -410,11 +410,12 @@ async fn permission_service_keto_namespace_metadata() {
     .await;
     assert_eq!(resp.status(), 200, "ensure failed: {:?}", resp.text().await);
     let body = resp.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(body["types"], json!(["document", "user"]));
+    // Only relation-bearing (object-capable) types are indexed; bare `user`
+    // is not.
+    assert_eq!(body["types"], json!(["document"]));
 
     let resp = post("GetPermissionNamespace", json!({ "namespace": "app" })).await;
     assert_eq!(resp.status(), 200);
-
     let resp = post("ListPermissionNamespaces", json!({})).await;
     assert_eq!(resp.status(), 200);
     let body = resp.json::<serde_json::Value>().await.unwrap();

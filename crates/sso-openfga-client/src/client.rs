@@ -57,6 +57,45 @@ impl OpenFgaClient {
         handle_response(response).await
     }
 
+    /// Find a store by name, returning its id.
+    ///
+    /// Paginates the store list because OpenFGA store names are not unique
+    /// and there is no server-side name filter; the first match wins.
+    #[instrument(skip(self), fields(base_url = %self.base_url))]
+    pub async fn find_store_by_name(&self, name: &str) -> Result<Option<String>, OpenFgaClientError> {
+        let url = self.base_url.join("stores")?;
+        let mut continuation_token = String::new();
+        loop {
+            let mut params: Vec<(&str, String)> = vec![("page_size", "100".to_string())];
+            if !continuation_token.is_empty() {
+                params.push(("continuation_token", continuation_token.clone()));
+            }
+            debug!(%url, %name, "searching openfga stores by name");
+            let response = self
+                .client
+                .get(url.clone())
+                .query(&params)
+                .send()
+                .await
+                .map_err(OpenFgaClientError::Http)?;
+            let body = handle_response(response).await?;
+            if let Some(stores) = body.get("stores").and_then(|v| v.as_array()) {
+                for store in stores {
+                    let store_name = store.get("name").and_then(|v| v.as_str());
+                    if store_name == Some(name)
+                        && let Some(id) = store.get("id").and_then(|v| v.as_str())
+                    {
+                        return Ok(Some(id.to_string()));
+                    }
+                }
+            }
+            match body.get("continuation_token").and_then(|v| v.as_str()) {
+                Some(token) if !token.is_empty() => continuation_token = token.to_string(),
+                _ => return Ok(None),
+            }
+        }
+    }
+
     /// Get a store by id.
     #[instrument(skip(self), fields(base_url = %self.base_url))]
     pub async fn get_store(&self, store_id: &str) -> Result<Value, OpenFgaClientError> {
@@ -241,6 +280,79 @@ impl OpenFgaClient {
             Ok(())
         } else {
             Err(openfga_error(response).await)
+        }
+    }
+
+    /// Read tuples matching a tuple key filter.
+    ///
+    /// The filter fields are matched exactly; passing a fully specified key
+    /// (object, relation, and user) therefore yields at most one tuple.
+    /// Condition data is not returned by the read endpoint, so the returned
+    /// keys always carry `None` condition fields.
+    #[instrument(skip(self, key), fields(base_url = %self.base_url))]
+    pub async fn read_tuples(
+        &self,
+        store_id: &str,
+        key: &TupleKey,
+    ) -> Result<Vec<TupleKey>, OpenFgaClientError> {
+        let url = self.base_url.join(&format!("stores/{store_id}/read"))?;
+        debug!(%url, %store_id, "reading openfga tuples");
+
+        let mut continuation_token = String::new();
+        let mut tuples = Vec::new();
+        loop {
+            let mut payload = serde_json::json!({
+                "tuple_key": {
+                    "user": key.user,
+                    "relation": key.relation,
+                    "object": key.object,
+                },
+                "page_size": 100,
+            });
+            if !continuation_token.is_empty() {
+                payload["continuation_token"] = Value::String(continuation_token.clone());
+            }
+
+            let response = self
+                .client
+                .post(url.clone())
+                .json(&payload)
+                .send()
+                .await
+                .map_err(OpenFgaClientError::Http)?;
+            let body = handle_response(response).await?;
+
+            if let Some(entries) = body.get("tuples").and_then(|v| v.as_array()) {
+                for entry in entries {
+                    let Some(key) = entry.get("key") else {
+                        continue;
+                    };
+                    let user = match key.get("user").and_then(|v| v.as_str()) {
+                        Some(user) => user.to_string(),
+                        None => continue,
+                    };
+                    let relation = match key.get("relation").and_then(|v| v.as_str()) {
+                        Some(relation) => relation.to_string(),
+                        None => continue,
+                    };
+                    let object = match key.get("object").and_then(|v| v.as_str()) {
+                        Some(object) => object.to_string(),
+                        None => continue,
+                    };
+                    tuples.push(TupleKey {
+                        user,
+                        relation,
+                        object,
+                        condition_name: None,
+                        condition_context: None,
+                    });
+                }
+            }
+
+            match body.get("continuation_token").and_then(|v| v.as_str()) {
+                Some(token) if !token.is_empty() => continuation_token = token.to_string(),
+                _ => return Ok(tuples),
+            }
         }
     }
 
@@ -639,6 +751,7 @@ mod tests {
                 get(get_model),
             )
             .route("/stores/{store_id}/write", post(write_tuple))
+            .route("/stores/{store_id}/read", post(read_tuples))
             .route("/stores/{store_id}/check", post(check))
             .route("/stores/{store_id}/expand", post(expand))
             .route("/stores/{store_id}/list-objects", post(list_objects))
@@ -740,12 +853,44 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn check(
+    async fn read_tuples(
         State(state): State<FakeState>,
         Path(store_id): Path<String>,
         Json(body): Json<Value>,
     ) -> Json<Value> {
         let key = body.get("tuple_key").cloned().unwrap_or_default();
+        let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
+        let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
+        let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
+        let tuples: Vec<Value> = state
+            .tuples
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.get("store_id").and_then(|v| v.as_str()) == Some(&store_id)
+                    && (user.is_empty() || t.get("user").and_then(|v| v.as_str()) == Some(user))
+                    && (relation.is_empty()
+                        || t.get("relation").and_then(|v| v.as_str()) == Some(relation))
+                    && (object.is_empty()
+                        || t.get("object").and_then(|v| v.as_str()) == Some(object))
+            })
+            .map(|t| {
+                json!({ "key": {
+                    "user": t.get("user"),
+                    "relation": t.get("relation"),
+                    "object": t.get("object"),
+                } })
+            })
+            .collect();
+        Json(json!({ "tuples": tuples, "continuation_token": "" }))
+    }
+
+    async fn check(
+        State(state): State<FakeState>,
+        Path(store_id): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {        let key = body.get("tuple_key").cloned().unwrap_or_default();
         let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
         let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
         let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
@@ -828,6 +973,59 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         (handle, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn find_store_by_name_matches_and_misses() {
+        let (_handle, url) = start_server().await;
+        let client = OpenFgaClient::new(&url).unwrap();
+
+        assert!(client.find_store_by_name("tenant-1-entitlements").await.unwrap().is_none());
+
+        let store_id = client.create_store("tenant-1-entitlements").await.unwrap();
+        client.create_store("tenant-1-kanban").await.unwrap();
+
+        let found = client
+            .find_store_by_name("tenant-1-entitlements")
+            .await
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(store_id.as_str()));
+        assert!(client.find_store_by_name("tenant-2-entitlements").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_tuples_filters_exact_key() {
+        let (_handle, url) = start_server().await;
+        let client = OpenFgaClient::new(&url).unwrap();
+        let store_id = client.create_store("reads").await.unwrap();
+        let model_id = client
+            .write_authorization_model(&store_id, "document", &["reader".into()])
+            .await
+            .unwrap();
+
+        let key = TupleKey {
+            user: "user:alice".into(),
+            relation: "reader".into(),
+            object: "document:doc-1".into(),
+            condition_name: None,
+            condition_context: None,
+        };
+        let other = TupleKey {
+            user: "user:bob".into(),
+            ..key.clone()
+        };
+
+        // Nothing stored yet.
+        assert!(client.read_tuples(&store_id, &key).await.unwrap().is_empty());
+
+        client
+            .write_tuples(&store_id, &model_id, &[key.clone(), other], &[])
+            .await
+            .unwrap();
+
+        // An exact key yields exactly the matching tuple.
+        let found = client.read_tuples(&store_id, &key).await.unwrap();
+        assert_eq!(found, vec![key.clone()]);
     }
 
     #[tokio::test]

@@ -55,7 +55,9 @@ pub use local_auth::{
 };
 pub use login_state::{LoginStateRow, LoginStateStore, PgLoginStateStore};
 pub use permission::{PermissionTupleRow, PermissionTupleStore, PgPermissionTupleStore, TupleKeyInput};
-pub use permission_namespace::{PermissionNamespaceRow, PgPermissionNamespaceStore};
+pub use permission_namespace::{
+    PermissionNamespaceRow, PgPermissionNamespaceStore, relation_bearing_type_names,
+};
 pub use pool::{DbPool, bootstrap_system_tenant, create_pool};
 pub use saml_identity_mapping::{
     PgSamlIdentityMappingStore, SamlIdentityMappingRow, SamlIdentityMappingStore,
