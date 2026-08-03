@@ -211,8 +211,9 @@ pub struct Oauth2State {
     pub(crate) kratos: Option<Arc<dyn IntrospectKratos>>,
     /// Clients whose introspection responses always carry the user's email.
     pub(crate) force_email_claim_client_ids: Vec<String>,
-    /// Whether the MSC2965 `urn:matrix:client:` scope-prefix match injects
-    /// the email claim into introspection responses.
+    /// Whether the Matrix scope-prefix match (MSC2965 `urn:matrix:client:`
+    /// and the unstable MSC2967 prefix) injects the email claim into
+    /// introspection responses.
     pub(crate) matrix_email_claim_enabled: bool,
     /// Whether Matrix-shaped authorize requests get `offline_access` appended
     /// and Matrix DCR registrations keep the refresh-token grant.
@@ -406,9 +407,9 @@ async fn authorize(
     };
     // Guardrail replacing the DCR ceiling that Matrix `*` registrations drop:
     // a Matrix-shaped authorize request may carry only plain-OIDC scopes and
-    // `urn:matrix:client:`-prefixed scopes, so anonymous DCR clients cannot
-    // consent-phish admin scopes through their `*` registration. Stateless
-    // and client-agnostic; non-Matrix requests are unaffected.
+    // Matrix-prefixed (MSC2965/MSC2967) scopes, so anonymous DCR clients
+    // cannot consent-phish admin scopes through their `*` registration.
+    // Stateless and client-agnostic; non-Matrix requests are unaffected.
     if let Some(offending) = params
         .get("scope")
         .and_then(|scope| disallowed_matrix_scope(scope))
@@ -418,7 +419,7 @@ async fn authorize(
             axum::Json(json!({
                 "error": "invalid_scope",
                 "error_description": format!(
-                    "scope '{offending}' is not allowed alongside {MATRIX_CLIENT_SCOPE_PREFIX}* scopes"
+                    "scope '{offending}' is not allowed alongside Matrix (MSC2965/MSC2967) scopes"
                 ),
             })),
         )
@@ -444,10 +445,7 @@ async fn authorize(
     };
     let effective_scope = with_matrix_offline_access(&state, &scope);
     let requested: Vec<&str> = effective_scope.split_whitespace().collect();
-    if requested
-        .iter()
-        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
-    {
+    if requested.iter().any(|s| is_matrix_scope(s)) {
         maybe_expand_matrix_client_scope(&state, &ory_id, &requested).await;
     }
 
@@ -671,9 +669,9 @@ async fn userinfo(State(state): State<Arc<Oauth2State>>, headers: HeaderMap) -> 
 /// Scopes a publicly registered (RFC 7591) client may hold. Registration is
 /// open — there is no way to distinguish e.g. a Matrix client from anyone
 /// else at DCR time — so the ceiling keeps anonymous clients inside the
-/// plain OIDC surface. MSC2965 `urn:matrix:client:*` scopes are exempt:
-/// per-device Matrix registrations cannot be enumerated, so they pass
-/// through verbatim (see `register`).
+/// plain OIDC surface. Matrix scopes (MSC2965 `urn:matrix:client:*` and the
+/// unstable MSC2967 prefix) are exempt: per-device Matrix registrations
+/// cannot be enumerated, so they pass through verbatim (see `register`).
 const DCR_ALLOWED_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
 
 async fn register(
@@ -695,7 +693,7 @@ async fn register(
     let redirect_uris = json_string_array(&body["redirect_uris"]);
     let mut grant_types = json_string_array(&body["grant_types"]);
     let response_types = json_string_array(&body["response_types"]);
-    // MSC2965 exception to the DCR ceiling: `urn:matrix:client:*` scopes are
+    // MSC2965/MSC2967 exception to the DCR ceiling: Matrix scopes are
     // preserved verbatim (per-device registrations can't be enumerated), and
     // when the offline-access feature is on the client also gets the
     // `offline_access` scope and the `refresh_token` grant so Matrix sessions
@@ -704,9 +702,7 @@ async fn register(
     let mut scope = match body["scope"].as_str() {
         Some(s) => s
             .split_whitespace()
-            .filter(|s| {
-                DCR_ALLOWED_SCOPES.contains(s) || s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
-            })
+            .filter(|s| DCR_ALLOWED_SCOPES.contains(s) || is_matrix_scope(s))
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
         None => Vec::new(),
@@ -717,9 +713,7 @@ async fn register(
     if grant_types.is_empty() {
         grant_types.push("authorization_code".to_string());
     }
-    let is_matrix = scope
-        .iter()
-        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
+    let is_matrix = scope.iter().any(|s| is_matrix_scope(s));
     if is_matrix && state.matrix_offline_access_enabled {
         if !scope.iter().any(|s| s == "offline_access") {
             scope.push("offline_access".to_string());
@@ -1074,34 +1068,44 @@ async fn introspect(
 }
 
 /// MSC2965 Matrix client scope family. Matrix OIDC tokens always carry a
-/// `urn:matrix:client:`-prefixed scope (e.g. `urn:matrix:client:api:*`),
-/// which identifies Matrix-issued tokens — including per-device DCR clients
-/// that no static client-id list could enumerate.
+/// Matrix-prefixed scope (e.g. `urn:matrix:client:api:*`), which identifies
+/// Matrix-issued tokens — including per-device DCR clients that no static
+/// client-id list could enumerate.
 const MATRIX_CLIENT_SCOPE_PREFIX: &str = "urn:matrix:client:";
 
+/// Unstable MSC2967 Matrix client scope family (SSO-032). Element X 26.07+
+/// requests scopes under this prefix (e.g.
+/// `urn:matrix:org.matrix.msc2967.client:api:*`); it receives the full
+/// Matrix treatment exactly like the stable MSC2965 prefix.
+const MATRIX_CLIENT_SCOPE_PREFIX_MSC2967: &str = "urn:matrix:org.matrix.msc2967.client:";
+
+/// Whether a scope belongs to a Matrix client scope family (MSC2965 stable
+/// prefix or the unstable MSC2967 prefix).
+fn is_matrix_scope(scope: &str) -> bool {
+    scope.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
+        || scope.starts_with(MATRIX_CLIENT_SCOPE_PREFIX_MSC2967)
+}
+
 /// Guardrail for Matrix-shaped authorize requests (see `authorize`): when any
-/// requested scope carries the MSC2965 prefix, every requested scope must be
+/// requested scope carries a Matrix prefix, every requested scope must be
 /// plain-OIDC or Matrix-prefixed. Returns the first offending scope.
 fn disallowed_matrix_scope(scope: &str) -> Option<String> {
     let scopes: Vec<&str> = scope.split_whitespace().collect();
-    if !scopes
-        .iter()
-        .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
-    {
+    if !scopes.iter().any(|s| is_matrix_scope(s)) {
         return None;
     }
     scopes
         .iter()
         .find(|s| {
             !matches!(**s, "openid" | "profile" | "email" | "offline_access")
-                && !s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
+                && !is_matrix_scope(s)
         })
         .map(|s| s.to_string())
 }
 
-/// Self-heal for Matrix (MSC2965) clients whose Hydra registration predates
-/// the wildcard DCR rule — notably Element Web/Desktop, whose DCR request
-/// carries no `urn:matrix:client:` scopes, so the client registered as plain
+/// Self-heal for Matrix (MSC2965/MSC2967) clients whose Hydra registration
+/// predates the wildcard DCR rule — notably Element Web/Desktop, whose DCR
+/// request carries no Matrix scopes, so the client registered as plain
 /// `openid` and every Matrix-shaped authorize dies with `invalid_scope`
 /// (Hydra exact-matches scopes). When the registered scope does not cover the
 /// requested set, the client is expanded to scope `*` (same as the legacy
@@ -1174,15 +1178,13 @@ async fn maybe_expand_matrix_client_scope(
 }
 
 /// Append `offline_access` to an authorize-request scope string when it
-/// carries a Matrix (MSC2965) scope and the feature is enabled. An absent or
-/// already-offline scope is returned untouched.
+/// carries a Matrix (MSC2965/MSC2967) scope and the feature is enabled. An
+/// absent or already-offline scope is returned untouched.
 fn with_matrix_offline_access(state: &Oauth2State, scope: &str) -> String {
     let mut scopes: Vec<&str> = scope.split_whitespace().collect();
     if !state.matrix_offline_access_enabled
         || scopes.is_empty()
-        || !scopes
-            .iter()
-            .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX))
+        || !scopes.iter().any(|s| is_matrix_scope(s))
         || scopes.contains(&"offline_access")
     {
         return scope.to_string();
@@ -1195,12 +1197,12 @@ fn with_matrix_offline_access(state: &Oauth2State, scope: &str) -> String {
 ///
 /// Matrix homeservers (zendrite) never read the id_token; they validate
 /// tokens through this introspection response, so the email must ride here.
-/// Injection happens for Matrix-shaped tokens (MSC2965 scope family) and for
-/// clients on the configured force list, matched against both the raw Hydra
-/// client id and its translated public ULID. Failures never fail the
-/// introspection: a machine-client subject (no Kratos identity), a Kratos
-/// error, or a missing `traits.email` all yield the response without the
-/// claim.
+/// Injection happens for Matrix-shaped tokens (MSC2965/MSC2967 scope
+/// families) and for clients on the configured force list, matched against
+/// both the raw Hydra client id and its translated public ULID. Failures
+/// never fail the introspection: a machine-client subject (no Kratos
+/// identity), a Kratos error, or a missing `traits.email` all yield the
+/// response without the claim.
 async fn maybe_inject_introspection_email(
     state: &Oauth2State,
     raw_sub: &str,
@@ -1215,9 +1217,7 @@ async fn maybe_inject_introspection_email(
         None => String::new(),
     };
     let is_matrix_token = state.matrix_email_claim_enabled
-        && scope
-            .split_whitespace()
-            .any(|s| s.starts_with(MATRIX_CLIENT_SCOPE_PREFIX));
+        && scope.split_whitespace().any(is_matrix_scope);
     let translated_client_id = value.get("client_id").and_then(|v| v.as_str());
     let is_force_listed = state.force_email_claim_client_ids.iter().any(|id| {
         Some(id.as_str()) == raw_client_id || Some(id.as_str()) == translated_client_id
@@ -4902,6 +4902,151 @@ mod tests {
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
+
+    /// MSC2967 (SSO-032): a registration carrying the unstable
+    /// `urn:matrix:org.matrix.msc2967.client:` prefix gets the full Matrix
+    /// treatment — wildcard scope, `offline_access`, and the refresh-token
+    /// grant — exactly like the stable MSC2965 prefix.
+    #[tokio::test]
+    async fn register_matrix_msc2967_client_registers_wildcard_scope() {
+        let (state, hydra, _) = register_recording_state();
+        let body = json!({
+            "client_name": "element-x-26.07",
+            "redirect_uris": ["https://example.com/callback"],
+            "scope": "openid urn:matrix:org.matrix.msc2967.client:api:* tenant:admin",
+        });
+        let resp = register(State(state), None, Json(body)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(value["scope"], "*");
+        let grant_types: Vec<&str> = value["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(grant_types.contains(&"authorization_code"));
+        assert!(grant_types.contains(&"refresh_token"));
+        let creates = hydra.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0]["scope"], "*");
+        let payload_scopes: Vec<&str> = creates[0]["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(payload_scopes.contains(&"refresh_token"));
+    }
+
+    /// MSC2967: the authorize guardrail accepts a mixed plain-OIDC + msc2967
+    /// scope set and still appends `offline_access`.
+    #[tokio::test]
+    async fn authorize_passes_valid_msc2967_scopes_with_device_and_offline_access() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:TESTDEV"
+                    .to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let calls = hydra.authorize_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].iter().find(|(k, _)| k == "scope").map(|(_, v)| v),
+            Some(
+                &"openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:TESTDEV offline_access"
+                    .to_string()
+            )
+        );
+    }
+
+    /// MSC2967: the guardrail still rejects non-OIDC/non-Matrix scopes (e.g.
+    /// admin scopes) smuggled alongside an msc2967 scope.
+    #[tokio::test]
+    async fn authorize_rejects_admin_scope_alongside_msc2967_scope() {
+        let (state, hydra) = recording_state();
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:org.matrix.msc2967.client:api:* tenant:admin".to_string(),
+            ),
+        ]);
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"], "invalid_scope");
+        assert!(value["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("tenant:admin"));
+        assert!(
+            hydra.authorize_calls.lock().unwrap().is_empty(),
+            "rejected requests must not reach Hydra"
+        );
+    }
+
+    /// MSC2967 self-heal: a client stuck at plain `openid` (registered before
+    /// the wildcard DCR rule) is expanded to scope `*` plus the refresh-token
+    /// grant when an msc2967-shaped authorize arrives.
+    #[tokio::test]
+    async fn authorize_expands_under_scoped_matrix_client_for_msc2967() {
+        let (state, hydra) = recording_state_with_response(under_scoped_matrix_client());
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:TESTDEV"
+                    .to_string(),
+            ),
+        ]);
+        let _ = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        let updates = hydra.update_calls.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, "hydra-client-id-1");
+        assert_eq!(updates[0].1["scope"], "*");
+        let grants: Vec<&str> = updates[0].1["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(grants.contains(&"authorization_code"));
+        assert!(grants.contains(&"refresh_token"));
+        assert_eq!(hydra.authorize_calls.lock().unwrap().len(), 1);
+    }
+
+    /// MSC2967: introspection responses for msc2967-scoped tokens carry the
+    /// user's email, exactly like the stable MSC2965 scope family.
+    #[tokio::test]
+    async fn introspect_injects_email_for_msc2967_scope() {
+        let kratos = StubKratos::with_identity(json!({"traits": {"email": "m@example.com"}}));
+        let state = introspect_email_state(
+            json!({
+                "active": true,
+                "sub": "kratos-identity-1",
+                "client_id": "hydra-client-id-1",
+                "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
+            }),
+            kratos,
+            Vec::new(),
+        );
+        let value = introspect_admin(state).await;
+        assert_eq!(value["email"], "m@example.com");
+    }
+
     /// Mapping stub with a working tenant-less resolution chain and a
     /// recorded tenant-scoped delete, for the orphaned-mapping
     /// reconciliation paths (SSO-031).

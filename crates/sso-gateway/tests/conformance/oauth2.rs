@@ -302,6 +302,221 @@ async fn oauth2_authorize_rejects_unknown_client() {
 
 const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
 
+/// Unstable MSC2967 scope prefix requested by Element X 26.07+ (SSO-032).
+const MSC2967_API_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:api:*";
+const MSC2967_DEVICE_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:device:TESTDEV";
+
+/// MSC2967 end-to-end (SSO-032): Element X 26.07+ requests scopes under the
+/// unstable `urn:matrix:org.matrix.msc2967.client:` prefix. The gateway must
+/// give the registration the full Matrix treatment (wildcard scope,
+/// `offline_access`, refresh-token grant) and the authorize request must not
+/// die with `invalid_scope` — Hydra exact-matches scopes, so an unrecognized
+/// prefix would ceiling the client to plain `openid` and break the login.
+#[tokio::test]
+async fn matrix_msc2967_dcr_client_receives_usable_refresh_token() {
+    let gateway = Gateway::start().await;
+
+    // 1. Register exactly like Element X 26.07: openid + an msc2967 scope,
+    //    no offline_access, no device scope (it is per-login).
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "element-x-26.07",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": format!("openid {MSC2967_API_SCOPE}"),
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    assert_eq!(
+        registration["scope"], "*",
+        "MSC2967 Matrix clients must be registered with wildcard scope"
+    );
+    let registered_grants: Vec<&str> = registration["grant_types"]
+        .as_array()
+        .expect("registered grant_types")
+        .iter()
+        .map(|v| v.as_str().expect("grant type should be a string"))
+        .collect();
+    assert!(
+        registered_grants.contains(&"refresh_token"),
+        "refresh_token grant must be added at DCR: {registered_grants:?}"
+    );
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+    let client_secret = registration["client_secret"]
+        .as_str()
+        .expect("client_secret")
+        .to_string();
+
+    // 2. Run the authorization-code flow requesting what Element X requests
+    //    at login: the msc2967 api scope plus the per-login device scope (no
+    //    offline_access — the gateway injects it).
+    let subject = ulid::Ulid::new().to_string();
+    let result = gateway
+        .authorization_code_flow_for_client(
+            &subject,
+            &client_id,
+            &client_secret,
+            // DCR sets the Hydra client_id to the public ULID.
+            &client_id,
+            REDIRECT_URI,
+            &["code"],
+            &["openid", MSC2967_API_SCOPE, MSC2967_DEVICE_SCOPE],
+            None,
+            true,
+            None,
+        )
+        .await;
+    assert!(
+        result.token["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "token response must contain an access token: {}",
+        result.token
+    );
+    let token_scope = result.token["scope"].as_str().unwrap_or_default();
+    assert!(
+        token_scope.split_whitespace().any(|s| s == MSC2967_DEVICE_SCOPE),
+        "token scope must carry the msc2967 device scope: {token_scope}"
+    );
+    assert!(
+        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        "token scope must carry offline_access: {token_scope}"
+    );
+    let refresh_token = result.token["refresh_token"]
+        .as_str()
+        .expect("MSC2967 Matrix flow must yield a refresh token");
+    assert!(!refresh_token.is_empty());
+
+    // 3. The refresh token actually works — proving the client holds the
+    //    refresh_token grant (fosite rejects the exchange otherwise).
+    let refreshed = gateway
+        .refresh_token_flow(refresh_token, &client_id, &client_secret)
+        .await;
+    assert!(
+        refreshed.get("error").is_none(),
+        "refresh grant must not error: {refreshed}"
+    );
+    assert!(
+        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "refresh grant must return a new access token: {refreshed}"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// MSC2967 self-heal (SSO-032): a client registered as plain `openid` — the
+/// pre-fix state every Element X registration is stuck in — must be expanded
+/// to scope `*` (plus the refresh-token grant) when the first msc2967-shaped
+/// authorize arrives, and the flow must succeed.
+#[tokio::test]
+async fn matrix_msc2967_authorize_self_heals_openid_client() {
+    let gateway = Gateway::start().await;
+
+    // 1. Register as the pre-fix gateway would have: msc2967 scopes were not
+    //    recognized, so the DCR ceiling reduced the client to plain openid.
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "element-x-pre-fix",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid",
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    assert_eq!(registration["scope"], "openid");
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+    let client_secret = registration["client_secret"]
+        .as_str()
+        .expect("client_secret")
+        .to_string();
+
+    // 2. Run the full flow with the Element X 26.07 login scopes. Without
+    //    the self-heal this dies at authorize with invalid_scope (see
+    //    hydra_authorize_enforces_registered_scope_ceiling).
+    let subject = ulid::Ulid::new().to_string();
+    let result = gateway
+        .authorization_code_flow_for_client(
+            &subject,
+            &client_id,
+            &client_secret,
+            &client_id,
+            REDIRECT_URI,
+            &["code"],
+            &["openid", MSC2967_API_SCOPE, MSC2967_DEVICE_SCOPE],
+            None,
+            true,
+            None,
+        )
+        .await;
+    let token_scope = result.token["scope"].as_str().unwrap_or_default();
+    assert!(
+        token_scope.split_whitespace().any(|s| s == MSC2967_DEVICE_SCOPE),
+        "token scope must carry the msc2967 device scope: {token_scope}"
+    );
+    assert!(
+        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        "token scope must carry offline_access: {token_scope}"
+    );
+    let refresh_token = result.token["refresh_token"]
+        .as_str()
+        .expect("self-healed MSC2967 flow must yield a refresh token");
+    assert!(!refresh_token.is_empty());
+
+    // 3. The heal persisted: the Hydra client now has scope `*` and the
+    //    refresh-token grant.
+    let healed: serde_json::Value = gateway
+        .http
+        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .send()
+        .await
+        .expect("hydra client fetch should succeed")
+        .json()
+        .await
+        .expect("hydra client should be json");
+    assert_eq!(healed["scope"], "*");
+    let healed_grants: Vec<&str> = healed["grant_types"]
+        .as_array()
+        .expect("grant_types")
+        .iter()
+        .map(|v| v.as_str().expect("grant type should be a string"))
+        .collect();
+    assert!(
+        healed_grants.contains(&"refresh_token"),
+        "healed client must hold the refresh_token grant: {healed_grants:?}"
+    );
+
+    // 4. And the refresh grant works end to end.
+    let refreshed = gateway
+        .refresh_token_flow(refresh_token, &client_id, &client_secret)
+        .await;
+    assert!(
+        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "refresh grant must return a new access token: {refreshed}"
+    );
+
+    gateway.shutdown().await;
+}
+
 /// SSO-031 self-service delete end-to-end: a DCR client deletes itself with
 /// its own Basic credentials; afterwards the client is gone from Hydra, the
 /// id_mappings row is gone, and a retry with the old credentials is a
