@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.08.2] - 2026-08-03
+
+### Fixed
+
+- Per-user scope ceilings are additive again: gateway members and admins keep
+  the OIDC baseline (`openid profile email offline_access`) on top of their
+  iam read/admin scopes, so system-tenant employees can complete OIDC consent
+  instead of being refused with `requested scopes exceed entitlement ceiling`
+  (SSO-036).
+
 ## [2026.08.1] - 2026-08-03
 
 ### Added
