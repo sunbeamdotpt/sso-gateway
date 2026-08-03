@@ -302,6 +302,103 @@ async fn oauth2_authorize_rejects_unknown_client() {
 
 const REDIRECT_URI: &str = "https://127.0.0.1:9999/callback";
 
+/// SSO-031 self-service delete end-to-end: a DCR client deletes itself with
+/// its own Basic credentials; afterwards the client is gone from Hydra, the
+/// id_mappings row is gone, and a retry with the old credentials is a
+/// terminal `401 invalid_client` short-circuited at resolution.
+#[tokio::test]
+async fn dcr_client_self_delete_removes_client_and_mapping() {
+    let gateway = Gateway::start().await;
+
+    let registration: serde_json::Value = gateway
+        .http
+        .post(format!("{}/oauth2/register", gateway.base_url))
+        .json(&serde_json::json!({
+            "client_name": "self-delete-conformance",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": "openid",
+            "token_endpoint_auth_method": "client_secret_basic",
+        }))
+        .send()
+        .await
+        .expect("DCR request should succeed")
+        .json()
+        .await
+        .expect("DCR response should be json");
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_string();
+    let client_secret = registration["client_secret"]
+        .as_str()
+        .expect("client_secret")
+        .to_string();
+    assert!(
+        gateway.get_hydra_client_id(&client_id).await.is_ok(),
+        "mapping row must exist after DCR"
+    );
+
+    // 1. The client deletes itself with its own Basic credentials.
+    let delete = gateway
+        .http
+        .delete(format!(
+            "{}/oauth2/register/{client_id}",
+            gateway.base_url
+        ))
+        .basic_auth(&client_id, Some(&client_secret))
+        .send()
+        .await
+        .expect("delete request should complete");
+    assert_eq!(
+        delete.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "self-delete must return 204: {:?}",
+        delete.status()
+    );
+
+    // 2. The client is gone from Hydra...
+    let hydra_get = gateway
+        .http
+        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .send()
+        .await
+        .expect("hydra client fetch should complete");
+    assert_eq!(
+        hydra_get.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "client must be gone from Hydra after self-delete"
+    );
+
+    // 3. ...and the id_mappings row is gone.
+    assert!(
+        gateway.get_hydra_client_id(&client_id).await.is_err(),
+        "mapping row must be deleted after self-delete"
+    );
+
+    // 4. A retry with the old credentials is a terminal 401 invalid_client,
+    //    short-circuited at resolution (heal_client_mapping's Hydra 404).
+    let introspect = gateway
+        .http
+        .post(format!("{}/oauth2/introspect", gateway.base_url))
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[("token", "some-token")])
+        .send()
+        .await
+        .expect("introspect request should complete");
+    assert_eq!(
+        introspect.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "deleted client introspection must be a terminal 401"
+    );
+    let body: serde_json::Value = introspect.json().await.expect("401 body should be json");
+    assert_eq!(body["error"], "invalid_client");
+
+    gateway.shutdown().await;
+}
+
+
 /// MSC2965 end-to-end: a Matrix-style DCR client that never requests
 /// `offline_access` still receives a usable refresh token, and the per-login
 /// `urn:matrix:client:device:<id>` scope round-trips into the issued token

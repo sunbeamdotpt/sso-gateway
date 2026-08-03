@@ -9,11 +9,11 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde_json::json;
 use sso_ory_client::{error::OryClientError, hydra::HydraClient, kratos::KratosClient};
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 use ulid::Ulid;
 
 use crate::auth::{
@@ -73,6 +73,13 @@ pub trait HydraOperations: Send + Sync + 'static {
     ) -> Result<serde_json::Value, OryClientError> {
         Err(OryClientError::InvalidResponse(
             "update_oauth2_client not supported".into(),
+        ))
+    }
+    /// Client delete (Hydra `DELETE /admin/clients/{id}`). Only used by the
+    /// DCR self-service delete endpoint, so stubs may keep the default.
+    async fn delete_oauth2_client(&self, _id: &str) -> Result<(), OryClientError> {
+        Err(OryClientError::InvalidResponse(
+            "delete_oauth2_client not supported".into(),
         ))
     }
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError>;
@@ -158,6 +165,10 @@ impl HydraOperations for HydraClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, OryClientError> {
         self.update_oauth2_client(id, payload).await
+    }
+
+    async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError> {
+        self.delete_oauth2_client(id).await
     }
 
     async fn get_json(&self, url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -274,6 +285,7 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/oauth2/userinfo", get(userinfo))
         .route("/userinfo", get(userinfo))
         .route("/oauth2/register", post(register))
+        .route("/oauth2/register/{client_id}", delete(delete_registered_client))
         .route("/oauth2/introspect", post(introspect))
         .route("/oauth2/revoke", post(revoke))
         .layer(axum::middleware::from_fn(cors_middleware))
@@ -826,6 +838,52 @@ async fn register(
     json_response(response)
 }
 
+/// Self-service delete for publicly registered (RFC 7591) clients
+/// (SSO-031): a client may delete its own registration by presenting its
+/// Basic credentials — possession of the secret is the credential,
+/// deliberately without RFC 7592 registration-access-token machinery. The
+/// Hydra client and the id_mappings row are both removed, so a deleted
+/// client stops reaching Hydra on subsequent requests.
+async fn delete_registered_client(
+    State(state): State<Arc<Oauth2State>>,
+    headers: HeaderMap,
+    Path(client_id): Path<String>,
+) -> impl IntoResponse {
+    let (basic_id, secret) = match basic_auth_credentials(&headers) {
+        Some(credentials) => credentials,
+        None => return invalid_client(),
+    };
+    // The Basic client_id must name the same client as the path, or one
+    // client's credentials could delete another client.
+    if basic_id != client_id {
+        return invalid_client();
+    }
+    let ory_id = match resolve_public_client(&state, &client_id).await {
+        Ok(id) => id,
+        Err(err) => return *err,
+    };
+    match state
+        .hydra
+        .verify_client_credentials(&ory_id, &secret)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return invalid_client(),
+        Err(OryClientError::Ory { status: 404, .. }) => {
+            // Already gone from Hydra: reconcile the orphaned mapping and
+            // treat the delete as done (DELETE is idempotent).
+            delete_orphaned_client_mapping(&state, &ory_id).await;
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        Err(err) => return map_ory_error(err, "/oauth2/register", Some(&client_id)),
+    }
+    if let Err(err) = state.hydra.delete_oauth2_client(&ory_id).await {
+        return map_ory_error(err, "/oauth2/register", Some(&client_id));
+    }
+    delete_orphaned_client_mapping(&state, &ory_id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 fn json_string_array(value: &serde_json::Value) -> Vec<String> {
     match value.as_array() {
         Some(arr) => arr
@@ -925,7 +983,26 @@ async fn introspect(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return invalid_client(),
+            Ok(false) => {
+                // Hydra's token endpoint 401s for a wrong secret AND for a
+                // client deleted out-of-band; confirm via the admin API and
+                // drop the orphaned mapping so retries short-circuit at
+                // resolution instead of hitting Hydra on every retry
+                // (SSO-031).
+                if matches!(
+                    state.hydra.get_oauth2_client(&ory_id).await,
+                    Err(OryClientError::Ory { status: 404, .. })
+                ) {
+                    delete_orphaned_client_mapping(&state, &ory_id).await;
+                }
+                return invalid_client();
+            }
+            Err(OryClientError::Ory { status: 404, .. }) => {
+                // The mapped client is gone from Hydra; drop the orphaned
+                // mapping and keep the terminal 401 (SSO-031).
+                delete_orphaned_client_mapping(&state, &ory_id).await;
+                return invalid_client();
+            }
             Err(err) => return map_ory_error(err, "/oauth2/introspect", Some(&client_id)),
         }
         match state.hydra.introspect_token(&token).await {
@@ -1042,10 +1119,20 @@ async fn maybe_expand_matrix_client_scope(
 ) {
     let client = match state.hydra.get_oauth2_client(ory_id).await {
         Ok(client) => client,
+        Err(OryClientError::Ory { status: 404, .. }) => {
+            // The mapped client is gone from Hydra (deleted out-of-band);
+            // drop the orphaned mapping so later requests short-circuit at
+            // resolution (SSO-031), then proxy unhealed as usual. The raw
+            // pass-through case from resolve_public_client_for_authorize has
+            // no mapping row, so the cleanup is a no-op there.
+            delete_orphaned_client_mapping(state, ory_id).await;
+            warn!(
+                client_id = %ory_id,
+                "matrix scope self-heal: client not found in hydra; proxying unhealed"
+            );
+            return;
+        }
         Err(err) => {
-            // Includes the raw pass-through case from
-            // resolve_public_client_for_authorize, where the client may not
-            // exist in Hydra at all.
             warn!(
                 client_id = %ory_id,
                 "matrix scope self-heal: failed to fetch client; proxying unhealed: {err}"
@@ -1227,6 +1314,62 @@ async fn heal_client_mapping(state: &Oauth2State, client_id: &str) -> Result<Str
         warn!("failed to backfill client mapping for {}: {}", client_id, err);
     }
     Ok(ory_id)
+}
+
+/// Delete the id_mappings row for a Hydra client the backend no longer knows
+/// — clients deleted directly in Hydra leave orphaned rows behind, and every
+/// request for them would otherwise keep forwarding to Hydra admin
+/// (SSO-031). Public-id resolution is tenant-less, so the row's tenant is
+/// recovered through the Ory id before the tenant-scoped delete. Best-effort:
+/// failures are logged, never fatal — a lingering row only means the next
+/// request repeats the Hydra round-trip.
+async fn delete_orphaned_client_mapping(state: &Oauth2State, ory_id: &str) {
+    let tenant_id = match state
+        .mappings
+        .get_tenant_id_by_ory_id(BACKEND_HYDRA, ory_id)
+        .await
+    {
+        Ok(Some(tenant_id)) => tenant_id,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(
+                client_id = %ory_id,
+                "orphaned client mapping cleanup: tenant lookup failed: {err}"
+            );
+            return;
+        }
+    };
+    let public_id = match state
+        .mappings
+        .get_public_id_by_ory_id(BACKEND_HYDRA, ory_id)
+        .await
+    {
+        Ok(public_id) => public_id,
+        Err(err) => {
+            warn!(
+                client_id = %ory_id,
+                "orphaned client mapping cleanup: public id lookup failed: {err}"
+            );
+            return;
+        }
+    };
+    match state
+        .mappings
+        .delete(&tenant_id, BACKEND_HYDRA, &public_id)
+        .await
+    {
+        Ok(()) => info!(
+            tenant_id = %tenant_id,
+            public_id = %public_id,
+            ory_id = %ory_id,
+            "deleted orphaned hydra client mapping"
+        ),
+        Err(err) => warn!(
+            tenant_id = %tenant_id,
+            public_id = %public_id,
+            "orphaned client mapping cleanup: delete failed: {err}"
+        ),
+    }
 }
 
 /// Resolve a gateway public client id to the Ory id. If the value is already an
@@ -2142,7 +2285,12 @@ mod tests {
         create_calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         get_client_calls: Arc<std::sync::Mutex<Vec<String>>>,
         update_calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        delete_calls: Arc<std::sync::Mutex<Vec<String>>>,
         fail_update: bool,
+        /// verify_client_credentials fails with a Hydra 404 (client gone).
+        verify_not_found: bool,
+        /// get_oauth2_client fails with a Hydra 404 (client gone).
+        client_gone: bool,
     }
 
     #[async_trait]
@@ -2214,6 +2362,12 @@ mod tests {
             _client_id: &str,
             client_secret: &str,
         ) -> Result<bool, OryClientError> {
+            if self.verify_not_found {
+                return Err(OryClientError::Ory {
+                    status: 404,
+                    message: "not found".into(),
+                });
+            }
             Ok(client_secret == "secret")
         }
 
@@ -2237,6 +2391,12 @@ mod tests {
             id: &str,
         ) -> Result<serde_json::Value, OryClientError> {
             self.get_client_calls.lock().unwrap().push(id.to_string());
+            if self.client_gone {
+                return Err(OryClientError::Ory {
+                    status: 404,
+                    message: "not found".into(),
+                });
+            }
             Ok(self.response.clone())
         }
 
@@ -2256,6 +2416,11 @@ mod tests {
                 });
             }
             Ok(payload)
+        }
+
+        async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError> {
+            self.delete_calls.lock().unwrap().push(id.to_string());
+            Ok(())
         }
 
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -4736,5 +4901,369 @@ mod tests {
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+    /// Mapping stub with a working tenant-less resolution chain and a
+    /// recorded tenant-scoped delete, for the orphaned-mapping
+    /// reconciliation paths (SSO-031).
+    #[derive(Clone, Default)]
+    struct DeletingMappingStore {
+        #[allow(clippy::type_complexity)]
+        deleted: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl IdMappingStore for DeletingMappingStore {
+        async fn create(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+            _ory_global_id: &str,
+        ) -> Result<crate::db::IdMappingRow, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_ory_id_by_public_id(
+            &self,
+            _backend: &str,
+            _public_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            Ok("hydra-client-id-1".to_string())
+        }
+
+        async fn get_public_id(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_public_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            Ok("gateway-client-1".to_string())
+        }
+
+        async fn delete(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            public_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            self.deleted.lock().unwrap().push((
+                tenant_id.to_string(),
+                backend.to_string(),
+                public_id.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn list_public_ids(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+        ) -> Result<Vec<String>, crate::db::DbError> {
+            unimplemented!()
+        }
+
+        async fn get_tenant_id_by_ory_id(
+            &self,
+            _backend: &str,
+            _ory_global_id: &str,
+        ) -> Result<Option<String>, crate::db::DbError> {
+            Ok(Some("system-tenant-1".to_string()))
+        }
+    }
+
+    fn deleting_state(hydra: RecordingHydra) -> (Arc<Oauth2State>, Arc<DeletingMappingStore>) {
+        let mappings = Arc::new(DeletingMappingStore::default());
+        let state = Arc::new(Oauth2State {
+            hydra: Arc::new(hydra),
+            mappings: mappings.clone(),
+            public_base_url: "https://gateway.example.com".to_string(),
+            token_cache: None,
+            system_tenant_id: "system-tenant-1".to_string(),
+            dynamic_client_registration_enabled: true,
+            kratos: None,
+            force_email_claim_client_ids: Vec::new(),
+            matrix_email_claim_enabled: true,
+            matrix_offline_access_enabled: true,
+        });
+        (state, mappings)
+    }
+
+    /// SSO-031: when credential verification 404s — the mapped client is
+    /// gone from Hydra — the orphaned id_mappings row is deleted and the
+    /// response stays a terminal `401 invalid_client`.
+    #[tokio::test]
+    async fn introspect_deletes_orphaned_mapping_when_verify_finds_client_gone() {
+        let (state, mappings) = deleting_state(RecordingHydra {
+            verify_not_found: true,
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+        let deleted = mappings.deleted.lock().unwrap();
+        assert_eq!(
+            *deleted,
+            vec![(
+                "system-tenant-1".to_string(),
+                "hydra".to_string(),
+                "gateway-client-1".to_string(),
+            )]
+        );
+    }
+
+    /// SSO-031: Hydra's token endpoint 401s a deleted client exactly like a
+    /// wrong secret (`Ok(false)`), so the introspect path confirms via the
+    /// admin API and drops the orphaned mapping on a 404.
+    #[tokio::test]
+    async fn introspect_deletes_orphaned_mapping_when_failed_verify_confirms_client_gone() {
+        let (state, mappings) = deleting_state(RecordingHydra {
+            client_gone: true,
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "wrong-secret"),
+        );
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+        let deleted = mappings.deleted.lock().unwrap();
+        assert_eq!(
+            *deleted,
+            vec![(
+                "system-tenant-1".to_string(),
+                "hydra".to_string(),
+                "gateway-client-1".to_string(),
+            )]
+        );
+    }
+
+    /// A plain wrong secret on an existing client keeps the mapping: the
+    /// confirmatory admin lookup does not 404, so nothing is deleted.
+    #[tokio::test]
+    async fn introspect_keeps_mapping_for_wrong_secret_on_existing_client() {
+        let (state, mappings) = deleting_state(RecordingHydra {
+            response: json!({"client_id": "hydra-client-id-1", "scope": "*"}),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "wrong-secret"),
+        );
+        let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
+        let resp = introspect(State(state), None, headers, Form(form))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(mappings.deleted.lock().unwrap().is_empty());
+    }
+
+    /// SSO-031: the Matrix self-heal sees the client is gone from Hydra,
+    /// drops the orphaned mapping, and still proxies the request unhealed.
+    #[tokio::test]
+    async fn authorize_self_heal_deletes_orphaned_mapping_when_client_gone() {
+        let hydra = RecordingHydra {
+            response: json!({"status": "ok"}),
+            client_gone: true,
+            ..Default::default()
+        };
+        let authorize_calls = hydra.authorize_calls.clone();
+        let (state, mappings) = deleting_state(hydra);
+        let params = HashMap::from([
+            ("client_id".to_string(), "gateway-client-1".to_string()),
+            (
+                "scope".to_string(),
+                "openid urn:matrix:client:api:*".to_string(),
+            ),
+        ]);
+        let resp = authorize(State(state), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(authorize_calls.lock().unwrap().len(), 1);
+        let deleted = mappings.deleted.lock().unwrap();
+        assert_eq!(
+            *deleted,
+            vec![(
+                "system-tenant-1".to_string(),
+                "hydra".to_string(),
+                "gateway-client-1".to_string(),
+            )]
+        );
+    }
+
+    /// SSO-031: the self-service delete endpoint removes the Hydra client and
+    /// the id_mappings row, answering 204.
+    #[tokio::test]
+    async fn delete_registered_client_happy_path() {
+        let hydra = RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        };
+        let delete_calls = hydra.delete_calls.clone();
+        let (state, mappings) = deleting_state(hydra);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        let resp = delete_registered_client(
+            State(state),
+            headers,
+            Path("gateway-client-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            *delete_calls.lock().unwrap(),
+            vec!["hydra-client-id-1".to_string()]
+        );
+        let deleted = mappings.deleted.lock().unwrap();
+        assert_eq!(
+            *deleted,
+            vec![(
+                "system-tenant-1".to_string(),
+                "hydra".to_string(),
+                "gateway-client-1".to_string(),
+            )]
+        );
+    }
+
+    /// Bad Basic credentials never delete anything: terminal 401.
+    #[tokio::test]
+    async fn delete_registered_client_rejects_bad_credentials() {
+        let hydra = RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        };
+        let delete_calls = hydra.delete_calls.clone();
+        let (state, mappings) = deleting_state(hydra);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "wrong-secret"),
+        );
+        let resp = delete_registered_client(
+            State(state),
+            headers,
+            Path("gateway-client-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+        assert!(delete_calls.lock().unwrap().is_empty());
+        assert!(mappings.deleted.lock().unwrap().is_empty());
+    }
+
+    /// The Basic client_id must match the path client_id, or one client's
+    /// credentials could delete another client.
+    #[tokio::test]
+    async fn delete_registered_client_rejects_mismatched_basic_client_id() {
+        let hydra = RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        };
+        let delete_calls = hydra.delete_calls.clone();
+        let (state, mappings) = deleting_state(hydra);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("other-client", "secret"));
+        let resp = delete_registered_client(
+            State(state),
+            headers,
+            Path("gateway-client-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(delete_calls.lock().unwrap().is_empty());
+        assert!(mappings.deleted.lock().unwrap().is_empty());
+    }
+
+    /// An unknown client gets the same terminal `401 invalid_client` the
+    /// other public handlers return (via the resolution self-heal's Hydra
+    /// 404), without reaching the delete.
+    #[tokio::test]
+    async fn delete_registered_client_unknown_client_is_terminal() {
+        let state = Arc::new(resolve_state(Ok(None)));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("unknown-client", "secret"));
+        let resp = delete_registered_client(State(state), headers, Path("unknown-client".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_to_string(resp).await;
+        assert!(body.contains("invalid_client"));
+    }
+
+    /// A client already gone from Hydra is a successful (idempotent) delete:
+    /// the orphaned mapping is reconciled and the endpoint answers 204.
+    #[tokio::test]
+    async fn delete_registered_client_already_gone_from_hydra_is_idempotent() {
+        let (state, mappings) = deleting_state(RecordingHydra {
+            verify_not_found: true,
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        let resp = delete_registered_client(
+            State(state),
+            headers,
+            Path("gateway-client-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(mappings.deleted.lock().unwrap().len(), 1);
+    }
+
+    /// The router serves the self-service delete route; a request without
+    /// credentials reaches the handler and is refused with `invalid_client`
+    /// (not a 405/404 from routing).
+    #[tokio::test]
+    async fn router_serves_register_delete_route() {
+        let hydra = RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        };
+        let (state, _) = deleting_state(hydra);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::delete("/oauth2/register/gateway-client-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

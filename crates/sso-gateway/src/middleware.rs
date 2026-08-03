@@ -131,6 +131,45 @@ fn form_body_client_id(headers: &HeaderMap, body: &[u8]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Endpoint class used to segregate the fallback rate-limit bucket for
+/// requests without an OAuth2 `client_id`.
+///
+/// A burst against one unauthenticated flow (e.g. discovery) must not drain
+/// the bucket shared by every other unauthenticated flow (SSO-031). The set
+/// is deliberately small and fixed so the key space stays bounded under
+/// `MAX_RATE_LIMIT_KEYS`.
+fn endpoint_class(path: &str) -> &'static str {
+    if path.starts_with("/.well-known/") {
+        "discovery"
+    } else if path == "/oauth2/userinfo" || path == "/userinfo" {
+        "userinfo"
+    } else if path == "/oauth2/register" || path.starts_with("/oauth2/register/") {
+        "register"
+    } else if path == "/oauth2/token" {
+        "token"
+    } else if path == "/oauth2/introspect" {
+        "introspect"
+    } else if path == "/oauth2/revoke" {
+        "revoke"
+    } else if path == "/oauth2/device" || path.starts_with("/oauth2/device/") {
+        "device"
+    } else if path == "/oauth2/auth" {
+        "auth"
+    } else if path == "/saml" || path.starts_with("/saml/") {
+        "saml"
+    } else if path == "/scim" || path.starts_with("/scim/") {
+        "scim"
+    } else if path == "/self-service" || path.starts_with("/self-service/") {
+        "self-service"
+    } else if path == "/callbacks" || path.starts_with("/callbacks/") {
+        "callbacks"
+    } else if path == "/health" || path.starts_with("/health/") {
+        "health"
+    } else {
+        "other"
+    }
+}
+
 /// Reject requests with `429 Too Many Requests` when the key's bucket is empty.
 pub async fn rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
@@ -138,6 +177,7 @@ pub async fn rate_limit_middleware(
     next: Next,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
     // These routes already sit behind a 1 MiB DefaultBodyLimit, so buffering
     // the body to sniff a form-encoded client_id is bounded.
     let body = match axum::body::to_bytes(body, 1_048_576).await {
@@ -149,12 +189,16 @@ pub async fn rate_limit_middleware(
         .or_else(|| form_body_client_id(&parts.headers, &body))
     {
         Some(client_id) => client_id,
-        None => "global".to_string(),
+        None => format!("global:{}", endpoint_class(&path)),
     };
     let request = Request::from_parts(parts, Body::from(body));
     if limiter.check(&key) {
         next.run(request).await
     } else {
+        // Log the bucket key and path only — never tokens, secrets, or
+        // Authorization headers — so a drainer is identifiable from prod
+        // logs running at RUST_LOG=warn (SSO-031).
+        tracing::warn!(rate_limit_key = %key, path = %path, "rate limit exceeded");
         StatusCode::TOO_MANY_REQUESTS.into_response()
     }
 }
@@ -185,7 +229,9 @@ fn is_public_path(path: &str) -> bool {
         // the link itself.
         "/self-service/recovery" | "/self-service/verification" => true,
         "/health" | "/health/ready" | "/health/live" => true,
-        _ => path.starts_with("/oauth2/device/"),
+        // DCR client self-delete authenticates with the client's own Basic
+        // credentials inside the handler (SSO-031).
+        _ => path.starts_with("/oauth2/device/") || path.starts_with("/oauth2/register/"),
     }
 }
 
@@ -800,6 +846,7 @@ mod tests {
         assert!(is_public_path("/oauth2/device/auth"));
         assert!(is_public_path("/oauth2/revoke"));
         assert!(is_public_path("/oauth2/register"));
+        assert!(is_public_path("/oauth2/register/01JEXAMPLECLIENTID000000"));
         assert!(is_public_path("/oauth2/introspect"));
         assert!(is_public_path("/oauth2/userinfo"));
         assert!(is_public_path("/userinfo"));
@@ -1068,6 +1115,9 @@ mod tests {
     fn rate_limit_router(limiter: Arc<RateLimiter>) -> Router {
         Router::new()
             .route("/limited", get(ok_handler).post(echo_body))
+            .route("/.well-known/openid-configuration", get(ok_handler))
+            .route("/.well-known/jwks.json", get(ok_handler))
+            .route("/oauth2/userinfo", get(ok_handler))
             .layer(from_fn_with_state(limiter, rate_limit_middleware))
     }
 
@@ -1195,8 +1245,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn endpoint_class_maps_paths_to_fixed_set() {
+        assert_eq!(endpoint_class("/.well-known/openid-configuration"), "discovery");
+        assert_eq!(endpoint_class("/.well-known/jwks.json"), "discovery");
+        assert_eq!(endpoint_class("/oauth2/userinfo"), "userinfo");
+        assert_eq!(endpoint_class("/userinfo"), "userinfo");
+        assert_eq!(endpoint_class("/oauth2/register"), "register");
+        assert_eq!(endpoint_class("/oauth2/register/abc"), "register");
+        assert_eq!(endpoint_class("/oauth2/token"), "token");
+        assert_eq!(endpoint_class("/oauth2/introspect"), "introspect");
+        assert_eq!(endpoint_class("/oauth2/revoke"), "revoke");
+        assert_eq!(endpoint_class("/oauth2/device/auth"), "device");
+        assert_eq!(endpoint_class("/oauth2/auth"), "auth");
+        assert_eq!(endpoint_class("/saml/metadata"), "saml");
+        assert_eq!(endpoint_class("/scim/v2/Users"), "scim");
+        assert_eq!(endpoint_class("/self-service/recovery"), "self-service");
+        assert_eq!(endpoint_class("/callbacks/oidc"), "callbacks");
+        assert_eq!(endpoint_class("/health"), "health");
+        assert_eq!(endpoint_class("/health/ready"), "health");
+        assert_eq!(endpoint_class("/limited"), "other");
+        assert_eq!(endpoint_class("/iam/v1/tenants"), "other");
+    }
+
+    /// Without a client_id, the fallback bucket is keyed per endpoint class:
+    /// draining one class (here `other`) must not starve another (`discovery`).
     #[tokio::test]
-    async fn rate_limit_falls_back_to_global_bucket() {
+    async fn rate_limit_falls_back_to_per_class_global_bucket() {
         let router = rate_limit_router(Arc::new(RateLimiter::new(2, Duration::from_secs(60))));
         for i in 0..2 {
             let response = router
@@ -1207,10 +1282,191 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "request {i} should pass");
         }
         let response = router
+            .clone()
             .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The discovery class bucket is untouched by the `other` burst.
+        let response = router
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Segregation (SSO-031): a burst draining the `discovery` bucket does
+    /// not 429 `userinfo`, and a burst draining `userinfo` does not 429
+    /// `discovery`.
+    #[tokio::test]
+    async fn rate_limit_global_buckets_are_segregated_by_endpoint_class() {
+        // Drain discovery; userinfo must stay available.
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/userinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Drain userinfo; discovery must stay available.
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/oauth2/userinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/oauth2/userinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Paths within one endpoint class share a single bucket:
+    /// `/.well-known/openid-configuration` and `/.well-known/jwks.json` both
+    /// draw from `global:discovery`.
+    #[tokio::test]
+    async fn rate_limit_global_bucket_is_shared_within_endpoint_class() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(2, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Both discovery paths together exhaust the shared bucket.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .oneshot(
+                Request::get("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A client_id-keyed request has its own bucket, independent of every
+    /// `global:*` fallback bucket.
+    #[tokio::test]
+    async fn rate_limit_client_id_buckets_are_independent_of_global_buckets() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        // Drain the `global:other` bucket with client_id-less requests.
+        let response = router
+            .clone()
+            .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(Request::get("/limited").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // A client_id-keyed request to the same path still passes.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited?client_id=query-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // ...and its own bucket is the one that drains.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/limited?client_id=query-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The client_id burst never touched the `global:discovery` bucket.
+        let response = router
+            .oneshot(
+                Request::get("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// On every other public path the bearer token is the protocol
