@@ -126,11 +126,16 @@ async fn entitlement_service_keto_lifecycle() {
             .expect("check should succeed")
     );
 
-    // The scope ceiling follows the gateway entitlement.
+    // The scope ceiling follows the gateway entitlement and stays additive:
+    // admins keep the OIDC baseline alongside the iam scopes (SSO-036).
     let ceiling = svc.effective_scope_ceiling(&tenant, "alice").await;
     assert!(
         ceiling.iter().any(|s| s == "tenant:admin"),
         "admin ceiling expected, got {ceiling:?}"
+    );
+    assert!(
+        ceiling.iter().any(|s| s == "openid"),
+        "admin ceiling must include the OIDC baseline, got {ceiling:?}"
     );
 
     // Direct grants work alongside group-derived access.

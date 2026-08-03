@@ -273,9 +273,13 @@ mutation hook in the authorize proxy.
 
 | Entitlement in tenant | Effective scope ceiling |
 |---|---|
-| `admin` of the gateway application | all `*:admin` + `*:read` scopes |
-| `member` of the gateway application | `*:read` scopes |
+| `admin` of the gateway application | OIDC scopes + all `*:admin` + `*:read` scopes |
+| `member` of the gateway application | OIDC scopes + `*:read` scopes |
 | none | OIDC scopes only (`openid profile email offline_access`) |
+
+  The OIDC baseline (`openid profile email offline_access`) is additive:
+  a higher entitlement MUST never shrink the ceiling below what any
+  authenticated user can consent to (SSO-036).
 
 - The client's registered ceiling remains the outer bound; the entitlement
   ceiling is the per-user inner bound. The granted set MUST NOT exceed

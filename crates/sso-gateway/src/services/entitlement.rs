@@ -305,7 +305,12 @@ impl EntitlementService for EntitlementServiceImpl {
             }
         };
         if is_gateway_admin {
-            return admin_scope_ceiling();
+            // Ceilings are additive (SSO-036): a gateway admin keeps the OIDC
+            // baseline every authenticated user can consent to, plus the iam
+            // admin/read scopes. Privilege must never shrink the ceiling.
+            let mut ceiling = admin_scope_ceiling();
+            ceiling.extend(oidc_scope_ceiling());
+            return ceiling;
         }
 
         let is_gateway_member = match self
@@ -319,7 +324,9 @@ impl EntitlementService for EntitlementServiceImpl {
             }
         };
         if is_gateway_member {
-            return read_scope_ceiling();
+            let mut ceiling = read_scope_ceiling();
+            ceiling.extend(oidc_scope_ceiling());
+            return ceiling;
         }
 
         oidc_scope_ceiling()
@@ -1241,6 +1248,8 @@ mod tests {
         let ceiling = svc.effective_scope_ceiling("tenant-1", "user-1").await;
         assert!(ceiling.contains(&SCOPE_APPLICATION_ADMIN.to_string()));
         assert!(ceiling.contains(&SCOPE_APPLICATION_READ.to_string()));
+        // SSO-036: the OIDC baseline is additive — privilege must not shrink it.
+        assert!(ceiling.contains(&"openid".to_string()));
     }
 
     #[tokio::test]
@@ -1250,6 +1259,8 @@ mod tests {
         let ceiling = svc.effective_scope_ceiling("tenant-1", "user-1").await;
         assert!(!ceiling.contains(&SCOPE_APPLICATION_ADMIN.to_string()));
         assert!(ceiling.contains(&SCOPE_APPLICATION_READ.to_string()));
+        // SSO-036: members keep the OIDC baseline alongside read scopes.
+        assert!(ceiling.contains(&"openid".to_string()));
     }
 
     #[tokio::test]
