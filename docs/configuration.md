@@ -65,7 +65,7 @@ All configuration is read from environment variables.
 | `DATABASE_IDLE_TIMEOUT_SECONDS` | `600` | Idle connection timeout. |
 | `DATABASE_MAX_LIFETIME_SECONDS` | `1800` | Maximum lifetime of a pool connection. |
 | `DATABASE_STATEMENT_TIMEOUT_SECONDS` | `30` | Postgres statement timeout. |
-| `PUBLIC_RATE_LIMIT_REQUESTS` | `100` | Maximum number of requests allowed per public IP in the rate-limit window. |
+| `PUBLIC_RATE_LIMIT_REQUESTS` | `100` | Maximum number of requests allowed per rate-limit bucket in the window. |
 | `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Duration of the rate-limit window in seconds. |
 
 ## Branded self-service paths
@@ -124,6 +124,6 @@ causes identity creation to fail.
 - The gateway runs `sqlx migrate` against `DATABASE_URL` on startup.
 - The gateway session cookie is named `__Host-sso_session`. The `__Host-` prefix requires `Secure=true`; startup fails if `COOKIE_SECURE=false`.
 - Bearer tokens and session cookies are both accepted by the shared auth middleware. Session cookies are verified locally; bearer tokens are introspected via Hydra and cached in `token_introspection_cache`.
-- Public routes (discovery, authorization, token, device, federation callbacks, SAML metadata/ACS/SSO, and universal login callbacks) are rate-limited per source IP using a token-bucket algorithm.
+- Public routes are rate-limited with a per-key token bucket: requests carrying an OAuth2 `client_id` (Basic auth, query, or form body) get a bucket per client; client_id-less requests fall back to a bucket per endpoint class (`global:discovery`, `global:userinfo`, `global:register`, …), so a burst on one public endpoint cannot 429 unrelated flows. Rejections are logged at warn with the bucket key and path.
 - The maximum request body size for all routes is 1 MiB.
 - For production, use mTLS or network policies to protect the Ory admin endpoints.

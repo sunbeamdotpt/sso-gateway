@@ -341,6 +341,17 @@ allowed = entitlement claim says app-admin
 
 ## 4. Data Model
 
+> **Erratum (2026-08-03, SSO-029):** the tuple shapes below were simplified at
+> implementation time. The gateway's OpenFGA mapping uses the namespace name as
+> the object type, so applications and groups both live as `entitlements`
+> objects: membership is `entitlements:<group>#member @ user:<id>`, and group
+> links are userset subjects on the checked relations —
+> `entitlements:<app>#{member,admin} @ entitlements:<group>#member`. The model
+> is `type user` plus `type entitlements` with
+> `define member: [user, entitlements#member]` (same for `admin`). Semantics,
+> including "admin ⊇ group members", are unchanged; the `application:`/`group:`
+> object-type split described below never shipped in working form.
+
 The entitlement namespace model (OpenFGA DSL, sketch):
 
 ```

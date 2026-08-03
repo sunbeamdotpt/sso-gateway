@@ -19,6 +19,9 @@ This is a backend-only unified IAM gateway. It hides Ory Hydra, Ory Kratos, and 
 - **Branded browser surface**: No Ory path may ever reach a browser — not in an address bar, redirect chain, or inbox. Every Kratos self-service URL is rewritten onto the gateway-owned paths configured via `SELF_SERVICE_*_PATH` (defaults `/identity/…`); the translation table and nested-`return_to` rewriting live in `services/self_service_url_rewriter.rs`, the browser proxy in `services/handlers/self_service.rs`, and Kratos-shaped email links bounce through the `/self-service/{recovery,verification}` shims. Caller- and app-owned URLs (`return_to`, OAuth2 client URIs) get the host-only rewrite; their paths are not ours to rebrand.
 - **SAML**: The gateway is both a SAML Service Provider (`/saml/metadata`, `/saml/acs`) and a SAML Identity Provider (`/saml/sso`). IdP signing keys are stored in `saml_idp_keys`; SP client configuration is stored in `saml_sp_clients`.
 - **Latest versions**: Use the latest compatible versions of crates. Do not pin versions unless required to resolve a known incompatibility.
+- **Production service**: This gateway runs in production for real tenants (deployed to the sbbb cluster; deploys tracked as SBBB cards). Treat every change as production-bound:
+  - Every behavioral change ships with unit tests **and** container-based integration tests. The permission/entitlement layer must be verified on **both** the `keto` and `openfga` features — never land a permission change tested on only one backend.
+  - **Never assume fresh state.** Every change touching a stateful backend (Postgres, OpenFGA, Keto, Hydra, Kratos) must define and test its migration/convergence path from the previous release's persisted state: sqlx migrations must be rolling-deploy compatible; OpenFGA model changes publish new model versions into existing stores (tuples are never re-initialized); bootstrap/startup paths must be idempotent and must converge partial state left by a crashed earlier attempt (orphaned stores, half-written registry rows, duplicate tuple writes).
 
 ## Code layout
 
@@ -80,10 +83,12 @@ consistency) must stay reachable through the gateway API.
 
 - Tenant namespaces are registered via `EnsurePermissionNamespace` with a full
   OpenFGA model; the registry lives in `permission_namespaces` (plus the
-  `permission_namespace_types` index mapping object type → namespace).
-  Ensuring an identical model is a no-op; a changed model publishes a new
-  OpenFGA model version into the existing store — tuples are never
-  re-initialized.
+  `permission_namespace_types` index mapping object type → namespace). Only
+  relation-bearing (object-capable) types are indexed and uniqueness-checked;
+  bare subject types such as `user` may be declared by many namespaces of the
+  same tenant. Ensuring an identical model is a no-op; a changed model
+  publishes a new OpenFGA model version into the existing store — tuples are
+  never re-initialized.
 - On OpenFGA, each (tenant, namespace) maps to exactly one store; tuple and
   check calls resolve the store through the type index.
 - `ListRelationTuples` reads from the `permission_tuples` mirror with keyset

@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Added
+
+- `DELETE /oauth2/register/{client_id}`: a DCR client can delete itself with
+  its own Basic credentials; the gateway removes both the Hydra client and
+  its `id_mappings` row (SSO-031).
+
+### Fixed
+
+- Fresh OpenFGA bootstrap no longer crashes with `type 'entitlements' not
+  found`: the entitlement model now follows the gateway's
+  namespace-as-object-type convention (types `user` + `entitlements`), and
+  seeded group links are userset subjects on the checked relations, so
+  group-derived member/admin checks resolve on both OpenFGA and Keto
+  (SSO-029).
+- Bootstrap on existing deployments no longer fails with `type user is
+  already registered`: the permission namespace type index now covers only
+  relation-bearing (object-capable) types, so bare subject types such as
+  `user` may be shared across namespaces of the same tenant (SSO-030).
+- Entitlement seeding and grant/revoke/membership writes are idempotent
+  (read-before-write on OpenFGA; Keto deduplicates natively), so gateway
+  restarts and SCIM retries no longer fail on duplicate tuples (SSO-029).
+- Startup adopts an existing `{tenant}-{namespace}` OpenFGA store instead of
+  creating another orphan after a crashed earlier bootstrap attempt
+  (SSO-030).
+- Matrix scopes are recognized in both MSC2965 (`urn:matrix:client:`) and
+  MSC2967 (`urn:matrix:org.matrix.msc2967.client:`) forms at DCR, authorize,
+  and token introspection, unbreaking Element X/26.07.4 logins (SSO-032).
+- Client_id-less public endpoints no longer share a single global rate-limit
+  bucket: the fallback bucket is keyed per endpoint class
+  (`global:discovery`, `global:userinfo`, …), and 429 decisions are logged
+  at warn with the bucket key and path (SSO-031).
+- Introspection for a Hydra-deleted client now removes the orphaned
+  `id_mappings` row and fails terminally at resolution instead of being
+  forwarded to Hydra on every retry (SSO-031).
+
+### Changed
+
+- `PermissionNamespace.types` and the type index list relation-bearing
+  object types only; bare subject types such as `user` are no longer
+  indexed or uniqueness-checked across namespaces (SSO-030).
+
 ## [2026.07.31] - 2026-07-31
 
 ### Fixed
