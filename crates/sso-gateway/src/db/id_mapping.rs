@@ -83,6 +83,19 @@ pub trait IdMappingStore: Send + Sync + 'static {
         ory_global_id: &str,
     ) -> Result<Option<String>, DbError>;
 
+    /// Move a mapping row to a different tenant (DCR first-use re-home,
+    /// SSO-039). `public_id` is globally unique, so this is a plain row
+    /// update keyed by backend + public id. Stores that cannot re-home keep
+    /// the default.
+    async fn update_tenant(
+        &self,
+        backend: &str,
+        public_id: &str,
+        new_tenant_id: &str,
+    ) -> Result<(), DbError> {
+        let _ = (backend, public_id, new_tenant_id);
+        Err(DbError::MappingNotFound)
+    }
 }
 
 #[derive(Clone)]
@@ -255,6 +268,26 @@ impl PgIdMappingStore {
         ory_id.ok_or(DbError::MappingNotFound)
     }
 
+    pub async fn update_tenant(
+        &self,
+        backend: &str,
+        public_id: &str,
+        new_tenant_id: &str,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE id_mappings SET tenant_id = $3 \
+             WHERE backend = $1 AND public_id = $2",
+        )
+        .bind(backend)
+        .bind(public_id)
+        .bind(new_tenant_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::MappingNotFound);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -332,6 +365,14 @@ impl IdMappingStore for PgIdMappingStore {
         self.get_tenant_id_by_ory_id(backend, ory_global_id).await
     }
 
+    async fn update_tenant(
+        &self,
+        backend: &str,
+        public_id: &str,
+        new_tenant_id: &str,
+    ) -> Result<(), DbError> {
+        self.update_tenant(backend, public_id, new_tenant_id).await
+    }
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for IdMappingRow {
@@ -539,6 +580,41 @@ impl IdMappingStore for MemoryIdMappingStore {
             .find(|row| row.backend == backend && row.ory_global_id == ory_global_id)
             .map(|row| row.tenant_id.clone()))
     }
+
+    async fn update_tenant(
+        &self,
+        backend: &str,
+        public_id: &str,
+        new_tenant_id: &str,
+    ) -> Result<(), DbError> {
+        let mut lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let old_key = lock
+            .values()
+            .find(|row| row.backend == backend && row.public_id == public_id)
+            .map(|row| {
+                (
+                    row.tenant_id.clone(),
+                    row.backend.clone(),
+                    row.public_id.clone(),
+                )
+            })
+            .ok_or(DbError::MappingNotFound)?;
+        if let Some(mut row) = lock.remove(&old_key) {
+            row.tenant_id = new_tenant_id.to_string();
+            lock.insert(
+                (
+                    new_tenant_id.to_string(),
+                    backend.to_string(),
+                    public_id.to_string(),
+                ),
+                row,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -699,5 +775,101 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn pg_update_tenant_rehomes_mapping() {
+        let pool = postgres_pool().await;
+        let store: Arc<dyn IdMappingStore> = Arc::new(PgIdMappingStore::new(pool.clone()));
+        let tenant_a = format!("tenant-{}", Ulid::new());
+        let tenant_b = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant_a).await;
+        create_test_tenant(&pool, &tenant_b).await;
+        let public_id = format!("public-{}", Ulid::new());
+        let ory_id = format!("ory-{}", Ulid::new());
+        store
+            .create(&tenant_a, "hydra", &public_id, &ory_id)
+            .await
+            .unwrap();
+
+        store
+            .update_tenant("hydra", &public_id, &tenant_b)
+            .await
+            .unwrap();
+
+        // The row now resolves in the new tenant and no longer in the old.
+        assert_eq!(
+            store
+                .get_public_id(&tenant_b, "hydra", &ory_id)
+                .await
+                .unwrap(),
+            public_id
+        );
+        assert!(matches!(
+            store.get_public_id(&tenant_a, "hydra", &ory_id).await,
+            Err(DbError::MappingNotFound)
+        ));
+        assert_eq!(
+            store
+                .get_tenant_id_by_ory_id("hydra", &ory_id)
+                .await
+                .unwrap(),
+            Some(tenant_b.clone())
+        );
+        assert_eq!(
+            store
+                .get_ory_id(&tenant_b, "hydra", &public_id)
+                .await
+                .unwrap(),
+            ory_id
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_update_tenant_missing_mapping_returns_not_found() {
+        let store = store().await;
+        let err = store
+            .update_tenant("hydra", "missing", "tenant")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::MappingNotFound));
+    }
+
+    #[tokio::test]
+    async fn memory_update_tenant_rehomes_mapping() {
+        let store = MemoryIdMappingStore::default();
+        store
+            .create("tenant-a", "hydra", "public-1", "ory-1")
+            .await
+            .unwrap();
+
+        store
+            .update_tenant("hydra", "public-1", "tenant-b")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_public_id("tenant-b", "hydra", "ory-1")
+                .await
+                .unwrap(),
+            "public-1"
+        );
+        assert!(matches!(
+            store.get_public_id("tenant-a", "hydra", "ory-1").await,
+            Err(DbError::MappingNotFound)
+        ));
+        assert_eq!(
+            store
+                .get_tenant_id_by_ory_id("hydra", "ory-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tenant-b")
+        );
+        assert!(matches!(
+            store.update_tenant("hydra", "missing", "tenant-b").await,
+            Err(DbError::MappingNotFound)
+        ));
     }
 }

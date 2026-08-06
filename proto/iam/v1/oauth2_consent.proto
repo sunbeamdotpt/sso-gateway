@@ -58,6 +58,11 @@ message ConsentRequest {
   google.protobuf.Struct oidc_context = 8;
   // OAuth2 client metadata.
   OAuth2Client client = 9;
+  // Whether accepting this consent is the subject's first-use approval of a
+  // DCR-registered client: acceptance grants the subject member access to the
+  // application (SSO-039). The consent UI should render first-use approval
+  // copy when set.
+  bool first_use = 10;
 }
 
 // AcceptConsentRequest is the input for accepting a consent request.

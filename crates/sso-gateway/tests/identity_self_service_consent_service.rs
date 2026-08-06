@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
@@ -8,6 +11,7 @@ use axum::{
 };
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_FLOW,
@@ -22,7 +26,6 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
-use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -150,7 +153,10 @@ async fn kratos_submit_flow(
         "set-cookie",
         "ory_kratos_session=mock; Path=/; HttpOnly".parse().unwrap(),
     );
-    let flow_id = params.get("flow").cloned().unwrap_or_else(|| "flow-1".into());
+    let flow_id = params
+        .get("flow")
+        .cloned()
+        .unwrap_or_else(|| "flow-1".into());
     // Kratos answers a failed password submit with 400 and the flow JSON
     // itself as the body — raw flow UUID in `id` and in the flow URLs.
     if body.get("password").and_then(|p| p.as_str()) == Some("wrong-password") {
@@ -356,9 +362,7 @@ async fn hydra_get_login(
     }))
 }
 
-async fn hydra_accept_login(
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn hydra_accept_login(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(json!({
         "redirect_to": format!("http://redirect-after-login?subject={}", body["subject"].as_str().unwrap_or(""))
     }))
@@ -549,6 +553,7 @@ async fn self_service_and_consent_round_trip() {
         hydra.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        Arc::new(sso_gateway::db::ApplicationRepo::new(pool.clone())),
         sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
         sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         entitlements(),
@@ -564,6 +569,7 @@ async fn self_service_and_consent_round_trip() {
         kratos.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        Arc::new(sso_gateway::db::ApplicationRepo::new(pool.clone())),
         entitlements(),
         Vec::new(),
     ));
@@ -733,17 +739,17 @@ async fn self_service_and_consent_round_trip() {
         "create_login_flow (no skip) failed: {}",
         resp.text().await.unwrap_or_default()
     );
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .expect("no-skip response should be json");
+    let body: serde_json::Value = resp.json().await.expect("no-skip response should be json");
     let flow_id = body["id"].as_str().unwrap_or_default();
     assert!(
         ulid::Ulid::from_string(flow_id).is_ok(),
         "no-skip path should create a flow with a public id: {body}"
     );
     assert!(
-        body["redirectBrowserTo"].as_str().unwrap_or_default().is_empty(),
+        body["redirectBrowserTo"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "no-skip path must not redirect: {body}"
     );
 
@@ -1285,6 +1291,7 @@ async fn submit_login_flow_wrong_password_error_scrubs_raw_flow_id() {
         hydra.clone(),
         TransientTokenRepo::new(pool.clone()),
         mappings.clone(),
+        Arc::new(sso_gateway::db::ApplicationRepo::new(pool.clone())),
         sso_gateway::db::IdentitySchemaRepo::new(pool.clone()),
         sso_gateway::db::TenantMembershipRepo::new(pool.clone()),
         entitlements(),

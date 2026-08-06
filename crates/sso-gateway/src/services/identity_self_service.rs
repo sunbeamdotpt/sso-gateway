@@ -13,8 +13,8 @@ use tracing::{instrument, warn};
 use ulid::Ulid;
 
 use crate::db::{
-    DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, IdentitySchemaStore,
-    TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
+    ApplicationStore, DbError, IdMappingRepo, IdMappingStore, IdentitySchemaRepo,
+    IdentitySchemaStore, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
     TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
     TenantMembershipRepo, TenantMembershipStore, TransientTokenRepo, TransientTokenStore,
 };
@@ -28,6 +28,7 @@ use crate::proto::iam::v1::{
     SubmitRecoveryTokenResponse, SubmitVerificationTokenRequest, SubmitVerificationTokenResponse,
     TenantCapabilities, ToSessionRequest, WebAuthnJsResponse,
 };
+use crate::services::client_entitlement::{ClientEntitlement, resolve_client_entitlement};
 use crate::services::entitlement::EntitlementService;
 use crate::services::identity::{extract_email, normalize_traits, validate_traits};
 use buffa_types::google::protobuf::Empty;
@@ -438,6 +439,7 @@ pub struct IdentitySelfServiceImpl {
     hydra: Arc<dyn LoginHydra>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
+    applications: Arc<dyn ApplicationStore>,
     schemas: Arc<dyn IdentitySchemaStore>,
     memberships: Arc<dyn TenantMembershipStore>,
     entitlements: Arc<dyn EntitlementService>,
@@ -483,6 +485,103 @@ fn aal_level_from_login_request(login_request: &Value) -> i32 {
     required
 }
 
+/// Audit-log that an unentitled user's login is deferred to the consent step
+/// because the client is first-use eligible (SSO-039).
+fn defer_to_consent(tenant_id: &str, public_subject: &str, app_public_id: &str) {
+    tracing::info!(
+        target: "sso_gateway::audit",
+        tenant_id = tenant_id,
+        actor = public_subject,
+        application = app_public_id,
+        action = "entitlement.login_deferred_to_consent",
+        outcome = "deferred",
+        "unentitled user of a first-use-eligible client; deferring the decision to consent"
+    );
+}
+
+/// Audit-log and return the login-gate denial for an unentitled user of a
+/// non-eligible client. `member` is the failed membership check.
+fn deny_login(
+    tenant_id: &str,
+    public_subject: &str,
+    app_public_id: &str,
+    member: Result<bool, ServiceError>,
+) -> Result<(), ServiceError> {
+    match member {
+        Err(err) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.login_denied",
+                outcome = "error",
+                error = ?err,
+                "entitlement check failed; refusing login"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.login_denied",
+                outcome = "denied",
+                "user is not entitled to this application"
+            );
+        }
+    }
+    Err(ServiceError::PermissionDenied(
+        "user is not entitled to this application".into(),
+    ))
+}
+
+/// Audit-log and return the login-gate denial for a cross-tenant user of a
+/// `cross_tenant`-flagged application who lacks a per-user grant in the
+/// owner tenant. The audit record is written against the OWNER tenant (with
+/// `subject_tenant` identifying the user's home tenant) so the owner's audit
+/// trail shows every foreign access decision. `member` is the failed
+/// membership check.
+fn deny_login_cross_tenant(
+    owner_tenant: &str,
+    subject_tenant: &str,
+    public_subject: &str,
+    app_public_id: &str,
+    member: Result<bool, ServiceError>,
+) -> Result<(), ServiceError> {
+    match member {
+        Err(err) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = owner_tenant,
+                subject_tenant = subject_tenant,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.login_denied",
+                outcome = "error",
+                error = ?err,
+                "cross-tenant entitlement check failed; refusing login"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = owner_tenant,
+                subject_tenant = subject_tenant,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.login_denied",
+                outcome = "denied",
+                "cross-tenant user is not entitled to this application"
+            );
+        }
+    }
+    Err(ServiceError::PermissionDenied(
+        "user is not entitled to this application".into(),
+    ))
+}
+
 impl IdentitySelfServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -490,6 +589,7 @@ impl IdentitySelfServiceImpl {
         hydra: Arc<HydraClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
+        applications: Arc<dyn ApplicationStore>,
         schemas: IdentitySchemaRepo,
         memberships: TenantMembershipRepo,
         entitlements: Arc<dyn EntitlementService>,
@@ -505,6 +605,7 @@ impl IdentitySelfServiceImpl {
             hydra: hydra as Arc<dyn LoginHydra>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            applications,
             schemas: Arc::new(schemas) as Arc<dyn IdentitySchemaStore>,
             memberships: Arc::new(memberships) as Arc<dyn TenantMembershipStore>,
             entitlements,
@@ -590,16 +691,28 @@ impl IdentitySelfServiceImpl {
         if let Err(err) = validate_traits(&schema.schema_json, &traits) {
             // Roll back the mapping so we don't leave a half-provisioned
             // identity; the Kratos record itself is unchanged.
-            let _ = self.mappings.delete(tenant_id, BACKEND_KRATOS, &public_id).await;
+            let _ = self
+                .mappings
+                .delete(tenant_id, BACKEND_KRATOS, &public_id)
+                .await;
             return Err(err);
         }
 
         if let Err(err) = self
             .memberships
-            .upsert(tenant_id, &public_id, &schema.schema_id, schema.version, traits)
+            .upsert(
+                tenant_id,
+                &public_id,
+                &schema.schema_id,
+                schema.version,
+                traits,
+            )
             .await
         {
-            let _ = self.mappings.delete(tenant_id, BACKEND_KRATOS, &public_id).await;
+            let _ = self
+                .mappings
+                .delete(tenant_id, BACKEND_KRATOS, &public_id)
+                .await;
             return Err(err.into());
         }
 
@@ -644,7 +757,8 @@ impl IdentitySelfServiceImpl {
             return Ok(());
         }
 
-        self.provision_self_service_identity(tenant_id, &identity).await
+        self.provision_self_service_identity(tenant_id, &identity)
+            .await
     }
 
     /// Replace every non-empty `flow` query parameter in `value` with the
@@ -917,7 +1031,10 @@ impl IdentitySelfServiceImpl {
         let login_request = match self.hydra.get_login_request(ory_challenge).await {
             Ok(request) => request,
             Err(err) => {
-                tracing::debug!(?err, "hydra login request fetch failed; creating kratos flow");
+                tracing::debug!(
+                    ?err,
+                    "hydra login request fetch failed; creating kratos flow"
+                );
                 return Ok(None);
             }
         };
@@ -958,19 +1075,25 @@ impl IdentitySelfServiceImpl {
             return Ok(None);
         }
 
-        // Resolve the OAuth2 client to the public application id and enforce
-        // the application-entitlement gate before any session/token exists.
+        // Resolve the OAuth2 client to its entitlement/ownership state and
+        // enforce the application-entitlement gate before any session/token
+        // exists. First-use-eligible clients (DCR-registered, not yet usable
+        // by this user) are NOT denied here: the login proceeds to the
+        // consent step, which makes the decision (SSO-039).
         if let Some(ory_client_id) = login_request
             .pointer("/client/client_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            match self
-                .mappings
-                .get_public_id(tenant_id, BACKEND_HYDRA, ory_client_id)
-                .await
+            match resolve_client_entitlement(
+                &*self.mappings,
+                &*self.applications,
+                tenant_id,
+                ory_client_id,
+            )
+            .await
             {
-                Ok(app_public_id) => {
+                Ok(resolution) => {
                     let public_subject = match self
                         .mappings
                         .get_public_id(tenant_id, BACKEND_KRATOS, subject)
@@ -985,40 +1108,104 @@ impl IdentitySelfServiceImpl {
                             subject.to_string()
                         }
                     };
-                    match self
-                        .entitlements
-                        .is_member(tenant_id, &public_subject, &app_public_id)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::info!(
-                                target: "sso_gateway::audit",
-                                tenant_id = tenant_id,
-                                actor = public_subject,
-                                application = app_public_id,
-                                action = "entitlement.login_denied",
-                                outcome = "denied",
-                                "user is not entitled to this application"
+                    match resolution {
+                        ClientEntitlement::Unmapped => {
+                            // Truly unmapped client (legacy/heal paths): keep
+                            // the historical pass-through. A hard deny here is
+                            // a documented follow-up.
+                            tracing::debug!(
+                                tenant_id,
+                                ory_client_id,
+                                "unable to resolve application for login entitlement check"
                             );
-                            return Err(ServiceError::PermissionDenied(
-                                "user is not entitled to this application".into(),
-                            ));
                         }
-                        Err(err) => {
-                            tracing::info!(
-                                target: "sso_gateway::audit",
-                                tenant_id = tenant_id,
-                                actor = public_subject,
-                                application = app_public_id,
-                                action = "entitlement.login_denied",
-                                outcome = "error",
-                                error = ?err,
-                                "entitlement check failed; refusing login"
-                            );
-                            return Err(ServiceError::PermissionDenied(
-                                "user is not entitled to this application".into(),
-                            ));
+                        // Cross-tenant ownership is first-consent-wins and
+                        // permanent. A row flagged `cross_tenant` admits
+                        // foreign subjects that hold a per-user grant in the
+                        // OWNER tenant's entitlement store; unflagged rows
+                        // fail closed regardless of local state.
+                        ClientEntitlement::CrossTenantOwned {
+                            public_id,
+                            owner_tenant,
+                            cross_tenant,
+                        } => {
+                            if !cross_tenant {
+                                tracing::info!(
+                                    target: "sso_gateway::audit",
+                                    tenant_id = tenant_id,
+                                    actor = public_subject,
+                                    application = public_id,
+                                    owner_tenant = owner_tenant,
+                                    action = "entitlement.login_denied",
+                                    outcome = "cross_tenant",
+                                    "application belongs to a different organization"
+                                );
+                                return Err(ServiceError::PermissionDenied(
+                                    "application belongs to a different organization".into(),
+                                ));
+                            }
+                            match self
+                                .entitlements
+                                .is_member(&owner_tenant, &public_subject, &public_id)
+                                .await
+                            {
+                                Ok(true) => {
+                                    tracing::info!(
+                                        target: "sso_gateway::audit",
+                                        tenant_id = owner_tenant,
+                                        subject_tenant = tenant_id,
+                                        actor = public_subject,
+                                        application = public_id,
+                                        action = "entitlement.cross_tenant_allowed",
+                                        outcome = "allowed",
+                                        "cross-tenant user is entitled to this application"
+                                    );
+                                }
+                                member => {
+                                    deny_login_cross_tenant(
+                                        &owner_tenant,
+                                        tenant_id,
+                                        &public_subject,
+                                        &public_id,
+                                        member,
+                                    )?;
+                                }
+                            }
+                        }
+                        ClientEntitlement::Local { public_id, source } => {
+                            match self
+                                .entitlements
+                                .is_member(tenant_id, &public_subject, &public_id)
+                                .await
+                            {
+                                Ok(true) => {}
+                                member => {
+                                    if source == crate::db::REGISTRATION_SOURCE_DCR {
+                                        defer_to_consent(tenant_id, &public_subject, &public_id);
+                                    } else {
+                                        deny_login(tenant_id, &public_subject, &public_id, member)?;
+                                    }
+                                }
+                            }
+                        }
+                        // A provisional client owned by another tenant has no
+                        // local tuples to check; it is first-use eligible and
+                        // the consent step claims it for this tenant.
+                        ClientEntitlement::Provisional {
+                            public_id,
+                            owner_tenant,
+                        } => {
+                            let member = if owner_tenant == tenant_id {
+                                self.entitlements
+                                    .is_member(tenant_id, &public_subject, &public_id)
+                                    .await
+                            } else {
+                                Ok(false)
+                            };
+                            match member {
+                                Ok(true) => {}
+                                _ => defer_to_consent(tenant_id, &public_subject, &public_id),
+                            }
                         }
                     }
                 }
@@ -1174,13 +1361,17 @@ impl IdentitySelfServiceImpl {
         {
             Ok(public_id) => {
                 obj.insert("id".to_string(), Value::String(public_id));
-                if let Some(url) = obj.get("request_url").and_then(Value::as_str).map(str::to_owned)
+                if let Some(url) = obj
+                    .get("request_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
                     && let Ok(scrubbed) = self.scrub_flow_id_in_url(tenant_id, &url, false).await
                 {
                     obj.insert("request_url".to_string(), Value::String(scrubbed));
                 }
                 if let Some(ui) = obj.get_mut("ui").and_then(Value::as_object_mut)
-                    && let Some(action) = ui.get("action").and_then(Value::as_str).map(str::to_owned)
+                    && let Some(action) =
+                        ui.get("action").and_then(Value::as_str).map(str::to_owned)
                     && let Ok(scrubbed) = self.scrub_flow_id_in_url(tenant_id, &action, false).await
                 {
                     ui.insert("action".to_string(), Value::String(scrubbed));
@@ -2089,12 +2280,15 @@ mod tests {
         kratos::{KratosClient, KratosRedirectResponse, KratosResponse},
     };
     use sunbeam_g2v::error::ServiceError;
+    use tracing_subscriber::prelude::*;
 
     use crate::db::{
-        DbError, IdMappingRow, IdMappingStore, IdentitySchemaRow, IdentitySchemaStore,
-        TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE, TOKEN_TYPE_LOGOUT_TOKEN,
-        TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION, TOKEN_TYPE_VERIFICATION_TOKEN,
-        TenantMembershipRow, TenantMembershipStore, TransientTokenRow, TransientTokenStore,
+        ApplicationStore, DbError, IdMappingRow, IdMappingStore, IdentitySchemaRow,
+        IdentitySchemaStore, MemoryApplicationStore, REGISTRATION_SOURCE_ADMIN,
+        REGISTRATION_SOURCE_DCR, TOKEN_TYPE_FLOW, TOKEN_TYPE_LOGIN_CHALLENGE,
+        TOKEN_TYPE_LOGOUT_TOKEN, TOKEN_TYPE_RECOVERY_TOKEN, TOKEN_TYPE_SESSION,
+        TOKEN_TYPE_VERIFICATION_TOKEN, TenantMembershipRow, TenantMembershipStore,
+        TransientTokenRow, TransientTokenStore,
     };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
@@ -2110,7 +2304,10 @@ mod tests {
         BACKEND_HYDRA, BACKEND_KRATOS, IdentitySelfServiceImpl, KratosSelfService, LoginHydra,
         cookie_from_context, csrf_token_from_context, map_ory_error, tenant_from_context,
     };
-    use crate::services::entitlement::{EntitlementService, test_helpers::{ConfigurableEntitlementService, entitlements}};
+    use crate::services::entitlement::{
+        EntitlementService,
+        test_helpers::{ConfigurableEntitlementService, entitlements},
+    };
 
     fn request_context_with_cookie(cookie: &str) -> RequestContext {
         let mut headers = HeaderMap::new();
@@ -2144,6 +2341,53 @@ mod tests {
         let view = Req::View::decode_view(bytes).unwrap();
         let view: &'static Req::View<'static> = Box::leak(Box::new(view));
         ServiceRequest::from_parts(view, bytes)
+    }
+
+    /// Tracing layer capturing audit events for field assertions.
+    #[derive(Default, Clone)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{:?}", value));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields: visitor.fields,
+            });
+        }
     }
 
     fn sample_flow() -> KratosResponse {
@@ -2715,9 +2959,15 @@ mod tests {
         async fn get_tenant_id_by_ory_id(
             &self,
             _backend: &str,
-            _ory_global_id: &str,
+            ory_global_id: &str,
         ) -> Result<Option<String>, DbError> {
-            Ok(None)
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.ory_global_id == ory_global_id)
+                .map(|r| r.tenant_id.clone()))
         }
     }
 
@@ -2849,6 +3099,42 @@ mod tests {
         StubMappingStore::default()
             .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
             .with_mapping("tenant-1", BACKEND_HYDRA, "pub-client-1", "client-1")
+    }
+
+    /// Session + Hydra fixtures for the login entitlement gate: a skippable
+    /// login request for `client-1` and a valid aal1 session.
+    fn login_gate_fixtures() -> (FakeKratos, FakeHydra) {
+        let fake = FakeKratos {
+            session: Arc::new(Mutex::new(Some(Ok(json!({
+                "id": "session-1",
+                "active": true,
+                "authenticator_assurance_level": "aal1",
+                "identity": { "id": "identity-1" },
+                "authentication_methods": [{ "method": "password", "aal": "aal1" }]
+            }))))),
+            ..Default::default()
+        };
+        let hydra = FakeHydra {
+            login_request: Arc::new(Mutex::new(Some(Ok(json!({
+                "challenge": "challenge-1",
+                "skip": true,
+                "client": { "client_id": "client-1" }
+            }))))),
+            accept_login: Arc::new(Mutex::new(Some(Ok(json!({
+                "redirect_to": "https://hydra.example.com/oauth2/auth?login_verifier=v1"
+            }))))),
+            ..Default::default()
+        };
+        (fake, hydra)
+    }
+
+    async fn admin_app_store(tenant_id: &str, public_id: &str) -> MemoryApplicationStore {
+        let store = MemoryApplicationStore::default();
+        store
+            .create(tenant_id, public_id, false, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
+        store
     }
 
     fn default_transient_store() -> StubTransientTokenStore {
@@ -3207,11 +3493,28 @@ mod tests {
         hydra: FakeHydra,
         entitlements: Arc<dyn EntitlementService>,
     ) -> IdentitySelfServiceImpl {
+        service_with_full_stores(
+            kratos,
+            hydra,
+            entitlements,
+            default_mapping_store(),
+            MemoryApplicationStore::default(),
+        )
+    }
+
+    fn service_with_full_stores(
+        kratos: FakeKratos,
+        hydra: FakeHydra,
+        entitlements: Arc<dyn EntitlementService>,
+        mappings: StubMappingStore,
+        applications: MemoryApplicationStore,
+    ) -> IdentitySelfServiceImpl {
         IdentitySelfServiceImpl {
             kratos: Arc::new(kratos),
             hydra: Arc::new(hydra),
             transient: Arc::new(default_transient_store()),
-            mappings: Arc::new(default_mapping_store()),
+            mappings: Arc::new(mappings),
+            applications: Arc::new(applications),
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(default_membership_store()),
             entitlements,
@@ -3240,6 +3543,7 @@ mod tests {
             hydra,
             crate::db::TransientTokenRepo::new(pool.clone()),
             crate::db::IdMappingRepo::new(pool.clone()),
+            Arc::new(crate::db::ApplicationRepo::new(pool.clone())),
             crate::db::IdentitySchemaRepo::new(pool.clone()),
             crate::db::TenantMembershipRepo::new(pool.clone()),
             entitlements(),
@@ -3307,6 +3611,7 @@ mod tests {
             hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
             schemas: Arc::new(StubSchemaStore::with_default(IdentitySchemaRow {
                 id: "schema-1".into(),
                 tenant_id: "tenant-1".into(),
@@ -3342,6 +3647,7 @@ mod tests {
             hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
             schemas: Arc::new(StubSchemaStore::with_default_error(DbError::SchemaNotFound)),
             memberships: Arc::new(default_membership_store()),
             entitlements: entitlements(),
@@ -3586,7 +3892,13 @@ mod tests {
             ..Default::default()
         };
         let transient = default_transient_store();
-        transient.seed("", BACKEND_KRATOS, TOKEN_TYPE_FLOW, &public_flow_id, raw_flow_id);
+        transient.seed(
+            "",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            &public_flow_id,
+            raw_flow_id,
+        );
         let mut svc = service(fake);
         svc.transient = Arc::new(transient);
         let ctx = request_context_with_cookie("session=abc");
@@ -4330,13 +4642,16 @@ mod tests {
         };
         let entitlements = ConfigurableEntitlementService::default();
         entitlements.deny("tenant-1", "pub-identity-1", "pub-client-1");
-        let svc = service_with_hydra_and_entitlements(
+        let svc = service_with_full_stores(
             fake.clone(),
             hydra.clone(),
             Arc::new(entitlements),
+            default_mapping_store(),
+            admin_app_store("tenant-1", "pub-client-1").await,
         );
         let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
-        ctx.extensions_mut().insert(TenantId("tenant-1".to_string()));
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
         let req = service_request(CreateLoginFlowRequest {
             login_challenge: "challenge-1".to_string(),
             ..Default::default()
@@ -4357,6 +4672,364 @@ mod tests {
                 .iter()
                 .all(|call| !call.starts_with("accept_login_request")),
             "login must not be accepted for unentitled user"
+        );
+    }
+
+    /// SSO-039: an unentitled user of a DCR-registered client is NOT denied
+    /// at login; the flow proceeds so the consent step can make the decision.
+    #[tokio::test]
+    async fn create_login_flow_defers_unentitled_user_of_dcr_client() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        entitlements.deny("tenant-1", "pub-identity-1", "pub-client-1");
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-1", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            default_mapping_store(),
+            applications,
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let resp = svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(
+            !resp.body.redirect_browser_to.is_empty(),
+            "login must be accepted so the flow reaches consent"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1")),
+            "login should be accepted for a first-use-eligible client"
+        );
+    }
+
+    /// SSO-039: a provisional client (mapping, no applications row anywhere)
+    /// is first-use eligible and defers to consent.
+    #[tokio::test]
+    async fn create_login_flow_defers_unentitled_user_of_provisional_client() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        entitlements.deny("tenant-1", "pub-identity-1", "pub-client-1");
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            default_mapping_store(),
+            MemoryApplicationStore::default(),
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
+        );
+    }
+
+    /// SSO-039: a client owned by another tenant (its applications row lives
+    /// there) fails closed for this tenant's users.
+    #[tokio::test]
+    async fn create_login_flow_denies_cross_tenant_owned_client() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
+            .with_mapping("tenant-2", BACKEND_HYDRA, "pub-client-1", "client-1");
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-2", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            mappings,
+            applications,
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("different organization"),
+            "unexpected error message: {err:?}"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request")),
+            "login must not be accepted cross-tenant"
+        );
+    }
+
+    /// Cross-tenant fixtures: the client mapping and its (admin-sourced)
+    /// applications row live in tenant-2, flagged `cross_tenant` per the arg.
+    async fn cross_tenant_owned_stores(
+        cross_tenant: bool,
+    ) -> (StubMappingStore, MemoryApplicationStore) {
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
+            .with_mapping("tenant-2", BACKEND_HYDRA, "pub-client-1", "client-1");
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create(
+                "tenant-2",
+                "pub-client-1",
+                cross_tenant,
+                REGISTRATION_SOURCE_ADMIN,
+            )
+            .await
+            .unwrap();
+        (mappings, applications)
+    }
+
+    /// SSO-039: a `cross_tenant`-flagged app admits a foreign user who holds
+    /// a per-user grant in the OWNER tenant's entitlement store. The audit
+    /// record lands on the owner tenant with the user's home tenant in
+    /// `subject_tenant`.
+    #[tokio::test]
+    async fn create_login_flow_allows_cross_tenant_entitled_user() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        // The grant lives in the OWNER tenant (tenant-2), referencing the
+        // user's home-tenant public ULID.
+        entitlements.allow("tenant-2", "pub-identity-1", "pub-client-1");
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            mappings,
+            applications,
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1")),
+            "entitled cross-tenant user should pass the login gate"
+        );
+        let audit: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit.len(), 1);
+        let fields = &audit[0].fields;
+        assert_eq!(
+            fields.get("action"),
+            Some(&"entitlement.cross_tenant_allowed".to_string())
+        );
+        assert_eq!(fields.get("tenant_id"), Some(&"tenant-2".to_string()));
+        assert_eq!(fields.get("subject_tenant"), Some(&"tenant-1".to_string()));
+    }
+
+    /// SSO-039: a `cross_tenant`-flagged app still denies a foreign user
+    /// WITHOUT a grant in the owner tenant — with the plain "not entitled"
+    /// message, since cross-tenant access is legitimate here.
+    #[tokio::test]
+    async fn create_login_flow_denies_cross_tenant_unentitled_user() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            mappings,
+            applications,
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not entitled"),
+            "flagged cross-tenant denial uses the plain message: {err:?}"
+        );
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+        let audit: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert_eq!(audit.len(), 1);
+        let fields = &audit[0].fields;
+        assert_eq!(
+            fields.get("action"),
+            Some(&"entitlement.login_denied".to_string())
+        );
+        assert_eq!(fields.get("tenant_id"), Some(&"tenant-2".to_string()));
+        assert_eq!(fields.get("subject_tenant"), Some(&"tenant-1".to_string()));
+    }
+
+    /// SSO-039: a backend error on the owner-tenant check fails closed.
+    #[tokio::test]
+    async fn create_login_flow_denies_cross_tenant_on_check_error() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        *entitlements.check_error.lock().unwrap() =
+            Some(ServiceError::Internal("backend down".to_string()));
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            mappings,
+            applications,
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.create_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("accept_login_request"))
+        );
+    }
+
+    /// SSO-039: a provisional client mapped in another tenant (no row
+    /// anywhere) is unowned; this tenant's user defers to consent, which
+    /// will claim the client.
+    #[tokio::test]
+    async fn create_login_flow_defers_cross_tenant_provisional_client() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
+            .with_mapping("tenant-2", BACKEND_HYDRA, "pub-client-1", "client-1");
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            mappings,
+            MemoryApplicationStore::default(),
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
+        );
+    }
+
+    /// A client with no mapping anywhere keeps the historical pass-through.
+    #[tokio::test]
+    async fn create_login_flow_passes_through_unmapped_client() {
+        let (fake, hydra) = login_gate_fixtures();
+        let entitlements = ConfigurableEntitlementService::default();
+        entitlements.deny("tenant-1", "pub-identity-1", "pub-client-1");
+        let svc = service_with_full_stores(
+            fake,
+            hydra.clone(),
+            Arc::new(entitlements),
+            // Only the identity mapping; no hydra client mapping.
+            StubMappingStore::default().with_mapping(
+                "tenant-1",
+                BACKEND_KRATOS,
+                "pub-identity-1",
+                "identity-1",
+            ),
+            MemoryApplicationStore::default(),
+        );
+        let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
+        let req = service_request(CreateLoginFlowRequest {
+            login_challenge: "challenge-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.create_login_flow(ctx, req).await.unwrap();
+        assert!(
+            hydra
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("accept_login_request(challenge=challenge-1"))
         );
     }
 
@@ -4391,7 +5064,8 @@ mod tests {
             Arc::new(entitlements),
         );
         let mut ctx = request_context_with_cookie("ory_kratos_session=session-1");
-        ctx.extensions_mut().insert(TenantId("tenant-1".to_string()));
+        ctx.extensions_mut()
+            .insert(TenantId("tenant-1".to_string()));
         let req = service_request(CreateLoginFlowRequest {
             login_challenge: "challenge-1".to_string(),
             ..Default::default()
@@ -5131,6 +5805,7 @@ mod tests {
             hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
             schemas: Arc::new(default_schema_store()),
             memberships: memberships.clone(),
             entitlements: entitlements(),
@@ -5195,6 +5870,7 @@ mod tests {
             hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(StubMembershipStore::with_membership(TenantMembershipRow {
                 tenant_id: "tenant-1".into(),
@@ -5565,6 +6241,7 @@ mod tests {
             hydra: Arc::new(FakeHydra::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(mappings),
+            applications: Arc::new(MemoryApplicationStore::default()),
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(memberships),
             entitlements: entitlements(),
@@ -5660,9 +6337,9 @@ mod tests {
 
         let recorded = fake.calls.lock().unwrap();
         assert!(
-            recorded.iter().any(|c| c.starts_with(
-                "to_session(cookie=Some(\"ory_kratos_session=session-reg\")"
-            )),
+            recorded.iter().any(
+                |c| c.starts_with("to_session(cookie=Some(\"ory_kratos_session=session-reg\")")
+            ),
             "to_session should be called with the redirected session cookie: {:?}",
             recorded
         );

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod application;
 pub mod client_credential;
+pub mod client_entitlement;
 pub mod dcr_maintenance;
 pub mod entitlement;
 pub mod federation;

@@ -11,16 +11,18 @@ use ulid::Ulid;
 
 use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
 use crate::db::{
-    DbError, IdMappingRepo, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE,
-    TOKEN_TYPE_LOGOUT_CHALLENGE, TransientTokenRepo, TransientTokenStore,
+    ApplicationStore, DbError, IdMappingRepo, IdMappingStore, REGISTRATION_SOURCE_DCR,
+    TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE, TransientTokenRepo,
+    TransientTokenStore,
 };
-use crate::services::entitlement::EntitlementService;
 use crate::middleware::TenantId;
 use crate::proto::iam::v1::{
     AcceptConsentRequest, AcceptLogoutRequest, ConsentRequest, ConsentResponse,
     GetChallengeRequest, LogoutRequest, LogoutResponse, OAuth2ConsentService, RejectConsentRequest,
     RejectLogoutRequest,
 };
+use crate::services::client_entitlement::{ClientEntitlement, resolve_client_entitlement};
+use crate::services::entitlement::{EntitlementLevel, EntitlementService};
 
 use super::oauth2_consent_mapper::{
     accept_consent_request_to_json, accept_logout_request_to_json, inject_id_token_claim,
@@ -40,6 +42,84 @@ fn map_db_error(err: DbError) -> ServiceError {
         DbError::MappingNotFound => ServiceError::NotFound("mapping not found".into()),
         _ => ServiceError::Database(err.to_string()),
     }
+}
+
+/// Audit-log and build the consent-gate denial for an unentitled user of a
+/// non-eligible (admin-registered) client. `member` is the failed membership
+/// check.
+fn deny_consent(
+    tenant_id: &str,
+    public_subject: &str,
+    app_public_id: &str,
+    member: Result<bool, ServiceError>,
+) -> ServiceError {
+    match member {
+        Err(err) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.consent_denied",
+                outcome = "error",
+                error = ?err,
+                "entitlement check failed; refusing consent"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.consent_denied",
+                outcome = "denied",
+                "user is not entitled to this application"
+            );
+        }
+    }
+    ServiceError::PermissionDenied("user is not entitled to this application".into())
+}
+
+/// Audit-log and build the consent-gate denial for a cross-tenant user of a
+/// `cross_tenant`-flagged application who lacks a per-user grant in the
+/// owner tenant. Written against the OWNER tenant (with `subject_tenant`)
+/// so the owner's audit trail shows every foreign access decision.
+fn deny_consent_cross_tenant(
+    owner_tenant: &str,
+    subject_tenant: &str,
+    public_subject: &str,
+    app_public_id: &str,
+    member: Result<bool, ServiceError>,
+) -> ServiceError {
+    match member {
+        Err(err) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = owner_tenant,
+                subject_tenant = subject_tenant,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.consent_denied",
+                outcome = "error",
+                error = ?err,
+                "cross-tenant entitlement check failed; refusing consent"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = owner_tenant,
+                subject_tenant = subject_tenant,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.consent_denied",
+                outcome = "denied",
+                "cross-tenant user is not entitled to this application"
+            );
+        }
+    }
+    ServiceError::PermissionDenied("user is not entitled to this application".into())
 }
 
 /// Hydra operations used by the OAuth2 consent service.
@@ -131,6 +211,7 @@ pub struct OAuth2ConsentServiceImpl {
     kratos: Arc<dyn ConsentKratos>,
     transient: Arc<dyn TransientTokenStore>,
     mappings: Arc<dyn IdMappingStore>,
+    applications: Arc<dyn ApplicationStore>,
     entitlements: Arc<dyn EntitlementService>,
     force_email_claim_client_ids: Vec<String>,
 }
@@ -141,6 +222,7 @@ impl OAuth2ConsentServiceImpl {
         kratos: Arc<KratosClient>,
         transient: TransientTokenRepo,
         mappings: IdMappingRepo,
+        applications: Arc<dyn ApplicationStore>,
         entitlements: Arc<dyn EntitlementService>,
         force_email_claim_client_ids: Vec<String>,
     ) -> Self {
@@ -149,6 +231,7 @@ impl OAuth2ConsentServiceImpl {
             kratos: kratos as Arc<dyn ConsentKratos>,
             transient: Arc::new(transient) as Arc<dyn TransientTokenStore>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
+            applications,
             entitlements,
             force_email_claim_client_ids,
         }
@@ -351,6 +434,7 @@ impl OAuth2ConsentServiceImpl {
         tenant_id: &str,
         mut consent: ConsentRequest,
     ) -> Result<ConsentRequest, ServiceError> {
+        let ory_client_id = consent.client_id.clone();
         consent.challenge = self
             .public_challenge(tenant_id, &consent.challenge, TOKEN_TYPE_CONSENT_CHALLENGE)
             .await?;
@@ -359,7 +443,138 @@ impl OAuth2ConsentServiceImpl {
         if let Some(client) = consent.client.as_option_mut() {
             client.client_id = self.public_client_id(tenant_id, &client.client_id).await?;
         }
+        consent.first_use = self
+            .is_first_use(tenant_id, &ory_client_id, &consent.subject)
+            .await;
         Ok(consent)
+    }
+
+    /// Whether this consent is the user's first-use approval of a
+    /// DCR-registered client (SSO-039): the client is first-use eligible and
+    /// the user is not yet a member. Resolution/check failures report `false`
+    /// — the accept path re-resolves and enforces.
+    async fn is_first_use(
+        &self,
+        tenant_id: &str,
+        ory_client_id: &str,
+        public_subject: &str,
+    ) -> bool {
+        if ory_client_id.is_empty() {
+            return false;
+        }
+        let resolution = match resolve_client_entitlement(
+            &*self.mappings,
+            &*self.applications,
+            tenant_id,
+            ory_client_id,
+        )
+        .await
+        {
+            Ok(resolution) => resolution,
+            Err(err) => {
+                tracing::debug!(
+                    tenant_id = %tenant_id,
+                    client_id = %ory_client_id,
+                    "first-use resolution failed; reporting false: {err}"
+                );
+                return false;
+            }
+        };
+        if !resolution.is_first_use_eligible() {
+            return false;
+        }
+        let Some(public_id) = resolution.public_id() else {
+            return false;
+        };
+        // A provisional client owned by another tenant has no local tuples;
+        // consenting claims it, so this is always a first use.
+        if let ClientEntitlement::Provisional { owner_tenant, .. } = &resolution
+            && owner_tenant != tenant_id
+        {
+            return true;
+        }
+        !matches!(
+            self.entitlements
+                .is_member(tenant_id, public_subject, public_id)
+                .await,
+            Ok(true)
+        )
+    }
+
+    /// Grant the consenting user first-use access to a first-use-eligible
+    /// client (SSO-039): re-home the mapping into the user's tenant when the
+    /// client was provisional elsewhere, ensure the DCR-marked applications
+    /// row, then grant `member` to the consenting user only.
+    ///
+    /// Anti-bypass: a skipped consent (Hydra remembered a prior decision)
+    /// must never silently re-grant — otherwise revoking a user's grant would
+    /// be undone by the next auto-accepted consent.
+    async fn grant_first_use(
+        &self,
+        tenant_id: &str,
+        public_subject: &str,
+        app_public_id: &str,
+        rehome: bool,
+        consent_skip: bool,
+    ) -> Result<(), ServiceError> {
+        if consent_skip {
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = tenant_id,
+                actor = public_subject,
+                application = app_public_id,
+                action = "entitlement.consent_denied",
+                outcome = "denied",
+                "refusing silent first-use grant on a skipped consent"
+            );
+            return Err(ServiceError::PermissionDenied(
+                "user is not entitled to this application".into(),
+            ));
+        }
+        if rehome {
+            self.mappings
+                .update_tenant(BACKEND_HYDRA, app_public_id, tenant_id)
+                .await
+                .map_err(map_db_error)?;
+        }
+        self.ensure_dcr_row(tenant_id, app_public_id).await?;
+        self.entitlements
+            .grant(
+                tenant_id,
+                public_subject,
+                app_public_id,
+                EntitlementLevel::Member,
+            )
+            .await?;
+        tracing::info!(
+            target: "sso_gateway::audit",
+            tenant_id = tenant_id,
+            actor = public_subject,
+            application = app_public_id,
+            action = "entitlement.first_use_consent_granted",
+            outcome = "success",
+            rehomed = rehome,
+            "first-use consent granted"
+        );
+        Ok(())
+    }
+
+    /// Create the DCR-marked `applications` row, tolerating a duplicate-row
+    /// race with a concurrent consent (same idiom as dcr_maintenance's
+    /// `ensure_dcr_row`): a lost create race is confirmed by the row now
+    /// existing.
+    async fn ensure_dcr_row(&self, tenant_id: &str, public_id: &str) -> Result<(), ServiceError> {
+        match self
+            .applications
+            .create(tenant_id, public_id, false, REGISTRATION_SOURCE_DCR)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => match self.applications.get(tenant_id, public_id).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(map_db_error(err)),
+            },
+        }
     }
 
     async fn map_logout_request(
@@ -501,53 +716,154 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
             .into());
         }
 
-        // Resolve the application and re-check that the user is entitled to it.
-        let app_public_id = self.public_client_id(&tenant_id, &consent.client_id).await;
-        if let Ok(app_public_id) = &app_public_id {
-            match self
-                .entitlements
-                .is_member(&tenant_id, &public_subject, app_public_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
+        // Resolve the application and re-check that the user is entitled to
+        // it. For a first-use-eligible client (DCR-registered, not yet usable
+        // by this user) an interactive accept IS the user's first-use
+        // approval: re-home the client into this tenant if it was provisional
+        // elsewhere, ensure its DCR-marked applications row, and grant the
+        // consenting user — never a group link (SSO-039).
+        let mut app_public_id = self.public_client_id(&tenant_id, &consent.client_id).await;
+        // Tenant whose entitlement store the per-app claim is minted from:
+        // the caller's tenant, except for cross-tenant-allowed clients, where
+        // the grant (and thus the claim) lives in the owner tenant.
+        let mut claim_tenant = tenant_id.clone();
+        match resolve_client_entitlement(
+            &*self.mappings,
+            &*self.applications,
+            &tenant_id,
+            &consent.client_id,
+        )
+        .await
+        {
+            Ok(ClientEntitlement::Unmapped) => {
+                tracing::debug!(
+                    tenant_id = %tenant_id,
+                    client_id = %consent.client_id,
+                    "consent client has no application mapping; skipping app entitlement check"
+                );
+            }
+            // An owned client is never first-use eligible: unflagged rows
+            // fail closed, and a `cross_tenant`-flagged row re-checks the
+            // foreign user's per-user grant in the OWNER tenant — a missing
+            // grant is a plain denial, never an approval-grant.
+            Ok(ClientEntitlement::CrossTenantOwned {
+                public_id,
+                owner_tenant,
+                cross_tenant,
+            }) => {
+                if !cross_tenant {
                     tracing::info!(
                         target: "sso_gateway::audit",
                         tenant_id = tenant_id,
                         actor = public_subject,
-                        application = app_public_id,
+                        application = public_id,
+                        owner_tenant = owner_tenant,
                         action = "entitlement.consent_denied",
-                        outcome = "denied",
-                        "user is not entitled to this application"
+                        outcome = "cross_tenant",
+                        "application belongs to a different organization"
                     );
                     return Err(ServiceError::PermissionDenied(
-                        "user is not entitled to this application".into(),
+                        "application belongs to a different organization".into(),
                     )
                     .into());
                 }
-                Err(err) => {
-                    tracing::info!(
-                        target: "sso_gateway::audit",
-                        tenant_id = tenant_id,
-                        actor = public_subject,
-                        application = app_public_id,
-                        action = "entitlement.consent_denied",
-                        outcome = "error",
-                        error = ?err,
-                        "entitlement check failed; refusing consent"
-                    );
-                    return Err(ServiceError::PermissionDenied(
-                        "user is not entitled to this application".into(),
-                    )
-                    .into());
+                match self
+                    .entitlements
+                    .is_member(&owner_tenant, &public_subject, &public_id)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            target: "sso_gateway::audit",
+                            tenant_id = owner_tenant,
+                            subject_tenant = tenant_id,
+                            actor = public_subject,
+                            application = public_id,
+                            action = "entitlement.cross_tenant_allowed",
+                            outcome = "allowed",
+                            "cross-tenant user is entitled to this application"
+                        );
+                        claim_tenant = owner_tenant;
+                        app_public_id = Ok(public_id);
+                    }
+                    member => {
+                        return Err(deny_consent_cross_tenant(
+                            &owner_tenant,
+                            &tenant_id,
+                            &public_subject,
+                            &public_id,
+                            member,
+                        )
+                        .into());
+                    }
                 }
             }
-        } else {
-            tracing::debug!(
-                tenant_id = %tenant_id,
-                client_id = %consent.client_id,
-                "consent client has no application mapping; skipping app entitlement check"
-            );
+            Ok(ClientEntitlement::Local { public_id, source }) => {
+                match self
+                    .entitlements
+                    .is_member(&tenant_id, &public_subject, &public_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    member => {
+                        if source == REGISTRATION_SOURCE_DCR {
+                            self.grant_first_use(
+                                &tenant_id,
+                                &public_subject,
+                                &public_id,
+                                false,
+                                consent.skip,
+                            )
+                            .await?;
+                            app_public_id = Ok(public_id);
+                        } else {
+                            return Err(deny_consent(
+                                &tenant_id,
+                                &public_subject,
+                                &public_id,
+                                member,
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            // A provisional client owned by another tenant has no local
+            // tuples to check; the interactive accept claims it for this
+            // tenant (first consent wins).
+            Ok(ClientEntitlement::Provisional {
+                public_id,
+                owner_tenant,
+            }) => {
+                let member = if owner_tenant == tenant_id {
+                    self.entitlements
+                        .is_member(&tenant_id, &public_subject, &public_id)
+                        .await
+                } else {
+                    Ok(false)
+                };
+                match member {
+                    Ok(true) => {}
+                    _ => {
+                        self.grant_first_use(
+                            &tenant_id,
+                            &public_subject,
+                            &public_id,
+                            owner_tenant != tenant_id,
+                            consent.skip,
+                        )
+                        .await?;
+                        app_public_id = Ok(public_id);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    tenant_id = %tenant_id,
+                    client_id = %consent.client_id,
+                    "consent client resolution failed; skipping app entitlement check: {err}"
+                );
+            }
         }
 
         let mut body = accept_consent_request_to_json(&req);
@@ -582,10 +898,12 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
 
         // Mint the per-application entitlement claim into the id_token. The
         // claim is skipped when the client has no gateway application mapping.
+        // For cross-tenant-allowed clients the claim comes from the owner
+        // tenant's entitlement store, where the per-user grant lives.
         if let Ok(app_public_id) = &app_public_id {
             let claim = self
                 .entitlements
-                .mint_claim(&tenant_id, &public_subject, app_public_id)
+                .mint_claim(&claim_tenant, &public_subject, app_public_id)
                 .await;
             if let Some(obj) = claim.as_object()
                 && let Some(body_obj) = body.as_object_mut()
@@ -742,12 +1060,14 @@ mod tests {
     use serde_json::{Value, json};
     use sso_ory_client::{error::OryClientError, hydra::HydraClient, kratos::KratosClient};
     use sunbeam_g2v::error::ServiceError;
+    use tracing_subscriber::prelude::*;
     use ulid::Ulid;
 
     use crate::auth::{AuthContext, SCOPE_IDENTITY_ADMIN, SCOPE_TENANT_ADMIN};
     use crate::db::{
-        IdMappingRow, IdMappingStore, TOKEN_TYPE_CONSENT_CHALLENGE, TOKEN_TYPE_LOGOUT_CHALLENGE,
-        TransientTokenRepo, TransientTokenRow, TransientTokenStore,
+        ApplicationStore, IdMappingRow, IdMappingStore, MemoryApplicationStore,
+        REGISTRATION_SOURCE_ADMIN, REGISTRATION_SOURCE_DCR, TOKEN_TYPE_CONSENT_CHALLENGE,
+        TOKEN_TYPE_LOGOUT_CHALLENGE, TransientTokenRepo, TransientTokenRow, TransientTokenStore,
     };
     use crate::middleware::TenantId;
     use crate::proto::iam::v1::{
@@ -756,7 +1076,9 @@ mod tests {
     };
 
     use super::{ConsentHydra, ConsentKratos, OAuth2ConsentServiceImpl, map_ory_error};
-    use crate::services::entitlement::test_helpers::{ConfigurableEntitlementService, entitlements};
+    use crate::services::entitlement::test_helpers::{
+        ConfigurableEntitlementService, entitlements,
+    };
 
     #[derive(Debug, Clone)]
     enum Call {
@@ -1099,6 +1421,20 @@ mod tests {
                 .ok_or(crate::db::DbError::MappingNotFound)
         }
 
+        async fn get_public_id_by_ory_id(
+            &self,
+            backend: &str,
+            ory_global_id: &str,
+        ) -> Result<String, crate::db::DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.backend == backend && r.ory_global_id == ory_global_id)
+                .map(|r| r.public_id.clone())
+                .ok_or(crate::db::DbError::MappingNotFound)
+        }
+
         async fn delete(
             &self,
             _tenant_id: &str,
@@ -1119,9 +1455,30 @@ mod tests {
         async fn get_tenant_id_by_ory_id(
             &self,
             _backend: &str,
-            _ory_global_id: &str,
+            ory_global_id: &str,
         ) -> Result<Option<String>, crate::db::DbError> {
-            Ok(None)
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.ory_global_id == ory_global_id)
+                .map(|r| r.tenant_id.clone()))
+        }
+
+        async fn update_tenant(
+            &self,
+            backend: &str,
+            public_id: &str,
+            new_tenant_id: &str,
+        ) -> Result<(), crate::db::DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|r| r.backend == backend && r.public_id == public_id)
+                .ok_or(crate::db::DbError::MappingNotFound)?;
+            row.tenant_id = new_tenant_id.to_string();
+            Ok(())
         }
     }
 
@@ -1212,11 +1569,31 @@ mod tests {
         force_email_claim_client_ids: Vec<String>,
         entitlements: Arc<dyn crate::services::entitlement::EntitlementService>,
     ) -> OAuth2ConsentServiceImpl {
+        service_with_full_stores(
+            hydra,
+            kratos,
+            force_email_claim_client_ids,
+            entitlements,
+            default_mapping_store(),
+            MemoryApplicationStore::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn service_with_full_stores(
+        hydra: Arc<dyn ConsentHydra>,
+        kratos: MockConsentKratos,
+        force_email_claim_client_ids: Vec<String>,
+        entitlements: Arc<dyn crate::services::entitlement::EntitlementService>,
+        mappings: StubMappingStore,
+        applications: MemoryApplicationStore,
+    ) -> OAuth2ConsentServiceImpl {
         OAuth2ConsentServiceImpl {
             hydra,
             kratos: Arc::new(kratos),
             transient: Arc::new(default_transient_store()),
-            mappings: Arc::new(default_mapping_store()),
+            mappings: Arc::new(mappings),
+            applications: Arc::new(applications),
             entitlements,
             force_email_claim_client_ids,
         }
@@ -1257,6 +1634,79 @@ mod tests {
             let view = decode_request::<$ty>(&bytes).unwrap();
             let $id = ServiceRequest::<$ty>::from_parts(&view, &bytes);
         };
+    }
+
+    /// Tracing layer capturing audit events for field assertions.
+    #[derive(Default, Clone)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{:?}", value));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    /// Cross-tenant consent fixtures: client mapping + applications row in
+    /// tenant-2 (flag per arg), identity mapping in tenant-1.
+    async fn cross_tenant_owned_stores(
+        cross_tenant: bool,
+    ) -> (StubMappingStore, MemoryApplicationStore) {
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-2", super::BACKEND_HYDRA, "pub-client-1", "client-1")
+            .with_mapping(
+                "tenant-1",
+                super::BACKEND_KRATOS,
+                "subject-1",
+                "ory-subject-1",
+            );
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create(
+                "tenant-2",
+                "pub-client-1",
+                cross_tenant,
+                REGISTRATION_SOURCE_ADMIN,
+            )
+            .await
+            .unwrap();
+        (mappings, applications)
     }
 
     #[test]
@@ -1313,7 +1763,8 @@ mod tests {
             hydra,
             kratos,
             TransientTokenRepo::new(pool.clone()),
-            crate::db::IdMappingRepo::new(pool),
+            crate::db::IdMappingRepo::new(pool.clone()),
+            Arc::new(crate::db::ApplicationRepo::new(pool)),
             entitlements(),
             Vec::new(),
         );
@@ -1487,10 +1938,7 @@ mod tests {
             .unwrap();
         let bodies = mock.take_accept_bodies();
         assert_eq!(bodies.len(), 1);
-        assert_eq!(
-            bodies[0]["session"]["id_token"]["identity_id"],
-            "subject-1"
-        );
+        assert_eq!(bodies[0]["session"]["id_token"]["identity_id"], "subject-1");
     }
 
     #[tokio::test]
@@ -1529,10 +1977,7 @@ mod tests {
             bodies[0]["session"]["id_token"]["identity_id"],
             "caller-supplied"
         );
-        assert_eq!(
-            bodies[0]["session"]["id_token"]["email"],
-            "a@example.com"
-        );
+        assert_eq!(bodies[0]["session"]["id_token"]["email"], "a@example.com");
     }
 
     #[tokio::test]
@@ -1626,10 +2071,7 @@ mod tests {
             bodies[0]["session"]["id_token"]["email"],
             "user@example.com"
         );
-        assert_eq!(
-            bodies[0]["session"]["id_token"]["identity_id"],
-            "subject-1"
-        );
+        assert_eq!(bodies[0]["session"]["id_token"]["identity_id"], "subject-1");
     }
 
     #[tokio::test]
@@ -1648,11 +2090,7 @@ mod tests {
             "id": "ory-subject-1",
             "traits": { "email": "user@example.com" },
         }));
-        let svc = service_with_email_config(
-            mock.clone(),
-            kratos,
-            vec!["client-1".to_string()],
-        );
+        let svc = service_with_email_config(mock.clone(), kratos, vec!["client-1".to_string()]);
         svc_req!(
             req,
             AcceptConsentRequest {
@@ -1731,11 +2169,7 @@ mod tests {
             "id": "ory-subject-1",
             "traits": { "email": "user@example.com" },
         }));
-        let svc = service_with_email_config(
-            mock.clone(),
-            kratos,
-            vec!["pub-client-1".to_string()],
-        );
+        let svc = service_with_email_config(mock.clone(), kratos, vec!["pub-client-1".to_string()]);
         let session: buffa_types::google::protobuf::Struct = serde_json::from_value(json!({
             "id_token": { "email": "caller@example.com" }
         }))
@@ -1774,11 +2208,7 @@ mod tests {
         })));
         // Default mock result is an error; consent must still succeed.
         let kratos = MockConsentKratos::default();
-        let svc = service_with_email_config(
-            mock.clone(),
-            kratos,
-            vec!["pub-client-1".to_string()],
-        );
+        let svc = service_with_email_config(mock.clone(), kratos, vec!["pub-client-1".to_string()]);
         svc_req!(
             req,
             AcceptConsentRequest {
@@ -1799,10 +2229,7 @@ mod tests {
             bodies[0]
         );
         // identity_id is unaffected by the email lookup failure.
-        assert_eq!(
-            bodies[0]["session"]["id_token"]["identity_id"],
-            "subject-1"
-        );
+        assert_eq!(bodies[0]["session"]["id_token"]["identity_id"], "subject-1");
     }
 
     #[tokio::test]
@@ -2339,6 +2766,7 @@ mod tests {
             kratos: Arc::new(MockConsentKratos::default()),
             transient: Arc::new(default_transient_store()),
             mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
             entitlements,
             force_email_claim_client_ids: Vec::new(),
         }
@@ -2386,7 +2814,14 @@ mod tests {
         let entitlements = Arc::new(ConfigurableEntitlementService::default());
         entitlements.set_ceiling(vec!["openid".to_string()]);
         entitlements.deny("tenant-1", "subject-1", "pub-client-1");
-        let svc = service_with_entitlements(mock.clone(), entitlements);
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            default_mapping_store(),
+            admin_app_store("tenant-1", "pub-client-1").await,
+        );
         svc_req!(
             req,
             AcceptConsentRequest {
@@ -2402,6 +2837,609 @@ mod tests {
             .unwrap_err()
             .into();
         assert!(matches!(err, ServiceError::PermissionDenied(_)));
+        // The denial writes nothing: no grant, no applications row.
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+    }
+
+    async fn admin_app_store(tenant_id: &str, public_id: &str) -> MemoryApplicationStore {
+        let store = MemoryApplicationStore::default();
+        store
+            .create(tenant_id, public_id, false, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
+        store
+    }
+
+    /// SSO-039: an interactive accept for a DCR-registered client the user is
+    /// not entitled to is their first-use approval: the DCR row is ensured
+    /// and member is granted to the consenting user only.
+    #[tokio::test]
+    async fn accept_consent_grants_first_use_for_dcr_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.deny("tenant-1", "subject-1", "pub-client-1");
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-1", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let mappings = default_mapping_store();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+
+        // Per-user grant, never a group link.
+        assert_eq!(
+            entitlements.grants.lock().unwrap().as_slice(),
+            &[(
+                "tenant-1".to_string(),
+                "subject-1".to_string(),
+                "pub-client-1".to_string(),
+                crate::services::entitlement::EntitlementLevel::Member
+            )]
+        );
+        // No re-home: the mapping already belonged to tenant-1.
+        let stored = svc
+            .mappings
+            .get_tenant_id_by_ory_id("hydra", "client-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("tenant-1"));
+        // The row was already there; exactly one DCR row exists.
+        let row = applications.get("tenant-1", "pub-client-1").await.unwrap();
+        assert_eq!(row.registration_source, REGISTRATION_SOURCE_DCR);
+    }
+
+    /// SSO-039: a provisional client (no applications row anywhere) gets its
+    /// DCR row created by the first-use accept.
+    #[tokio::test]
+    async fn accept_consent_first_use_creates_dcr_row_for_provisional_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        let applications = MemoryApplicationStore::default();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            default_mapping_store(),
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+
+        let row = applications
+            .get("tenant-1", "pub-client-1")
+            .await
+            .expect("first-use accept must create the DCR row");
+        assert_eq!(row.registration_source, REGISTRATION_SOURCE_DCR);
+        assert_eq!(entitlements.grants.lock().unwrap().len(), 1);
+    }
+
+    /// SSO-039: a provisional client mapped in another tenant is claimed by
+    /// the consenting user's tenant — the mapping is re-homed.
+    #[tokio::test]
+    async fn accept_consent_first_use_rehomes_cross_tenant_provisional_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        // The client mapping lives in tenant-2; no applications row anywhere.
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-2", super::BACKEND_HYDRA, "pub-client-1", "client-1")
+            .with_mapping(
+                "tenant-1",
+                super::BACKEND_KRATOS,
+                "subject-1",
+                "ory-subject-1",
+            );
+        let applications = MemoryApplicationStore::default();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+
+        // Re-homed into the consenting user's tenant.
+        let stored = svc
+            .mappings
+            .get_tenant_id_by_ory_id("hydra", "client-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("tenant-1"));
+        // DCR row + grant landed in tenant-1.
+        let row = applications
+            .get("tenant-1", "pub-client-1")
+            .await
+            .expect("first-use accept must create the DCR row in the user's tenant");
+        assert_eq!(row.registration_source, REGISTRATION_SOURCE_DCR);
+        assert_eq!(
+            entitlements.grants.lock().unwrap().as_slice(),
+            &[(
+                "tenant-1".to_string(),
+                "subject-1".to_string(),
+                "pub-client-1".to_string(),
+                crate::services::entitlement::EntitlementLevel::Member
+            )]
+        );
+    }
+
+    /// SSO-039 anti-bypass: a skipped consent (Hydra remembered a prior
+    /// decision) must NOT silently re-grant an unentitled user — otherwise
+    /// revocation would be undone by the next auto-accepted consent.
+    #[tokio::test]
+    async fn accept_consent_skipped_consent_never_grants_first_use() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": true,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-1", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let mappings = default_mapping_store();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+        // Hydra must never see an accept for the denied consent.
+        assert!(
+            mock.take_calls()
+                .iter()
+                .all(|c| !matches!(c, Call::AcceptConsent(_)))
+        );
+    }
+
+    /// SSO-039: consent for a client owned by another tenant fails closed.
+    #[tokio::test]
+    async fn accept_consent_denies_cross_tenant_owned_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        let mappings = StubMappingStore::default()
+            .with_mapping("tenant-2", super::BACKEND_HYDRA, "pub-client-1", "client-1")
+            .with_mapping(
+                "tenant-1",
+                super::BACKEND_KRATOS,
+                "subject-1",
+                "ory-subject-1",
+            );
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-2", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+        // Zero state changes: no grant, no row in tenant-1, no re-home.
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+        assert!(applications.get("tenant-1", "pub-client-1").await.is_err());
+        let stored = svc
+            .mappings
+            .get_tenant_id_by_ory_id("hydra", "client-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("tenant-2"));
+    }
+
+    /// SSO-039: a `cross_tenant`-flagged app accepts consent from a foreign
+    /// user holding a per-user grant in the OWNER tenant; the claim is minted
+    /// from the owner tenant and the audit lands there with `subject_tenant`.
+    #[tokio::test]
+    async fn accept_consent_allows_cross_tenant_entitled_user() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        // The grant lives in the OWNER tenant (tenant-2).
+        entitlements.allow("tenant-2", "subject-1", "pub-client-1");
+        entitlements.set_claim(json!({ "entitlements": { "pub-client-1": ["member"] } }));
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        svc.accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap();
+
+        // No first-use writes: no grant, no row in tenant-1, no re-home.
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+        assert!(applications.get("tenant-1", "pub-client-1").await.is_err());
+        let stored = svc
+            .mappings
+            .get_tenant_id_by_ory_id("hydra", "client-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("tenant-2"));
+        // The claim is minted from the OWNER tenant.
+        assert_eq!(
+            entitlements.mint_calls.lock().unwrap().as_slice(),
+            &[(
+                "tenant-2".to_string(),
+                "subject-1".to_string(),
+                "pub-client-1".to_string()
+            )]
+        );
+        let bodies = mock.take_accept_bodies();
+        assert_eq!(
+            bodies[0]["session"]["id_token"]["entitlements"]["pub-client-1"],
+            json!(["member"])
+        );
+        let audit: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert!(
+            audit.iter().any(|e| {
+                e.fields.get("action") == Some(&"entitlement.cross_tenant_allowed".to_string())
+                    && e.fields.get("tenant_id") == Some(&"tenant-2".to_string())
+                    && e.fields.get("subject_tenant") == Some(&"tenant-1".to_string())
+            }),
+            "expected a cross_tenant_allowed audit on the owner tenant: {audit:?}"
+        );
+    }
+
+    /// SSO-039: a `cross_tenant`-flagged app denies a foreign user without an
+    /// owner-tenant grant — plain "not entitled", and NEVER a first-use
+    /// approval-grant (owned apps are not first-use eligible).
+    #[tokio::test]
+    async fn accept_consent_denies_cross_tenant_unentitled_user() {
+        let layer = CaptureLayer::default();
+        let events = layer.events.clone();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications.clone(),
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        match &err {
+            ServiceError::PermissionDenied(message) => {
+                assert!(
+                    message.contains("not entitled"),
+                    "flagged cross-tenant denial uses the plain message: {message}"
+                );
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        // Zero state changes and, critically, no first-use grant.
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+        assert!(applications.get("tenant-1", "pub-client-1").await.is_err());
+        let stored = svc
+            .mappings
+            .get_tenant_id_by_ory_id("hydra", "client-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("tenant-2"));
+        let audit: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "sso_gateway::audit")
+            .cloned()
+            .collect();
+        assert!(
+            audit.iter().any(|e| {
+                e.fields.get("action") == Some(&"entitlement.consent_denied".to_string())
+                    && e.fields.get("tenant_id") == Some(&"tenant-2".to_string())
+                    && e.fields.get("subject_tenant") == Some(&"tenant-1".to_string())
+            }),
+            "expected a consent_denied audit on the owner tenant: {audit:?}"
+        );
+    }
+
+    /// SSO-039: a backend error on the owner-tenant check fails closed.
+    #[tokio::test]
+    async fn accept_consent_denies_cross_tenant_on_check_error() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        *entitlements.check_error.lock().unwrap() =
+            Some(ServiceError::Internal("backend down".to_string()));
+        let (mappings, applications) = cross_tenant_owned_stores(true).await;
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            mappings,
+            applications,
+        );
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec!["openid".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+        assert!(entitlements.grants.lock().unwrap().is_empty());
+        assert!(
+            mock.take_calls()
+                .iter()
+                .all(|c| !matches!(c, Call::AcceptConsent(_)))
+        );
+    }
+
+    /// SSO-039: GetConsentRequest flags first-use so the consent UI can
+    /// render first-use approval copy.
+    #[tokio::test]
+    async fn get_consent_request_marks_first_use_for_unentitled_dcr_client() {
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-1",
+            "client": { "client_id": "client-1", "client_name": "App" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-1", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements.clone(),
+            default_mapping_store(),
+            applications,
+        );
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "pub-consent-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_consent_request(auth_context(&[SCOPE_TENANT_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        assert!(resp.first_use);
+
+        // An entitled user is not a first use.
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-1",
+            "client": { "client_id": "client-1", "client_name": "App" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid"],
+            "skip": false,
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        let applications = MemoryApplicationStore::default();
+        applications
+            .create("tenant-1", "pub-client-1", false, REGISTRATION_SOURCE_DCR)
+            .await
+            .unwrap();
+        let svc = service_with_full_stores(
+            mock.clone(),
+            MockConsentKratos::default(),
+            Vec::new(),
+            entitlements,
+            default_mapping_store(),
+            applications,
+        );
+        svc_req!(
+            req,
+            GetChallengeRequest {
+                challenge: "pub-consent-1".into(),
+                ..Default::default()
+            },
+            GetChallengeRequest
+        );
+        let resp = svc
+            .get_consent_request(auth_context(&[SCOPE_TENANT_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        assert!(!resp.first_use);
     }
 
     #[tokio::test]

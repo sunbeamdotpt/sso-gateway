@@ -369,6 +369,7 @@ pub async fn build_app_with_upstream(
         hydra.clone(),
         transient.clone(),
         mappings.clone(),
+        application_store.clone(),
         schemas.clone(),
         memberships.clone(),
         entitlements.clone(),
@@ -384,6 +385,7 @@ pub async fn build_app_with_upstream(
         kratos.clone(),
         transient.clone(),
         mappings.clone(),
+        application_store.clone(),
         entitlements.clone(),
         config.force_email_claim_client_ids.clone(),
     ));
