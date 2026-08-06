@@ -24,6 +24,18 @@ This document summarizes the security-focused code review performed on the SSO G
 - **Tenant isolation** is enforced at the HTTP middleware layer for Connect-RPC calls and at the handler layer for OAuth2, SAML, SCIM, and federation protocol endpoints.
 - **Public paths** (`/.well-known/`, `/oauth2/`, `/callbacks/`, `/saml/`, `/scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`, `/scim/v2/Schemas`) skip shared bearer-token authentication because they perform protocol-native authentication (OAuth2 client credentials, SAML assertions, SCIM bearer tokens, OIDC/OAuth2 callback state). The branded browser self-service routes (`SELF_SERVICE_*_PATH`, defaults `/identity/…`) and the `/self-service/{recovery,verification}` email-link shims skip it as well; they carry Kratos session and CSRF cookies and Kratos performs the session checks upstream.
 
+## Dynamic client registration (SSO-039)
+
+`/oauth2/register` (RFC 7591) is open and anonymous by protocol necessity: per-device Matrix clients register before any user session exists, and stock Matrix clients cannot present an OIDC initial access token. The gateway's controls make an anonymous registration worthless on its own:
+
+- **Registration grants nothing.** A DCR registration creates only the Hydra client and a provisional `id_mappings` row — no `applications` row, no entitlement tuples. Both entitlement gates (login acceptance and consent) refuse unentitled clients.
+- **First use requires interactive consent.** The first authenticated user through a DCR client is routed to a branded consent step; on acceptance the client is re-homed into that user's tenant (first consent wins, permanently), a `registration_source = 'dcr'` applications row is created there, and `member` is granted to the consenting user only. Group links remain an admin action. A Hydra-remembered (`skip`) consent never re-grants a revoked entitlement — unentitled skipped consents are refused.
+- **Cross-tenant is fail-closed.** A client owned by tenant A denies users of tenant B unless its row carries `cross_tenant = true`, in which case the check runs in A's entitlement store against the foreign user's public id (per-user tuples only; nothing is written for the user in their own or the system tenant). Audit records carry both `tenant_id` (owner) and `subject_tenant` (home).
+- **Abuse is bounded.** Anonymous `/oauth2/register` requests are rate-limited per client IP; a daily worker deletes registrations never consented within `DCR_UNUSED_REGISTRATION_TTL_DAYS` (default 7); and self-delete (`DELETE /oauth2/register/{client_id}`) removes entitlement tuples, the applications row, and the Hydra client.
+- **Convergence, not drift.** A startup backfill seeds legacy DCR clients that have no entitlement tuples (never reseeding clients that have any, so deliberate revocations survive restarts).
+
+Known follow-ups: clients with no `id_mappings` row anywhere still pass the login gate (legacy `heal_client_mapping` paths depend on it) — a hard deny is tracked separately; cross-tenant ownership transfer is admin-initiated and not yet implemented.
+
 ## Audit logging
 
 The `audit_middleware` emits one structured log event per request to the

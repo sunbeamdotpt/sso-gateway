@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [Unreleased]
+
+### Added
+
+- `cross_tenant` applications now admit foreign users at the login and
+  consent gates (SSO-039): when a client is owned by another tenant and its
+  `applications` row carries `cross_tenant=true`, the gates re-check the
+  foreign user's per-user entitlement in the OWNER tenant's store (against
+  their globally unique public ULID) instead of failing closed. The
+  entitlement claim is minted from the owner tenant; the scope ceiling stays
+  a property of the user's home tenant. Cross-tenant access decisions are
+  audited against the owner tenant with a `subject_tenant` field
+  (`entitlement.cross_tenant_allowed` for allows, the existing
+  `entitlement.login_denied`/`entitlement.consent_denied` for denials).
+  Owned apps are never first-use eligible: a foreign user without a grant
+  gets the plain "user is not entitled to this application" denial and zero
+  state changes.
+- Consent-gated first-use entitlement for DCR-registered clients (SSO-039):
+  an unentitled user of a DCR-registered (or still-provisional) OAuth2 client
+  is no longer 403'd at login — the login gate defers to the consent step
+  (audit `entitlement.login_deferred_to_consent`), and an interactive
+  `AcceptConsent` becomes the user's first-use approval: the client's mapping
+  is re-homed into the consenting user's tenant when it was provisional
+  elsewhere (first consent wins), its DCR-marked `applications` row is
+  ensured, and `member` is granted to the consenting user only — never the
+  default group link, which stays an admin/backfill action (audit
+  `entitlement.first_use_consent_granted`). A skipped consent (Hydra
+  remembered a prior decision) never silently re-grants an unentitled user.
+- `ConsentRequest.first_use` (proto field 10): set when the client is
+  first-use eligible for the requesting subject, so the consent UI can render
+  first-use approval copy (SSO-039).
+- `IdMappingStore::update_tenant` re-homes a mapping row to a different
+  tenant (Pg + in-memory implementations) (SSO-039).
+- Applications now carry a `registration_source` marker (`admin` or `dcr`) in
+  the metadata store, distinguishing RFC 7591 dynamically registered clients
+  from admin-created ones ahead of consent-gated first-use entitlement
+  (SSO-039).
+- Default entitlement groups seeded for new applications are configurable via
+  `DEFAULT_ENTITLEMENT_GROUPS` (comma-separated, default `employees`),
+  replacing the hardcoded `employees` group (SSO-039).
+- Startup backfill for legacy DCR clients: on boot the gateway walks every
+  Hydra-mapped client, seeds tuple-less ones with the default entitlement
+  group links, and creates their DCR-marked `applications` rows. Clients that
+  already carry tuples are never reseeded, so deliberate revocations survive
+  restarts; agents and admin-created apps are skipped. The pass is idempotent
+  and safe for concurrent replicas (SSO-039).
+- Daily garbage collector for unused DCR registrations (24h interval, first
+  run one interval after startup): never-consented registrations older than
+  `DCR_UNUSED_REGISTRATION_TTL_DAYS` (default 7) are deleted from Hydra and
+  from `id_mappings`, with a last-moment re-check against concurrent first-use
+  consents. Disable with `DCR_GC_ENABLED=false`. Every reaped registration is
+  audit-logged (SSO-039).
+- Deleting a DCR-registered client (`DELETE /oauth2/register/{client_id}` or
+  orphaned-mapping reconciliation) now also removes its entitlement tuples
+  when an `applications` row exists, before the `id_mappings` delete cascades
+  the row away. Cleanup failures are logged and non-fatal — the reaper
+  converges any residue — and every deletion is audit-logged as
+  `dcr.registration_deleted` (SSO-039).
+- Anonymous requests to `/oauth2/register` are now rate-limited per client IP
+  (first `x-forwarded-for` hop, else the direct peer address) instead of a
+  shared global bucket, so one abuser cannot starve every other registrant and
+  NAT'd users stay independent; other endpoint classes keep their per-class
+  global buckets, and the register class degrades to the global key when no
+  IP is available (SSO-039).
+- RFC 7591 registration responses for confidential DCR clients now advertise
+  the unused-registration TTL as `client_secret_expires_at`
+  (`client_id_issued_at + DCR_UNUSED_REGISTRATION_TTL_DAYS`); public clients
+  (`token_endpoint_auth_method: none`) keep 0. Hydra does not enforce the
+  expiry — the DCR reaper does (SSO-039).
+
+### Fixed
+
+- The login and consent entitlement gates now fail closed cross-tenant
+  (SSO-039): a client whose mapping resolves in another tenant and has an
+  `applications` row there is denied with "application belongs to a different
+  organization" (audit outcome `cross_tenant`), closing the fail-open hole on
+  a tenant-local mapping miss. Truly unmapped clients keep the historical
+  pass-through for now; a hard deny there is a documented follow-up.
+
 ## [2026.08.2] - 2026-08-03
 
 ### Fixed

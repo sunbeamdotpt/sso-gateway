@@ -13,7 +13,7 @@ tags:
 authors:
   - Sienna Meridian Satterwhite
 created_at: "2026-07-30"
-updated_at: "2026-07-30"
+updated_at: "2026-08-04"
 related:
   - architecture.md
   - security.md
@@ -192,6 +192,14 @@ in the token, the scope list, or the store count:
 | Claim size per token | 1 application entry, always |
 | Checks per login | 2 (membership + ceiling), same store |
 | OpenFGA stores | 1 entitlement store per tenant (existing machinery) |
+
+> **Note (2026-08-04, SSO-039):** per-device DCR clients (Matrix) break the
+> "~40 applications per tenant" assumption. Each backfilled legacy DCR client
+> carries two group-link tuples, and each consented DCR client carries one
+> tuple per consented user, so tuple count per tenant is O(devices × users).
+> This remains well within store budgets, but any query that enumerates
+> entitlement objects (e.g. `ListRelationTuples` over the namespace) MUST
+> paginate.
 
 ## 3. Component Specifications
 
@@ -465,6 +473,49 @@ state. The login gate provides the synchronous backstop.
 2. Gateway seeds `application:<app>` object and default group links
    (e.g. `application:<app>#group @ group:employees`) if configured.
 
+> **Erratum (2026-08-04, SSO-039):** the lifecycle above assumed
+> admin-driven registration. RFC 7591 dynamic client registration (DCR) is
+> now a first-class lifecycle with a security model of *registration grants
+> nothing*:
+>
+> - **Registration** (anonymous or authenticated) creates only the Hydra
+>   client and a provisional `id_mappings` row — system tenant for
+>   anonymous callers, the caller's tenant otherwise. No `applications`
+>   row and no entitlement tuples are written; an anonymous registration
+>   is inert and carries no authorization value.
+> - **First use is consent-gated.** When an authenticated user logs in
+>   through a first-use-eligible client (an `applications` row marked
+>   `registration_source = 'dcr'`, or a provisional client with no row),
+>   the login gate defers to the consent step instead of refusing. On
+>   interactive consent acceptance the gateway (1) re-homes the client's
+>   `id_mappings` row into the consenting user's home tenant if it lived
+>   elsewhere — first consent wins and ownership is permanent — (2)
+>   creates the `applications` row in that tenant with
+>   `registration_source = 'dcr'`, and (3) grants `member` to the
+>   consenting user only, never a group link. A Hydra-remembered (`skip`)
+>   consent MUST NOT trigger this grant: an unentitled user facing a
+>   skipped consent is refused, so revocation cannot be silently undone.
+> - **Cross-tenant is fail-closed.** A client owned by another tenant
+>   refuses foreign logins unless its row carries `cross_tenant = true`;
+>   see the resolution of Open Question 5 in [Section 8](#8-open-questions).
+> - **Convergence.** At startup the gateway backfills legacy DCR clients:
+>   for each Hydra-mapped client with no `applications` row (agent-managed
+>   clients excluded), it writes the DCR-marked row and — only when the
+>   client has zero entitlement tuples — seeds the default group links
+>   (`DEFAULT_ENTITLEMENT_GROUPS`, default `employees`). Clients with any
+>   tuples are never reseeded, so deliberate revocations survive restarts.
+>   The group-link seed is a legacy concession (per-user consent history
+>   is unreconstructable); new clients get per-user grants only.
+> - **Hygiene.** DCR self-delete (`DELETE /oauth2/register/{client_id}`)
+>   removes entitlement tuples (user tuples; group links dangle per
+>   "Application retired" below) before the mapping delete cascades the
+>   `applications` row. A daily worker reaps registrations never consented
+>   within `DCR_UNUSED_REGISTRATION_TTL_DAYS` (default 7), deleting the
+>   Hydra client and mapping; `client_secret_expires_at` advertises the
+>   TTL for confidential clients.
+> - **Scale.** The per-device growth this introduces is accounted for in
+>   the note in [Section 2.1](#21-scale-check).
+
 **Application retired**
 
 1. `applications` row deleted or marked retired.
@@ -598,7 +649,18 @@ wiki.
    is explicit group assignment always required?
 5. **Cross-tenant applications** (`applications.cross_tenant = true`):
    entitlements are checked in the token's tenant or the application's home
-   tenant?
+   tenant? — **Resolved 2026-08-04 (SSO-039):** in the application's home
+   tenant. The gates resolve the client's owning tenant and fail closed for
+   foreign users unless the row carries `cross_tenant = true`; when it does,
+   `member` is checked in the owner's entitlement store against the foreign
+   user's public identity id. Foreign grants are per-user tuples written by
+   the owner's administrators only — group links remain intra-tenant, and
+   first-use consent never applies cross-tenant. The per-user scope ceiling
+   continues to be evaluated in the user's home tenant; the entitlement
+   claim is minted from the application's home tenant. Audit records carry
+   both `tenant_id` (owner) and `subject_tenant` (home). A client mapping
+   that resolves in no tenant keeps the historical pass-through; a hard
+   deny for unmapped clients is tracked as follow-up work.
 6. **Denied-login UX**: the browser needs a branded error page when the
    login gate refuses — not a raw Hydra error.
 7. **Machine identities**: `client_credentials` flows have no login event
@@ -636,6 +698,29 @@ provides the immediate backstop.
 **Enforcement-point confusion.** The gate checks the actual client being
 authorized. A mis-resolved client identity MUST fail closed, never default
 to a privileged application object.
+
+**Open dynamic client registration (2026-08-04, SSO-039).** DCR is
+anonymous by protocol necessity: per-device Matrix clients register before
+any user session exists, and stock Matrix clients do not support OIDC DCR
+1.0 initial access tokens. The gateway therefore treats registration as
+valueless — no `applications` row, no entitlement tuples — and creates
+authorization value only through an authenticated tenant member's
+interactive consent (see the erratum in
+[Section 6.1](#61-administrative-lifecycle)). Anonymous-registration abuse
+is bounded by per-IP rate limiting on `/oauth2/register` and by the daily
+reaper for never-consented registrations.
+
+**Consent revocation bypass.** A Hydra-remembered (`skip`) consent would
+silently re-grant a revoked entitlement if first-use grants fired on every
+consent accept. The gateway MUST refuse an unentitled user whose consent
+is skipped rather than re-granting.
+
+**Cross-tenant client confusion.** The login and consent gates resolve the
+client's owning tenant and fail closed when the client is owned by another
+tenant, unless its row carries `cross_tenant = true`, in which case the
+entitlement check runs in the owner's store against the foreign public
+identity id. Audit records for these decisions carry both `tenant_id`
+(owner) and `subject_tenant` (home).
 
 **Audit.** Gate refusals, ceiling rejections, and entitlement writes are
 emitted to the structured audit stream; per the project conventions these
