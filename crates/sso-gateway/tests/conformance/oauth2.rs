@@ -378,17 +378,23 @@ async fn matrix_msc2967_dcr_client_receives_usable_refresh_token() {
         )
         .await;
     assert!(
-        result.token["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        result.token["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "token response must contain an access token: {}",
         result.token
     );
     let token_scope = result.token["scope"].as_str().unwrap_or_default();
     assert!(
-        token_scope.split_whitespace().any(|s| s == MSC2967_DEVICE_SCOPE),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == MSC2967_DEVICE_SCOPE),
         "token scope must carry the msc2967 device scope: {token_scope}"
     );
     assert!(
-        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "offline_access"),
         "token scope must carry offline_access: {token_scope}"
     );
     let refresh_token = result.token["refresh_token"]
@@ -406,7 +412,9 @@ async fn matrix_msc2967_dcr_client_receives_usable_refresh_token() {
         "refresh grant must not error: {refreshed}"
     );
     assert!(
-        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "refresh grant must return a new access token: {refreshed}"
     );
 
@@ -470,11 +478,15 @@ async fn matrix_msc2967_authorize_self_heals_openid_client() {
         .await;
     let token_scope = result.token["scope"].as_str().unwrap_or_default();
     assert!(
-        token_scope.split_whitespace().any(|s| s == MSC2967_DEVICE_SCOPE),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == MSC2967_DEVICE_SCOPE),
         "token scope must carry the msc2967 device scope: {token_scope}"
     );
     assert!(
-        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "offline_access"),
         "token scope must carry offline_access: {token_scope}"
     );
     let refresh_token = result.token["refresh_token"]
@@ -486,7 +498,10 @@ async fn matrix_msc2967_authorize_self_heals_openid_client() {
     //    refresh-token grant.
     let healed: serde_json::Value = gateway
         .http
-        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .get(format!(
+            "{}/admin/clients/{client_id}",
+            gateway.hydra_admin_url
+        ))
         .send()
         .await
         .expect("hydra client fetch should succeed")
@@ -510,7 +525,9 @@ async fn matrix_msc2967_authorize_self_heals_openid_client() {
         .refresh_token_flow(refresh_token, &client_id, &client_secret)
         .await;
     assert!(
-        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "refresh grant must return a new access token: {refreshed}"
     );
 
@@ -558,10 +575,7 @@ async fn dcr_client_self_delete_removes_client_and_mapping() {
     // 1. The client deletes itself with its own Basic credentials.
     let delete = gateway
         .http
-        .delete(format!(
-            "{}/oauth2/register/{client_id}",
-            gateway.base_url
-        ))
+        .delete(format!("{}/oauth2/register/{client_id}", gateway.base_url))
         .basic_auth(&client_id, Some(&client_secret))
         .send()
         .await
@@ -576,7 +590,10 @@ async fn dcr_client_self_delete_removes_client_and_mapping() {
     // 2. The client is gone from Hydra...
     let hydra_get = gateway
         .http
-        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .get(format!(
+            "{}/admin/clients/{client_id}",
+            gateway.hydra_admin_url
+        ))
         .send()
         .await
         .expect("hydra client fetch should complete");
@@ -612,7 +629,6 @@ async fn dcr_client_self_delete_removes_client_and_mapping() {
 
     gateway.shutdown().await;
 }
-
 
 /// MSC2965 end-to-end: a Matrix-style DCR client that never requests
 /// `offline_access` still receives a usable refresh token, and the per-login
@@ -694,7 +710,9 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         )
         .await;
     assert!(
-        result.token["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        result.token["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "token response must contain an access token: {}",
         result.token
     );
@@ -708,7 +726,9 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         "token scope must carry the device scope: {token_scope}"
     );
     assert!(
-        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "offline_access"),
         "token scope must carry offline_access: {token_scope}"
     );
     let refresh_token = result.token["refresh_token"]
@@ -727,7 +747,9 @@ async fn matrix_dcr_client_receives_usable_refresh_token() {
         "refresh grant must not error: {refreshed}"
     );
     assert!(
-        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "refresh grant must return a new access token: {refreshed}"
     );
 
@@ -886,7 +908,9 @@ async fn matrix_dcr_client_without_matrix_scopes_self_heals() {
         "token scope must carry the device scope: {token_scope}"
     );
     assert!(
-        token_scope.split_whitespace().any(|s| s == "offline_access"),
+        token_scope
+            .split_whitespace()
+            .any(|s| s == "offline_access"),
         "token scope must carry offline_access: {token_scope}"
     );
     let refresh_token = result.token["refresh_token"]
@@ -898,7 +922,10 @@ async fn matrix_dcr_client_without_matrix_scopes_self_heals() {
     //    refresh-token grant.
     let healed: serde_json::Value = gateway
         .http
-        .get(format!("{}/admin/clients/{client_id}", gateway.hydra_admin_url))
+        .get(format!(
+            "{}/admin/clients/{client_id}",
+            gateway.hydra_admin_url
+        ))
         .send()
         .await
         .expect("hydra client fetch should succeed")
@@ -922,7 +949,9 @@ async fn matrix_dcr_client_without_matrix_scopes_self_heals() {
         .refresh_token_flow(refresh_token, &client_id, &client_secret)
         .await;
     assert!(
-        refreshed["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "refresh grant must return a new access token: {refreshed}"
     );
 

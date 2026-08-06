@@ -70,10 +70,12 @@ fn pool_options(database_url: &str, ssl_required: bool) -> Result<PoolOptions, s
     let connect_options = PgConnectOptions::from_str(database_url)?;
 
     let max_connections = crate::config::env_parse_or("DATABASE_MAX_CONNECTIONS", 25);
-    let acquire_timeout_seconds = crate::config::env_parse_or("DATABASE_ACQUIRE_TIMEOUT_SECONDS", 10);
+    let acquire_timeout_seconds =
+        crate::config::env_parse_or("DATABASE_ACQUIRE_TIMEOUT_SECONDS", 10);
     let idle_timeout_seconds = crate::config::env_parse_or("DATABASE_IDLE_TIMEOUT_SECONDS", 600);
     let max_lifetime_seconds = crate::config::env_parse_or("DATABASE_MAX_LIFETIME_SECONDS", 1800);
-    let statement_timeout_seconds = crate::config::env_parse_or("DATABASE_STATEMENT_TIMEOUT_SECONDS", 30);
+    let statement_timeout_seconds =
+        crate::config::env_parse_or("DATABASE_STATEMENT_TIMEOUT_SECONDS", 30);
 
     Ok(PoolOptions {
         connect_options,

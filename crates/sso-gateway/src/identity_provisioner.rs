@@ -210,8 +210,14 @@ impl KratosIdentityProvisioner {
     }
 
     fn require_email_verified(claims: &serde_json::Value) -> Result<(), ProvisionError> {
-        let email_verified = matches!(claims.get("email_verified").and_then(|v| v.as_bool()), Some(true));
-        let trusted_provider = matches!(claims.get("trusted_provider").and_then(|v| v.as_bool()), Some(true));
+        let email_verified = matches!(
+            claims.get("email_verified").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let trusted_provider = matches!(
+            claims.get("trusted_provider").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         if !email_verified && !trusted_provider {
             return Err(ProvisionError::EmailNotVerified);
         }

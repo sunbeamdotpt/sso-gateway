@@ -214,10 +214,7 @@ async fn oidc_id_token_signature_validates_against_jwks() {
         .find(|k| k["kid"].as_str() == Some(kid))
         .expect("jwks must contain the signing key");
 
-    assert_eq!(
-        key["kty"], "RSA",
-        "signing key must be an RSA key"
-    );
+    assert_eq!(key["kty"], "RSA", "signing key must be an RSA key");
     assert!(
         key["n"].as_str().is_some(),
         "signing key must include RSA modulus"
@@ -499,4 +496,3 @@ fn decode_jwt_payload(token: &str) -> serde_json::Value {
         .expect("id_token payload should be base64url encoded");
     serde_json::from_slice(&payload).expect("id_token payload should be valid JSON")
 }
-

@@ -380,9 +380,7 @@ fn hydra_to_client_credential(
             None => String::new(),
         },
         scope: match client["scope"].as_str() {
-            Some(scope) if !scope.is_empty() => {
-                scope.split(' ').map(|s| s.to_string()).collect()
-            }
+            Some(scope) if !scope.is_empty() => scope.split(' ').map(|s| s.to_string()).collect(),
             _ => Vec::new(),
         },
         token_endpoint_auth_method: match client["token_endpoint_auth_method"].as_str() {

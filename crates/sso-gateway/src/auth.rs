@@ -361,9 +361,15 @@ pub async fn resolve_subject(
         ("hydra", SubjectBackend::Hydra),
         ("kratos", SubjectBackend::Kratos),
     ] {
-        match mappings.get_tenant_id_by_ory_id(backend_name, subject).await {
+        match mappings
+            .get_tenant_id_by_ory_id(backend_name, subject)
+            .await
+        {
             Ok(Some(tenant_id)) => {
-                match mappings.get_public_id_by_ory_id(backend_name, subject).await {
+                match mappings
+                    .get_public_id_by_ory_id(backend_name, subject)
+                    .await
+                {
                     Ok(public_id) => return Ok((tenant_id, public_id, backend)),
                     Err(DbError::MappingNotFound) => continue,
                     Err(e) => {

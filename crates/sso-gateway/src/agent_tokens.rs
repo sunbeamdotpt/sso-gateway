@@ -200,26 +200,28 @@ impl AgentTokenAuthority {
     // acceptable there.
     async fn evict_delegation(&self, delegation_id: &str) {
         let delegation_id = delegation_id.to_string();
-        let result = self
-            .act_cache
-            .invalidate_entries_if(move |_hash, entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|res| res.delegation_id == delegation_id)
-            });
-        debug_assert!(result.is_ok(), "act cache must support invalidation closures");
+        let result = self.act_cache.invalidate_entries_if(move |_hash, entry| {
+            entry
+                .as_ref()
+                .is_some_and(|res| res.delegation_id == delegation_id)
+        });
+        debug_assert!(
+            result.is_ok(),
+            "act cache must support invalidation closures"
+        );
         self.act_cache.run_pending_tasks().await;
     }
 
     async fn evict_agent(&self, agent_id: &str) {
         self.status_cache.invalidate(agent_id).await;
         let agent_id = agent_id.to_string();
-        let result = self
-            .act_cache
-            .invalidate_entries_if(move |_hash, entry| {
-                entry.as_ref().is_some_and(|res| res.agent_id == agent_id)
-            });
-        debug_assert!(result.is_ok(), "act cache must support invalidation closures");
+        let result = self.act_cache.invalidate_entries_if(move |_hash, entry| {
+            entry.as_ref().is_some_and(|res| res.agent_id == agent_id)
+        });
+        debug_assert!(
+            result.is_ok(),
+            "act cache must support invalidation closures"
+        );
         self.act_cache.run_pending_tasks().await;
     }
 
@@ -294,10 +296,7 @@ impl AgentTokenResolver for AgentTokenAuthority {
 
 /// Run the NATS subscriber applying remote invalidations to the authority's
 /// caches. Intended to be spawned as a background task at startup.
-pub async fn run_invalidation_subscriber(
-    nats: NatsClient,
-    authority: Arc<AgentTokenAuthority>,
-) {
+pub async fn run_invalidation_subscriber(nats: NatsClient, authority: Arc<AgentTokenAuthority>) {
     use futures_util::StreamExt;
 
     let mut subscriber = match nats.subscribe(INVALIDATION_SUBJECT).await {
@@ -634,24 +633,12 @@ mod tests {
             .mint(&delegation("del-1", "agent-1", time::Duration::hours(24)))
             .await
             .unwrap();
-        assert!(
-            authority
-                .resolve_act_token(&token)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(authority.resolve_act_token(&token).await.unwrap().is_some());
 
         delegations.revoke("del-1");
         // Still cached as valid until the revocation write evicts it.
         authority.invalidate_delegation("del-1").await;
-        assert!(
-            authority
-                .resolve_act_token(&token)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(authority.resolve_act_token(&token).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -671,26 +658,14 @@ mod tests {
             .mint(&delegation("del-1", "agent-1", time::Duration::hours(24)))
             .await
             .unwrap();
-        assert!(
-            authority
-                .resolve_act_token(&token)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(authority.resolve_act_token(&token).await.unwrap().is_some());
 
         agents.statuses.lock().unwrap().insert(
             "agent-1".to_string(),
             crate::db::AGENT_STATUS_DISABLED.to_string(),
         );
         authority.invalidate_agent("agent-1").await;
-        assert!(
-            authority
-                .resolve_act_token(&token)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(authority.resolve_act_token(&token).await.unwrap().is_none());
         // Status cache was evicted too.
         assert_eq!(
             authority.agent_status("agent-1").await.unwrap().as_deref(),
@@ -762,7 +737,13 @@ mod tests {
             authority.agent_status("agent-1").await.unwrap().as_deref(),
             Some(AGENT_STATUS_ACTIVE)
         );
-        assert!(authority.agent_status("not-an-agent").await.unwrap().is_none());
+        assert!(
+            authority
+                .agent_status("not-an-agent")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -782,13 +763,7 @@ mod tests {
             .mint(&delegation("del-1", "agent-1", time::Duration::hours(24)))
             .await
             .unwrap();
-        assert!(
-            authority
-                .resolve_act_token(&token)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(authority.resolve_act_token(&token).await.unwrap().is_some());
 
         // Simulate a remote revoke: cache still holds the token as valid, and
         // only the NATS message evicts it (the stub delegation stays live).

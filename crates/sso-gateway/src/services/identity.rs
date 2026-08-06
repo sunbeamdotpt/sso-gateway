@@ -949,10 +949,7 @@ impl IdentityService for IdentityServiceImpl {
                 Some(v) => v.to_string(),
                 None => String::new(),
             },
-            sent_at: message["sent_at"]
-                .as_str()
-                .and_then(parse_timestamp)
-                .into(),
+            sent_at: message["sent_at"].as_str().and_then(parse_timestamp).into(),
             link,
             flow: public_flow,
             ..Default::default()
@@ -1024,7 +1021,8 @@ impl IdentityServiceImpl {
         tenant_id: &str,
         flow: &serde_json::Value,
     ) -> Result<String, ServiceError> {
-        let Some(ory_identity_id) = flow["identity"]["id"].as_str().filter(|id| !id.is_empty()) else {
+        let Some(ory_identity_id) = flow["identity"]["id"].as_str().filter(|id| !id.is_empty())
+        else {
             return Ok(String::new());
         };
         self.mappings
@@ -1076,10 +1074,7 @@ const MAX_SCHEMA_SIZE_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 10;
 
 pub(crate) fn traits_subschema(schema_json: &serde_json::Value) -> &serde_json::Value {
-    match schema_json
-        .get("properties")
-        .and_then(|p| p.get("traits"))
-    {
+    match schema_json.get("properties").and_then(|p| p.get("traits")) {
         Some(traits) => traits,
         None => schema_json,
     }
@@ -1155,7 +1150,10 @@ fn validate_schema_size(schema: &serde_json::Value) -> Result<(), ServiceError> 
     let size = match serde_json::to_string(schema) {
         Ok(serialized) => serialized.len(),
         Err(err) => {
-            tracing::warn!("failed to serialize identity schema for size check: {}", err);
+            tracing::warn!(
+                "failed to serialize identity schema for size check: {}",
+                err
+            );
             usize::MAX
         }
     };
@@ -1367,10 +1365,7 @@ fn kratos_flow_to_flow(
         },
         tenant_id: tenant_id.to_string(),
         identity_id: public_identity_id.to_string(),
-        expires_at: flow["expires_at"]
-            .as_str()
-            .and_then(parse_timestamp)
-            .into(),
+        expires_at: flow["expires_at"].as_str().and_then(parse_timestamp).into(),
         ui: Some(ui_struct).into(),
         __buffa_unknown_fields: Default::default(),
     }

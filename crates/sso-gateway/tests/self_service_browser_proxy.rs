@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 //! End-to-end tests for the branded browser self-service surface, proxied
 //! through to a real Ory Kratos (v25.4) container. The unit tests in
@@ -42,9 +45,8 @@ fn browser_client() -> reqwest::Client {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branded_login_init_returns_a_real_kratos_flow() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     let response = browser_client()
@@ -68,9 +70,8 @@ async fn branded_login_init_returns_a_real_kratos_flow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branded_aal2_upgrade_error_passes_through() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     // Without an AAL1 session, Kratos answers the AAL2 init with 401
@@ -93,9 +94,8 @@ async fn branded_aal2_upgrade_error_passes_through() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branded_login_init_passes_browser_redirects_through() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     let response = browser_client()
@@ -121,9 +121,8 @@ async fn branded_login_init_passes_browser_redirects_through() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branded_webauthn_script_is_served_by_kratos() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     let response = browser_client()
@@ -142,9 +141,8 @@ async fn branded_webauthn_script_is_served_by_kratos() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kratos_shaped_email_link_bounces_to_the_branded_surface() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     // Kratos emits recovery links as {base_url}/self-service/recovery?token=…
@@ -158,16 +156,18 @@ async fn kratos_shaped_email_link_bounces_to_the_branded_surface() {
         .expect("email link request");
     assert_eq!(response.status(), reqwest::StatusCode::FOUND);
     assert_eq!(
-        response.headers().get("location").and_then(|v| v.to_str().ok()),
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
         Some("https://gateway.example.com/identity/recovery?token=t0&flow=f0")
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kratos_init_paths_are_not_served_directly() {
-    let (_kratos, _admin, kratos_public) = support::start_kratos()
-        .await
-        .expect("kratos should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
     let gateway = spawn_gateway(kratos_public).await;
 
     // Only the email-link shims exist under /self-service; init routes must

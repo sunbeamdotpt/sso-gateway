@@ -125,10 +125,7 @@ impl AgentService for AgentServiceImpl {
             .filter(|a| a.subject_type == SubjectType::User)
             .map(|a| a.subject.as_str());
 
-        let agent = self
-            .agents
-            .create(&tenant_id, owner, &req.name)
-            .await?;
+        let agent = self.agents.create(&tenant_id, owner, &req.name).await?;
 
         let payload = serde_json::json!({
             "client_id": agent.id,
@@ -200,7 +197,11 @@ impl AgentService for AgentServiceImpl {
 
         let (limit, after) = page_params(req.page.is_set().then(|| &*req.page))?;
         let (rows, total) = self.agents.list_page(&tenant_id, limit, after).await?;
-        let next_page_token = next_page_token(rows.last().map(|r| (r.created_at, r.id.as_str())), rows.len(), limit);
+        let next_page_token = next_page_token(
+            rows.last().map(|r| (r.created_at, r.id.as_str())),
+            rows.len(),
+            limit,
+        );
 
         Ok(Response::new(ListAgentsResponse {
             agents: rows.iter().map(agent_to_proto).collect(),
@@ -232,7 +233,8 @@ impl AgentService for AgentServiceImpl {
 
         if !req.name.is_empty() && req.name != agent.name {
             agent = self.agents.set_name(&tenant_id, &req.id, &req.name).await?;
-            self.rename_hydra_client(&tenant_id, &req.id, &req.name).await;
+            self.rename_hydra_client(&tenant_id, &req.id, &req.name)
+                .await;
         }
 
         if !req.status.is_empty() && req.status != agent.status {
@@ -324,30 +326,26 @@ impl AgentService for AgentServiceImpl {
         let tenant_id = require_tenant(&ctx)?;
         require_subject_type(&ctx, SubjectType::User)?;
         let req = request.to_owned_message();
-        let auth = ctx
-            .extensions()
-            .get::<AuthContext>()
-            .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+        let auth = ctx.extensions().get::<AuthContext>().ok_or_else(|| {
+            ServiceError::Unauthenticated("missing authentication context".into())
+        })?;
 
         let agent = self.agents.get(&tenant_id, &req.agent_id).await?;
         if agent.status != AGENT_STATUS_ACTIVE {
-            return Err(ServiceError::InvalidArgument(format!(
-                "agent {} is not active",
-                agent.id
-            ))
-            .into());
+            return Err(
+                ServiceError::InvalidArgument(format!("agent {} is not active", agent.id)).into(),
+            );
         }
 
-        self.require_active_member(&tenant_id, &auth.subject).await?;
+        self.require_active_member(&tenant_id, &auth.subject)
+            .await?;
         validate_delegation_scopes(&req.scope)?;
-        let expires_at = from_proto_timestamp(&req.expires_at).ok_or_else(|| {
-            ServiceError::InvalidArgument("expires_at is required".into())
-        })?;
+        let expires_at = from_proto_timestamp(&req.expires_at)
+            .ok_or_else(|| ServiceError::InvalidArgument("expires_at is required".into()))?;
         if expires_at <= time::OffsetDateTime::now_utc() {
-            return Err(ServiceError::InvalidArgument(
-                "expires_at must be in the future".into(),
-            )
-            .into());
+            return Err(
+                ServiceError::InvalidArgument("expires_at must be in the future".into()).into(),
+            );
         }
 
         let row = self
@@ -365,10 +363,9 @@ impl AgentService for AgentServiceImpl {
     ) -> ServiceResult<ListAgentDelegationsResponse> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let auth = ctx
-            .extensions()
-            .get::<AuthContext>()
-            .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+        let auth = ctx.extensions().get::<AuthContext>().ok_or_else(|| {
+            ServiceError::Unauthenticated("missing authentication context".into())
+        })?;
 
         let (limit, after) = page_params(req.page.is_set().then(|| &*req.page))?;
         let (rows, total) = if req.agent_id.is_empty() {
@@ -383,7 +380,11 @@ impl AgentService for AgentServiceImpl {
                 .list_page_by_agent(&tenant_id, &req.agent_id, limit, after)
                 .await?
         };
-        let next_page_token = next_page_token(rows.last().map(|r| (r.created_at, r.id.as_str())), rows.len(), limit);
+        let next_page_token = next_page_token(
+            rows.last().map(|r| (r.created_at, r.id.as_str())),
+            rows.len(),
+            limit,
+        );
 
         Ok(Response::new(ListAgentDelegationsResponse {
             delegations: rows.iter().map(delegation_to_proto).collect(),
@@ -405,14 +406,13 @@ impl AgentService for AgentServiceImpl {
     ) -> ServiceResult<AgentDelegation> {
         let tenant_id = require_tenant(&ctx)?;
         let req = request.to_owned_message();
-        let auth = ctx
-            .extensions()
-            .get::<AuthContext>()
-            .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+        let auth = ctx.extensions().get::<AuthContext>().ok_or_else(|| {
+            ServiceError::Unauthenticated("missing authentication context".into())
+        })?;
 
         let delegation = self.delegations.get(&tenant_id, &req.id).await?;
-        let is_owner = auth.subject_type == SubjectType::User
-            && auth.subject == delegation.user_identity_id;
+        let is_owner =
+            auth.subject_type == SubjectType::User && auth.subject == delegation.user_identity_id;
         let is_admin = auth.scopes.iter().any(|s| s == SCOPE_AGENT_ADMIN);
         if !is_owner && !is_admin {
             return Err(ServiceError::PermissionDenied(
@@ -436,10 +436,9 @@ impl AgentService for AgentServiceImpl {
         require_subject_type(&ctx, SubjectType::Agent)?;
         require_scope(&ctx, SCOPE_AGENT_ACT)?;
         let req = request.to_owned_message();
-        let auth = ctx
-            .extensions()
-            .get::<AuthContext>()
-            .ok_or_else(|| ServiceError::Unauthenticated("missing authentication context".into()))?;
+        let auth = ctx.extensions().get::<AuthContext>().ok_or_else(|| {
+            ServiceError::Unauthenticated("missing authentication context".into())
+        })?;
 
         // The middleware already rejects disabled agents at authentication;
         // re-check here so a direct call can never mint for a disabled agent.
@@ -457,10 +456,7 @@ impl AgentService for AgentServiceImpl {
         }
         let now = time::OffsetDateTime::now_utc();
         if delegation.revoked_at.is_some() {
-            return Err(ServiceError::InvalidArgument(
-                "delegation has been revoked".into(),
-            )
-            .into());
+            return Err(ServiceError::InvalidArgument("delegation has been revoked".into()).into());
         }
         if delegation.expires_at <= now {
             return Err(ServiceError::InvalidArgument("delegation has expired".into()).into());
@@ -628,9 +624,7 @@ fn validate_delegation_scopes(scopes: &[String]) -> Result<(), ServiceError> {
     }
     let mut seen = std::collections::HashSet::with_capacity(scopes.len());
     for scope in scopes {
-        if scope.is_empty()
-            || scope.len() > MAX_SCOPE_LEN
-            || scope.chars().any(char::is_whitespace)
+        if scope.is_empty() || scope.len() > MAX_SCOPE_LEN || scope.chars().any(char::is_whitespace)
         {
             return Err(ServiceError::InvalidArgument(format!(
                 "invalid scope: {scope:?}"
@@ -725,7 +719,6 @@ fn require_scope_any(ctx: &RequestContext, scopes: &[&str]) -> Result<(), Servic
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -741,9 +734,7 @@ mod tests {
 
     use super::*;
     use crate::agent_tokens::AgentInvalidator;
-    use crate::db::{
-        AgentActTokenRow, AgentActTokenStore, IdMappingRow, TenantMembershipRow,
-    };
+    use crate::db::{AgentActTokenRow, AgentActTokenStore, IdMappingRow, TenantMembershipRow};
     use crate::proto::iam::v1::{AgentService, PageRequest};
 
     macro_rules! svc_req {
@@ -852,11 +843,7 @@ mod tests {
 
         async fn delete_oauth2_client(&self, id: &str) -> Result<(), OryClientError> {
             self.delete_calls.lock().unwrap().push(id.to_string());
-            self.delete_result
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Ok(()))
+            self.delete_result.lock().unwrap().take().unwrap_or(Ok(()))
         }
 
         async fn rotate_client_secret(&self, _id: &str) -> Result<Value, OryClientError> {
@@ -901,7 +888,10 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             };
-            self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), row.clone());
             Ok(row)
         }
 
@@ -986,9 +976,7 @@ mod tests {
                     .then_with(|| b.id.cmp(&a.id))
             });
             if let Some((cursor_ts, cursor_id)) = after {
-                all.retain(|r| {
-                    (r.created_at, r.id.as_str()) < (cursor_ts, cursor_id.as_str())
-                });
+                all.retain(|r| (r.created_at, r.id.as_str()) < (cursor_ts, cursor_id.as_str()));
             }
             all.truncate(limit as usize);
             Ok((all, total))
@@ -1014,9 +1002,7 @@ mod tests {
                     .then_with(|| b.id.cmp(&a.id))
             });
             if let Some((cursor_ts, cursor_id)) = after {
-                rows.retain(|r| {
-                    (r.created_at, r.id.as_str()) < (cursor_ts, cursor_id.as_str())
-                });
+                rows.retain(|r| (r.created_at, r.id.as_str()) < (cursor_ts, cursor_id.as_str()));
             }
             rows.truncate(limit as usize);
             (rows, total)
@@ -1512,7 +1498,10 @@ mod tests {
         };
         assert_eq!(payload["client_id"], json!(agent.id));
         assert_eq!(payload["scope"], json!("agent:act agent:read"));
-        assert_eq!(payload["grant_types"], json!([GRANT_TYPE_CLIENT_CREDENTIALS]));
+        assert_eq!(
+            payload["grant_types"],
+            json!([GRANT_TYPE_CLIENT_CREDENTIALS])
+        );
 
         // Mapping resolves the agent id to the hydra client id.
         let ory_id = f
@@ -2002,7 +1991,10 @@ mod tests {
                 .create_agent_delegation(user_ctx(&[]), r)
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains(expected), "expected {expected}: {err}");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected}: {err}"
+            );
         }
     }
 
@@ -2059,11 +2051,7 @@ mod tests {
             .body;
         assert_eq!(resp.delegations.len(), 2);
         assert_eq!(resp.page.total_size, 2);
-        assert!(
-            resp.delegations
-                .iter()
-                .all(|d| d.user_identity_id == USER)
-        );
+        assert!(resp.delegations.iter().all(|d| d.user_identity_id == USER));
 
         // The own view is not available to non-user subjects.
         let req = ListAgentDelegationsRequest::default();

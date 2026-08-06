@@ -56,8 +56,7 @@ pub fn ory_identity_to_proto(value: &Value) -> BrowserIdentity {
             Some(traits) => traits.into(),
             None => Default::default(),
         },
-        verifiable_addresses: match value.get("verifiable_addresses").and_then(|v| v.as_array())
-        {
+        verifiable_addresses: match value.get("verifiable_addresses").and_then(|v| v.as_array()) {
             Some(arr) => arr.iter().map(ory_verifiable_address_to_proto).collect(),
             None => Vec::new(),
         },

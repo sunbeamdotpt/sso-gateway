@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 //! End-to-end coverage for agent identities: the AgentService RPC surface
 //! (backed by a real Hydra and Postgres) and the middleware classification of
@@ -168,15 +171,11 @@ async fn agent_service_delegation_lifecycle_end_to_end() {
         .route("/ctx", get(ctx))
         .layer(from_fn(auth_middleware))
         .layer(Extension(session_signer()))
-        .layer(Extension(
-            Arc::new(UserOrHydraIntrospector {
-                hydra: hydra.clone(),
-            }) as Arc<dyn TokenIntrospector>,
-        ))
+        .layer(Extension(Arc::new(UserOrHydraIntrospector {
+            hydra: hydra.clone(),
+        }) as Arc<dyn TokenIntrospector>))
         .layer(Extension(support::test_session_store()))
-        .layer(Extension(
-            authority.clone() as Arc<dyn AgentTokenResolver>
-        ))
+        .layer(Extension(authority.clone() as Arc<dyn AgentTokenResolver>))
         .layer(Extension(Arc::new(mappings) as Arc<dyn IdMappingStore>));
 
     let (listener, addr) = bind_random_port("127.0.0.1")
@@ -250,10 +249,7 @@ async fn agent_service_delegation_lifecycle_end_to_end() {
     let cc_resp = client
         .post(format!("{hydra_public_url}/oauth2/token"))
         .basic_auth(&agent_id, Some(&client_secret))
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("scope", "agent:act"),
-        ])
+        .form(&[("grant_type", "client_credentials"), ("scope", "agent:act")])
         .send()
         .await
         .expect("client credentials request should succeed");
@@ -305,7 +301,10 @@ async fn agent_service_delegation_lifecycle_end_to_end() {
         .json()
         .await
         .expect("delegation should be json");
-    let delegation_id = delegation["id"].as_str().expect("delegation id").to_string();
+    let delegation_id = delegation["id"]
+        .as_str()
+        .expect("delegation id")
+        .to_string();
     assert_eq!(delegation["userIdentityId"], support::TEST_SUBJECT);
     assert!(delegation["revokedAt"].is_null());
 
@@ -373,9 +372,7 @@ async fn agent_service_delegation_lifecycle_end_to_end() {
 
     // --- The big red button: revocation kills the act-token immediately. ---
     let revoke_resp = client
-        .post(format!(
-            "{base}/iam.v1.AgentService/RevokeAgentDelegation"
-        ))
+        .post(format!("{base}/iam.v1.AgentService/RevokeAgentDelegation"))
         .header("authorization", &user_auth)
         .header("content-type", "application/json")
         .json(&json!({ "id": delegation_id }))
@@ -524,9 +521,7 @@ async fn act_token_middleware_paths() {
         .layer(Extension(session_signer()))
         .layer(Extension(support::test_introspector()))
         .layer(Extension(support::test_session_store()))
-        .layer(Extension(
-            authority.clone() as Arc<dyn AgentTokenResolver>
-        ))
+        .layer(Extension(authority.clone() as Arc<dyn AgentTokenResolver>))
         .layer(Extension(
             Arc::new(IdMappingRepo::new(pool.clone())) as Arc<dyn IdMappingStore>
         ));

@@ -369,14 +369,24 @@ mod tests {
             .await
             .unwrap();
 
-        let by_type = store.get_by_type(&tenant, "KanbanCard").await.unwrap().unwrap();
+        let by_type = store
+            .get_by_type(&tenant, "KanbanCard")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(by_type.namespace, "kanban");
 
         // Fallback: "legacy" is not in the type index but is a namespace name.
         let fallback = store.get_by_type(&tenant, "legacy").await.unwrap().unwrap();
         assert_eq!(fallback.namespace, "legacy");
 
-        assert!(store.get_by_type(&tenant, "unknown").await.unwrap().is_none());
+        assert!(
+            store
+                .get_by_type(&tenant, "unknown")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

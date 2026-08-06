@@ -62,7 +62,10 @@ impl OpenFgaClient {
     /// Paginates the store list because OpenFGA store names are not unique
     /// and there is no server-side name filter; the first match wins.
     #[instrument(skip(self), fields(base_url = %self.base_url))]
-    pub async fn find_store_by_name(&self, name: &str) -> Result<Option<String>, OpenFgaClientError> {
+    pub async fn find_store_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, OpenFgaClientError> {
         let url = self.base_url.join("stores")?;
         let mut continuation_token = String::new();
         loop {
@@ -890,7 +893,8 @@ mod tests {
         State(state): State<FakeState>,
         Path(store_id): Path<String>,
         Json(body): Json<Value>,
-    ) -> Json<Value> {        let key = body.get("tuple_key").cloned().unwrap_or_default();
+    ) -> Json<Value> {
+        let key = body.get("tuple_key").cloned().unwrap_or_default();
         let user = key.get("user").and_then(|v| v.as_str()).unwrap_or("");
         let relation = key.get("relation").and_then(|v| v.as_str()).unwrap_or("");
         let object = key.get("object").and_then(|v| v.as_str()).unwrap_or("");
@@ -980,7 +984,13 @@ mod tests {
         let (_handle, url) = start_server().await;
         let client = OpenFgaClient::new(&url).unwrap();
 
-        assert!(client.find_store_by_name("tenant-1-entitlements").await.unwrap().is_none());
+        assert!(
+            client
+                .find_store_by_name("tenant-1-entitlements")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let store_id = client.create_store("tenant-1-entitlements").await.unwrap();
         client.create_store("tenant-1-kanban").await.unwrap();
@@ -990,7 +1000,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.as_deref(), Some(store_id.as_str()));
-        assert!(client.find_store_by_name("tenant-2-entitlements").await.unwrap().is_none());
+        assert!(
+            client
+                .find_store_by_name("tenant-2-entitlements")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1016,7 +1032,13 @@ mod tests {
         };
 
         // Nothing stored yet.
-        assert!(client.read_tuples(&store_id, &key).await.unwrap().is_empty());
+        assert!(
+            client
+                .read_tuples(&store_id, &key)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         client
             .write_tuples(&store_id, &model_id, &[key.clone(), other], &[])

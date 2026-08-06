@@ -1,6 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
-
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 #![cfg(feature = "openfga")]
 
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use std::sync::Arc;
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, PermissionTupleRepo, TenantRepo, bootstrap_system_tenant,
@@ -24,7 +27,6 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
-use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_openfga_client::OpenFgaClient;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
@@ -395,7 +397,12 @@ async fn permission_service_openfga_namespace_lifecycle() {
         }),
     )
     .await;
-    assert_eq!(resp.status(), 200, "batch write failed: {:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "batch write failed: {:?}",
+        resp.text().await
+    );
     let body = resp.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["written"], 2);
 
@@ -425,7 +432,12 @@ async fn permission_service_openfga_namespace_lifecycle() {
         }),
     )
     .await;
-    assert_eq!(resp.status(), 200, "list users failed: {:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "list users failed: {:?}",
+        resp.text().await
+    );
     let body = resp.json::<serde_json::Value>().await.unwrap();
     let users = body["users"].as_array().unwrap();
     assert!(
@@ -449,7 +461,12 @@ async fn permission_service_openfga_namespace_lifecycle() {
         json!({ "namespace": "kanban", "model": model_v2 }),
     )
     .await;
-    assert_eq!(resp.status(), 200, "model update failed: {:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "model update failed: {:?}",
+        resp.text().await
+    );
     let body = resp.json::<serde_json::Value>().await.unwrap();
     assert!(
         body["model"]["type_definitions"]
@@ -457,7 +474,10 @@ async fn permission_service_openfga_namespace_lifecycle() {
             .unwrap()
             .iter()
             .any(|def| def["type"] == "KanbanProject"
-                && def["relations"].as_object().unwrap().contains_key("commenter")),
+                && def["relations"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("commenter")),
         "updated model should include the new relation"
     );
 
@@ -517,7 +537,11 @@ async fn permission_service_openfga_namespace_lifecycle() {
         }),
     )
     .await;
-    assert_eq!(resp.status(), 400, "deleted namespace should be unconfigured");
+    assert_eq!(
+        resp.status(),
+        400,
+        "deleted namespace should be unconfigured"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = handle.await;

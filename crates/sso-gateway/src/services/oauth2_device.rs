@@ -35,8 +35,7 @@ fn transient_expiry() -> time::OffsetDateTime {
 /// Hydra operations used by the OAuth2 device service.
 #[async_trait]
 pub trait DeviceHydra: Send + Sync {
-    async fn device_authorize(&self, form: Vec<(String, String)>)
-    -> Result<Value, OryClientError>;
+    async fn device_authorize(&self, form: Vec<(String, String)>) -> Result<Value, OryClientError>;
 
     /// Poll the standard token endpoint with the device-code grant (RFC 8628
     /// §3.4 — there is no dedicated device token endpoint).
@@ -57,10 +56,7 @@ pub trait DeviceHydra: Send + Sync {
 
 #[async_trait]
 impl DeviceHydra for HydraClient {
-    async fn device_authorize(
-        &self,
-        form: Vec<(String, String)>,
-    ) -> Result<Value, OryClientError> {
+    async fn device_authorize(&self, form: Vec<(String, String)>) -> Result<Value, OryClientError> {
         self.device("auth", form, None).await
     }
 
@@ -265,11 +261,7 @@ impl OAuth2DeviceService for OAuth2DeviceServiceImpl {
             ("client_id".to_string(), ory_client_id),
             ("device_code".to_string(), req.device_code),
         ];
-        let value = self
-            .hydra
-            .token(form)
-            .await
-            .map_err(map_ory_error)?;
+        let value = self.hydra.token(form).await.map_err(map_ory_error)?;
         Ok(Response::new(ory_token_to_proto(&value)))
     }
 

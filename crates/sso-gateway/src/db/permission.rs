@@ -190,13 +190,12 @@ impl PgPermissionTupleStore {
         tenant_id: &str,
         namespace: &str,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "DELETE FROM permission_tuples WHERE tenant_id = $1 AND namespace = $2",
-        )
-        .bind(tenant_id)
-        .bind(namespace)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM permission_tuples WHERE tenant_id = $1 AND namespace = $2")
+                .bind(tenant_id)
+                .bind(namespace)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected())
     }
 
@@ -294,7 +293,10 @@ impl PgPermissionTupleStore {
              FROM permission_tuples WHERE {filters}"
         );
         if after.is_some() {
-            query.push_str(&format!(" AND (created_at, id) < (${param_idx}, ${})", param_idx + 1));
+            query.push_str(&format!(
+                " AND (created_at, id) < (${param_idx}, ${})",
+                param_idx + 1
+            ));
             param_idx += 2;
         }
         query.push_str(&format!(
@@ -547,13 +549,7 @@ mod tests {
         let tenant = format!("tenant-{}", Ulid::new());
         create_test_tenant(&pool, &tenant).await;
 
-        assert!(
-            store
-                .create_many(&tenant, &[])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.create_many(&tenant, &[]).await.unwrap().is_empty());
 
         let keys = vec![
             key("app", "doc-1", "reader", "user-1"),

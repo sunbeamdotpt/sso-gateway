@@ -137,8 +137,9 @@ impl PgAgentDelegationStore {
         limit: u32,
         after: Option<(time::OffsetDateTime, String)>,
     ) -> Result<(Vec<AgentDelegationRow>, i64), DbError> {
-        let count_query =
-            format!("SELECT COUNT(*) FROM agent_delegations WHERE tenant_id = $1 AND {column} = $2");
+        let count_query = format!(
+            "SELECT COUNT(*) FROM agent_delegations WHERE tenant_id = $1 AND {column} = $2"
+        );
         let total: i64 = sqlx::query_scalar(&count_query)
             .bind(tenant_id)
             .bind(value)
@@ -186,8 +187,14 @@ impl PgAgentDelegationStore {
         limit: u32,
         after: Option<(time::OffsetDateTime, String)>,
     ) -> Result<(Vec<AgentDelegationRow>, i64), DbError> {
-        self.list_page_by(tenant_id, "user_identity_id", user_identity_id, limit, after)
-            .await
+        self.list_page_by(
+            tenant_id,
+            "user_identity_id",
+            user_identity_id,
+            limit,
+            after,
+        )
+        .await
     }
 }
 
@@ -224,7 +231,8 @@ impl AgentDelegationStore for PgAgentDelegationStore {
         limit: u32,
         after: Option<(time::OffsetDateTime, String)>,
     ) -> Result<(Vec<AgentDelegationRow>, i64), DbError> {
-        self.list_page_by_agent(tenant_id, agent_id, limit, after).await
+        self.list_page_by_agent(tenant_id, agent_id, limit, after)
+            .await
     }
 
     async fn list_page_by_user(
@@ -270,7 +278,11 @@ mod tests {
             .create(&tenant, None, "bot")
             .await
             .unwrap();
-        (Arc::new(PgAgentDelegationStore::new(pool)), tenant, agent.id)
+        (
+            Arc::new(PgAgentDelegationStore::new(pool)),
+            tenant,
+            agent.id,
+        )
     }
 
     fn expiry() -> time::OffsetDateTime {
@@ -343,12 +355,24 @@ mod tests {
         let (store, tenant, agent_id) = store_tenant_agent().await;
         for _ in 0..3 {
             store
-                .create(&tenant, &agent_id, "user-1", &["tenant:read".to_string()], expiry())
+                .create(
+                    &tenant,
+                    &agent_id,
+                    "user-1",
+                    &["tenant:read".to_string()],
+                    expiry(),
+                )
                 .await
                 .unwrap();
         }
         store
-            .create(&tenant, &agent_id, "user-2", &["tenant:read".to_string()], expiry())
+            .create(
+                &tenant,
+                &agent_id,
+                "user-2",
+                &["tenant:read".to_string()],
+                expiry(),
+            )
             .await
             .unwrap();
 

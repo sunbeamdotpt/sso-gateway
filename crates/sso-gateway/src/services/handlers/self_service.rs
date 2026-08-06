@@ -144,7 +144,11 @@ async fn redirect_to_branded(
     let Some(branded) = state.paths.gateway_path_for_kratos(path) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let mut location = format!("{}{}", state.gateway_public_url.trim_end_matches('/'), branded);
+    let mut location = format!(
+        "{}{}",
+        state.gateway_public_url.trim_end_matches('/'),
+        branded
+    );
     if let Some(query) = request.uri().query() {
         location.push('?');
         location.push_str(query);
@@ -341,8 +345,8 @@ mod tests {
 
     #[test]
     fn build_upstream_url_builds_path() {
-        let url = build_upstream_url("http://kratos.example.com", "/self-service/login/browser")
-            .unwrap();
+        let url =
+            build_upstream_url("http://kratos.example.com", "/self-service/login/browser").unwrap();
         assert_eq!(
             url.as_str(),
             "http://kratos.example.com/self-service/login/browser"
@@ -434,9 +438,7 @@ mod tests {
     async fn branded_login_init_is_proxied_with_query() {
         let upstream_origin = spawn_upstream(Router::new().route(
             "/self-service/login/browser",
-            get(|uri: axum::http::Uri| async move {
-                uri.query().unwrap_or_default().to_string()
-            }),
+            get(|uri: axum::http::Uri| async move { uri.query().unwrap_or_default().to_string() }),
         ))
         .await;
 
@@ -461,14 +463,8 @@ mod tests {
     async fn branded_recovery_with_token_hits_submission_route() {
         let upstream_origin = spawn_upstream(
             Router::new()
-                .route(
-                    "/self-service/recovery",
-                    get(|| async { "submission" }),
-                )
-                .route(
-                    "/self-service/recovery/browser",
-                    get(|| async { "init" }),
-                ),
+                .route("/self-service/recovery", get(|| async { "submission" }))
+                .route("/self-service/recovery/browser", get(|| async { "init" })),
         )
         .await;
 
@@ -493,14 +489,8 @@ mod tests {
     async fn branded_recovery_without_token_hits_init_route() {
         let upstream_origin = spawn_upstream(
             Router::new()
-                .route(
-                    "/self-service/recovery",
-                    get(|| async { "submission" }),
-                )
-                .route(
-                    "/self-service/recovery/browser",
-                    get(|| async { "init" }),
-                ),
+                .route("/self-service/recovery", get(|| async { "submission" }))
+                .route("/self-service/recovery/browser", get(|| async { "init" })),
         )
         .await;
 
@@ -685,11 +675,7 @@ mod tests {
         let state = test_state("http://127.0.0.1:1".to_string());
         let app = router(state);
         let response = app
-            .oneshot(
-                Request::get("/identity/login")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/identity/login").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

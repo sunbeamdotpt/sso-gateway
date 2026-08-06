@@ -61,7 +61,8 @@ pub struct PgAgentStore {
     pool: DbPool,
 }
 
-const AGENT_COLUMNS: &str = "id, tenant_id, owner_identity_id, name, status, created_at, updated_at";
+const AGENT_COLUMNS: &str =
+    "id, tenant_id, owner_identity_id, name, status, created_at, updated_at";
 
 impl PgAgentStore {
     pub fn new(pool: DbPool) -> Self {
@@ -101,11 +102,10 @@ impl PgAgentStore {
     }
 
     pub async fn get_status(&self, id: &str) -> Result<String, DbError> {
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM agents WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM agents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         status.ok_or(DbError::AgentNotFound)
     }
 
@@ -295,7 +295,10 @@ mod tests {
         let status = store.get_status(&created.id).await.unwrap();
         assert_eq!(status, AGENT_STATUS_ACTIVE);
 
-        let renamed = store.set_name(&tenant, &created.id, "renamed").await.unwrap();
+        let renamed = store
+            .set_name(&tenant, &created.id, "renamed")
+            .await
+            .unwrap();
         assert_eq!(renamed.name, "renamed");
 
         let disabled = store
@@ -353,10 +356,7 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(page1.len(), 2);
 
-        let cursor = page1
-            .last()
-            .map(|r| (r.created_at, r.id.clone()))
-            .unwrap();
+        let cursor = page1.last().map(|r| (r.created_at, r.id.clone())).unwrap();
         let (page2, _) = store.list_page(&tenant, 2, Some(cursor)).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].id, page2[0].id);

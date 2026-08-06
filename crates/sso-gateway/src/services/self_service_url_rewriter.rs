@@ -91,10 +91,16 @@ impl SelfServicePaths {
     fn kratos_table(&self) -> [(&'static str, &str); 12] {
         [
             ("/self-service/login/browser", self.login.as_str()),
-            ("/self-service/registration/browser", self.registration.as_str()),
+            (
+                "/self-service/registration/browser",
+                self.registration.as_str(),
+            ),
             ("/self-service/settings/browser", self.settings.as_str()),
             ("/self-service/recovery/browser", self.recovery.as_str()),
-            ("/self-service/verification/browser", self.verification.as_str()),
+            (
+                "/self-service/verification/browser",
+                self.verification.as_str(),
+            ),
             ("/self-service/logout/browser", self.logout.as_str()),
             ("/self-service/recovery", self.recovery.as_str()),
             ("/self-service/verification", self.verification.as_str()),
@@ -122,17 +128,21 @@ impl SelfServicePaths {
     /// preserving any suffix (e.g. the OIDC provider segment). Returns `None`
     /// when the path is not a browser-facing self-service route.
     pub fn gateway_path_for_kratos(&self, kratos_path: &str) -> Option<String> {
-        self.kratos_table().into_iter().find_map(|(kratos, gateway)| {
-            Self::match_prefix(kratos_path, kratos).map(|suffix| format!("{gateway}{suffix}"))
-        })
+        self.kratos_table()
+            .into_iter()
+            .find_map(|(kratos, gateway)| {
+                Self::match_prefix(kratos_path, kratos).map(|suffix| format!("{gateway}{suffix}"))
+            })
     }
 
     /// Translate a branded gateway path back to the Kratos upstream path.
     /// Returns `None` when the path is not part of the branded surface.
     pub fn kratos_path_for_gateway(&self, gateway_path: &str) -> Option<String> {
-        self.kratos_table().into_iter().find_map(|(kratos, gateway)| {
-            Self::match_prefix(gateway_path, gateway).map(|suffix| format!("{kratos}{suffix}"))
-        })
+        self.kratos_table()
+            .into_iter()
+            .find_map(|(kratos, gateway)| {
+                Self::match_prefix(gateway_path, gateway).map(|suffix| format!("{kratos}{suffix}"))
+            })
     }
 
     /// True when `path` belongs to the branded browser surface and must skip
@@ -181,18 +191,26 @@ impl SelfServicePaths {
 
     /// Rewrite nested URLs inside a raw query string, leaving every other
     /// pair byte-identical in order.
-    fn rewrite_nested_query(&self, query: &str, kratos_prefix: &str, gateway_prefix: &str) -> String {
+    fn rewrite_nested_query(
+        &self,
+        query: &str,
+        kratos_prefix: &str,
+        gateway_prefix: &str,
+    ) -> String {
         form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(form_urlencoded::parse(query.as_bytes()).map(|(key, value)| {
-                if NESTED_URL_PARAMS.contains(&key.as_ref()) {
-                    (
-                        key,
-                        self.rewrite_browser_url(&value, kratos_prefix, gateway_prefix).into(),
-                    )
-                } else {
-                    (key, value)
-                }
-            }))
+            .extend_pairs(
+                form_urlencoded::parse(query.as_bytes()).map(|(key, value)| {
+                    if NESTED_URL_PARAMS.contains(&key.as_ref()) {
+                        (
+                            key,
+                            self.rewrite_browser_url(&value, kratos_prefix, gateway_prefix)
+                                .into(),
+                        )
+                    } else {
+                        (key, value)
+                    }
+                }),
+            )
             .finish()
     }
 }
@@ -290,16 +308,25 @@ mod tests {
         let paths = paths();
         let cases = [
             ("/self-service/login/browser", "/identity/login"),
-            ("/self-service/registration/browser", "/identity/registration"),
+            (
+                "/self-service/registration/browser",
+                "/identity/registration",
+            ),
             ("/self-service/settings/browser", "/identity/settings"),
             ("/self-service/recovery/browser", "/identity/recovery"),
             ("/self-service/recovery", "/identity/recovery"),
-            ("/self-service/verification/browser", "/identity/verification"),
+            (
+                "/self-service/verification/browser",
+                "/identity/verification",
+            ),
             ("/self-service/verification", "/identity/verification"),
             ("/self-service/logout/browser", "/identity/logout"),
             ("/self-service/logout", "/identity/logout"),
             ("/self-service/errors", "/identity/errors"),
-            ("/self-service/methods/oidc/callback", "/identity/oidc/callback"),
+            (
+                "/self-service/methods/oidc/callback",
+                "/identity/oidc/callback",
+            ),
             (
                 "/self-service/methods/oidc/callback/google",
                 "/identity/oidc/callback/google",
@@ -426,14 +453,20 @@ mod tests {
         let foreign = "https://other.example.com/self-service/login/browser";
         assert_eq!(paths.rewrite_browser_url(foreign, KRATOS, GATEWAY), foreign);
         let unmapped = "http://kratos.example.com/self-service/login/flows?id=1";
-        assert_eq!(paths.rewrite_browser_url(unmapped, KRATOS, GATEWAY), unmapped);
+        assert_eq!(
+            paths.rewrite_browser_url(unmapped, KRATOS, GATEWAY),
+            unmapped
+        );
     }
 
     #[test]
     fn rewrite_browser_url_tolerates_unparseable_urls() {
         let paths = paths();
         let relative = "self-service/login/browser";
-        assert_eq!(paths.rewrite_browser_url(relative, KRATOS, GATEWAY), relative);
+        assert_eq!(
+            paths.rewrite_browser_url(relative, KRATOS, GATEWAY),
+            relative
+        );
     }
 
     #[test]

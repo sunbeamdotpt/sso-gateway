@@ -1,11 +1,15 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
     db::{
         IdMappingRepo, IdMappingStore, IdentitySchemaRepo, TenantRepo, TransientTokenRepo,
@@ -16,7 +20,6 @@ use sso_gateway::{
     services::{identity::IdentityServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
-use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::KratosClient;
 use sunbeam_g2v::{
     health::HealthRouter,

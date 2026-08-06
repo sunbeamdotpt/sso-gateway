@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,7 +102,9 @@ async fn refresh_token_flow_returns_new_access_token() {
         "refresh grant must issue a new access_token"
     );
     assert_eq!(
-        refreshed["token_type"].as_str().map(|s| s.to_ascii_lowercase()),
+        refreshed["token_type"]
+            .as_str()
+            .map(|s| s.to_ascii_lowercase()),
         Some("bearer".to_string())
     );
     assert!(
@@ -162,10 +167,7 @@ async fn client_credentials_with_client_secret_basic_returns_token() {
         .http
         .post(format!("{}/oauth2/token", gateway.base_url))
         .basic_auth(&client_id, Some(&client_secret))
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("scope", "openid"),
-        ])
+        .form(&[("grant_type", "client_credentials"), ("scope", "openid")])
         .send()
         .await
         .expect("token request should succeed")
@@ -434,7 +436,12 @@ fn assert_id_token_well_formed(id_token: &str) {
     );
 }
 
-fn assert_id_token(gateway: &Gateway, token: &serde_json::Value, subject: &str, ory_client_id: &str) {
+fn assert_id_token(
+    gateway: &Gateway,
+    token: &serde_json::Value,
+    subject: &str,
+    ory_client_id: &str,
+) {
     let id_token = token["id_token"].as_str().expect("id_token");
     assert_id_token_well_formed(id_token);
     let claims = decode_jwt_payload(id_token);
