@@ -465,6 +465,9 @@ pub async fn build_app_with_upstream(
             hydra.clone(),
             oauth_mappings,
             config.public_base_url.clone(),
+            entitlements.clone(),
+            application_store.clone(),
+            std::time::Duration::from_secs(config.dcr_unused_registration_ttl_days * 86_400),
         )
         .with_system_tenant_id(config.system_tenant_ulid.clone())
         .with_dynamic_client_registration_enabled(config.dynamic_client_registration_enabled)

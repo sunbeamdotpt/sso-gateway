@@ -118,6 +118,9 @@ async fn scim_users_and_groups_round_trip() {
         hydra.clone(),
         mappings.clone(),
         base.clone(),
+        entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
     ));
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
 

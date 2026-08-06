@@ -1,12 +1,13 @@
 use axum::{
     Extension,
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,6 +174,45 @@ fn endpoint_class(path: &str) -> &'static str {
     }
 }
 
+/// Client IP used for the anonymous `register` rate-limit bucket: the first
+/// `x-forwarded-for` hop (the gateway sits behind an ingress that sets it,
+/// matching the forwarded-header precedent in the self-service proxy), else
+/// the direct peer address when the server is built with `ConnectInfo`.
+fn client_ip(parts: &axum::http::request::Parts) -> Option<String> {
+    if let Some(xff) = parts
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        && let Some(first) = xff.split(',').next()
+    {
+        let first = first.trim();
+        if !first.is_empty() {
+            return Some(first.to_string());
+        }
+    }
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip().to_string())
+}
+
+/// Fallback bucket key for requests without an OAuth2 `client_id`.
+///
+/// DCR abuse is anonymous by definition, so the `register` class keys on the
+/// client IP instead of a shared global bucket (SSO-039) — one abuser must
+/// not starve every other registrant, and distinct NAT'd users must not share
+/// one bucket. With no IP available it degrades to the global key. Every
+/// other class keeps the per-class global bucket (SSO-031).
+fn anonymous_bucket_key(parts: &axum::http::request::Parts) -> String {
+    let class = endpoint_class(parts.uri.path());
+    if class == "register"
+        && let Some(ip) = client_ip(parts)
+    {
+        return format!("register-ip:{ip}");
+    }
+    format!("global:{class}")
+}
+
 /// Reject requests with `429 Too Many Requests` when the key's bucket is empty.
 pub async fn rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
@@ -192,7 +232,7 @@ pub async fn rate_limit_middleware(
         .or_else(|| form_body_client_id(&parts.headers, &body))
     {
         Some(client_id) => client_id,
-        None => format!("global:{}", endpoint_class(&path)),
+        None => anonymous_bucket_key(&parts),
     };
     let request = Request::from_parts(parts, Body::from(body));
     if limiter.check(&key) {
@@ -619,7 +659,7 @@ mod tests {
         http::Request,
         middleware::from_fn,
         middleware::from_fn_with_state,
-        routing::get,
+        routing::{get, post},
     };
     use std::sync::Mutex;
     use tower::ServiceExt;
@@ -1128,6 +1168,7 @@ mod tests {
             .route("/.well-known/openid-configuration", get(ok_handler))
             .route("/.well-known/jwks.json", get(ok_handler))
             .route("/oauth2/userinfo", get(ok_handler))
+            .route("/oauth2/register", post(ok_handler))
             .layer(from_fn_with_state(limiter, rate_limit_middleware))
     }
 
@@ -1253,6 +1294,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// SSO-039: anonymous DCR requests bucket per client IP (taken from
+    /// `x-forwarded-for`), so one abuser cannot drain a bucket shared with
+    /// every other registrant and distinct NAT'd users stay independent.
+    #[tokio::test]
+    async fn rate_limit_register_buckets_anonymous_requests_per_client_ip() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let request = |ip: &str| {
+            Request::post("/oauth2/register")
+                .header("x-forwarded-for", ip)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request("203.0.113.1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The same IP exhausts its own bucket...
+        let response = router
+            .clone()
+            .oneshot(request("203.0.113.1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // ...while a different IP has an independent bucket.
+        let response = router.oneshot(request("203.0.113.2")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// SSO-039: with no forwarded header, the peer address from ConnectInfo
+    /// keys the register bucket.
+    #[tokio::test]
+    async fn rate_limit_register_uses_peer_addr_without_forwarded_for() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let request = |addr: &str| {
+            let mut request = Request::post("/oauth2/register")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
+            request
+        };
+        let response = router
+            .clone()
+            .oneshot(request("192.0.2.1:1234"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(request("192.0.2.1:5678"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router.oneshot(request("192.0.2.2:1234")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// SSO-039: with no IP at all, the register class degrades to the shared
+    /// global bucket key.
+    #[tokio::test]
+    async fn rate_limit_register_falls_back_to_global_bucket_without_client_ip() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/oauth2/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .oneshot(
+                Request::post("/oauth2/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// SSO-039: only the register class keys on the client IP — every other
+    /// class keeps the shared per-class global bucket even when the
+    /// anonymous requests come from distinct IPs.
+    #[tokio::test]
+    async fn rate_limit_non_register_classes_ignore_client_ip() {
+        let router = rate_limit_router(Arc::new(RateLimiter::new(1, Duration::from_secs(60))));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/oauth2/userinfo")
+                    .header("x-forwarded-for", "203.0.113.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .oneshot(
+                Request::get("/oauth2/userinfo")
+                    .header("x-forwarded-for", "203.0.113.2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

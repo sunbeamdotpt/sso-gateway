@@ -80,7 +80,14 @@ async fn oauth2_public_endpoints_round_trip() {
     let connect_router: ConnectRouter = application_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
 
-    let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
+    let oauth_state = Arc::new(Oauth2State::new(
+        hydra,
+        mappings.clone(),
+        base.clone(),
+        entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -417,7 +424,14 @@ async fn oauth2_missing_client_id_is_rejected() {
     let connect_router: ConnectRouter = application_service.register(connect_router);
     let service_router = ServiceRouter::from_router(connect_router);
 
-    let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
+    let oauth_state = Arc::new(Oauth2State::new(
+        hydra,
+        mappings.clone(),
+        base.clone(),
+        entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)
@@ -512,8 +526,15 @@ async fn oauth2_dynamic_client_registration_is_public() {
     let mappings = IdMappingRepo::new(pool.clone());
 
     let oauth_state = Arc::new(
-        Oauth2State::new(hydra, mappings.clone(), base.clone())
-            .with_system_tenant_id(system_tenant_ulid.clone()),
+        Oauth2State::new(
+            hydra,
+            mappings.clone(),
+            base.clone(),
+            entitlements(),
+            Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+            std::time::Duration::from_secs(604_800),
+        )
+        .with_system_tenant_id(system_tenant_ulid.clone()),
     );
 
     let connect_router: ConnectRouter = ConnectRouter::new();

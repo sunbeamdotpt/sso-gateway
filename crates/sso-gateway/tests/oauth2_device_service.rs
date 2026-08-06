@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
@@ -102,7 +105,14 @@ async fn oauth2_device_verification_round_trip() {
     let connect_router: ConnectRouter = device_service.register(ConnectRouter::new());
     let service_router = ServiceRouter::from_router(connect_router);
 
-    let oauth_state = Arc::new(Oauth2State::new(hydra, mappings.clone(), base.clone()));
+    let oauth_state = Arc::new(Oauth2State::new(
+        hydra,
+        mappings.clone(),
+        base.clone(),
+        sso_gateway::services::entitlement::test_helpers::entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
+    ));
 
     let server = ServerBuilder::new()
         .with_router(service_router)

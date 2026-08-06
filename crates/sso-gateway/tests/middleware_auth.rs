@@ -74,6 +74,9 @@ async fn auth_middleware_public_path_bypass_and_rejections() {
         hydra,
         IdMappingRepo::new(pool.clone()),
         "http://localhost".to_string(),
+        sso_gateway::services::entitlement::test_helpers::entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
     ));
     let mappings = IdMappingRepo::new(pool.clone());
     let kratos = Arc::new(
@@ -184,6 +187,9 @@ async fn cross_tenant_header_routes_to_target_tenant() {
         hydra,
         IdMappingRepo::new(pool.clone()),
         "http://localhost".to_string(),
+        sso_gateway::services::entitlement::test_helpers::entitlements(),
+        Arc::new(sso_gateway::db::MemoryApplicationStore::default()),
+        std::time::Duration::from_secs(604_800),
     ));
     let mappings = IdMappingRepo::new(pool.clone());
     let kratos = Arc::new(

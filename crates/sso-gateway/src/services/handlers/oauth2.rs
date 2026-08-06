@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -20,11 +21,12 @@ use crate::auth::{
     AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_TENANT_ADMIN, hash_token,
     resolve_tenant_from_subject,
 };
-use crate::db::{IdMappingRepo, IdMappingStore, TokenIntrospectionCache};
+use crate::db::{ApplicationStore, IdMappingRepo, IdMappingStore, TokenIntrospectionCache};
 use crate::services::application::{
     BACKEND_HYDRA, validate_native_redirect_uris, validate_redirect_uris,
     validate_token_endpoint_auth_method,
 };
+use crate::services::entitlement::EntitlementService;
 
 /// Async trait for the Hydra operations used by the public OAuth2/OIDC handlers.
 #[async_trait]
@@ -218,10 +220,26 @@ pub struct Oauth2State {
     /// Whether Matrix-shaped authorize requests get `offline_access` appended
     /// and Matrix DCR registrations keep the refresh-token grant.
     pub(crate) matrix_offline_access_enabled: bool,
+    /// Entitlement cleanup for deleted client registrations (SSO-039).
+    pub(crate) entitlements: Arc<dyn EntitlementService>,
+    /// Application rows: their presence decides whether a deleted client had
+    /// entitlements to clean up. The row itself cascades away with the
+    /// id_mappings delete (`ON DELETE CASCADE`).
+    pub(crate) applications: Arc<dyn ApplicationStore>,
+    /// Unused-registration TTL surfaced as `client_secret_expires_at` on DCR
+    /// responses (SSO-039). Hydra does not enforce it; the DCR reaper does.
+    pub(crate) dcr_unused_registration_ttl: Duration,
 }
 
 impl Oauth2State {
-    pub fn new(hydra: Arc<HydraClient>, mappings: IdMappingRepo, public_base_url: String) -> Self {
+    pub fn new(
+        hydra: Arc<HydraClient>,
+        mappings: IdMappingRepo,
+        public_base_url: String,
+        entitlements: Arc<dyn EntitlementService>,
+        applications: Arc<dyn ApplicationStore>,
+        dcr_unused_registration_ttl: Duration,
+    ) -> Self {
         Self {
             hydra: hydra as Arc<dyn HydraOperations>,
             mappings: Arc::new(mappings) as Arc<dyn IdMappingStore>,
@@ -233,6 +251,9 @@ impl Oauth2State {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements,
+            applications,
+            dcr_unused_registration_ttl,
         }
     }
 
@@ -286,7 +307,10 @@ pub fn router(state: Arc<Oauth2State>) -> Router {
         .route("/oauth2/userinfo", get(userinfo))
         .route("/userinfo", get(userinfo))
         .route("/oauth2/register", post(register))
-        .route("/oauth2/register/{client_id}", delete(delete_registered_client))
+        .route(
+            "/oauth2/register/{client_id}",
+            delete(delete_registered_client),
+        )
         .route("/oauth2/introspect", post(introspect))
         .route("/oauth2/revoke", post(revoke))
         .layer(axum::middleware::from_fn(cors_middleware))
@@ -817,11 +841,21 @@ async fn register(
     }
 
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    // RFC 7591: a public client has no secret, so no expiry either. For
+    // confidential DCR clients the timestamp surfaces the unused-registration
+    // TTL the reaper enforces (SSO-039); Hydra itself ignores it, and the TTL
+    // stops applying once the client is consented — which the response cannot
+    // foresee.
+    let client_secret_expires_at = if token_endpoint_auth_method == "none" {
+        0
+    } else {
+        now + state.dcr_unused_registration_ttl.as_secs() as i64
+    };
     let response = json!({
         "client_id": public_id,
         "client_secret": client_secret,
         "client_id_issued_at": now,
-        "client_secret_expires_at": 0,
+        "client_secret_expires_at": client_secret_expires_at,
         "client_name": client_name,
         "redirect_uris": redirect_uris,
         "grant_types": grant_types,
@@ -1052,8 +1086,13 @@ async fn introspect(
                     obj.insert("client_id".to_string(), json!(public_id));
                 }
             }
-            maybe_inject_introspection_email(&state, &subject, raw_client_id.as_deref(), &mut value)
-                .await;
+            maybe_inject_introspection_email(
+                &state,
+                &subject,
+                raw_client_id.as_deref(),
+                &mut value,
+            )
+            .await;
             json_response(value)
         }
         Err(crate::auth::AuthError::UnknownSubject) => {
@@ -1097,8 +1136,7 @@ fn disallowed_matrix_scope(scope: &str) -> Option<String> {
     scopes
         .iter()
         .find(|s| {
-            !matches!(**s, "openid" | "profile" | "email" | "offline_access")
-                && !is_matrix_scope(s)
+            !matches!(**s, "openid" | "profile" | "email" | "offline_access") && !is_matrix_scope(s)
         })
         .map(|s| s.to_string())
 }
@@ -1148,8 +1186,8 @@ async fn maybe_expand_matrix_client_scope(
         Some(scope) => scope.split_whitespace().collect(),
         None => Vec::new(),
     };
-    let covered = registered.contains(&"*")
-        || requested_scopes.iter().all(|s| registered.contains(s));
+    let covered =
+        registered.contains(&"*") || requested_scopes.iter().all(|s| registered.contains(s));
     if covered {
         return;
     }
@@ -1216,12 +1254,13 @@ async fn maybe_inject_introspection_email(
         Some(scope) => scope.to_owned(),
         None => String::new(),
     };
-    let is_matrix_token = state.matrix_email_claim_enabled
-        && scope.split_whitespace().any(is_matrix_scope);
+    let is_matrix_token =
+        state.matrix_email_claim_enabled && scope.split_whitespace().any(is_matrix_scope);
     let translated_client_id = value.get("client_id").and_then(|v| v.as_str());
-    let is_force_listed = state.force_email_claim_client_ids.iter().any(|id| {
-        Some(id.as_str()) == raw_client_id || Some(id.as_str()) == translated_client_id
-    });
+    let is_force_listed = state
+        .force_email_claim_client_ids
+        .iter()
+        .any(|id| Some(id.as_str()) == raw_client_id || Some(id.as_str()) == translated_client_id);
     if !is_matrix_token && !is_force_listed {
         return;
     }
@@ -1268,9 +1307,7 @@ async fn resolve_public_client(
         .await
     {
         Ok(ory_id) => Ok(ory_id),
-        Err(crate::db::DbError::MappingNotFound) => {
-            heal_client_mapping(state, client_id).await
-        }
+        Err(crate::db::DbError::MappingNotFound) => heal_client_mapping(state, client_id).await,
         Err(e) => {
             warn!("failed to resolve public client {}: {}", client_id, e);
             Err(Box::new(internal_error()))
@@ -1283,7 +1320,10 @@ async fn resolve_public_client(
 /// the row was lost). If Hydra knows the client, backfill the mapping under
 /// the system tenant and carry on; a Hydra 404 stays a terminal
 /// `401 invalid_client`.
-async fn heal_client_mapping(state: &Oauth2State, client_id: &str) -> Result<String, Box<Response>> {
+async fn heal_client_mapping(
+    state: &Oauth2State,
+    client_id: &str,
+) -> Result<String, Box<Response>> {
     let client = match state.hydra.get_oauth2_client(client_id).await {
         Ok(client) => client,
         Err(OryClientError::Ory { status: 404, .. }) => {
@@ -1311,7 +1351,10 @@ async fn heal_client_mapping(state: &Oauth2State, client_id: &str) -> Result<Str
     {
         // A racing replica may have written the row first; the client id is
         // resolved either way, so the backfill failure is not terminal.
-        warn!("failed to backfill client mapping for {}: {}", client_id, err);
+        warn!(
+            "failed to backfill client mapping for {}: {}",
+            client_id, err
+        );
     }
     Ok(ory_id)
 }
@@ -1353,17 +1396,56 @@ async fn delete_orphaned_client_mapping(state: &Oauth2State, ory_id: &str) {
             return;
         }
     };
+    // Entitlement cleanup runs before the mapping delete (SSO-039): the
+    // applications row cascades away with the mapping, and a client with no
+    // row never had entitlements to remove. Group links are deliberately left
+    // dangling — that is `remove_application`'s designed behavior. Failures
+    // are non-fatal: the client is gone from Hydra either way and the DCR
+    // reaper/backfill converges any residue.
+    match state.applications.get(&tenant_id, &public_id).await {
+        Ok(_) => {
+            if let Err(err) = state
+                .entitlements
+                .remove_application(&tenant_id, &public_id)
+                .await
+            {
+                warn!(
+                    tenant_id = %tenant_id,
+                    public_id = %public_id,
+                    "client registration cleanup: entitlement removal failed: {err}"
+                );
+            }
+        }
+        Err(crate::db::DbError::ApplicationNotFound) => {}
+        Err(err) => {
+            warn!(
+                tenant_id = %tenant_id,
+                public_id = %public_id,
+                "client registration cleanup: application lookup failed: {err}"
+            );
+        }
+    }
     match state
         .mappings
         .delete(&tenant_id, BACKEND_HYDRA, &public_id)
         .await
     {
-        Ok(()) => info!(
-            tenant_id = %tenant_id,
-            public_id = %public_id,
-            ory_id = %ory_id,
-            "deleted orphaned hydra client mapping"
-        ),
+        Ok(()) => {
+            info!(
+                tenant_id = %tenant_id,
+                public_id = %public_id,
+                ory_id = %ory_id,
+                "deleted orphaned hydra client mapping"
+            );
+            tracing::info!(
+                target: "sso_gateway::audit",
+                tenant_id = %tenant_id,
+                public_id = %public_id,
+                action = "dcr.registration_deleted",
+                outcome = "success",
+                "audit event"
+            );
+        }
         Err(err) => warn!(
             tenant_id = %tenant_id,
             public_id = %public_id,
@@ -1491,9 +1573,7 @@ fn map_ory_error(err: OryClientError, path: &str, client_id: Option<&str>) -> Re
             (StatusCode::INTERNAL_SERVER_ERROR, server_error_body())
         }
         OryClientError::MissingTenant => (StatusCode::UNAUTHORIZED, server_error_body()),
-        OryClientError::Redirect { .. } => {
-            (StatusCode::INTERNAL_SERVER_ERROR, server_error_body())
-        }
+        OryClientError::Redirect { .. } => (StatusCode::INTERNAL_SERVER_ERROR, server_error_body()),
     };
     let client_id = match client_id {
         Some(id) => id.to_owned(),
@@ -1526,10 +1606,21 @@ fn relay_client_error_body(status: u16, message: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use crate::auth::SubjectType;
     use super::*;
+    use crate::auth::SubjectType;
     use axum::http::HeaderValue;
     use tower::ServiceExt;
+
+    /// TTL used by the shared Oauth2State fixtures (seconds).
+    const TEST_DCR_TTL_SECS: u64 = 604_800;
+
+    fn noop_entitlements() -> Arc<dyn EntitlementService> {
+        crate::services::entitlement::test_helpers::entitlements()
+    }
+
+    fn memory_applications() -> Arc<dyn ApplicationStore> {
+        Arc::new(crate::db::MemoryApplicationStore::default())
+    }
 
     #[derive(Default)]
     struct StubHydra;
@@ -1599,10 +1690,7 @@ mod tests {
             unimplemented!("stub create_oauth2_client not configured")
         }
 
-        async fn get_oauth2_client(
-            &self,
-            _id: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn get_oauth2_client(&self, _id: &str) -> Result<serde_json::Value, OryClientError> {
             Err(OryClientError::Ory {
                 status: 404,
                 message: "not found".into(),
@@ -1791,6 +1879,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         }
     }
 
@@ -1806,6 +1897,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         }
     }
 
@@ -1846,7 +1940,11 @@ mod tests {
         let resp = map_ory_error(OryClientError::MissingTenant, "/test", None);
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = map_ory_error(OryClientError::InvalidResponse("fail".into()), "/test", None);
+        let resp = map_ory_error(
+            OryClientError::InvalidResponse("fail".into()),
+            "/test",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let resp = map_ory_error(
@@ -1993,7 +2091,9 @@ mod tests {
         let resp = map_ory_error(
             OryClientError::Ory {
                 status: 500,
-                message: "{\"error\":\"internal\",\"error_description\":\"db connection string leaked\"}".into(),
+                message:
+                    "{\"error\":\"internal\",\"error_description\":\"db connection string leaked\"}"
+                        .into(),
             },
             "/test",
             None,
@@ -2131,6 +2231,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         };
         let ory_id = resolve_public_client(&state, "external-client")
             .await
@@ -2162,6 +2265,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         };
         let err = resolve_public_client(&state, "external-client")
             .await
@@ -2255,10 +2361,7 @@ mod tests {
             }))
         }
 
-        async fn get_oauth2_client(
-            &self,
-            _id: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn get_oauth2_client(&self, _id: &str) -> Result<serde_json::Value, OryClientError> {
             Ok(self.response.clone())
         }
 
@@ -2386,10 +2489,7 @@ mod tests {
             }))
         }
 
-        async fn get_oauth2_client(
-            &self,
-            id: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn get_oauth2_client(&self, id: &str) -> Result<serde_json::Value, OryClientError> {
             self.get_client_calls.lock().unwrap().push(id.to_string());
             if self.client_gone {
                 return Err(OryClientError::Ory {
@@ -2455,6 +2555,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         }
     }
 
@@ -2596,6 +2699,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         }
     }
 
@@ -2894,6 +3000,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         (state, hydra)
     }
@@ -3017,10 +3126,12 @@ mod tests {
         let body = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["error"], "invalid_scope");
-        assert!(value["error_description"]
-            .as_str()
-            .unwrap()
-            .contains("tenant:admin"));
+        assert!(
+            value["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("tenant:admin")
+        );
         assert!(
             hydra.authorize_calls.lock().unwrap().is_empty(),
             "rejected requests must not reach Hydra"
@@ -3305,6 +3416,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-1"));
@@ -3411,10 +3525,7 @@ mod tests {
             value["introspection_endpoint"],
             "https://gateway.example.com/oauth2/introspect"
         );
-        assert_eq!(
-            value["code_challenge_methods_supported"],
-            json!(["S256"])
-        );
+        assert_eq!(value["code_challenge_methods_supported"], json!(["S256"]));
         assert!(
             value["token_endpoint_auth_methods_supported"]
                 .as_array()
@@ -3499,10 +3610,7 @@ mod tests {
             Err(hydra_err())
         }
 
-        async fn get_oauth2_client(
-            &self,
-            _id: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn get_oauth2_client(&self, _id: &str) -> Result<serde_json::Value, OryClientError> {
             Err(hydra_err())
         }
 
@@ -3536,6 +3644,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         }
     }
 
@@ -3667,9 +3778,14 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
-            .await
-            .into_response();
+        let resp = introspect(
+            State(state),
+            Some(Extension(auth)),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -3701,6 +3817,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3712,9 +3831,14 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
-            .await
-            .into_response();
+        let resp = introspect(
+            State(state),
+            Some(Extension(auth)),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3747,6 +3871,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3758,9 +3885,14 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
-            .await
-            .into_response();
+        let resp = introspect(
+            State(state),
+            Some(Extension(auth)),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3797,6 +3929,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let auth = AuthContext {
             tenant_id: "tenant-1".into(),
@@ -3808,9 +3943,14 @@ mod tests {
             authentication_methods: vec![],
         };
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
-        let resp = introspect(State(state), Some(Extension(auth)), HeaderMap::new(), Form(form))
-            .await
-            .into_response();
+        let resp = introspect(
+            State(state),
+            Some(Extension(auth)),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3850,9 +3990,15 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
         let resp = introspect(State(state), None, headers, Form(form))
             .await
@@ -3886,6 +4032,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3985,6 +4134,9 @@ mod tests {
             force_email_claim_client_ids: force_ids,
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         })
     }
 
@@ -4032,7 +4184,10 @@ mod tests {
         let value = introspect_admin(state).await;
         assert_eq!(value["active"], true);
         assert_eq!(value["email"], "m@example.com");
-        assert_eq!(*calls.lock().unwrap(), vec!["kratos-identity-1".to_string()]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["kratos-identity-1".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -4178,7 +4333,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let headers = resp.headers();
-        assert_eq!(headers[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            headers[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
         assert_eq!(
             headers[axum::http::header::ACCESS_CONTROL_ALLOW_METHODS],
             "GET, POST, OPTIONS"
@@ -4299,6 +4457,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         (state, mappings)
     }
@@ -4324,6 +4485,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         (state, hydra, mappings)
     }
@@ -4341,13 +4505,21 @@ mod tests {
             "scope": "openid profile",
             "token_endpoint_auth_method": "client_secret_basic",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
         assert!(value["client_id"].as_str().unwrap().starts_with("01"));
         assert_eq!(value["client_secret"], "ory-secret-1");
-        assert_eq!(value["client_secret_expires_at"], 0);
+        // SSO-039: confidential DCR clients advertise the unused-registration
+        // TTL as the secret expiry.
+        let issued_at = value["client_id_issued_at"].as_i64().unwrap();
+        assert_eq!(
+            value["client_secret_expires_at"].as_i64().unwrap(),
+            issued_at + TEST_DCR_TTL_SECS as i64
+        );
         assert_eq!(value["scope"], "openid profile");
 
         let created = mappings.created.lock().unwrap();
@@ -4397,7 +4569,9 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("access_denied"));
@@ -4431,7 +4605,9 @@ mod tests {
             "client_name": "test-client",
             "redirect_uris": ["not-a-url"],
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -4448,11 +4624,31 @@ mod tests {
             "redirect_uris": ["io.element.android:/"],
             "token_endpoint_auth_method": "none",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let value: serde_json::Value =
-            serde_json::from_str(&body_to_string(resp).await).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body_to_string(resp).await).unwrap();
         assert_eq!(value["redirect_uris"][0], "io.element.android:/");
+    }
+
+    /// RFC 7591/SSO-039: a public client has no secret, so its registration
+    /// response keeps `client_secret_expires_at` at 0 instead of advertising
+    /// the unused-registration TTL.
+    #[tokio::test]
+    async fn register_public_client_has_no_secret_expiry() {
+        let (state, _) = register_state();
+        let body = json!({
+            "client_name": "element-x-android",
+            "redirect_uris": ["io.element.android:/"],
+            "token_endpoint_auth_method": "none",
+        });
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body_to_string(resp).await).unwrap();
+        assert_eq!(value["client_secret_expires_at"], 0);
     }
 
     /// Custom schemes stay rejected for confidential clients, which play by
@@ -4465,7 +4661,9 @@ mod tests {
             "redirect_uris": ["io.element.android:/"],
             "token_endpoint_auth_method": "client_secret_basic",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -4481,7 +4679,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid tenant:admin email offline_access bogus:scope",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4502,7 +4702,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid urn:matrix:client:api:* tenant:admin",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4542,7 +4744,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid urn:matrix:client:api:*",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4564,7 +4768,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid tenant:admin email",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4582,7 +4788,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "tenant:admin",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4602,12 +4810,17 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let body = json!({
             "client_name": "test-client",
             "redirect_uris": ["https://example.com/callback"],
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -4619,7 +4832,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "token_endpoint_auth_method": "invalid_method",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_str = body_to_string(resp).await;
         assert!(body_str.contains("invalid_request"));
@@ -4684,10 +4899,7 @@ mod tests {
         ) -> Result<serde_json::Value, OryClientError> {
             Ok(json!({"client_secret": "secret"}))
         }
-        async fn get_oauth2_client(
-            &self,
-            _id: &str,
-        ) -> Result<serde_json::Value, OryClientError> {
+        async fn get_oauth2_client(&self, _id: &str) -> Result<serde_json::Value, OryClientError> {
             unimplemented!()
         }
         async fn get_json(&self, _url: reqwest::Url) -> Result<serde_json::Value, OryClientError> {
@@ -4711,6 +4923,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let body = json!({
             "client_name": "test-client",
@@ -4796,6 +5011,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let body = json!({
             "client_name": "test-client",
@@ -4898,6 +5116,9 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: noop_entitlements(),
+            applications: memory_applications(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
         let resp = jwks(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -4915,7 +5136,9 @@ mod tests {
             "redirect_uris": ["https://example.com/callback"],
             "scope": "openid urn:matrix:org.matrix.msc2967.client:api:* tenant:admin",
         });
-        let resp = register(State(state), None, Json(body)).await.into_response();
+        let resp = register(State(state), None, Json(body))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body_str).unwrap();
@@ -4986,10 +5209,12 @@ mod tests {
         let body = body_to_string(resp).await;
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["error"], "invalid_scope");
-        assert!(value["error_description"]
-            .as_str()
-            .unwrap()
-            .contains("tenant:admin"));
+        assert!(
+            value["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("tenant:admin")
+        );
         assert!(
             hydra.authorize_calls.lock().unwrap().is_empty(),
             "rejected requests must not reach Hydra"
@@ -5133,8 +5358,20 @@ mod tests {
         }
     }
 
-    fn deleting_state(hydra: RecordingHydra) -> (Arc<Oauth2State>, Arc<DeletingMappingStore>) {
+    #[allow(clippy::type_complexity)]
+    fn deleting_state(
+        hydra: RecordingHydra,
+    ) -> (
+        Arc<Oauth2State>,
+        Arc<DeletingMappingStore>,
+        Arc<crate::services::entitlement::test_helpers::ConfigurableEntitlementService>,
+        Arc<crate::db::MemoryApplicationStore>,
+    ) {
         let mappings = Arc::new(DeletingMappingStore::default());
+        let entitlements = Arc::new(
+            crate::services::entitlement::test_helpers::ConfigurableEntitlementService::default(),
+        );
+        let applications = Arc::new(crate::db::MemoryApplicationStore::default());
         let state = Arc::new(Oauth2State {
             hydra: Arc::new(hydra),
             mappings: mappings.clone(),
@@ -5146,8 +5383,11 @@ mod tests {
             force_email_claim_client_ids: Vec::new(),
             matrix_email_claim_enabled: true,
             matrix_offline_access_enabled: true,
+            entitlements: entitlements.clone(),
+            applications: applications.clone(),
+            dcr_unused_registration_ttl: Duration::from_secs(TEST_DCR_TTL_SECS),
         });
-        (state, mappings)
+        (state, mappings, entitlements, applications)
     }
 
     /// SSO-031: when credential verification 404s — the mapped client is
@@ -5155,12 +5395,15 @@ mod tests {
     /// response stays a terminal `401 invalid_client`.
     #[tokio::test]
     async fn introspect_deletes_orphaned_mapping_when_verify_finds_client_gone() {
-        let (state, mappings) = deleting_state(RecordingHydra {
+        let (state, mappings, _, _) = deleting_state(RecordingHydra {
             verify_not_found: true,
             ..Default::default()
         });
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
         let form = HashMap::from([("token".to_string(), "token-1".to_string())]);
         let resp = introspect(State(state), None, headers, Form(form))
             .await
@@ -5184,7 +5427,7 @@ mod tests {
     /// admin API and drops the orphaned mapping on a 404.
     #[tokio::test]
     async fn introspect_deletes_orphaned_mapping_when_failed_verify_confirms_client_gone() {
-        let (state, mappings) = deleting_state(RecordingHydra {
+        let (state, mappings, _, _) = deleting_state(RecordingHydra {
             client_gone: true,
             ..Default::default()
         });
@@ -5215,7 +5458,7 @@ mod tests {
     /// confirmatory admin lookup does not 404, so nothing is deleted.
     #[tokio::test]
     async fn introspect_keeps_mapping_for_wrong_secret_on_existing_client() {
-        let (state, mappings) = deleting_state(RecordingHydra {
+        let (state, mappings, _, _) = deleting_state(RecordingHydra {
             response: json!({"client_id": "hydra-client-id-1", "scope": "*"}),
             ..Default::default()
         });
@@ -5242,7 +5485,7 @@ mod tests {
             ..Default::default()
         };
         let authorize_calls = hydra.authorize_calls.clone();
-        let (state, mappings) = deleting_state(hydra);
+        let (state, mappings, _, _) = deleting_state(hydra);
         let params = HashMap::from([
             ("client_id".to_string(), "gateway-client-1".to_string()),
             (
@@ -5275,16 +5518,16 @@ mod tests {
             ..Default::default()
         };
         let delete_calls = hydra.delete_calls.clone();
-        let (state, mappings) = deleting_state(hydra);
+        let (state, mappings, _, _) = deleting_state(hydra);
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
-        let resp = delete_registered_client(
-            State(state),
-            headers,
-            Path("gateway-client-1".to_string()),
-        )
-        .await
-        .into_response();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(
             *delete_calls.lock().unwrap(),
@@ -5309,19 +5552,16 @@ mod tests {
             ..Default::default()
         };
         let delete_calls = hydra.delete_calls.clone();
-        let (state, mappings) = deleting_state(hydra);
+        let (state, mappings, _, _) = deleting_state(hydra);
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
             basic_auth_header("gateway-client-1", "wrong-secret"),
         );
-        let resp = delete_registered_client(
-            State(state),
-            headers,
-            Path("gateway-client-1".to_string()),
-        )
-        .await
-        .into_response();
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = body_to_string(resp).await;
         assert!(body.contains("invalid_client"));
@@ -5338,16 +5578,13 @@ mod tests {
             ..Default::default()
         };
         let delete_calls = hydra.delete_calls.clone();
-        let (state, mappings) = deleting_state(hydra);
+        let (state, mappings, _, _) = deleting_state(hydra);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("other-client", "secret"));
-        let resp = delete_registered_client(
-            State(state),
-            headers,
-            Path("gateway-client-1".to_string()),
-        )
-        .await
-        .into_response();
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(delete_calls.lock().unwrap().is_empty());
         assert!(mappings.deleted.lock().unwrap().is_empty());
@@ -5361,9 +5598,10 @@ mod tests {
         let state = Arc::new(resolve_state(Ok(None)));
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, basic_auth_header("unknown-client", "secret"));
-        let resp = delete_registered_client(State(state), headers, Path("unknown-client".to_string()))
-            .await
-            .into_response();
+        let resp =
+            delete_registered_client(State(state), headers, Path("unknown-client".to_string()))
+                .await
+                .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = body_to_string(resp).await;
         assert!(body.contains("invalid_client"));
@@ -5373,19 +5611,111 @@ mod tests {
     /// the orphaned mapping is reconciled and the endpoint answers 204.
     #[tokio::test]
     async fn delete_registered_client_already_gone_from_hydra_is_idempotent() {
-        let (state, mappings) = deleting_state(RecordingHydra {
+        let (state, mappings, _, _) = deleting_state(RecordingHydra {
             verify_not_found: true,
             ..Default::default()
         });
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, basic_auth_header("gateway-client-1", "secret"));
-        let resp = delete_registered_client(
-            State(state),
-            headers,
-            Path("gateway-client-1".to_string()),
-        )
-        .await
-        .into_response();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(mappings.deleted.lock().unwrap().len(), 1);
+    }
+
+    /// SSO-039: a deleted client with an applications row gets its
+    /// entitlement tuples removed — with the mapping's (tenant, public_id) —
+    /// before the mapping delete cascades the row away.
+    #[tokio::test]
+    async fn delete_registered_client_removes_entitlements_before_mapping_delete() {
+        let (state, mappings, entitlements, applications) = deleting_state(RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        });
+        applications
+            .create(
+                "system-tenant-1",
+                "gateway-client-1",
+                false,
+                crate::db::REGISTRATION_SOURCE_DCR,
+            )
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            *entitlements.removals.lock().unwrap(),
+            vec![(
+                "system-tenant-1".to_string(),
+                "gateway-client-1".to_string()
+            )]
+        );
+        assert_eq!(mappings.deleted.lock().unwrap().len(), 1);
+    }
+
+    /// SSO-039: without an applications row there is nothing to clean up, and
+    /// the mapping delete still proceeds.
+    #[tokio::test]
+    async fn delete_registered_client_without_application_row_still_deletes_mapping() {
+        let (state, mappings, entitlements, _) = deleting_state(RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(entitlements.removals.lock().unwrap().is_empty());
+        assert_eq!(mappings.deleted.lock().unwrap().len(), 1);
+    }
+
+    /// SSO-039: an entitlement cleanup failure is logged and non-fatal — the
+    /// client is gone from Hydra either way, and the DCR reaper converges any
+    /// residue — so the delete still answers 204.
+    #[tokio::test]
+    async fn delete_registered_client_ignores_entitlement_cleanup_failure() {
+        let (state, mappings, entitlements, applications) = deleting_state(RecordingHydra {
+            response: json!({"status": "ok"}),
+            ..Default::default()
+        });
+        applications
+            .create(
+                "system-tenant-1",
+                "gateway-client-1",
+                false,
+                crate::db::REGISTRATION_SOURCE_DCR,
+            )
+            .await
+            .unwrap();
+        *entitlements.remove_error.lock().unwrap() = Some("backend down".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            basic_auth_header("gateway-client-1", "secret"),
+        );
+        let resp =
+            delete_registered_client(State(state), headers, Path("gateway-client-1".to_string()))
+                .await
+                .into_response();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(mappings.deleted.lock().unwrap().len(), 1);
     }
@@ -5399,7 +5729,7 @@ mod tests {
             response: json!({"status": "ok"}),
             ..Default::default()
         };
-        let (state, _) = deleting_state(hydra);
+        let (state, ..) = deleting_state(hydra);
         let app = router(state);
         let resp = app
             .oneshot(
