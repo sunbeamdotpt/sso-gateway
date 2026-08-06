@@ -110,6 +110,9 @@ consistency) must stay reachable through the gateway API.
   git tags are zero-padded (`v2026.07.23`).
 - Cutting a release: add the `CHANGELOG.md` section (Keep a Changelog,
   dated with the actual ship date), bump the workspace `Cargo.toml`
-  version, commit as `chore(release): bump version to <Y.M.N>`, tag
-  `v<YYYY.MM.N>`. Pushing the tag triggers `.github/workflows/release.yml`,
-  which builds and pushes the multi-arch GHCR image.
+  version, then **run `cargo check` so `Cargo.lock` picks up the new
+  version and commit it too** — the release Dockerfile builds with
+  `cargo fetch --locked` and fails on a stale lock. Commit as
+  `chore(release): bump version to <Y.M.N>`, tag `v<YYYY.MM.N>`.
+  Pushing the tag triggers `.github/workflows/release.yml`, which builds
+  and pushes the multi-arch GHCR image.
