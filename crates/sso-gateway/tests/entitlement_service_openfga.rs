@@ -551,32 +551,38 @@ async fn entitlement_service_openfga_adopts_orphan_store() {
     );
 }
 
-/// Full-app bootstrap E2E: `build_app` with the system bootstrap client runs
-/// the exact production startup path (Hydra client provisioning + entitlement
-/// namespace ensure + gateway app seed). This is the sequence that crashed
-/// fresh deployments (SSO-029) and crashlooped restarts. Building twice
-/// proves both.
-#[tokio::test]
-async fn app_bootstrap_with_entitlements_is_restart_safe() {
-    let (database_url, openfga_url) = container_urls().await;
-    let (_hydra, hydra_admin_url, hydra_public_url) = support::start_hydra()
-        .await
-        .expect("hydra should start");
+/// One system tenant ULID per test binary: `tenants.slug` is globally
+/// unique, so every `build_app` boot in this binary must reuse the same
+/// system tenant.
+fn system_tenant_ulid() -> String {
+    static SYSTEM_TENANT_ULID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SYSTEM_TENANT_ULID
+        .get_or_init(|| ulid::Ulid::new().to_string())
+        .clone()
+}
 
-    let system_tenant_ulid = ulid::Ulid::new().to_string();
-    let config = sso_gateway::config::Config {
+/// Gateway config pointing at this binary's containers, with the system
+/// bootstrap client enabled so `build_app` runs the full production startup
+/// path (Hydra provisioning + entitlement seed + DCR backfill).
+fn gateway_config(
+    database_url: &str,
+    hydra_admin_url: &str,
+    hydra_public_url: &str,
+    openfga_url: &str,
+) -> sso_gateway::config::Config {
+    sso_gateway::config::Config {
         bind_addr: "127.0.0.1:0".parse().expect("addr"),
-        system_tenant_ulid,
-        database_url: database_url.clone(),
-        hydra_admin_url,
-        hydra_public_url,
+        system_tenant_ulid: system_tenant_ulid(),
+        database_url: database_url.to_string(),
+        hydra_admin_url: hydra_admin_url.to_string(),
+        hydra_public_url: hydra_public_url.to_string(),
         kratos_admin_url: "http://127.0.0.1:1".to_string(),
         kratos_public_url: "http://127.0.0.1:1".to_string(),
         kratos_default_schema_id: "default".to_string(),
         permissions_backend: sso_gateway::config::PermissionsBackend::OpenFga,
         keto_read_url: "http://127.0.0.1:1".to_string(),
         keto_write_url: "http://127.0.0.1:1".to_string(),
-        openfga_url,
+        openfga_url: openfga_url.to_string(),
         public_base_url: "http://127.0.0.1:8080".to_string(),
         ui_public_url: "http://ui.example.com".to_string(),
         saml_sp_private_key_pem_path: None,
@@ -615,7 +621,42 @@ async fn app_bootstrap_with_entitlements_is_restart_safe() {
         public_rate_limit_requests: 100,
         public_rate_limit_window_seconds: 60,
         self_service_paths: sso_gateway::config::SelfServicePaths::default(),
-    };
+    }
+}
+
+/// Assertion-side entitlement service over the shared containers.
+fn entitlement_service(pool: &sqlx::PgPool, openfga_url: &str) -> EntitlementServiceImpl {
+    let client = OpenFgaClient::new(openfga_url).expect("openfga client should build");
+    let namespaces = Arc::new(PgPermissionNamespaceStore::new(pool.clone()));
+    let backend: Arc<dyn PermissionBackend> =
+        Arc::new(OpenFgaPermissionBackend::new(client, namespaces));
+    EntitlementServiceImpl::new(backend, Arc::new(ApplicationRepo::new(pool.clone())))
+}
+
+/// Serializes the `build_app` tests in this binary: they share one database
+/// and one system tenant, and every boot runs the DCR backfill over all
+/// tenants — a concurrent boot would seed the other test's fabricated
+/// tuple-less clients mid-assertion.
+static BOOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Full-app bootstrap E2E: `build_app` with the system bootstrap client runs
+/// the exact production startup path (Hydra client provisioning + entitlement
+/// namespace ensure + gateway app seed). This is the sequence that crashed
+/// fresh deployments (SSO-029) and crashlooped restarts. Building twice
+/// proves both.
+#[tokio::test]
+async fn app_bootstrap_with_entitlements_is_restart_safe() {
+    let _guard = BOOT_LOCK.lock().await;
+    let (database_url, openfga_url) = container_urls().await;
+    let (_hydra, hydra_admin_url, hydra_public_url) =
+        support::start_hydra().await.expect("hydra should start");
+
+    let config = gateway_config(
+        &database_url,
+        &hydra_admin_url,
+        &hydra_public_url,
+        &openfga_url,
+    );
 
     // First boot: provisions the Hydra client, creates the entitlement store,
     // publishes the model, and seeds the gateway application.
@@ -634,4 +675,153 @@ async fn app_bootstrap_with_entitlements_is_restart_safe() {
     let _app = sso_gateway::app::build_app(&config, pool)
         .await
         .expect("restart bootstrap should succeed (no duplicate tuple crash)");
+}
+
+/// SSO-039 §5: a restart backfills pre-enforcement DCR clients (Hydra
+/// mapping, no `applications` row, no tuples) with the default group links
+/// plus their DCR-marked row, and never reseeds clients that already carry
+/// tuples — deliberate revocations survive restarts.
+#[tokio::test]
+async fn dcr_legacy_backfill_is_restart_safe() {
+    let _guard = BOOT_LOCK.lock().await;
+    let (database_url, openfga_url) = container_urls().await;
+    let (_hydra, hydra_admin_url, hydra_public_url) =
+        support::start_hydra().await.expect("hydra should start");
+    let config = gateway_config(
+        &database_url,
+        &hydra_admin_url,
+        &hydra_public_url,
+        &openfga_url,
+    );
+    let tenant = system_tenant_ulid();
+
+    // First boot: system tenant, bootstrap client, gateway entitlement seed.
+    let pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+    let _app = sso_gateway::app::build_app(&config, pool)
+        .await
+        .expect("first boot should succeed");
+
+    // Fabricate the exact legacy shape: a hydra mapping with no applications
+    // row and no tuples (what the DCR handler wrote before entitlement
+    // enforcement).
+    let pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+    let mappings = sso_gateway::db::PgIdMappingStore::new(pool.clone());
+    let legacy_public = ulid::Ulid::new().to_string();
+    sso_gateway::db::IdMappingStore::create(
+        &mappings,
+        &tenant,
+        "hydra",
+        &legacy_public,
+        &format!("ory-{legacy_public}"),
+    )
+    .await
+    .expect("legacy mapping should be created");
+    // The manually-patched prod shape: tuples granted out-of-band, still no
+    // applications row.
+    let patched_public = ulid::Ulid::new().to_string();
+    sso_gateway::db::IdMappingStore::create(
+        &mappings,
+        &tenant,
+        "hydra",
+        &patched_public,
+        &format!("ory-{patched_public}"),
+    )
+    .await
+    .expect("patched mapping should be created");
+    let service = entitlement_service(&pool, &openfga_url);
+    service
+        .grant(&tenant, "carol", &patched_public, EntitlementLevel::Member)
+        .await
+        .expect("out-of-band patch grant should succeed");
+
+    // Restart: the startup backfill converges both clients.
+    let restart_pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+    let _app = sso_gateway::app::build_app(&config, restart_pool)
+        .await
+        .expect("restart boot should succeed");
+
+    // The legacy client got its DCR row and the employees group-link seed.
+    let applications = ApplicationRepo::new(pool.clone());
+    let legacy_row =
+        sso_gateway::db::ApplicationStore::get_by_public_id(&applications, &legacy_public)
+            .await
+            .expect("legacy client should have an applications row");
+    assert_eq!(legacy_row.registration_source, "dcr");
+    assert_eq!(legacy_row.tenant_id, tenant);
+    assert!(
+        service
+            .has_any_tuples(&tenant, &legacy_public)
+            .await
+            .expect("tuple read should succeed"),
+        "the backfill must seed tuple-less legacy clients"
+    );
+    service
+        .set_group_membership(&tenant, "employees", "alice", true)
+        .await
+        .expect("group membership should succeed");
+    assert!(
+        service
+            .is_member(&tenant, "alice", &legacy_public)
+            .await
+            .expect("check should succeed"),
+        "the backfill seed is the employees group-link shape"
+    );
+
+    // The patched client got its row but was NOT reseeded: carol keeps her
+    // grant, while employees members gain nothing.
+    let patched_row =
+        sso_gateway::db::ApplicationStore::get_by_public_id(&applications, &patched_public)
+            .await
+            .expect("patched client should have an applications row");
+    assert_eq!(patched_row.registration_source, "dcr");
+    assert!(
+        service
+            .is_member(&tenant, "carol", &patched_public)
+            .await
+            .expect("check should succeed"),
+        "the out-of-band grant must survive the backfill"
+    );
+    assert!(
+        !service
+            .is_member(&tenant, "alice", &patched_public)
+            .await
+            .expect("check should succeed"),
+        "a tuple-having client must never be reseeded"
+    );
+
+    // A second restart is a no-op: rows stay singular, tuples are unchanged.
+    let second_restart_pool = create_pool(&database_url, false)
+        .await
+        .expect("database pool should be created");
+    let _app = sso_gateway::app::build_app(&config, second_restart_pool)
+        .await
+        .expect("second restart boot should succeed");
+    for public_id in [&legacy_public, &patched_public] {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM applications WHERE public_id = $1")
+                .bind(public_id)
+                .fetch_one(&pool)
+                .await
+                .expect("row count should query");
+        assert_eq!(count, 1, "no duplicate applications rows for {public_id}");
+    }
+    assert!(
+        service
+            .is_member(&tenant, "carol", &patched_public)
+            .await
+            .expect("check should succeed")
+    );
+    assert!(
+        !service
+            .is_member(&tenant, "alice", &patched_public)
+            .await
+            .expect("check should succeed"),
+        "restarts must not resurrect the group link on the patched client"
+    );
 }

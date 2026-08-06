@@ -57,7 +57,11 @@ pub trait EntitlementService: Send + Sync + 'static {
     ) -> Result<(), ServiceError>;
 
     /// Remove all entitlement tuples for an application (e.g. on retirement).
-    async fn remove_application(&self, tenant_id: &str, app_public_id: &str) -> Result<(), ServiceError>;
+    async fn remove_application(
+        &self,
+        tenant_id: &str,
+        app_public_id: &str,
+    ) -> Result<(), ServiceError>;
 
     /// Check whether `identity_id` has at least `relation` (`member` or `admin`)
     /// on `app_public_id`.
@@ -69,6 +73,18 @@ pub trait EntitlementService: Send + Sync + 'static {
         relation: &str,
     ) -> Result<bool, ServiceError>;
 
+    /// Whether the application object carries any entitlement tuples at all.
+    ///
+    /// Used by bootstrap/backfill convergence to detect never-seeded
+    /// applications. Deliberately tuple-based rather than row-based: deliberate
+    /// revocations leave the object tuple-less, and that state must survive
+    /// restarts.
+    async fn has_any_tuples(
+        &self,
+        tenant_id: &str,
+        app_public_id: &str,
+    ) -> Result<bool, ServiceError>;
+
     /// Convenience check for member access.
     async fn is_member(
         &self,
@@ -76,7 +92,8 @@ pub trait EntitlementService: Send + Sync + 'static {
         identity_id: &str,
         app_public_id: &str,
     ) -> Result<bool, ServiceError> {
-        self.check(tenant_id, identity_id, app_public_id, MEMBER_REL).await
+        self.check(tenant_id, identity_id, app_public_id, MEMBER_REL)
+            .await
     }
 
     /// Return the effective OAuth2 scope ceiling for `identity_id` in the
@@ -112,17 +129,16 @@ pub trait EntitlementService: Send + Sync + 'static {
 
     /// Remove all explicit and group-derived entitlements for an identity.
     /// Used when a user is disabled.
-    async fn remove_all_for_identity(&self, tenant_id: &str, identity_id: &str) -> Result<(), ServiceError>;
+    async fn remove_all_for_identity(
+        &self,
+        tenant_id: &str,
+        identity_id: &str,
+    ) -> Result<(), ServiceError>;
 
     /// Mint the per-client entitlement claim for `app_public_id`. Returns a
     /// JSON object like `{"entitlements": {"kanban": ["member", "admin"]}}`
     /// containing only the requested application's entry.
-    async fn mint_claim(
-        &self,
-        tenant_id: &str,
-        identity_id: &str,
-        app_public_id: &str,
-    ) -> Value;
+    async fn mint_claim(&self, tenant_id: &str, identity_id: &str, app_public_id: &str) -> Value;
 }
 
 /// Default implementation backed by the configured `PermissionBackend`.
@@ -190,11 +206,19 @@ impl EntitlementService for EntitlementServiceImpl {
                 .map_err(map_backend_error)?;
         }
 
-        info!(tenant_id, app_id = app_public_id, "entitlement application seeded");
+        info!(
+            tenant_id,
+            app_id = app_public_id,
+            "entitlement application seeded"
+        );
         Ok(())
     }
 
-    async fn remove_application(&self, tenant_id: &str, app_public_id: &str) -> Result<(), ServiceError> {
+    async fn remove_application(
+        &self,
+        tenant_id: &str,
+        app_public_id: &str,
+    ) -> Result<(), ServiceError> {
         // OpenFGA does not provide a cheap "delete object and all tuples" operation.
         // We list all subjects with relations on this application and delete the
         // corresponding tuples. This is acceptable because the entitlement
@@ -257,8 +281,12 @@ impl EntitlementService for EntitlementServiceImpl {
 
         // Deduplicate while preserving a deterministic order.
         deletes.sort_by(|a, b| {
-            (&a.namespace, &a.object, &a.relation, &a.subject_id)
-                .cmp(&(&b.namespace, &b.object, &b.relation, &b.subject_id))
+            (&a.namespace, &a.object, &a.relation, &a.subject_id).cmp(&(
+                &b.namespace,
+                &b.object,
+                &b.relation,
+                &b.subject_id,
+            ))
         });
         deletes.dedup();
 
@@ -267,7 +295,11 @@ impl EntitlementService for EntitlementServiceImpl {
             .await
             .map_err(map_backend_error)?;
 
-        info!(tenant_id, app_id = app_public_id, "entitlement application removed");
+        info!(
+            tenant_id,
+            app_id = app_public_id,
+            "entitlement application removed"
+        );
         Ok(())
     }
 
@@ -291,6 +323,19 @@ impl EntitlementService for EntitlementServiceImpl {
             .await
             .map_err(map_backend_error)?;
         Ok(allowed)
+    }
+
+    async fn has_any_tuples(
+        &self,
+        tenant_id: &str,
+        app_public_id: &str,
+    ) -> Result<bool, ServiceError> {
+        let tuples = self
+            .backend
+            .read_tuples(tenant_id, ENTITLEMENT_NAMESPACE, app_public_id)
+            .await
+            .map_err(map_backend_error)?;
+        Ok(!tuples.is_empty())
     }
 
     async fn effective_scope_ceiling(&self, tenant_id: &str, identity_id: &str) -> Vec<String> {
@@ -436,7 +481,11 @@ impl EntitlementService for EntitlementServiceImpl {
         Ok(())
     }
 
-    async fn remove_all_for_identity(&self, tenant_id: &str, identity_id: &str) -> Result<(), ServiceError> {
+    async fn remove_all_for_identity(
+        &self,
+        tenant_id: &str,
+        identity_id: &str,
+    ) -> Result<(), ServiceError> {
         // List every application in the tenant and revoke both member/admin for
         // this identity. Also remove group memberships. This is intentionally
         // exhaustive: a disabled account leaves no lingering tuples.
@@ -468,8 +517,7 @@ impl EntitlementService for EntitlementServiceImpl {
         // TODO: track group membership in Postgres or expose OpenFGA tuple list.
         warn!(
             tenant_id,
-            identity_id,
-            "remove_all_for_identity may leave orphaned group memberships"
+            identity_id, "remove_all_for_identity may leave orphaned group memberships"
         );
 
         if !deletes.is_empty() {
@@ -482,12 +530,7 @@ impl EntitlementService for EntitlementServiceImpl {
         Ok(())
     }
 
-    async fn mint_claim(
-        &self,
-        tenant_id: &str,
-        identity_id: &str,
-        app_public_id: &str,
-    ) -> Value {
+    async fn mint_claim(&self, tenant_id: &str, identity_id: &str, app_public_id: &str) -> Value {
         let mut levels = Vec::new();
         let is_member = match self
             .check(tenant_id, identity_id, app_public_id, MEMBER_REL)
@@ -669,6 +712,14 @@ pub mod test_helpers {
             Ok(true)
         }
 
+        async fn has_any_tuples(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
+
         async fn effective_scope_ceiling(
             &self,
             _tenant_id: &str,
@@ -739,8 +790,20 @@ pub mod test_helpers {
     #[allow(clippy::type_complexity)]
     pub struct ConfigurableEntitlementService {
         pub member_results: Arc<Mutex<HashMap<(String, String, String), bool>>>,
+        pub tuple_results: Arc<Mutex<HashMap<(String, String), bool>>>,
         pub ceiling: Arc<Mutex<Vec<String>>>,
         pub claim: Arc<Mutex<Value>>,
+        /// Recorded `grant` calls: (tenant, identity, app, level).
+        pub grants: Arc<Mutex<Vec<(String, String, String, EntitlementLevel)>>>,
+        /// Recorded `remove_application` calls: (tenant, app).
+        pub removals: Arc<Mutex<Vec<(String, String)>>>,
+        /// When set, `remove_application` fails with this message after
+        /// recording the call.
+        pub remove_error: Arc<Mutex<Option<String>>>,
+        /// When set, `check` fails with this error (backend-failure injection).
+        pub check_error: Arc<Mutex<Option<ServiceError>>>,
+        /// Recorded `mint_claim` calls: (tenant, identity, app).
+        pub mint_calls: Arc<Mutex<Vec<(String, String, String)>>>,
     }
 
     impl ConfigurableEntitlementService {
@@ -750,7 +813,11 @@ pub mod test_helpers {
                 Err(e) => e.into_inner(),
             };
             results.insert(
-                (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string()),
+                (
+                    tenant_id.to_string(),
+                    identity_id.to_string(),
+                    app_public_id.to_string(),
+                ),
                 true,
             );
         }
@@ -761,9 +828,21 @@ pub mod test_helpers {
                 Err(e) => e.into_inner(),
             };
             results.insert(
-                (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string()),
+                (
+                    tenant_id.to_string(),
+                    identity_id.to_string(),
+                    app_public_id.to_string(),
+                ),
                 false,
             );
+        }
+
+        pub fn set_has_tuples(&self, tenant_id: &str, app_public_id: &str, has: bool) {
+            let mut results = match self.tuple_results.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            results.insert((tenant_id.to_string(), app_public_id.to_string()), has);
         }
 
         pub fn set_ceiling(&self, scopes: Vec<String>) {
@@ -800,10 +879,23 @@ pub mod test_helpers {
 
         async fn remove_application(
             &self,
-            _tenant_id: &str,
-            _app_public_id: &str,
+            tenant_id: &str,
+            app_public_id: &str,
         ) -> Result<(), ServiceError> {
-            Ok(())
+            let mut removals = match self.removals.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            removals.push((tenant_id.to_string(), app_public_id.to_string()));
+            drop(removals);
+            let remove_error = match self.remove_error.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            match remove_error.as_ref() {
+                Some(message) => Err(ServiceError::Internal(message.clone())),
+                None => Ok(()),
+            }
         }
 
         async fn check(
@@ -813,8 +905,39 @@ pub mod test_helpers {
             app_public_id: &str,
             _relation: &str,
         ) -> Result<bool, ServiceError> {
-            let key = (tenant_id.to_string(), identity_id.to_string(), app_public_id.to_string());
+            let injected = match self.check_error.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if let Some(err) = &*injected {
+                return Err(match err {
+                    ServiceError::Internal(m) => ServiceError::Internal(m.clone()),
+                    other => ServiceError::Internal(format!("{other}")),
+                });
+            }
+            drop(injected);
+            let key = (
+                tenant_id.to_string(),
+                identity_id.to_string(),
+                app_public_id.to_string(),
+            );
             let results = match self.member_results.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            Ok(match results.get(&key) {
+                Some(v) => *v,
+                None => false,
+            })
+        }
+
+        async fn has_any_tuples(
+            &self,
+            tenant_id: &str,
+            app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            let key = (tenant_id.to_string(), app_public_id.to_string());
+            let results = match self.tuple_results.lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
@@ -838,11 +961,24 @@ pub mod test_helpers {
 
         async fn grant(
             &self,
-            _tenant_id: &str,
-            _identity_id: &str,
-            _app_public_id: &str,
-            _level: EntitlementLevel,
+            tenant_id: &str,
+            identity_id: &str,
+            app_public_id: &str,
+            level: EntitlementLevel,
         ) -> Result<(), ServiceError> {
+            let mut grants = match self.grants.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            grants.push((
+                tenant_id.to_string(),
+                identity_id.to_string(),
+                app_public_id.to_string(),
+                level,
+            ));
+            drop(grants);
+            // The grant makes the user a member, mirroring the real service.
+            self.allow(tenant_id, identity_id, app_public_id);
             Ok(())
         }
 
@@ -876,10 +1012,20 @@ pub mod test_helpers {
 
         async fn mint_claim(
             &self,
-            _tenant_id: &str,
-            _identity_id: &str,
-            _app_public_id: &str,
+            tenant_id: &str,
+            identity_id: &str,
+            app_public_id: &str,
         ) -> Value {
+            let mut calls = match self.mint_calls.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            calls.push((
+                tenant_id.to_string(),
+                identity_id.to_string(),
+                app_public_id.to_string(),
+            ));
+            drop(calls);
             let claim = match self.claim.lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
@@ -915,15 +1061,36 @@ mod tests {
     impl MockBackend {
         fn allow(&self, tenant: &str, obj: &str, relation: &str, _subject: &str) {
             self.check_results.lock().unwrap().insert(
-                (tenant.to_string(), ENTITLEMENT_NAMESPACE.to_string(), obj.to_string(), relation.to_string()),
+                (
+                    tenant.to_string(),
+                    ENTITLEMENT_NAMESPACE.to_string(),
+                    obj.to_string(),
+                    relation.to_string(),
+                ),
                 true,
             );
         }
 
         fn set_users(&self, tenant: &str, obj: &str, relation: &str, users: &[String]) {
             self.list_users_results.lock().unwrap().insert(
-                (tenant.to_string(), ENTITLEMENT_NAMESPACE.to_string(), obj.to_string(), relation.to_string()),
+                (
+                    tenant.to_string(),
+                    ENTITLEMENT_NAMESPACE.to_string(),
+                    obj.to_string(),
+                    relation.to_string(),
+                ),
                 users.to_vec(),
+            );
+        }
+
+        fn set_tuples(&self, tenant: &str, obj: &str, tuples: &[RelationTupleKey]) {
+            self.read_tuples_results.lock().unwrap().insert(
+                (
+                    tenant.to_string(),
+                    ENTITLEMENT_NAMESPACE.to_string(),
+                    obj.to_string(),
+                ),
+                tuples.to_vec(),
             );
         }
 
@@ -961,8 +1128,18 @@ mod tests {
                 relation.to_string(),
                 subject_id.to_string(),
             ));
-            let key = (tenant_id.to_string(), namespace.to_string(), object.to_string(), relation.to_string());
-            Ok(*self.check_results.lock().unwrap().get(&key).unwrap_or(&false))
+            let key = (
+                tenant_id.to_string(),
+                namespace.to_string(),
+                object.to_string(),
+                relation.to_string(),
+            );
+            Ok(*self
+                .check_results
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap_or(&false))
         }
 
         async fn create_relation_tuple(
@@ -1057,8 +1234,19 @@ mod tests {
             if let Some(err) = self.list_users_error.lock().unwrap().take() {
                 return Err(err);
             }
-            let key = (tenant_id.to_string(), namespace.to_string(), object.to_string(), relation.to_string());
-            Ok(self.list_users_results.lock().unwrap().get(&key).cloned().unwrap_or_default())
+            let key = (
+                tenant_id.to_string(),
+                namespace.to_string(),
+                object.to_string(),
+                relation.to_string(),
+            );
+            Ok(self
+                .list_users_results
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn read_tuples(
@@ -1096,7 +1284,10 @@ mod tests {
             namespace: &str,
             _model: &Value,
         ) -> Result<(), PermissionBackendError> {
-            self.ensured.lock().unwrap().push((tenant_id.to_string(), namespace.to_string()));
+            self.ensured
+                .lock()
+                .unwrap()
+                .push((tenant_id.to_string(), namespace.to_string()));
             Ok(())
         }
 
@@ -1140,11 +1331,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get(
-            &self,
-            _tenant_id: &str,
-            _public_id: &str,
-        ) -> Result<ApplicationRow, DbError> {
+        async fn get(&self, _tenant_id: &str, _public_id: &str) -> Result<ApplicationRow, DbError> {
             unimplemented!()
         }
 
@@ -1173,7 +1360,11 @@ mod tests {
         }
     }
 
-    fn service() -> (EntitlementServiceImpl, Arc<MockBackend>, Arc<MockApplicationStore>) {
+    fn service() -> (
+        EntitlementServiceImpl,
+        Arc<MockBackend>,
+        Arc<MockApplicationStore>,
+    ) {
         let backend = Arc::new(MockBackend::default());
         let apps = Arc::new(MockApplicationStore::default());
         let svc = EntitlementServiceImpl::new(backend.clone(), apps.clone());
@@ -1198,10 +1389,10 @@ mod tests {
         // lets a seeded `entitlements:<group>#member` subject resolve through
         // userset expansion.
         for relation in ["member", "admin"] {
-            let user_types = entitlements["metadata"]["relations"][relation]
-                ["directly_related_user_types"]
-                .as_array()
-                .unwrap();
+            let user_types =
+                entitlements["metadata"]["relations"][relation]["directly_related_user_types"]
+                    .as_array()
+                    .unwrap();
             assert!(user_types.iter().any(|t| t["type"] == "user"));
             assert!(
                 user_types
@@ -1223,7 +1414,10 @@ mod tests {
         let (svc, backend, _) = service();
         svc.ensure_namespace("tenant-1").await.unwrap();
         let ensured = backend.ensured.lock().unwrap();
-        assert_eq!(ensured.as_slice(), &[("tenant-1".to_string(), ENTITLEMENT_NAMESPACE.to_string())]);
+        assert_eq!(
+            ensured.as_slice(),
+            &[("tenant-1".to_string(), ENTITLEMENT_NAMESPACE.to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1251,7 +1445,9 @@ mod tests {
     #[tokio::test]
     async fn seed_application_without_groups_writes_nothing() {
         let (svc, backend, _) = service();
-        svc.seed_application("tenant-1", "app-1", &[]).await.unwrap();
+        svc.seed_application("tenant-1", "app-1", &[])
+            .await
+            .unwrap();
         assert!(backend.ensured_tuples.lock().unwrap().is_empty());
         assert!(backend.writes.lock().unwrap().is_empty());
     }
@@ -1260,7 +1456,11 @@ mod tests {
     async fn check_resolves_allowed() {
         let (svc, backend, _) = service();
         backend.allow("tenant-1", "app-1", MEMBER_REL, "user-1");
-        assert!(svc.check("tenant-1", "user-1", "app-1", MEMBER_REL).await.unwrap());
+        assert!(
+            svc.check("tenant-1", "user-1", "app-1", MEMBER_REL)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1579,12 @@ mod tests {
     #[tokio::test]
     async fn remove_application_deletes_member_and_admin_tuples() {
         let (svc, backend, _) = service();
-        backend.set_users("tenant-1", "app-1", MEMBER_REL, &["user-1".to_string(), "user-2".to_string()]);
+        backend.set_users(
+            "tenant-1",
+            "app-1",
+            MEMBER_REL,
+            &["user-1".to_string(), "user-2".to_string()],
+        );
         backend.set_users("tenant-1", "app-1", ADMIN_REL, &["user-3".to_string()]);
         svc.remove_application("tenant-1", "app-1").await.unwrap();
 
@@ -1390,17 +1595,25 @@ mod tests {
         assert_eq!(deletes.len(), 6);
         for user in ["user-1", "user-2"] {
             assert!(deletes.iter().any(|k| {
-                k.relation == MEMBER_REL && k.subject_id == user && k.namespace == ENTITLEMENT_NAMESPACE
+                k.relation == MEMBER_REL
+                    && k.subject_id == user
+                    && k.namespace == ENTITLEMENT_NAMESPACE
             }));
             assert!(deletes.iter().any(|k| {
-                k.relation == ADMIN_REL && k.subject_id == user && k.namespace == ENTITLEMENT_NAMESPACE
+                k.relation == ADMIN_REL
+                    && k.subject_id == user
+                    && k.namespace == ENTITLEMENT_NAMESPACE
             }));
         }
         assert!(deletes.iter().any(|k| {
-            k.relation == MEMBER_REL && k.subject_id == "user-3" && k.namespace == ENTITLEMENT_NAMESPACE
+            k.relation == MEMBER_REL
+                && k.subject_id == "user-3"
+                && k.namespace == ENTITLEMENT_NAMESPACE
         }));
         assert!(deletes.iter().any(|k| {
-            k.relation == ADMIN_REL && k.subject_id == "user-3" && k.namespace == ENTITLEMENT_NAMESPACE
+            k.relation == ADMIN_REL
+                && k.subject_id == "user-3"
+                && k.namespace == ENTITLEMENT_NAMESPACE
         }));
         // The deletion is idempotent (ensure_tuples), so partially-removed
         // applications can be retired again without error.
@@ -1414,7 +1627,10 @@ mod tests {
             status: 500,
             message: "keto down".into(),
         });
-        let err = svc.remove_application("tenant-1", "app-1").await.unwrap_err();
+        let err = svc
+            .remove_application("tenant-1", "app-1")
+            .await
+            .unwrap_err();
         assert!(matches!(err, ServiceError::Internal(_)));
     }
 
@@ -1440,7 +1656,9 @@ mod tests {
         ]));
         let backend = Arc::new(MockBackend::default());
         let svc = EntitlementServiceImpl::new(backend.clone(), apps);
-        svc.remove_all_for_identity("tenant-1", "user-1").await.unwrap();
+        svc.remove_all_for_identity("tenant-1", "user-1")
+            .await
+            .unwrap();
 
         let writes = backend.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
@@ -1462,7 +1680,10 @@ mod tests {
         apps.fail_next_list(DbError::TenantNotFound);
         let backend = Arc::new(MockBackend::default());
         let svc = EntitlementServiceImpl::new(backend, apps);
-        let err = svc.remove_all_for_identity("tenant-1", "user-1").await.unwrap_err();
+        let err = svc
+            .remove_all_for_identity("tenant-1", "user-1")
+            .await
+            .unwrap_err();
         assert!(matches!(err, ServiceError::Database(_)));
     }
 
@@ -1473,7 +1694,10 @@ mod tests {
             status: 500,
             message: "keto down".into(),
         });
-        let err = svc.check("tenant-1", "user-1", "app-1", MEMBER_REL).await.unwrap_err();
+        let err = svc
+            .check("tenant-1", "user-1", "app-1", MEMBER_REL)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ServiceError::Internal(_)));
     }
 
@@ -1489,5 +1713,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn has_any_tuples_reflects_backend_reads() {
+        let (svc, backend, _) = service();
+        assert!(!svc.has_any_tuples("tenant-1", "app-1").await.unwrap());
+
+        backend.set_tuples(
+            "tenant-1",
+            "app-1",
+            &[tuple_key(
+                ENTITLEMENT_NAMESPACE,
+                "app-1",
+                MEMBER_REL,
+                "entitlements:employees#member",
+            )],
+        );
+        assert!(svc.has_any_tuples("tenant-1", "app-1").await.unwrap());
     }
 }

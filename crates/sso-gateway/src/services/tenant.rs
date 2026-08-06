@@ -22,7 +22,11 @@ pub struct TenantServiceImpl {
 }
 
 impl TenantServiceImpl {
-    pub fn new<R>(repo: R, system_tenant_ulid: String, entitlements: Arc<dyn EntitlementService>) -> Self
+    pub fn new<R>(
+        repo: R,
+        system_tenant_ulid: String,
+        entitlements: Arc<dyn EntitlementService>,
+    ) -> Self
     where
         R: TenantStore + 'static,
     {
@@ -213,8 +217,19 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             Ok(true)
         }
+        async fn has_any_tuples(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
 
-        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+        async fn effective_scope_ceiling(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Vec<String> {
             vec![]
         }
 
@@ -256,7 +271,12 @@ mod tests {
             Ok(())
         }
 
-        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+        async fn mint_claim(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+        ) -> Value {
             Value::Null
         }
     }
@@ -308,8 +328,19 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             Ok(true)
         }
+        async fn has_any_tuples(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
 
-        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+        async fn effective_scope_ceiling(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Vec<String> {
             vec![]
         }
 
@@ -351,7 +382,12 @@ mod tests {
             Ok(())
         }
 
-        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+        async fn mint_claim(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+        ) -> Value {
             Value::Null
         }
     }
@@ -650,12 +686,16 @@ mod tests {
         };
         svc_req!(request, req_msg, CreateTenantRequest);
         service.create_tenant(ctx, request).await.unwrap();
-        assert_eq!(entitlements.ensured.lock().unwrap().as_slice(), &["tenant-1"]);
+        assert_eq!(
+            entitlements.ensured.lock().unwrap().as_slice(),
+            &["tenant-1"]
+        );
     }
 
     #[tokio::test]
     async fn create_tenant_requires_admin_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
@@ -673,7 +713,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = CreateTenantRequest::default();
         svc_req!(request, req_msg, CreateTenantRequest);
@@ -732,7 +773,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_tenant_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = GetTenantRequest::default();
         svc_req!(request, req_msg, GetTenantRequest);
@@ -780,7 +822,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_tenants_requires_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = RequestContext::new(http::HeaderMap::new());
         let req_msg = ListTenantsRequest::default();
         svc_req!(request, req_msg, ListTenantsRequest);
@@ -804,7 +847,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_tenant_rejects_non_system_tenant() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = admin_ctx("tenant-1");
         let req_msg = CreateTenantRequest {
             slug: "acme".into(),
@@ -927,7 +971,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_tenant_requires_read_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = GetTenantRequest {
             id: "tenant-1".into(),
@@ -940,7 +985,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_tenants_requires_read_scope() {
-        let service = TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
+        let service =
+            TenantServiceImpl::new(StubTenantStore::default(), "system".into(), entitlements());
         let ctx = ctx_without_scope("tenant-1");
         let req_msg = ListTenantsRequest::default();
         svc_req!(request, req_msg, ListTenantsRequest);

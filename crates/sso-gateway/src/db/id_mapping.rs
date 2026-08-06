@@ -63,12 +63,26 @@ pub trait IdMappingStore: Send + Sync + 'static {
     async fn list_public_ids(&self, tenant_id: &str, backend: &str)
     -> Result<Vec<String>, DbError>;
 
+    /// List full mapping rows (including `created_at`) for a tenant+backend.
+    ///
+    /// Used by the DCR garbage collector, which needs registration ages, not
+    /// just ids. Stores that do not track full rows may keep the default.
+    async fn list_mappings(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+    ) -> Result<Vec<IdMappingRow>, DbError> {
+        let _ = (tenant_id, backend);
+        Err(DbError::MappingNotFound)
+    }
+
     /// Find the tenant that owns a given Ory global id for a backend.
     async fn get_tenant_id_by_ory_id(
         &self,
         backend: &str,
         ory_global_id: &str,
     ) -> Result<Option<String>, DbError>;
+
 }
 
 #[derive(Clone)]
@@ -192,6 +206,23 @@ impl PgIdMappingStore {
         Ok(ids)
     }
 
+    pub async fn list_mappings(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+    ) -> Result<Vec<IdMappingRow>, DbError> {
+        let rows = sqlx::query_as::<_, IdMappingRow>(
+            "SELECT id, tenant_id, backend, public_id, ory_global_id, created_at \
+             FROM id_mappings \
+             WHERE tenant_id = $1 AND backend = $2 ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(backend)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn get_tenant_id_by_ory_id(
         &self,
         backend: &str,
@@ -223,6 +254,7 @@ impl PgIdMappingStore {
         .await?;
         ory_id.ok_or(DbError::MappingNotFound)
     }
+
 }
 
 #[async_trait]
@@ -284,6 +316,14 @@ impl IdMappingStore for PgIdMappingStore {
         self.list_public_ids(tenant_id, backend).await
     }
 
+    async fn list_mappings(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+    ) -> Result<Vec<IdMappingRow>, DbError> {
+        self.list_mappings(tenant_id, backend).await
+    }
+
     async fn get_tenant_id_by_ory_id(
         &self,
         backend: &str,
@@ -291,6 +331,7 @@ impl IdMappingStore for PgIdMappingStore {
     ) -> Result<Option<String>, DbError> {
         self.get_tenant_id_by_ory_id(backend, ory_global_id).await
     }
+
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for IdMappingRow {
@@ -303,6 +344,200 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for IdMappingRow {
             ory_global_id: row.try_get("ory_global_id")?,
             created_at: row.try_get("created_at")?,
         })
+    }
+}
+
+/// Key of an in-memory mapping row: `(tenant_id, backend, public_id)`.
+type MappingKey = (String, String, String);
+
+/// In-memory id-mapping store for tests. `create_at` lets tests control
+/// `created_at` (the DCR garbage collector reads registration ages).
+#[derive(Clone, Default)]
+pub struct MemoryIdMappingStore {
+    rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<MappingKey, IdMappingRow>>>,
+}
+
+impl MemoryIdMappingStore {
+    /// Insert a mapping with an explicit `created_at`.
+    pub async fn create_at(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+        public_id: &str,
+        ory_global_id: &str,
+        created_at: time::OffsetDateTime,
+    ) -> Result<IdMappingRow, DbError> {
+        let mut lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let key = (
+            tenant_id.to_string(),
+            backend.to_string(),
+            public_id.to_string(),
+        );
+        if lock.contains_key(&key) {
+            return Err(DbError::MappingNotFound);
+        }
+        let row = IdMappingRow {
+            id: Ulid::new().to_string(),
+            tenant_id: tenant_id.to_string(),
+            backend: backend.to_string(),
+            public_id: public_id.to_string(),
+            ory_global_id: ory_global_id.to_string(),
+            created_at,
+        };
+        lock.insert(key, row.clone());
+        Ok(row)
+    }
+}
+
+#[async_trait]
+impl IdMappingStore for MemoryIdMappingStore {
+    async fn create(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+        public_id: &str,
+        ory_global_id: &str,
+    ) -> Result<IdMappingRow, DbError> {
+        self.create_at(
+            tenant_id,
+            backend,
+            public_id,
+            ory_global_id,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
+    async fn get_ory_id(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+        public_id: &str,
+    ) -> Result<String, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        lock.get(&(
+            tenant_id.to_string(),
+            backend.to_string(),
+            public_id.to_string(),
+        ))
+        .map(|row| row.ory_global_id.clone())
+        .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn get_ory_id_by_public_id(
+        &self,
+        backend: &str,
+        public_id: &str,
+    ) -> Result<String, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        lock.values()
+            .find(|row| row.backend == backend && row.public_id == public_id)
+            .map(|row| row.ory_global_id.clone())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn get_public_id(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<String, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        lock.values()
+            .find(|row| {
+                row.tenant_id == tenant_id
+                    && row.backend == backend
+                    && row.ory_global_id == ory_global_id
+            })
+            .map(|row| row.public_id.clone())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn get_public_id_by_ory_id(
+        &self,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<String, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        lock.values()
+            .find(|row| row.backend == backend && row.ory_global_id == ory_global_id)
+            .map(|row| row.public_id.clone())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn delete(&self, tenant_id: &str, backend: &str, public_id: &str) -> Result<(), DbError> {
+        let mut lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        lock.remove(&(
+            tenant_id.to_string(),
+            backend.to_string(),
+            public_id.to_string(),
+        ))
+        .map(|_| ())
+        .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn list_public_ids(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(self
+            .list_mappings(tenant_id, backend)
+            .await?
+            .into_iter()
+            .map(|row| row.public_id)
+            .collect())
+    }
+
+    async fn list_mappings(
+        &self,
+        tenant_id: &str,
+        backend: &str,
+    ) -> Result<Vec<IdMappingRow>, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let mut rows: Vec<IdMappingRow> = lock
+            .values()
+            .filter(|row| row.tenant_id == tenant_id && row.backend == backend)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
+        Ok(rows)
+    }
+
+    async fn get_tenant_id_by_ory_id(
+        &self,
+        backend: &str,
+        ory_global_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let lock = match self.rows.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        Ok(lock
+            .values()
+            .find(|row| row.backend == backend && row.ory_global_id == ory_global_id)
+            .map(|row| row.tenant_id.clone()))
     }
 }
 
@@ -429,5 +664,40 @@ mod tests {
         let tenant = format!("tenant-{}", Ulid::new());
         let ids = store.list_public_ids(&tenant, "kratos").await.unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_mappings_returns_full_rows() {
+        let pool = postgres_pool().await;
+        let store: Arc<dyn IdMappingStore> = Arc::new(PgIdMappingStore::new(pool.clone()));
+        let tenant = format!("tenant-{}", Ulid::new());
+        create_test_tenant(&pool, &tenant).await;
+        let public_id = format!("public-{}", Ulid::new());
+        store
+            .create(&tenant, "hydra", &public_id, "ory-1")
+            .await
+            .unwrap();
+
+        let rows = store.list_mappings(&tenant, "hydra").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].public_id, public_id);
+        assert_eq!(rows[0].ory_global_id, "ory-1");
+        assert_eq!(rows[0].tenant_id, tenant);
+
+        // Other backends and tenants are excluded.
+        assert!(
+            store
+                .list_mappings(&tenant, "kratos")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_mappings("other-tenant", "hydra")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

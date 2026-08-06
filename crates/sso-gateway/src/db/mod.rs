@@ -47,7 +47,7 @@ pub use connection::{
 };
 pub use domain::{PgTenantDomainStore, TenantDomainRow, TenantDomainStore};
 pub use error::DbError;
-pub use id_mapping::{IdMappingRow, IdMappingStore, PgIdMappingStore};
+pub use id_mapping::{IdMappingRow, IdMappingStore, MemoryIdMappingStore, PgIdMappingStore};
 pub use identity_schema::{IdentitySchemaRow, IdentitySchemaStore, PgIdentitySchemaStore};
 pub use local_auth::{
     LocalAuthMethod, PgTenantLocalAuthStore, TenantLocalAuthRow, TenantLocalAuthStore,

@@ -215,6 +215,34 @@ pub async fn build_app_with_upstream(
     let agent_act_tokens: Arc<dyn crate::db::AgentActTokenStore> =
         Arc::new(AgentActTokenRepo::new(pool.clone()));
 
+    // SSO-039: converge pre-enforcement DCR clients (Hydra client + mapping,
+    // but no applications row / no tuples) and reap never-used registrations.
+    // The pass is idempotent and converges partial state on the next boot, so
+    // per-client failures are logged inside and never fail startup.
+    let dcr_maintenance = Arc::new(crate::services::dcr_maintenance::DcrMaintenance::new(
+        Arc::new(mappings.clone()) as Arc<dyn crate::db::IdMappingStore>,
+        application_store.clone(),
+        entitlements.clone(),
+        hydra.clone(),
+        Arc::new(tenant_repo.clone()) as Arc<dyn crate::db::TenantStore>,
+        agents.clone(),
+        config.default_entitlement_groups.clone(),
+        std::time::Duration::from_secs(config.dcr_unused_registration_ttl_days * 86_400),
+    ));
+    let backfill_stats = dcr_maintenance.backfill_legacy_dcr_clients().await;
+    if backfill_stats.errors > 0 {
+        warn!(
+            errors = backfill_stats.errors,
+            "dcr legacy client backfill completed with errors; the next boot retries"
+        );
+    }
+    if config.dcr_gc_enabled {
+        crate::services::dcr_maintenance::DcrMaintenance::spawn_gc_worker(
+            dcr_maintenance,
+            std::time::Duration::from_secs(24 * 3600),
+        );
+    }
+
     // Keep trait-object handles for the public callback handlers; the concrete
     // repos are moved into FederationServiceImpl below.
     let callback_connections: Arc<dyn crate::db::TenantConnectionStore> =

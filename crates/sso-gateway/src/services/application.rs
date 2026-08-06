@@ -649,6 +649,13 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             Ok(true)
         }
+        async fn has_any_tuples(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
         async fn effective_scope_ceiling(
             &self,
             _tenant_id: &str,
@@ -743,6 +750,13 @@ mod tests {
             _relation: &str,
         ) -> Result<bool, ServiceError> {
             Ok(true)
+        }
+        async fn has_any_tuples(
+            &self,
+            _tenant_id: &str,
+            _app_public_id: &str,
+        ) -> Result<bool, ServiceError> {
+            Ok(false)
         }
         async fn effective_scope_ceiling(
             &self,
