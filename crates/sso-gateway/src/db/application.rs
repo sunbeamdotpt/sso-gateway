@@ -5,11 +5,17 @@ use std::sync::{Arc, Mutex};
 
 use super::{DbError, DbPool};
 
+/// Application registered through the admin API (or the system bootstrap).
+pub const REGISTRATION_SOURCE_ADMIN: &str = "admin";
+/// Application registered through RFC 7591 dynamic client registration.
+pub const REGISTRATION_SOURCE_DCR: &str = "dcr";
+
 #[derive(Debug, Clone)]
 pub struct ApplicationRow {
     pub tenant_id: String,
     pub public_id: String,
     pub cross_tenant: bool,
+    pub registration_source: String,
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
 }
@@ -21,13 +27,10 @@ pub trait ApplicationStore: Send + Sync + 'static {
         tenant_id: &str,
         public_id: &str,
         cross_tenant: bool,
+        registration_source: &str,
     ) -> Result<ApplicationRow, DbError>;
 
-    async fn get(
-        &self,
-        tenant_id: &str,
-        public_id: &str,
-    ) -> Result<ApplicationRow, DbError>;
+    async fn get(&self, tenant_id: &str, public_id: &str) -> Result<ApplicationRow, DbError>;
 
     async fn get_by_public_id(&self, public_id: &str) -> Result<ApplicationRow, DbError>;
 
@@ -62,28 +65,26 @@ impl PgApplicationStore {
         tenant_id: &str,
         public_id: &str,
         cross_tenant: bool,
+        registration_source: &str,
     ) -> Result<ApplicationRow, DbError> {
         let row = sqlx::query_as::<_, ApplicationRow>(
-            "INSERT INTO applications (tenant_id, public_id, cross_tenant) \
-             VALUES ($1, $2, $3) \
-             RETURNING tenant_id, public_id, cross_tenant, created_at, updated_at",
+            "INSERT INTO applications (tenant_id, public_id, cross_tenant, registration_source) \
+             VALUES ($1, $2, $3, $4) \
+             RETURNING tenant_id, public_id, cross_tenant, registration_source, created_at, updated_at",
         )
         .bind(tenant_id)
         .bind(public_id)
         .bind(cross_tenant)
+        .bind(registration_source)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(row)
     }
 
-    pub async fn get(
-        &self,
-        tenant_id: &str,
-        public_id: &str,
-    ) -> Result<ApplicationRow, DbError> {
+    pub async fn get(&self, tenant_id: &str, public_id: &str) -> Result<ApplicationRow, DbError> {
         let row = sqlx::query_as::<_, ApplicationRow>(
-            "SELECT tenant_id, public_id, cross_tenant, created_at, updated_at \
+            "SELECT tenant_id, public_id, cross_tenant, registration_source, created_at, updated_at \
              FROM applications WHERE tenant_id = $1 AND public_id = $2",
         )
         .bind(tenant_id)
@@ -96,7 +97,7 @@ impl PgApplicationStore {
 
     pub async fn get_by_public_id(&self, public_id: &str) -> Result<ApplicationRow, DbError> {
         let row = sqlx::query_as::<_, ApplicationRow>(
-            "SELECT tenant_id, public_id, cross_tenant, created_at, updated_at \
+            "SELECT tenant_id, public_id, cross_tenant, registration_source, created_at, updated_at \
              FROM applications WHERE public_id = $1",
         )
         .bind(public_id)
@@ -106,12 +107,9 @@ impl PgApplicationStore {
         row.ok_or(DbError::ApplicationNotFound)
     }
 
-    pub async fn list_by_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<ApplicationRow>, DbError> {
+    pub async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<ApplicationRow>, DbError> {
         let rows = sqlx::query_as::<_, ApplicationRow>(
-            "SELECT tenant_id, public_id, cross_tenant, created_at, updated_at \
+            "SELECT tenant_id, public_id, cross_tenant, registration_source, created_at, updated_at \
              FROM applications WHERE tenant_id = $1 ORDER BY public_id",
         )
         .bind(tenant_id)
@@ -130,7 +128,7 @@ impl PgApplicationStore {
         let row = sqlx::query_as::<_, ApplicationRow>(
             "UPDATE applications SET cross_tenant = $3, updated_at = NOW() \
              WHERE tenant_id = $1 AND public_id = $2 \
-             RETURNING tenant_id, public_id, cross_tenant, created_at, updated_at",
+             RETURNING tenant_id, public_id, cross_tenant, registration_source, created_at, updated_at",
         )
         .bind(tenant_id)
         .bind(public_id)
@@ -142,13 +140,12 @@ impl PgApplicationStore {
     }
 
     pub async fn delete(&self, tenant_id: &str, public_id: &str) -> Result<(), DbError> {
-        let result = sqlx::query(
-            "DELETE FROM applications WHERE tenant_id = $1 AND public_id = $2",
-        )
-        .bind(tenant_id)
-        .bind(public_id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM applications WHERE tenant_id = $1 AND public_id = $2")
+                .bind(tenant_id)
+                .bind(public_id)
+                .execute(&self.pool)
+                .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::ApplicationNotFound);
@@ -165,15 +162,13 @@ impl ApplicationStore for PgApplicationStore {
         tenant_id: &str,
         public_id: &str,
         cross_tenant: bool,
+        registration_source: &str,
     ) -> Result<ApplicationRow, DbError> {
-        self.create(tenant_id, public_id, cross_tenant).await
+        self.create(tenant_id, public_id, cross_tenant, registration_source)
+            .await
     }
 
-    async fn get(
-        &self,
-        tenant_id: &str,
-        public_id: &str,
-    ) -> Result<ApplicationRow, DbError> {
+    async fn get(&self, tenant_id: &str, public_id: &str) -> Result<ApplicationRow, DbError> {
         self.get(tenant_id, public_id).await
     }
 
@@ -191,7 +186,8 @@ impl ApplicationStore for PgApplicationStore {
         public_id: &str,
         cross_tenant: bool,
     ) -> Result<ApplicationRow, DbError> {
-        self.set_cross_tenant(tenant_id, public_id, cross_tenant).await
+        self.set_cross_tenant(tenant_id, public_id, cross_tenant)
+            .await
     }
 
     async fn delete(&self, tenant_id: &str, public_id: &str) -> Result<(), DbError> {
@@ -205,6 +201,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ApplicationRow {
             tenant_id: row.try_get("tenant_id")?,
             public_id: row.try_get("public_id")?,
             cross_tenant: row.try_get("cross_tenant")?,
+            registration_source: row.try_get("registration_source")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -224,6 +221,7 @@ impl ApplicationStore for MemoryApplicationStore {
         tenant_id: &str,
         public_id: &str,
         cross_tenant: bool,
+        registration_source: &str,
     ) -> Result<ApplicationRow, DbError> {
         let mut lock = match self.records.lock() {
             Ok(g) => g,
@@ -237,6 +235,7 @@ impl ApplicationStore for MemoryApplicationStore {
             tenant_id: tenant_id.to_string(),
             public_id: public_id.to_string(),
             cross_tenant,
+            registration_source: registration_source.to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -244,11 +243,7 @@ impl ApplicationStore for MemoryApplicationStore {
         Ok(row)
     }
 
-    async fn get(
-        &self,
-        tenant_id: &str,
-        public_id: &str,
-    ) -> Result<ApplicationRow, DbError> {
+    async fn get(&self, tenant_id: &str, public_id: &str) -> Result<ApplicationRow, DbError> {
         let lock = match self.records.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -264,7 +259,9 @@ impl ApplicationStore for MemoryApplicationStore {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        lock.get(public_id).cloned().ok_or(DbError::ApplicationNotFound)
+        lock.get(public_id)
+            .cloned()
+            .ok_or(DbError::ApplicationNotFound)
     }
 
     async fn list_by_tenant(&self, tenant_id: &str) -> Result<Vec<ApplicationRow>, DbError> {
@@ -329,6 +326,7 @@ mod tests {
             tenant_id: "t1".to_string(),
             public_id: "p1".to_string(),
             cross_tenant: false,
+            registration_source: REGISTRATION_SOURCE_ADMIN.to_string(),
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),
         };
@@ -341,7 +339,8 @@ mod tests {
     async fn pg_application_store_round_trip() {
         let pool = postgres_pool().await;
         let store = PgApplicationStore::new(pool.clone());
-        let mappings: Arc<dyn IdMappingStore> = Arc::new(crate::db::PgIdMappingStore::new(pool.clone()));
+        let mappings: Arc<dyn IdMappingStore> =
+            Arc::new(crate::db::PgIdMappingStore::new(pool.clone()));
         let tenant_id = ulid::Ulid::new().to_string();
         let public_id = ulid::Ulid::new().to_string();
         create_test_tenant(&pool, &tenant_id).await;
@@ -351,29 +350,33 @@ mod tests {
             .expect("mapping should exist");
 
         let created = store
-            .create(&tenant_id, &public_id, true)
+            .create(&tenant_id, &public_id, true, REGISTRATION_SOURCE_DCR)
             .await
             .expect("create should succeed");
         assert_eq!(created.tenant_id, tenant_id);
         assert!(created.cross_tenant);
+        assert_eq!(created.registration_source, REGISTRATION_SOURCE_DCR);
 
         let fetched = store
             .get(&tenant_id, &public_id)
             .await
             .expect("get should succeed");
         assert_eq!(fetched.public_id, public_id);
+        assert_eq!(fetched.registration_source, REGISTRATION_SOURCE_DCR);
 
         let by_public_id = store
             .get_by_public_id(&public_id)
             .await
             .expect("get_by_public_id should succeed");
         assert!(by_public_id.cross_tenant);
+        assert_eq!(by_public_id.registration_source, REGISTRATION_SOURCE_DCR);
 
         let updated = store
             .set_cross_tenant(&tenant_id, &public_id, false)
             .await
             .expect("set_cross_tenant should succeed");
         assert!(!updated.cross_tenant);
+        assert_eq!(updated.registration_source, REGISTRATION_SOURCE_DCR);
 
         let listed = store
             .list_by_tenant(&tenant_id)
@@ -381,6 +384,7 @@ mod tests {
             .expect("list should succeed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].public_id, public_id);
+        assert_eq!(listed[0].registration_source, REGISTRATION_SOURCE_DCR);
 
         store
             .delete(&tenant_id, &public_id)

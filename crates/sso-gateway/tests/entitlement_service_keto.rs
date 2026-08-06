@@ -51,6 +51,7 @@ impl ApplicationStore for StubApplicationStore {
         _tenant_id: &str,
         _public_id: &str,
         _cross_tenant: bool,
+        _registration_source: &str,
     ) -> Result<ApplicationRow, DbError> {
         Err(DbError::ApplicationNotFound)
     }

@@ -93,7 +93,10 @@ impl RateLimiter {
 
 /// Extract the OAuth2 `client_id` from an HTTP Basic Authorization header.
 fn basic_auth_client_id(headers: &HeaderMap) -> Option<String> {
-    let header = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let (scheme, payload) = header.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
@@ -608,11 +611,15 @@ pub async fn audit_middleware(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use crate::auth::IntrospectionResult;
-    use crate::db::{ApplicationStore, MemoryApplicationStore};
+    use crate::db::{ApplicationStore, MemoryApplicationStore, REGISTRATION_SOURCE_ADMIN};
     use crate::session_token::SessionTokenSigner;
     use axum::{
-        Extension, Router, body::Body, http::Request, middleware::from_fn,
-        middleware::from_fn_with_state, routing::get,
+        Extension, Router,
+        body::Body,
+        http::Request,
+        middleware::from_fn,
+        middleware::from_fn_with_state,
+        routing::get,
     };
     use std::sync::Mutex;
     use tower::ServiceExt;
@@ -738,8 +745,9 @@ mod tests {
 
     #[derive(Default)]
     struct StubAgentResolver {
-        resolve_result:
-            Mutex<Option<Result<Option<crate::agent_tokens::ActTokenResolution>, crate::db::DbError>>>,
+        resolve_result: Mutex<
+            Option<Result<Option<crate::agent_tokens::ActTokenResolution>, crate::db::DbError>>,
+        >,
         status_result: Mutex<Option<Result<Option<String>, crate::db::DbError>>>,
     }
 
@@ -886,7 +894,9 @@ mod tests {
                 Arc::new(StubSessionStore(Mutex::new(Some(Ok(true))))) as Arc<dyn SessionStore>,
             ))
             .layer(Extension(no_mappings()))
-            .layer(Extension(Arc::new(crate::config::SelfServicePaths::default())));
+            .layer(Extension(Arc::new(
+                crate::config::SelfServicePaths::default(),
+            )));
         let response = router
             .oneshot(
                 Request::get("/identity/login?aal=aal2")
@@ -900,11 +910,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_browser_path_still_requires_auth_with_paths_extension() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        )
-        .layer(Extension(Arc::new(crate::config::SelfServicePaths::default())));
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings())
+            .layer(Extension(Arc::new(
+                crate::config::SelfServicePaths::default(),
+            )));
         let response = router
             .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
             .await
@@ -914,10 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_path_bypasses_auth() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/.well-known/openid-configuration")
@@ -931,12 +937,13 @@ mod tests {
 
     #[tokio::test]
     async fn public_register_path_bypasses_auth_when_anonymous() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
-            .oneshot(Request::get("/oauth2/register").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/oauth2/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -963,17 +970,17 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "pub-sub-1|client|");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "pub-sub-1|client|"
+        );
     }
 
     /// An invalid Bearer token on a public path rejects instead of falling
     /// through as an anonymous request.
     #[tokio::test]
     async fn public_path_with_invalid_bearer_rejects() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/oauth2/introspect")
@@ -1010,10 +1017,7 @@ mod tests {
     /// through to anonymous registration.
     #[tokio::test]
     async fn public_register_path_with_invalid_bearer_rejects() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/oauth2/register")
@@ -1061,7 +1065,9 @@ mod tests {
     async fn introspection_database_fault_returns_500() {
         let router = test_router(
             Arc::new(StubIntrospector(Mutex::new(Some(Err(
-                crate::auth::AuthError::Database(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)),
+                crate::auth::AuthError::Database(crate::db::DbError::Sqlx(
+                    sqlx::Error::RowNotFound,
+                )),
             ))))),
             no_mappings(),
         );
@@ -1073,13 +1079,15 @@ mod tests {
     #[tokio::test]
     async fn inactive_token_returns_401() {
         let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(Some(Ok(IntrospectionResult {
-                active: false,
-                sub: None,
-                scope: vec![],
-                exp: None,
-                authentication_methods: vec![],
-            }))))),
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+                IntrospectionResult {
+                    active: false,
+                    sub: None,
+                    scope: vec![],
+                    exp: None,
+                    authentication_methods: vec![],
+                },
+            ))))),
             no_mappings(),
         );
         let response = router.oneshot(bearer_request("/protected")).await.unwrap();
@@ -1091,13 +1099,15 @@ mod tests {
     #[tokio::test]
     async fn active_introspection_missing_subject_returns_500() {
         let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(Some(Ok(IntrospectionResult {
-                active: true,
-                sub: None,
-                scope: vec![],
-                exp: None,
-                authentication_methods: vec![],
-            }))))),
+            Arc::new(StubIntrospector(Mutex::new(Some(Ok(
+                IntrospectionResult {
+                    active: true,
+                    sub: None,
+                    scope: vec![],
+                    exp: None,
+                    authentication_methods: vec![],
+                },
+            ))))),
             no_mappings(),
         );
         let response = router.oneshot(bearer_request("/protected")).await.unwrap();
@@ -1247,7 +1257,10 @@ mod tests {
 
     #[test]
     fn endpoint_class_maps_paths_to_fixed_set() {
-        assert_eq!(endpoint_class("/.well-known/openid-configuration"), "discovery");
+        assert_eq!(
+            endpoint_class("/.well-known/openid-configuration"),
+            "discovery"
+        );
         assert_eq!(endpoint_class("/.well-known/jwks.json"), "discovery");
         assert_eq!(endpoint_class("/oauth2/userinfo"), "userinfo");
         assert_eq!(endpoint_class("/userinfo"), "userinfo");
@@ -1490,10 +1503,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_token_or_cookie_returns_unauthorized() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
             .await
@@ -1509,10 +1519,7 @@ mod tests {
             "https://gateway.example.com",
         );
         let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/protected")
@@ -1536,10 +1543,7 @@ mod tests {
             "https://gateway.example.com",
         );
         let (token, _) = signer.issue("public-1", "tenant-1", "oidc").unwrap();
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/protected")
@@ -1555,10 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_session_cookie_returns_unauthorized() {
-        let router = test_router(
-            Arc::new(StubIntrospector(Mutex::new(None))),
-            no_mappings(),
-        );
+        let router = test_router(Arc::new(StubIntrospector(Mutex::new(None))), no_mappings());
         let response = router
             .oneshot(
                 Request::get("/protected")
@@ -1887,16 +1888,14 @@ mod tests {
     #[tokio::test]
     async fn act_token_authenticates_as_user_with_actor() {
         let resolver = Arc::new(StubAgentResolver {
-            resolve_result: Mutex::new(Some(Ok(Some(
-                crate::agent_tokens::ActTokenResolution {
-                    tenant_id: "tenant-1".into(),
-                    user_identity_id: "user-1".into(),
-                    agent_id: "agent-1".into(),
-                    delegation_id: "del-1".into(),
-                    scopes: vec!["kanban:read".into()],
-                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
-                },
-            )))),
+            resolve_result: Mutex::new(Some(Ok(Some(crate::agent_tokens::ActTokenResolution {
+                tenant_id: "tenant-1".into(),
+                user_identity_id: "user-1".into(),
+                agent_id: "agent-1".into(),
+                delegation_id: "del-1".into(),
+                scopes: vec!["kanban:read".into()],
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            })))),
             ..Default::default()
         });
         // The introspector must never be consulted for act-tokens: it holds
@@ -2013,7 +2012,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_overrides_tenant_for_flagged_client() {
         let apps = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", true, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let target_tenant = ulid::Ulid::new().to_string();
 
         let router = cross_tenant_router(apps);
@@ -2026,7 +2027,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_overrides_resolved_tenant_for_flagged_client() {
         let apps: Arc<dyn ApplicationStore> = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", true, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let target_tenant = ulid::Ulid::new().to_string();
 
         let router = Router::new()
@@ -2064,7 +2067,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_ignored_for_user() {
         let apps = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", true, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let target_tenant = ulid::Ulid::new().to_string();
 
         let router = test_router(
@@ -2084,7 +2089,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_ignored_for_agent() {
         let apps = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", true, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let target_tenant = ulid::Ulid::new().to_string();
 
         let resolver = Arc::new(StubAgentResolver {
@@ -2106,7 +2113,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_ignored_for_unflagged_client() {
         let apps = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", false).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", false, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let target_tenant = ulid::Ulid::new().to_string();
 
         let router = cross_tenant_router(apps);
@@ -2159,7 +2168,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tenant_header_ignored_when_value_is_not_ulid() {
         let apps = Arc::new(MemoryApplicationStore::default());
-        apps.create("tenant-1", "pub-sub-1", true).await.unwrap();
+        apps.create("tenant-1", "pub-sub-1", true, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
 
         let router = cross_tenant_router(apps);
         let (status, body) = ctx_body_with_header(router, "not-a-ulid").await;

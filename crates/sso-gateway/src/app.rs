@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::jwks::ReqwestJwksService;
-use crate::services::permission::PermissionBackend;
 #[cfg(feature = "openfga")]
 use crate::services::permission::OpenFgaPermissionBackend;
+use crate::services::permission::PermissionBackend;
 use crate::upstream_oauth::ReqwestUpstreamOAuthClient;
 use crate::{
     agent_tokens::{
@@ -15,10 +15,10 @@ use crate::{
     db::{
         AgentActTokenRepo, AgentDelegationRepo, AgentRepo, ApplicationRepo, DbPool, IdMappingRepo,
         IdentitySchemaRepo, LoginStateRepo, PermissionNamespaceRepo, PermissionTupleRepo,
-        PgTokenIntrospectionCache, SamlIdentityMappingRepo, SamlIdpKeyRepo, SamlProviderRepo,
-        SamlReplayCache, SamlRequestRepo, SamlSpClientRepo, ScimGroupRepo, TenantConnectionRepo,
-        TenantDomainRepo, TenantMembershipRepo, TenantRepo, TransientTokenRepo,
-        bootstrap_system_tenant, create_pool,
+        PgTokenIntrospectionCache, REGISTRATION_SOURCE_ADMIN, SamlIdentityMappingRepo,
+        SamlIdpKeyRepo, SamlProviderRepo, SamlReplayCache, SamlRequestRepo, SamlSpClientRepo,
+        ScimGroupRepo, TenantConnectionRepo, TenantDomainRepo, TenantMembershipRepo, TenantRepo,
+        TransientTokenRepo, bootstrap_system_tenant, create_pool,
     },
     identity_provisioner::KratosIdentityProvisioner,
     middleware::{RateLimiter, audit_middleware, auth_middleware, rate_limit_middleware},
@@ -170,11 +170,9 @@ pub async fn build_app_with_upstream(
     let application_store: Arc<dyn crate::db::ApplicationStore> =
         Arc::new(application_repo.clone());
 
-    let entitlements: Arc<dyn crate::services::entitlement::EntitlementService> =
-        Arc::new(EntitlementServiceImpl::new(
-            backend.clone(),
-            application_store.clone(),
-        ));
+    let entitlements: Arc<dyn crate::services::entitlement::EntitlementService> = Arc::new(
+        EntitlementServiceImpl::new(backend.clone(), application_store.clone()),
+    );
 
     if let (Some(client_id), Some(client_secret)) = (
         config.system_bootstrap_client_id.as_deref(),
@@ -644,7 +642,12 @@ async fn bootstrap_system_client(
                 "creating system bootstrap application with cross_tenant"
             );
             applications
-                .create(system_tenant_ulid, client_id, true)
+                .create(
+                    system_tenant_ulid,
+                    client_id,
+                    true,
+                    REGISTRATION_SOURCE_ADMIN,
+                )
                 .await
                 .map_err(|e| {
                     sunbeam_g2v::error::ServiceError::Database(format!(
@@ -710,11 +713,7 @@ mod tests {
 
     use super::*;
     use crate::middleware::RateLimiter;
-    use crate::{
-        config::Config,
-        db::create_pool,
-        test_support::postgres_url,
-    };
+    use crate::{config::Config, db::create_pool, test_support::postgres_url};
 
     async fn ok_handler() -> StatusCode {
         StatusCode::OK
@@ -1103,14 +1102,16 @@ mod tests {
             )
             .route(
                 "/admin/clients",
-                axum::routing::post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    let client_id = body
-                        .get("client_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("bootstrap-client")
-                        .to_string();
-                    axum::Json(serde_json::json!({ "client_id": client_id }))
-                }),
+                axum::routing::post(
+                    |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        let client_id = body
+                            .get("client_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("bootstrap-client")
+                            .to_string();
+                        axum::Json(serde_json::json!({ "client_id": client_id }))
+                    },
+                ),
             );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1126,14 +1127,19 @@ mod tests {
         let url = db_url_with_name(base, db_name);
         let pool = create_pool(&url, false).await.unwrap();
         let system_tenant_ulid = Ulid::new().to_string();
-        bootstrap_system_tenant(&pool, &system_tenant_ulid).await.unwrap();
+        bootstrap_system_tenant(&pool, &system_tenant_ulid)
+            .await
+            .unwrap();
         (pool, system_tenant_ulid)
     }
 
     #[tokio::test]
     async fn bootstrap_system_client_creates_cross_tenant_application_row() {
-        let (pool, system_tenant_ulid) =
-            bootstrap_test_pool(&format!("bs_create_{}", Ulid::new().to_string().to_lowercase())).await;
+        let (pool, system_tenant_ulid) = bootstrap_test_pool(&format!(
+            "bs_create_{}",
+            Ulid::new().to_string().to_lowercase()
+        ))
+        .await;
 
         let mappings = IdMappingRepo::new(pool.clone());
         let applications = ApplicationRepo::new(pool.clone());
@@ -1157,15 +1163,24 @@ mod tests {
             .unwrap();
         assert_eq!(mapping, Some(system_tenant_ulid.clone()));
 
-        let app = applications.get_by_public_id("bootstrap-client").await.unwrap();
+        let app = applications
+            .get_by_public_id("bootstrap-client")
+            .await
+            .unwrap();
         assert_eq!(app.tenant_id, system_tenant_ulid);
-        assert!(app.cross_tenant, "bootstrap application must be cross-tenant");
+        assert!(
+            app.cross_tenant,
+            "bootstrap application must be cross-tenant"
+        );
     }
 
     #[tokio::test]
     async fn bootstrap_system_client_upgrades_existing_application_to_cross_tenant() {
-        let (pool, system_tenant_ulid) =
-            bootstrap_test_pool(&format!("bs_upgrade_{}", Ulid::new().to_string().to_lowercase())).await;
+        let (pool, system_tenant_ulid) = bootstrap_test_pool(&format!(
+            "bs_upgrade_{}",
+            Ulid::new().to_string().to_lowercase()
+        ))
+        .await;
 
         let mappings = IdMappingRepo::new(pool.clone());
         let applications = ApplicationRepo::new(pool.clone());
@@ -1173,11 +1188,21 @@ mod tests {
         // Pre-create an application row without cross_tenant, as would happen
         // if the bootstrap client was provisioned before this release.
         mappings
-            .create(&system_tenant_ulid, "hydra", "bootstrap-client", "bootstrap-client")
+            .create(
+                &system_tenant_ulid,
+                "hydra",
+                "bootstrap-client",
+                "bootstrap-client",
+            )
             .await
             .unwrap();
         let existing = applications
-            .create(&system_tenant_ulid, "bootstrap-client", false)
+            .create(
+                &system_tenant_ulid,
+                "bootstrap-client",
+                false,
+                REGISTRATION_SOURCE_ADMIN,
+            )
             .await
             .unwrap();
         assert!(!existing.cross_tenant);
@@ -1196,7 +1221,13 @@ mod tests {
         .await
         .unwrap();
 
-        let app = applications.get_by_public_id("bootstrap-client").await.unwrap();
-        assert!(app.cross_tenant, "bootstrap application must be upgraded to cross-tenant");
+        let app = applications
+            .get_by_public_id("bootstrap-client")
+            .await
+            .unwrap();
+        assert!(
+            app.cross_tenant,
+            "bootstrap application must be upgraded to cross-tenant"
+        );
     }
 }

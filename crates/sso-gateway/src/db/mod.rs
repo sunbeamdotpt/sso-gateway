@@ -35,13 +35,12 @@ mod tenant_membership;
 mod token_cache;
 mod transient_token;
 
-pub use agent::{
-    AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED, AgentRow, AgentStore, PgAgentStore,
-};
+pub use agent::{AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED, AgentRow, AgentStore, PgAgentStore};
 pub use agent_act_token::{AgentActTokenRow, AgentActTokenStore, PgAgentActTokenStore};
 pub use agent_delegation::{AgentDelegationRow, AgentDelegationStore, PgAgentDelegationStore};
 pub use application::{
     ApplicationRow, ApplicationStore, MemoryApplicationStore, PgApplicationStore,
+    REGISTRATION_SOURCE_ADMIN, REGISTRATION_SOURCE_DCR,
 };
 pub use connection::{
     ConnectionType, PgTenantConnectionStore, TenantConnectionRow, TenantConnectionStore,
@@ -54,7 +53,9 @@ pub use local_auth::{
     LocalAuthMethod, PgTenantLocalAuthStore, TenantLocalAuthRow, TenantLocalAuthStore,
 };
 pub use login_state::{LoginStateRow, LoginStateStore, PgLoginStateStore};
-pub use permission::{PermissionTupleRow, PermissionTupleStore, PgPermissionTupleStore, TupleKeyInput};
+pub use permission::{
+    PermissionTupleRow, PermissionTupleStore, PgPermissionTupleStore, TupleKeyInput,
+};
 pub use permission_namespace::{
     PermissionNamespaceRow, PgPermissionNamespaceStore, relation_bearing_type_names,
 };

@@ -1,5 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 //! Entitlement service integration tests against a real OpenFGA container and
 //! a real Postgres namespace registry.
@@ -13,11 +16,9 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use sso_gateway::db::{
-    ApplicationRepo, PgPermissionNamespaceStore, create_pool,
-};
+use sso_gateway::db::{ApplicationRepo, PgPermissionNamespaceStore, create_pool};
 use sso_gateway::services::entitlement::{
-    EntitlementLevel, EntitlementService, EntitlementServiceImpl, ENTITLEMENT_NAMESPACE,
+    ENTITLEMENT_NAMESPACE, EntitlementLevel, EntitlementService, EntitlementServiceImpl,
     GATEWAY_APP_OBJECT,
 };
 use sso_gateway::services::permission::{
@@ -33,8 +34,12 @@ mod support;
 /// on first start, so concurrently-started containers can be killed mid-test.
 /// Tests stay isolated through per-test tenant ids (per-tenant stores and
 /// registry rows).
-static CONTAINERS: tokio::sync::OnceCell<(ContainerAsync<GenericImage>, ContainerAsync<GenericImage>, String, String)> =
-    tokio::sync::OnceCell::const_new();
+static CONTAINERS: tokio::sync::OnceCell<(
+    ContainerAsync<GenericImage>,
+    ContainerAsync<GenericImage>,
+    String,
+    String,
+)> = tokio::sync::OnceCell::const_new();
 
 async fn container_urls() -> (String, String) {
     let (_, _, database_url, openfga_url) = CONTAINERS
@@ -98,10 +103,14 @@ async fn start_stack() -> Stack {
 
 impl Stack {
     async fn entitlement_record(&self) -> sso_gateway::services::permission::NamespaceRecord {
-        NamespaceMappingRepo::get(self.namespaces.as_ref(), &self.tenant, ENTITLEMENT_NAMESPACE)
-            .await
-            .expect("namespace lookup should succeed")
-            .expect("entitlement namespace should be registered")
+        NamespaceMappingRepo::get(
+            self.namespaces.as_ref(),
+            &self.tenant,
+            ENTITLEMENT_NAMESPACE,
+        )
+        .await
+        .expect("namespace lookup should succeed")
+        .expect("entitlement namespace should be registered")
     }
 }
 
@@ -238,7 +247,12 @@ async fn entitlement_service_openfga_lifecycle() {
         .expect("id mapping should be created");
     stack
         .applications
-        .create(tenant, "kanban", false)
+        .create(
+            tenant,
+            "kanban",
+            false,
+            sso_gateway::db::REGISTRATION_SOURCE_ADMIN,
+        )
         .await
         .expect("application row should be created");
     svc.grant(tenant, "carol", "kanban", EntitlementLevel::Member)
@@ -367,7 +381,10 @@ async fn entitlement_service_openfga_coexists_with_flat_namespace() {
         .expect("lookup should succeed")
         .expect("scim_group namespace should be registered");
     assert_ne!(entitlement_record.store_id, scim_record.store_id);
-    assert_eq!(entitlement_record.types, vec![ENTITLEMENT_NAMESPACE.to_string()]);
+    assert_eq!(
+        entitlement_record.types,
+        vec![ENTITLEMENT_NAMESPACE.to_string()]
+    );
 
     stack
         .service
@@ -501,7 +518,11 @@ async fn entitlement_service_openfga_adopts_orphan_store() {
     );
 
     // Still exactly one store with that name.
-    let stores = stack.client.list_stores().await.expect("stores should list");
+    let stores = stack
+        .client
+        .list_stores()
+        .await
+        .expect("stores should list");
     let named = stores["stores"]
         .as_array()
         .expect("stores array")

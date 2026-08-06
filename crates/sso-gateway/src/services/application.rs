@@ -11,7 +11,9 @@ use ulid::Ulid;
 
 use crate::{
     auth::{AuthContext, SCOPE_APPLICATION_ADMIN, SCOPE_APPLICATION_READ, require_scope},
-    db::{ApplicationRepo, ApplicationStore, IdMappingRepo, IdMappingStore},
+    db::{
+        ApplicationRepo, ApplicationStore, IdMappingRepo, IdMappingStore, REGISTRATION_SOURCE_ADMIN,
+    },
     middleware::TenantId,
     proto::iam::v1::{
         Application, ApplicationSecret, CreateApplicationRequest, DeleteApplicationRequest,
@@ -147,7 +149,12 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .create(&tenant_id, BACKEND_HYDRA, &public_id, ory_id)
             .await?;
         self.applications
-            .create(&tenant_id, &public_id, req.cross_tenant)
+            .create(
+                &tenant_id,
+                &public_id,
+                req.cross_tenant,
+                REGISTRATION_SOURCE_ADMIN,
+            )
             .await?;
         self.entitlements
             .seed_application(&tenant_id, &public_id, &["employees".to_string()])
@@ -320,10 +327,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             .delete_oauth2_client(&ory_id)
             .await
             .map_err(map_ory_error)?;
-        self.applications
-            .delete(&tenant_id, &req.id)
-            .await
-            .ok();
+        self.applications.delete(&tenant_id, &req.id).await.ok();
         self.mappings
             .delete(&tenant_id, BACKEND_HYDRA, &req.id)
             .await?;
@@ -642,7 +646,11 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             Ok(true)
         }
-        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+        async fn effective_scope_ceiling(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Vec<String> {
             vec![]
         }
         async fn grant(
@@ -679,7 +687,12 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+        async fn mint_claim(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+        ) -> Value {
             Value::Null
         }
     }
@@ -728,7 +741,11 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             Ok(true)
         }
-        async fn effective_scope_ceiling(&self, _tenant_id: &str, _identity_id: &str) -> Vec<String> {
+        async fn effective_scope_ceiling(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+        ) -> Vec<String> {
             vec![]
         }
         async fn grant(
@@ -765,7 +782,12 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn mint_claim(&self, _tenant_id: &str, _identity_id: &str, _app_public_id: &str) -> Value {
+        async fn mint_claim(
+            &self,
+            _tenant_id: &str,
+            _identity_id: &str,
+            _app_public_id: &str,
+        ) -> Value {
             Value::Null
         }
     }
@@ -1259,7 +1281,7 @@ mod tests {
             ..Default::default()
         };
         let apps = MemoryApplicationStore::default();
-        apps.create("system-tenant", "pub-1", false)
+        apps.create("system-tenant", "pub-1", false, REGISTRATION_SOURCE_ADMIN)
             .await
             .unwrap();
         let service = build_service_with_apps(hydra, mappings, apps.clone(), "system-tenant");
@@ -1303,7 +1325,9 @@ mod tests {
             ..Default::default()
         };
         let apps = MemoryApplicationStore::default();
-        apps.create("tenant-1", "pub-1", false).await.unwrap();
+        apps.create("tenant-1", "pub-1", false, REGISTRATION_SOURCE_ADMIN)
+            .await
+            .unwrap();
         let service = build_service_with_apps(hydra, mappings, apps.clone(), "system-tenant");
 
         let req = UpdateApplicationRequest {
@@ -2341,7 +2365,9 @@ mod tests {
     #[test]
     fn validate_native_redirect_uris_accepts_custom_scheme() {
         assert!(validate_native_redirect_uris(&["io.element.android:/".into()]).is_ok());
-        assert!(validate_native_redirect_uris(&["io.element.android:/oauth/callback".into()]).is_ok());
+        assert!(
+            validate_native_redirect_uris(&["io.element.android:/oauth/callback".into()]).is_ok()
+        );
     }
 
     #[test]

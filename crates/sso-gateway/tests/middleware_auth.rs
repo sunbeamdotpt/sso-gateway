@@ -1,11 +1,17 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
 use axum::{Extension, Router, middleware::from_fn, response::IntoResponse, routing::get};
 use sso_gateway::{
-    db::{ApplicationRepo, ApplicationStore, IdMappingRepo, IdMappingStore, bootstrap_system_tenant, create_pool},
+    db::{
+        ApplicationRepo, ApplicationStore, IdMappingRepo, IdMappingStore,
+        REGISTRATION_SOURCE_ADMIN, bootstrap_system_tenant, create_pool,
+    },
     middleware::{TenantId, audit_middleware, auth_middleware},
     services::handlers::oauth2::{Oauth2State, router as oauth2_router},
     session_token::SessionTokenSigner,
@@ -161,9 +167,14 @@ async fn cross_tenant_header_routes_to_target_tenant() {
     support::bootstrap_test_subject_mapping(&pool, &tenant_id).await;
 
     let apps = ApplicationRepo::new(pool.clone());
-    apps.create(&tenant_id, support::TEST_SUBJECT, true)
-        .await
-        .expect("cross-tenant application should be created");
+    apps.create(
+        &tenant_id,
+        support::TEST_SUBJECT,
+        true,
+        REGISTRATION_SOURCE_ADMIN,
+    )
+    .await
+    .expect("cross-tenant application should be created");
 
     let hydra = Arc::new(
         HydraClient::new("http://localhost:1", "http://localhost:1")

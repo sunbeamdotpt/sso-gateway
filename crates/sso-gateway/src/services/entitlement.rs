@@ -892,7 +892,7 @@ pub mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ApplicationRow, ApplicationStore, DbError};
+    use crate::db::{ApplicationRow, ApplicationStore, DbError, REGISTRATION_SOURCE_ADMIN};
     use crate::services::permission::{PermissionBackend, PermissionBackendError, QueryOptions};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1114,6 +1114,7 @@ mod tests {
             _tenant_id: &str,
             _public_id: &str,
             _cross_tenant: bool,
+            _registration_source: &str,
         ) -> Result<ApplicationRow, DbError> {
             unimplemented!()
         }
@@ -1403,6 +1404,7 @@ mod tests {
                 tenant_id: "tenant-1".into(),
                 public_id: "app-1".into(),
                 cross_tenant: false,
+                registration_source: REGISTRATION_SOURCE_ADMIN.into(),
                 created_at: time::OffsetDateTime::now_utc(),
                 updated_at: time::OffsetDateTime::now_utc(),
             },
@@ -1410,6 +1412,7 @@ mod tests {
                 tenant_id: "tenant-1".into(),
                 public_id: "app-2".into(),
                 cross_tenant: false,
+                registration_source: REGISTRATION_SOURCE_ADMIN.into(),
                 created_at: time::OffsetDateTime::now_utc(),
                 updated_at: time::OffsetDateTime::now_utc(),
             },
