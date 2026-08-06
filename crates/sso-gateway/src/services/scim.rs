@@ -16,6 +16,7 @@ use sunbeam_g2v::error::ServiceError;
 use tracing::{debug, instrument};
 use ulid::Ulid;
 
+use crate::services::entitlement::EntitlementService;
 use crate::{
     auth::{AuthContext, SCOPE_SCIM_ADMIN, SCOPE_SCIM_READ, SubjectType, require_scope},
     db::{
@@ -31,7 +32,6 @@ use crate::{
     },
     services::permission::PermissionBackend,
 };
-use crate::services::entitlement::EntitlementService;
 
 const BACKEND_KRATOS: &str = "kratos";
 const SCIM_GROUP_NAMESPACE: &str = "scim_group";
@@ -827,10 +827,10 @@ fn map_ory_error(err: OryClientError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::auth::SubjectType;
     use crate::services::entitlement::EntitlementLevel;
     use crate::services::entitlement::test_helpers::entitlements;
-    use super::*;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
@@ -1162,6 +1162,18 @@ mod tests {
             _user_type_filters: &[String],
             _opts: &crate::services::permission::QueryOptions,
         ) -> Result<Vec<String>, crate::services::permission::PermissionBackendError> {
+            Ok(Vec::new())
+        }
+
+        async fn read_tuples(
+            &self,
+            _tenant_id: &str,
+            _namespace: &str,
+            _object: &str,
+        ) -> Result<
+            Vec<crate::services::permission::RelationTupleKey>,
+            crate::services::permission::PermissionBackendError,
+        > {
             Ok(Vec::new())
         }
 
@@ -1659,7 +1671,8 @@ mod tests {
         let mappings = IdMappingRepo::new(pool.clone());
         let schemas = IdentitySchemaRepo::new(pool.clone());
         let groups = ScimGroupRepo::new(pool);
-        let service = ScimServiceImpl::new(kratos, backend, mappings, schemas, groups, entitlements());
+        let service =
+            ScimServiceImpl::new(kratos, backend, mappings, schemas, groups, entitlements());
         // Exercise Clone to ensure the struct fields are consistent.
         let _cloned = service.clone();
     }
@@ -1978,9 +1991,11 @@ mod tests {
             .body;
 
         let calls = entitlements.group_memberships.lock().await;
-        assert!(calls.iter().any(|(t, g, u, m)| {
-            t == "tenant-1" && *g == group.id && *u == user.id && *m
-        }));
+        assert!(
+            calls
+                .iter()
+                .any(|(t, g, u, m)| { t == "tenant-1" && *g == group.id && *u == user.id && *m })
+        );
     }
 
     #[tokio::test]

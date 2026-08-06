@@ -906,6 +906,7 @@ mod tests {
         checks: Mutex<Vec<(String, String, String, String, String)>>,
         check_results: Mutex<HashMap<(String, String, String, String), bool>>,
         list_users_results: Mutex<HashMap<(String, String, String, String), Vec<String>>>,
+        read_tuples_results: Mutex<HashMap<(String, String, String), Vec<RelationTupleKey>>>,
         check_error: Mutex<Option<PermissionBackendError>>,
         write_error: Mutex<Option<PermissionBackendError>>,
         list_users_error: Mutex<Option<PermissionBackendError>>,
@@ -1058,6 +1059,26 @@ mod tests {
             }
             let key = (tenant_id.to_string(), namespace.to_string(), object.to_string(), relation.to_string());
             Ok(self.list_users_results.lock().unwrap().get(&key).cloned().unwrap_or_default())
+        }
+
+        async fn read_tuples(
+            &self,
+            tenant_id: &str,
+            namespace: &str,
+            object: &str,
+        ) -> Result<Vec<RelationTupleKey>, PermissionBackendError> {
+            let key = (
+                tenant_id.to_string(),
+                namespace.to_string(),
+                object.to_string(),
+            );
+            Ok(self
+                .read_tuples_results
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn ensure_namespace(

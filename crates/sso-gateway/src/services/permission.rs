@@ -25,8 +25,8 @@ use crate::{
         EnsurePermissionNamespaceRequest, ExpandObjectsRequest, ExpandObjectsResponse,
         ExpandPermissionsRequest, ExpandPermissionsResponse, GetPermissionNamespaceRequest,
         ListPermissionNamespacesRequest, ListPermissionNamespacesResponse,
-        ListRelationTuplesRequest, ListRelationTuplesResponse, ListUsersRequest,
-        ListUsersResponse, PermissionNamespace, PermissionService, RelationTuple,
+        ListRelationTuplesRequest, ListRelationTuplesResponse, ListUsersRequest, ListUsersResponse,
+        PermissionNamespace, PermissionService, RelationTuple,
         RelationTupleKey as ProtoRelationTupleKey, WriteRelationTuplesRequest,
         WriteRelationTuplesResponse,
     },
@@ -264,6 +264,15 @@ pub trait PermissionBackend: Send + Sync + 'static {
         opts: &QueryOptions,
     ) -> Result<Vec<String>, PermissionBackendError>;
 
+    /// Read all relation tuples on an object in a namespace. Used by
+    /// bootstrap/backfill convergence to detect never-seeded objects.
+    async fn read_tuples(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        object: &str,
+    ) -> Result<Vec<RelationTupleKey>, PermissionBackendError>;
+
     /// Ensure that a namespace exists for the tenant using a flat,
     /// single-type model derived from `relations`.
     ///
@@ -446,6 +455,21 @@ impl PermissionBackend for KetoClient {
         ))
     }
 
+    async fn read_tuples(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        object: &str,
+    ) -> Result<Vec<RelationTupleKey>, PermissionBackendError> {
+        let tuples = self
+            .read_tuples(namespace, &tenant_object(tenant_id, object))
+            .await?;
+        Ok(tuples
+            .into_iter()
+            .map(|tuple| keto_tuple_key(tenant_id, tuple))
+            .collect())
+    }
+
     async fn ensure_namespace(
         &self,
         _tenant_id: &str,
@@ -496,7 +520,10 @@ fn reject_unsupported_opts(opts: &QueryOptions) -> Result<(), PermissionBackendE
 /// bare ids and typed subjects like `user:x` — stays a plain subject id. The
 /// subject-set object is tenant-prefixed like any other Keto object.
 #[cfg(feature = "keto")]
-fn keto_subject<'a>(tenant_id: &str, subject_id: &'a str) -> sso_ory_client::keto::TupleSubject<'a> {
+fn keto_subject<'a>(
+    tenant_id: &str,
+    subject_id: &'a str,
+) -> sso_ory_client::keto::TupleSubject<'a> {
     if let Some((left, relation)) = subject_id.split_once('#')
         && let Some((namespace, object)) = left.split_once(':')
         && !namespace.is_empty()
@@ -510,6 +537,42 @@ fn keto_subject<'a>(tenant_id: &str, subject_id: &'a str) -> sso_ory_client::ket
         };
     }
     sso_ory_client::keto::TupleSubject::Id(subject_id)
+}
+
+/// Map a Keto read tuple back onto a gateway tuple key: the tenant prefix is
+/// stripped from the object (and from subject-set objects, which were
+/// prefixed on write), and subject sets become canonical `ns:obj#rel`
+/// strings, mirroring [`keto_subject`].
+#[cfg(feature = "keto")]
+fn keto_tuple_key(
+    tenant_id: &str,
+    tuple: sso_ory_client::keto::KetoRelationTuple,
+) -> RelationTupleKey {
+    let subject_id = match tuple.subject {
+        sso_ory_client::keto::KetoTupleSubject::Id(subject_id) => subject_id,
+        sso_ory_client::keto::KetoTupleSubject::Set {
+            namespace,
+            object,
+            relation,
+        } => {
+            let object = match strip_tenant_object_prefix(tenant_id, &object) {
+                Some(stripped) => stripped,
+                None => object,
+            };
+            format!("{namespace}:{object}#{relation}")
+        }
+    };
+    RelationTupleKey {
+        namespace: tuple.namespace,
+        object: match strip_tenant_object_prefix(tenant_id, &tuple.object) {
+            Some(stripped) => stripped,
+            None => tuple.object,
+        },
+        relation: tuple.relation,
+        subject_id,
+        condition: None,
+        condition_context: None,
+    }
 }
 
 /// A registered tenant namespace and its provisioning state.
@@ -580,7 +643,9 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        Ok(lock.get(&(tenant_id.to_string(), namespace.to_string())).cloned())
+        Ok(lock
+            .get(&(tenant_id.to_string(), namespace.to_string()))
+            .cloned())
     }
 
     async fn get_by_type(
@@ -594,11 +659,15 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         };
         let by_type = lock
             .iter()
-            .find(|((t, _), record)| t == tenant_id && record.types.iter().any(|ty| ty == object_type))
+            .find(|((t, _), record)| {
+                t == tenant_id && record.types.iter().any(|ty| ty == object_type)
+            })
             .map(|(_, record)| record.clone());
         match by_type {
             Some(record) => Ok(Some(record)),
-            None => Ok(lock.get(&(tenant_id.to_string(), object_type.to_string())).cloned()),
+            None => Ok(lock
+                .get(&(tenant_id.to_string(), object_type.to_string()))
+                .cloned()),
         }
     }
 
@@ -631,8 +700,14 @@ impl NamespaceMappingRepo for MemoryNamespaceMappingRepo {
         let now = time::OffsetDateTime::now_utc();
         let merged = match lock.get(&key) {
             Some(existing) => NamespaceRecord {
-                store_id: record.store_id.clone().or_else(|| existing.store_id.clone()),
-                model_id: record.model_id.clone().or_else(|| existing.model_id.clone()),
+                store_id: record
+                    .store_id
+                    .clone()
+                    .or_else(|| existing.store_id.clone()),
+                model_id: record
+                    .model_id
+                    .clone()
+                    .or_else(|| existing.model_id.clone()),
                 updated_at: Some(now),
                 types: index_types,
                 ..record.clone()
@@ -804,7 +879,11 @@ fn client_tuple_key(key: &RelationTupleKey) -> sso_openfga_client::TupleKey {
 fn client_request_options(opts: &QueryOptions) -> sso_openfga_client::RequestOptions {
     sso_openfga_client::RequestOptions {
         context: opts.context.clone(),
-        contextual_tuples: opts.contextual_tuples.iter().map(client_tuple_key).collect(),
+        contextual_tuples: opts
+            .contextual_tuples
+            .iter()
+            .map(client_tuple_key)
+            .collect(),
         consistency: opts.consistency.clone(),
     }
 }
@@ -966,8 +1045,13 @@ impl PermissionBackend for OpenFgaPermissionBackend {
     ) -> Result<(), PermissionBackendError> {
         // Group keys by their owning store; OpenFGA writes are per-store.
         let mut records: HashMap<String, NamespaceRecord> = HashMap::new();
-        let mut grouped: HashMap<String, (Vec<sso_openfga_client::TupleKey>, Vec<sso_openfga_client::TupleKey>)> =
-            HashMap::new();
+        let mut grouped: HashMap<
+            String,
+            (
+                Vec<sso_openfga_client::TupleKey>,
+                Vec<sso_openfga_client::TupleKey>,
+            ),
+        > = HashMap::new();
 
         for key in writes.iter().chain(deletes.iter()) {
             if !records.contains_key(&key.namespace) {
@@ -1186,6 +1270,46 @@ impl PermissionBackend for OpenFgaPermissionBackend {
             .await?)
     }
 
+    async fn read_tuples(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        object: &str,
+    ) -> Result<Vec<RelationTupleKey>, PermissionBackendError> {
+        let mapping = match self.resolve_mapping(tenant_id, namespace).await {
+            Ok(mapping) => mapping,
+            // A namespace that was never provisioned has no tuples by
+            // definition; bootstrap convergence relies on reading zero
+            // tuples for fresh tenants instead of failing.
+            Err(PermissionBackendError::NamespaceNotConfigured(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let store_id = match mapping.store_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => String::new(),
+        };
+        // An object-only filter reads every tuple on the object.
+        let filter = sso_openfga_client::TupleKey {
+            user: String::new(),
+            relation: String::new(),
+            object: format!("{namespace}:{object}"),
+            condition_name: None,
+            condition_context: None,
+        };
+        let keys = self.client.read_tuples(&store_id, &filter).await?;
+        Ok(keys
+            .into_iter()
+            .map(|key| RelationTupleKey {
+                namespace: namespace.to_string(),
+                object: object.to_string(),
+                relation: key.relation,
+                subject_id: key.user,
+                condition: key.condition_name,
+                condition_context: key.condition_context,
+            })
+            .collect())
+    }
+
     async fn ensure_namespace(
         &self,
         tenant_id: &str,
@@ -1399,12 +1523,19 @@ impl PermissionService for PermissionServiceImpl {
 
         let expanded = self
             .backend
-            .expand(&tenant_id, &req.namespace, &req.object, &req.relation, &opts)
+            .expand(
+                &tenant_id,
+                &req.namespace,
+                &req.object,
+                &req.relation,
+                &opts,
+            )
             .await?;
 
         let sanitized = sanitize_expand_tree(&expanded, &tenant_id, &self.mappings).await?;
-        let tree = serde_json::to_string(&sanitized)
-            .map_err(|err| ServiceError::Internal(format!("failed to serialize expand tree: {err}")))?;
+        let tree = serde_json::to_string(&sanitized).map_err(|err| {
+            ServiceError::Internal(format!("failed to serialize expand tree: {err}"))
+        })?;
         Ok(Response::new(ExpandPermissionsResponse {
             tree,
             ..Default::default()
@@ -1452,8 +1583,9 @@ impl PermissionService for PermissionServiceImpl {
             None => Vec::new(),
         };
 
-        let tree = serde_json::to_string(&sanitized)
-            .map_err(|err| ServiceError::Internal(format!("failed to serialize expand tree: {err}")))?;
+        let tree = serde_json::to_string(&sanitized).map_err(|err| {
+            ServiceError::Internal(format!("failed to serialize expand tree: {err}"))
+        })?;
         Ok(Response::new(ExpandObjectsResponse {
             objects,
             tree,
@@ -1650,7 +1782,9 @@ impl PermissionService for PermissionServiceImpl {
         let req = request.to_owned_message();
 
         if req.writes.is_empty() && req.deletes.is_empty() {
-            return Err(ServiceError::InvalidArgument("at least one tuple key is required".into()).into());
+            return Err(
+                ServiceError::InvalidArgument("at least one tuple key is required".into()).into(),
+            );
         }
         for (direction, keys) in [("writes", &req.writes), ("deletes", &req.deletes)] {
             if keys.len() > MAX_BATCH_KEYS {
@@ -1998,7 +2132,9 @@ fn tuple_key_from_proto(key: ProtoRelationTupleKey) -> Result<RelationTupleKey, 
         .as_option()
         .map(serde_json::to_value)
         .transpose()
-        .map_err(|err| ServiceError::InvalidArgument(format!("invalid condition context: {err}")))?;
+        .map_err(|err| {
+            ServiceError::InvalidArgument(format!("invalid condition context: {err}"))
+        })?;
     Ok(RelationTupleKey {
         namespace: key.namespace,
         object: key.object,
@@ -2222,6 +2358,7 @@ mod tests {
         expand_objects_result: Result<Value, BackendError>,
         write_tuples_result: Result<(), BackendError>,
         list_users_result: Result<Vec<String>, BackendError>,
+        read_tuples_result: Result<Vec<RelationTupleKey>, BackendError>,
         ensure_model_result: Result<(), BackendError>,
         delete_namespace_result: Result<(), BackendError>,
         calls: Arc<Mutex<Vec<BackendCall>>>,
@@ -2279,6 +2416,11 @@ mod tests {
             relation: String,
             user_type_filters: Vec<String>,
         },
+        ReadTuples {
+            tenant_id: String,
+            namespace: String,
+            object: String,
+        },
         EnsureModel {
             tenant_id: String,
             namespace: String,
@@ -2300,6 +2442,7 @@ mod tests {
                 expand_objects_result: Ok(Value::Null),
                 write_tuples_result: Ok(()),
                 list_users_result: Ok(Vec::new()),
+                read_tuples_result: Ok(Vec::new()),
                 ensure_model_result: Ok(()),
                 delete_namespace_result: Ok(()),
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -2444,6 +2587,20 @@ mod tests {
             self.list_users_result.clone().map_err(Into::into)
         }
 
+        async fn read_tuples(
+            &self,
+            tenant_id: &str,
+            namespace: &str,
+            object: &str,
+        ) -> Result<Vec<RelationTupleKey>, PermissionBackendError> {
+            self.calls.lock().unwrap().push(BackendCall::ReadTuples {
+                tenant_id: tenant_id.into(),
+                namespace: namespace.into(),
+                object: object.into(),
+            });
+            self.read_tuples_result.clone().map_err(Into::into)
+        }
+
         async fn ensure_namespace(
             &self,
             _tenant_id: &str,
@@ -2472,10 +2629,13 @@ mod tests {
             tenant_id: &str,
             namespace: &str,
         ) -> Result<(), PermissionBackendError> {
-            self.calls.lock().unwrap().push(BackendCall::DeleteNamespace {
-                tenant_id: tenant_id.into(),
-                namespace: namespace.into(),
-            });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(BackendCall::DeleteNamespace {
+                    tenant_id: tenant_id.into(),
+                    namespace: namespace.into(),
+                });
             self.delete_namespace_result.clone().map_err(Into::into)
         }
     }
@@ -2652,10 +2812,13 @@ mod tests {
             tenant_id: &str,
             namespace: &str,
         ) -> Result<u64, DbError> {
-            self.calls.lock().unwrap().push(TupleCall::DeleteByNamespace {
-                tenant_id: tenant_id.into(),
-                namespace: namespace.into(),
-            });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(TupleCall::DeleteByNamespace {
+                    tenant_id: tenant_id.into(),
+                    namespace: namespace.into(),
+                });
             Ok(1)
         }
 
@@ -3504,10 +3667,58 @@ mod tests {
     // Existing helper tests
     // -------------------------------------------------------------------------
 
+    #[tokio::test]
+    async fn read_tuples_records_call_and_returns_result() {
+        let backend = FakePermissionBackend::new();
+        let tuples = PermissionBackend::read_tuples(&backend, "tenant-1", "ns", "obj")
+            .await
+            .unwrap();
+        assert!(tuples.is_empty());
+        let calls = backend.calls.lock().unwrap();
+        assert!(
+            matches!(&calls[0], BackendCall::ReadTuples { tenant_id, namespace, object }
+                if tenant_id == "tenant-1" && namespace == "ns" && object == "obj")
+        );
+    }
+
     #[cfg(feature = "keto")]
     #[test]
     fn tenant_object_prefixes_with_colon() {
         assert_eq!(tenant_object("tenant-1", "doc"), "tenant-1:doc");
+    }
+
+    #[cfg(feature = "keto")]
+    #[test]
+    fn keto_tuple_key_strips_prefix_and_canonicalizes_subject_sets() {
+        use sso_ory_client::keto::{KetoRelationTuple, KetoTupleSubject};
+
+        let by_id = keto_tuple_key(
+            "tenant-1",
+            KetoRelationTuple {
+                namespace: "entitlements".to_string(),
+                object: "tenant-1:app-1".to_string(),
+                relation: "member".to_string(),
+                subject: KetoTupleSubject::Id("alice".to_string()),
+            },
+        );
+        assert_eq!(by_id.object, "app-1");
+        assert_eq!(by_id.subject_id, "alice");
+        assert_eq!(by_id.namespace, "entitlements");
+
+        let by_set = keto_tuple_key(
+            "tenant-1",
+            KetoRelationTuple {
+                namespace: "entitlements".to_string(),
+                object: "tenant-1:app-1".to_string(),
+                relation: "admin".to_string(),
+                subject: KetoTupleSubject::Set {
+                    namespace: "entitlements".to_string(),
+                    object: "tenant-1:employees".to_string(),
+                    relation: "member".to_string(),
+                },
+            },
+        );
+        assert_eq!(by_set.subject_id, "entitlements:employees#member");
     }
 
     #[test]
@@ -3776,7 +3987,14 @@ mod tests {
         assert!(matches!(err, PermissionBackendError::Configuration(_)));
 
         let err = client
-            .list_users("tenant-1", "ns", "obj", "rel", &[], &QueryOptions::default())
+            .list_users(
+                "tenant-1",
+                "ns",
+                "obj",
+                "rel",
+                &[],
+                &QueryOptions::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, PermissionBackendError::Configuration(_)));
@@ -3900,7 +4118,12 @@ mod tests {
         }
     }
 
-    fn tuple_key(namespace: &str, object: &str, relation: &str, subject: &str) -> ProtoRelationTupleKey {
+    fn tuple_key(
+        namespace: &str,
+        object: &str,
+        relation: &str,
+        subject: &str,
+    ) -> ProtoRelationTupleKey {
         ProtoRelationTupleKey {
             namespace: namespace.into(),
             object: object.into(),
@@ -3934,7 +4157,10 @@ mod tests {
             "café",
             &"a".repeat(129),
         ] {
-            assert!(validate_namespace_name(name).is_err(), "expected {name:?} to fail");
+            assert!(
+                validate_namespace_name(name).is_err(),
+                "expected {name:?} to fail"
+            );
         }
     }
 
@@ -4009,7 +4235,8 @@ mod tests {
             Some(serde_json::json!({ "now": "2026-01-01" }))
         );
 
-        let converted = tuple_key_from_proto(tuple_key("ns", "obj", "viewer", "user:alice")).unwrap();
+        let converted =
+            tuple_key_from_proto(tuple_key("ns", "obj", "viewer", "user:alice")).unwrap();
         assert!(converted.condition.is_none());
         assert!(converted.condition_context.is_none());
     }
@@ -4031,8 +4258,7 @@ mod tests {
 
         let context = struct_field(serde_json::json!({ "ip": "10.0.0.1" }));
         let contextual = [tuple_key("ns", "obj", "viewer", "user:alice")];
-        let opts =
-            query_options_from(Some(&context), &contextual, "higher_consistency").unwrap();
+        let opts = query_options_from(Some(&context), &contextual, "higher_consistency").unwrap();
         assert!(!opts.is_default());
         assert_eq!(opts.context, Some(serde_json::json!({ "ip": "10.0.0.1" })));
         assert_eq!(opts.contextual_tuples.len(), 1);
@@ -4055,10 +4281,8 @@ mod tests {
                 .is_err()
         );
         assert!(
-            decode_page_token(
-                &base64::engine::general_purpose::STANDARD.encode("notanumber:id")
-            )
-            .is_err()
+            decode_page_token(&base64::engine::general_purpose::STANDARD.encode("notanumber:id"))
+                .is_err()
         );
         assert!(
             decode_page_token(&base64::engine::general_purpose::STANDARD.encode("123:")).is_err()
@@ -4073,7 +4297,8 @@ mod tests {
     async fn ensure_namespace_registers_model_and_types() {
         let backend = FakePermissionBackend::new();
         let namespaces = MemoryNamespaceMappingRepo::default();
-        let service = service_with_namespaces(backend.clone(), FakeTupleStore::new(), namespaces.clone());
+        let service =
+            service_with_namespaces(backend.clone(), FakeTupleStore::new(), namespaces.clone());
 
         let owned = crate::proto::iam::v1::EnsurePermissionNamespaceRequestOwnedView::from_owned(
             &ensure_req("kanban", rich_model(&["user", "KanbanProject"])),
@@ -4140,7 +4365,8 @@ mod tests {
     async fn ensure_namespace_publishes_new_version_on_model_change() {
         let backend = FakePermissionBackend::new();
         let namespaces = MemoryNamespaceMappingRepo::default();
-        let service = service_with_namespaces(backend.clone(), FakeTupleStore::new(), namespaces.clone());
+        let service =
+            service_with_namespaces(backend.clone(), FakeTupleStore::new(), namespaces.clone());
 
         let owned = crate::proto::iam::v1::EnsurePermissionNamespaceRequestOwnedView::from_owned(
             &ensure_req("kanban", rich_model(&["user", "KanbanProject"])),
@@ -4153,7 +4379,10 @@ mod tests {
             .unwrap();
 
         let owned = crate::proto::iam::v1::EnsurePermissionNamespaceRequestOwnedView::from_owned(
-            &ensure_req("kanban", rich_model(&["user", "KanbanProject", "KanbanCard"])),
+            &ensure_req(
+                "kanban",
+                rich_model(&["user", "KanbanProject", "KanbanCard"]),
+            ),
         )
         .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
@@ -4291,14 +4520,13 @@ mod tests {
             }
         ));
 
-        let owned =
-            crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
-                &DeletePermissionNamespaceRequest {
-                    namespace: "kanban".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let owned = crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
+            &DeletePermissionNamespaceRequest {
+                namespace: "kanban".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         let err = service
             .delete_permission_namespace(tenant_ctx(), req)
@@ -4354,11 +4582,10 @@ mod tests {
         assert_eq!(resp.body.types, vec!["KanbanProject"]);
 
         // List returns everything registered for the tenant.
-        let owned =
-            crate::proto::iam::v1::ListPermissionNamespacesRequestOwnedView::from_owned(
-                &ListPermissionNamespacesRequest::default(),
-            )
-            .unwrap();
+        let owned = crate::proto::iam::v1::ListPermissionNamespacesRequestOwnedView::from_owned(
+            &ListPermissionNamespacesRequest::default(),
+        )
+        .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         let resp = service
             .list_permission_namespaces(tenant_ctx(), req)
@@ -4412,14 +4639,13 @@ mod tests {
             .await
             .unwrap();
 
-        let owned =
-            crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
-                &DeletePermissionNamespaceRequest {
-                    namespace: "kanban".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let owned = crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
+            &DeletePermissionNamespaceRequest {
+                namespace: "kanban".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         service
             .delete_permission_namespace(admin_ctx(), req)
@@ -4438,17 +4664,22 @@ mod tests {
                     tenant_id == "tenant-1" && namespace == "kanban")
             );
         }
-        assert!(namespaces.get("tenant-1", "kanban").await.unwrap().is_none());
+        assert!(
+            namespaces
+                .get("tenant-1", "kanban")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Deleting an unknown namespace is NotFound.
-        let owned =
-            crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
-                &DeletePermissionNamespaceRequest {
-                    namespace: "kanban".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let owned = crate::proto::iam::v1::DeletePermissionNamespaceRequestOwnedView::from_owned(
+            &DeletePermissionNamespaceRequest {
+                namespace: "kanban".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         let err = service
             .delete_permission_namespace(admin_ctx(), req)
@@ -4626,9 +4857,8 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
-                .unwrap();
+        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
+            .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         let resp = service
             .list_relation_tuples(tenant_ctx(), req)
@@ -4650,9 +4880,8 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
-                .unwrap();
+        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
+            .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         service
             .list_relation_tuples(tenant_ctx(), req)
@@ -4686,9 +4915,8 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
-                .unwrap();
+        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
+            .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         service
             .list_relation_tuples(tenant_ctx(), req)
@@ -4709,9 +4937,8 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let owned =
-            crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
-                .unwrap();
+        let owned = crate::proto::iam::v1::ListRelationTuplesRequestOwnedView::from_owned(&request)
+            .unwrap();
         let req = ServiceRequest::from_parts(owned.view(), owned.bytes());
         let err = service
             .list_relation_tuples(tenant_ctx(), req)
@@ -4785,7 +5012,10 @@ mod tests {
 
         let opts = backend.opts_log.lock().unwrap();
         assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].context, Some(serde_json::json!({ "now": "2026-01-01" })));
+        assert_eq!(
+            opts[0].context,
+            Some(serde_json::json!({ "now": "2026-01-01" }))
+        );
         assert_eq!(opts[0].contextual_tuples.len(), 1);
         assert_eq!(opts[0].consistency.as_deref(), Some("minimize_latency"));
     }
@@ -4836,11 +5066,25 @@ mod tests {
         .unwrap();
 
         // Type resolution finds the owning namespace.
-        let record = repo.get_by_type("tenant-1", "KanbanProject").await.unwrap().unwrap();
+        let record = repo
+            .get_by_type("tenant-1", "KanbanProject")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(record.namespace, "kanban");
         // Unknown types fall back to a direct namespace lookup.
-        assert!(repo.get_by_type("tenant-1", "kanban").await.unwrap().is_some());
-        assert!(repo.get_by_type("tenant-1", "unknown").await.unwrap().is_none());
+        assert!(
+            repo.get_by_type("tenant-1", "kanban")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.get_by_type("tenant-1", "unknown")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // Records are isolated per tenant.
         assert!(repo.get("tenant-2", "kanban").await.unwrap().is_none());
         assert!(repo.list("tenant-2").await.unwrap().is_empty());
@@ -4919,7 +5163,11 @@ mod tests {
         assert_eq!(record.types, vec!["entitlements"]);
 
         // Type resolution still finds namespaces through their indexed types.
-        let found = repo.get_by_type("tenant-1", "scim_group").await.unwrap().unwrap();
+        let found = repo
+            .get_by_type("tenant-1", "scim_group")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.namespace, "scim_group");
     }
 
@@ -5222,7 +5470,14 @@ mod tests {
 
             assert!(
                 !backend
-                    .check_permission("tenant-1", "document", "doc-1", "reader", "user:alice", &opts)
+                    .check_permission(
+                        "tenant-1",
+                        "document",
+                        "doc-1",
+                        "reader",
+                        "user:alice",
+                        &opts
+                    )
                     .await
                     .unwrap()
             );
@@ -5234,7 +5489,14 @@ mod tests {
 
             assert!(
                 backend
-                    .check_permission("tenant-1", "document", "doc-1", "reader", "user:alice", &opts)
+                    .check_permission(
+                        "tenant-1",
+                        "document",
+                        "doc-1",
+                        "reader",
+                        "user:alice",
+                        &opts
+                    )
                     .await
                     .unwrap()
             );
@@ -5264,7 +5526,14 @@ mod tests {
 
             assert!(
                 !backend
-                    .check_permission("tenant-1", "document", "doc-1", "reader", "user:alice", &opts)
+                    .check_permission(
+                        "tenant-1",
+                        "document",
+                        "doc-1",
+                        "reader",
+                        "user:alice",
+                        &opts
+                    )
                     .await
                     .unwrap()
             );
@@ -5319,8 +5588,14 @@ mod tests {
 
             // Seeding twice stores the tuple exactly once: the second call
             // reads first and skips the already-present write.
-            backend.ensure_tuples("tenant-1", std::slice::from_ref(&key), &[]).await.unwrap();
-            backend.ensure_tuples("tenant-1", std::slice::from_ref(&key), &[]).await.unwrap();
+            backend
+                .ensure_tuples("tenant-1", std::slice::from_ref(&key), &[])
+                .await
+                .unwrap();
+            backend
+                .ensure_tuples("tenant-1", std::slice::from_ref(&key), &[])
+                .await
+                .unwrap();
             let matches = {
                 let stored = state.tuples.lock().unwrap();
                 stored
@@ -5339,11 +5614,20 @@ mod tests {
                 subject_id: "user:bob".into(),
                 ..key.clone()
             };
-            backend.ensure_tuples("tenant-1", &[], &[absent]).await.unwrap();
-            backend.ensure_tuples("tenant-1", &[], std::slice::from_ref(&key)).await.unwrap();
+            backend
+                .ensure_tuples("tenant-1", &[], &[absent])
+                .await
+                .unwrap();
+            backend
+                .ensure_tuples("tenant-1", &[], std::slice::from_ref(&key))
+                .await
+                .unwrap();
             assert!(state.tuples.lock().unwrap().is_empty());
             // Already gone: still no error.
-            backend.ensure_tuples("tenant-1", &[], std::slice::from_ref(&key)).await.unwrap();
+            backend
+                .ensure_tuples("tenant-1", &[], std::slice::from_ref(&key))
+                .await
+                .unwrap();
         }
 
         #[tokio::test]

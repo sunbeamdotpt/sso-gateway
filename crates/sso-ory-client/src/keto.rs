@@ -82,7 +82,11 @@ impl KetoClient {
                 "relation": relation,
                 "subject_id": subject_id,
             }),
-            TupleSubject::Set { namespace: s_ns, object: s_obj, relation: s_rel } => {
+            TupleSubject::Set {
+                namespace: s_ns,
+                object: s_obj,
+                relation: s_rel,
+            } => {
                 serde_json::json!({
                     "namespace": namespace,
                     "object": object,
@@ -132,7 +136,11 @@ impl KetoClient {
         ];
         match subject {
             TupleSubject::Id(subject_id) => params.push(("subject_id", subject_id.to_string())),
-            TupleSubject::Set { namespace: s_ns, object: s_obj, relation: s_rel } => {
+            TupleSubject::Set {
+                namespace: s_ns,
+                object: s_obj,
+                relation: s_rel,
+            } => {
                 params.push(("subject_set.namespace", s_ns));
                 params.push(("subject_set.object", s_obj));
                 params.push(("subject_set.relation", s_rel));
@@ -177,6 +185,76 @@ impl KetoClient {
         handle_response(response).await
     }
 
+    /// List the relation tuples on an object in a namespace.
+    ///
+    /// Used by bootstrap/backfill convergence to detect never-seeded objects.
+    /// Pagination is not needed in practice: entitlement objects carry a
+    /// handful of tuples.
+    #[instrument(skip(self), fields(read_url = %self.read_url))]
+    pub async fn read_tuples(
+        &self,
+        namespace: &str,
+        object: &str,
+    ) -> Result<Vec<KetoRelationTuple>, OryClientError> {
+        let url = self.read_url.join("relation-tuples")?;
+        debug!(%url, %namespace, %object, "reading keto relation tuples");
+        let response = self
+            .client
+            .get(url)
+            .query(&[("namespace", namespace), ("object", object)])
+            .send()
+            .await
+            .map_err(OryClientError::Http)?;
+        let body = handle_response(response).await?;
+        let entries = match body.get("relation_tuples").and_then(|v| v.as_array()) {
+            Some(entries) => entries,
+            None => return Ok(Vec::new()),
+        };
+        let mut tuples = Vec::new();
+        for entry in entries {
+            let namespace = match entry.get("namespace").and_then(|v| v.as_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let object = match entry.get("object").and_then(|v| v.as_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let relation = match entry.get("relation").and_then(|v| v.as_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let subject = match entry.get("subject_id").and_then(|v| v.as_str()) {
+                Some(subject_id) => KetoTupleSubject::Id(subject_id.to_string()),
+                None => {
+                    let set = match entry.get("subject_set") {
+                        Some(set) => set,
+                        None => continue,
+                    };
+                    let (Some(s_ns), Some(s_obj), Some(s_rel)) = (
+                        set.get("namespace").and_then(|v| v.as_str()),
+                        set.get("object").and_then(|v| v.as_str()),
+                        set.get("relation").and_then(|v| v.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    KetoTupleSubject::Set {
+                        namespace: s_ns.to_string(),
+                        object: s_obj.to_string(),
+                        relation: s_rel.to_string(),
+                    }
+                }
+            };
+            tuples.push(KetoRelationTuple {
+                namespace,
+                object,
+                relation,
+                subject,
+            });
+        }
+        Ok(tuples)
+    }
+
     /// Expand the objects a subject has a relation on.
     #[instrument(skip(self), fields(read_url = %self.read_url))]
     pub async fn expand_objects(
@@ -215,6 +293,36 @@ impl KetoClient {
             .map_err(OryClientError::Http)?;
         handle_response(response).await
     }
+}
+
+/// A relation tuple as returned by the Keto read API.
+#[derive(Debug, Clone)]
+pub struct KetoRelationTuple {
+    /// Namespace of the tuple.
+    pub namespace: String,
+    /// Object of the tuple.
+    pub object: String,
+    /// Relation of the tuple.
+    pub relation: String,
+    /// Subject of the tuple.
+    pub subject: KetoTupleSubject,
+}
+
+/// Owned subject of a relation tuple returned by reads: either a plain
+/// subject id or a subject set reference (`namespace:object#relation`).
+#[derive(Debug, Clone)]
+pub enum KetoTupleSubject {
+    /// A plain subject identifier.
+    Id(String),
+    /// A subject set reference.
+    Set {
+        /// Namespace of the subject set.
+        namespace: String,
+        /// Object of the subject set.
+        object: String,
+        /// Relation of the subject set.
+        relation: String,
+    },
 }
 
 /// Subject of a relation tuple: either a plain subject id or a subject set
@@ -618,6 +726,61 @@ mod tests {
             )
             .await
             .unwrap_err();
+        assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn read_tuples_round_trip() {
+        async fn handler(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+            assert_eq!(params.get("namespace").map(String::as_str), Some("app"));
+            assert_eq!(params.get("object").map(String::as_str), Some("doc-1"));
+            Json(json!({
+                "relation_tuples": [
+                    {
+                        "namespace": "app",
+                        "object": "doc-1",
+                        "relation": "read",
+                        "subject_id": "alice",
+                    },
+                    {
+                        "namespace": "app",
+                        "object": "doc-1",
+                        "relation": "read",
+                        "subject_set": {
+                            "namespace": "app",
+                            "object": "employees",
+                            "relation": "member",
+                        },
+                    },
+                ]
+            }))
+        }
+        let app = Router::new().route("/relation-tuples", get(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let tuples = client.read_tuples("app", "doc-1").await.unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert!(matches!(&tuples[0].subject, KetoTupleSubject::Id(id) if id == "alice"));
+        assert!(
+            matches!(&tuples[1].subject, KetoTupleSubject::Set { namespace, object, relation }
+                if namespace == "app" && object == "employees" && relation == "member")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tuples_error() {
+        let app = Router::new().route("/relation-tuples", get(error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KetoClient::new(&format!("http://{addr}"), &format!("http://{addr}")).unwrap();
+        let err = client.read_tuples("app", "doc-1").await.unwrap_err();
         assert!(matches!(err, OryClientError::Ory { status: 500, .. }));
     }
 
