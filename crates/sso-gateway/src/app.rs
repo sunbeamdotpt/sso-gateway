@@ -719,10 +719,13 @@ pub async fn run(config: Config) -> ServiceResult<()> {
 
     info!("listening on http://{}", config.bind_addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| sunbeam_g2v::error::ServiceError::Internal(format!("axum::serve: {e}")))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(|e| sunbeam_g2v::error::ServiceError::Internal(format!("axum::serve: {e}")))?;
 
     Ok(())
 }
