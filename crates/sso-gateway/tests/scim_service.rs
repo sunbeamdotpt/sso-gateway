@@ -1,6 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
-
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 #![cfg(feature = "keto")]
 
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use std::sync::Arc;
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
     db::{
         ApplicationRepo, IdMappingRepo, IdMappingStore, IdentitySchemaRepo, ScimGroupRepo,
@@ -23,7 +26,6 @@ use sso_gateway::{
     },
     session_token::SessionTokenSigner,
 };
-use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KetoClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -81,6 +83,7 @@ async fn scim_users_and_groups_round_trip() {
         application_repo,
         entitlements(),
         system_tenant_ulid.clone(),
+        vec!["employees".to_string()],
     ));
     let identity_service = Arc::new(IdentityServiceImpl::new(
         kratos.clone(),

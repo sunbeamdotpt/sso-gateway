@@ -199,7 +199,7 @@ pub async fn build_app_with_upstream(
             .seed_application(
                 &config.system_tenant_ulid,
                 GATEWAY_APP_OBJECT,
-                &["employees".to_string()],
+                &config.default_entitlement_groups,
             )
             .await?;
     }
@@ -305,6 +305,7 @@ pub async fn build_app_with_upstream(
         application_repo,
         entitlements.clone(),
         config.system_tenant_ulid.clone(),
+        config.default_entitlement_groups.clone(),
     ));
     let client_credential_service = Arc::new(ClientCredentialServiceImpl::new(
         hydra.clone(),
@@ -767,6 +768,9 @@ mod tests {
             matrix_offline_access_enabled: true,
             allowed_return_to_hosts: vec!["example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
+            default_entitlement_groups: vec!["employees".to_string()],
+            dcr_unused_registration_ttl_days: 7,
+            dcr_gc_enabled: true,
             system_bootstrap_client_id: None,
             system_bootstrap_client_secret: None,
             state_cookie_secret: "test-secret-key-for-cookies-at-least-32-bytes-long".into(),

@@ -70,6 +70,7 @@ pub struct ApplicationServiceImpl {
     applications: Arc<dyn ApplicationStore>,
     entitlements: Arc<dyn EntitlementService>,
     system_tenant_ulid: String,
+    default_entitlement_groups: Vec<String>,
     allow_http_redirect_uris: bool,
 }
 
@@ -80,6 +81,7 @@ impl ApplicationServiceImpl {
         applications: ApplicationRepo,
         entitlements: Arc<dyn EntitlementService>,
         system_tenant_ulid: String,
+        default_entitlement_groups: Vec<String>,
     ) -> Self {
         Self {
             hydra: hydra as Arc<dyn ApplicationHydra>,
@@ -87,6 +89,7 @@ impl ApplicationServiceImpl {
             applications: Arc::new(applications) as Arc<dyn ApplicationStore>,
             entitlements,
             system_tenant_ulid,
+            default_entitlement_groups,
             allow_http_redirect_uris: false,
         }
     }
@@ -157,7 +160,7 @@ impl crate::proto::iam::v1::ApplicationService for ApplicationServiceImpl {
             )
             .await?;
         self.entitlements
-            .seed_application(&tenant_id, &public_id, &["employees".to_string()])
+            .seed_application(&tenant_id, &public_id, &self.default_entitlement_groups)
             .await?;
 
         let mut app = hydra_to_application(&created, &tenant_id, &public_id, req.cross_tenant);
@@ -1012,6 +1015,7 @@ mod tests {
             applications: Arc::new(MemoryApplicationStore::default()),
             entitlements,
             system_tenant_ulid: "system-tenant".to_string(),
+            default_entitlement_groups: vec!["employees".to_string()],
             allow_http_redirect_uris: false,
         }
     }
@@ -1026,6 +1030,7 @@ mod tests {
             applications: Arc::new(MemoryApplicationStore::default()),
             entitlements: entitlements(),
             system_tenant_ulid: "system-tenant".to_string(),
+            default_entitlement_groups: vec!["employees".to_string()],
             allow_http_redirect_uris: true,
         }
     }
@@ -1042,6 +1047,7 @@ mod tests {
             applications: Arc::new(applications),
             entitlements: entitlements(),
             system_tenant_ulid: system_tenant_ulid.to_string(),
+            default_entitlement_groups: vec!["employees".to_string()],
             allow_http_redirect_uris: false,
         }
     }

@@ -94,6 +94,9 @@ impl Gateway {
             matrix_offline_access_enabled: true,
             allowed_return_to_hosts: vec!["app.example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
+            default_entitlement_groups: vec!["employees".to_string()],
+            dcr_unused_registration_ttl_days: 7,
+            dcr_gc_enabled: true,
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
             system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
             state_cookie_secret: "conformance-test-secret-key-at-least-32-bytes-long".into(),
@@ -596,7 +599,8 @@ impl Gateway {
             .get("location")
             .and_then(|h| h.to_str().ok())
             .expect("login location header should exist");
-        let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        let login_location =
+            resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
         assert!(
             login_location.contains("login_challenge="),
             "authorize did not redirect to login; location: {login_location}"
@@ -626,7 +630,8 @@ impl Gateway {
             .expect("login accept should return redirect_to");
 
         // 3. Follow the login verifier redirect through the gateway.
-        let after_login = resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
+        let after_login =
+            resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
         let consent_resp = no_redirect
             .get(&after_login)
             .send()
@@ -642,7 +647,8 @@ impl Gateway {
             .get("location")
             .and_then(|h| h.to_str().ok())
             .expect("consent location header should exist");
-        let consent_location = resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
+        let consent_location =
+            resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
         let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
             .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
             .expect("consent_challenge or consent_verifier should be present");
@@ -694,7 +700,8 @@ impl Gateway {
             .expect("consent accept should return redirect_to");
 
         // 5. Follow the consent verifier redirect through the gateway.
-        let redirect_to = resolve_to_gateway_url(redirect_to, &self.base_url, &self.hydra_public_url);
+        let redirect_to =
+            resolve_to_gateway_url(redirect_to, &self.base_url, &self.hydra_public_url);
         let final_resp = no_redirect
             .get(&redirect_to)
             .send()
@@ -716,7 +723,10 @@ impl Gateway {
             .unwrap_or_else(|_| panic!("final redirect should be a valid URL: {final_location}"));
         assert_eq!(
             redirect_url.origin().unicode_serialization(),
-            url::Url::parse(redirect_uri).unwrap().origin().unicode_serialization(),
+            url::Url::parse(redirect_uri)
+                .unwrap()
+                .origin()
+                .unicode_serialization(),
             "final redirect must target the requested redirect_uri"
         );
         // 6. Extract the authorization result from the final redirect URI.
@@ -732,7 +742,10 @@ impl Gateway {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(
-            query_params.get("state").map(String::as_str).or(fragment_params.get("state").map(String::as_str)),
+            query_params
+                .get("state")
+                .map(String::as_str)
+                .or(fragment_params.get("state").map(String::as_str)),
             Some("conformance-state"),
             "authorization response must return the requested state"
         );
@@ -876,8 +889,8 @@ impl Gateway {
             auth_status,
             auth_body
         );
-        let auth: serde_json::Value = serde_json::from_str(&auth_body)
-            .expect("authorize_device response should be json");
+        let auth: serde_json::Value =
+            serde_json::from_str(&auth_body).expect("authorize_device response should be json");
         let device_code = auth["deviceCode"]
             .as_str()
             .expect("deviceCode should exist")
@@ -968,7 +981,8 @@ impl Gateway {
             .get("location")
             .and_then(|h| h.to_str().ok())
             .expect("login location should exist");
-        let login_location = resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
+        let login_location =
+            resolve_to_gateway_url(login_location, &self.base_url, &self.hydra_public_url);
         assert!(
             login_location.contains("login_challenge="),
             "authorize did not redirect to login; location: {login_location}"
@@ -998,7 +1012,8 @@ impl Gateway {
             .expect("login accept should return redirect_to");
 
         // 6. Follow the login verifier redirect to obtain the consent challenge.
-        let after_login = resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
+        let after_login =
+            resolve_to_gateway_url(after_login, &self.base_url, &self.hydra_public_url);
         let consent_resp = no_redirect
             .get(&after_login)
             .send()
@@ -1014,7 +1029,8 @@ impl Gateway {
             .get("location")
             .and_then(|h| h.to_str().ok())
             .expect("consent location should exist");
-        let consent_location = resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
+        let consent_location =
+            resolve_to_gateway_url(consent_location, &self.base_url, &self.hydra_public_url);
         let consent_challenge = extract_query_param(&consent_location, "consent_challenge")
             .or_else(|| extract_query_param(&consent_location, "consent_verifier"))
             .expect("consent_challenge or consent_verifier should be present");
@@ -1041,7 +1057,8 @@ impl Gateway {
             .expect("consent accept should return redirect_to");
 
         // 8. Follow the consent verifier redirect; the device code is now bound.
-        let after_consent = resolve_to_gateway_url(after_consent, &self.base_url, &self.hydra_public_url);
+        let after_consent =
+            resolve_to_gateway_url(after_consent, &self.base_url, &self.hydra_public_url);
         let final_resp = no_redirect
             .get(&after_consent)
             .send()

@@ -1,19 +1,25 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
+use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_gateway::{
-    db::{ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{
+        ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant,
+        create_pool,
+    },
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::{application::ApplicationServiceImpl, tenant::TenantServiceImpl},
     session_token::SessionTokenSigner,
 };
-use sso_gateway::services::entitlement::test_helpers::entitlements;
 use sso_ory_client::{HydraClient, KratosClient};
 use sunbeam_g2v::{
     health::HealthRouter,
@@ -63,6 +69,7 @@ async fn application_service_round_trip() {
         application_repo,
         entitlements(),
         system_tenant_ulid.clone(),
+        vec!["employees".to_string()],
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
@@ -234,7 +241,10 @@ async fn application_service_round_trip() {
         .send()
         .await
         .expect("re-get application request should succeed");
-    assert!(reget_resp.status().is_success(), "re-get application failed");
+    assert!(
+        reget_resp.status().is_success(),
+        "re-get application failed"
+    );
     let refetched: serde_json::Value = reget_resp.json().await.expect("application should be json");
     assert_eq!(refetched["name"], "test-app-updated");
     assert_eq!(refetched["scope"], json![["openid"]]);

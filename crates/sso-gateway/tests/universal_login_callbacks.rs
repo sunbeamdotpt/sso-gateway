@@ -1,6 +1,8 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
-
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 #![cfg(feature = "keto")]
 
 //! Integration tests for the universal login HTTP callbacks.
@@ -154,6 +156,9 @@ impl CallbackHarness {
             matrix_offline_access_enabled: true,
             allowed_return_to_hosts: vec!["app.example.com".to_string()],
             force_email_claim_client_ids: Vec::new(),
+            default_entitlement_groups: vec!["employees".to_string()],
+            dcr_unused_registration_ttl_days: 7,
+            dcr_gc_enabled: true,
             system_bootstrap_client_id: Some("integration-test-admin-client".to_string()),
             system_bootstrap_client_secret: Some("integration-test-admin-secret".to_string()),
             state_cookie_secret: "callback-test-secret-key-at-least-32-bytes-long".into(),

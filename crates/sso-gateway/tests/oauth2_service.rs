@@ -1,15 +1,21 @@
 // SSO-027: tests may unwrap/expect freely; the panic/default bans target production code.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use std::sync::Arc;
 
 use axum::{Extension, middleware::from_fn};
 use connectrpc::Router as ConnectRouter;
 use serde_json::json;
-use sso_gateway::session_token::SessionTokenSigner;
 use sso_gateway::services::entitlement::test_helpers::entitlements;
+use sso_gateway::session_token::SessionTokenSigner;
 use sso_gateway::{
-    db::{ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant, create_pool},
+    db::{
+        ApplicationRepo, IdMappingRepo, IdMappingStore, TenantRepo, bootstrap_system_tenant,
+        create_pool,
+    },
     middleware::auth_middleware,
     proto::iam::v1::{ApplicationServiceExt, TenantServiceExt},
     services::handlers::oauth2::{Oauth2State, router as oauth2_router},
@@ -67,6 +73,7 @@ async fn oauth2_public_endpoints_round_trip() {
         application_repo,
         entitlements(),
         system_tenant_ulid.clone(),
+        vec!["employees".to_string()],
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
@@ -403,6 +410,7 @@ async fn oauth2_missing_client_id_is_rejected() {
         application_repo,
         entitlements(),
         system_tenant_ulid.clone(),
+        vec!["employees".to_string()],
     ));
 
     let connect_router: ConnectRouter = tenant_service.register(ConnectRouter::new());
@@ -552,10 +560,7 @@ async fn oauth2_dynamic_client_registration_is_public() {
 
     // The browser preflight must not hit the auth middleware.
     let preflight_resp = client
-        .request(
-            reqwest::Method::OPTIONS,
-            format!("{base}/oauth2/register"),
-        )
+        .request(reqwest::Method::OPTIONS, format!("{base}/oauth2/register"))
         .header("origin", "https://app.element.io")
         .header("access-control-request-method", "POST")
         .send()
@@ -724,12 +729,13 @@ async fn oauth2_dynamic_client_registration_is_public() {
         token_resp.text().await.unwrap_or_default()
     );
 
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM id_mappings WHERE backend = 'hydra' AND public_id = $1")
-            .bind(&client_id)
-            .fetch_one(&pool)
-            .await
-            .expect("mapping count should query");
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM id_mappings WHERE backend = 'hydra' AND public_id = $1",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("mapping count should query");
     assert_eq!(count, 1, "mapping row should be backfilled by self-heal");
 
     let _ = shutdown_tx.send(());

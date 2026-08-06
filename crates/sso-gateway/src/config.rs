@@ -30,6 +30,9 @@ pub struct Config {
     pub matrix_offline_access_enabled: bool,
     pub allowed_return_to_hosts: Vec<String>,
     pub force_email_claim_client_ids: Vec<String>,
+    pub default_entitlement_groups: Vec<String>,
+    pub dcr_unused_registration_ttl_days: u64,
+    pub dcr_gc_enabled: bool,
     pub system_bootstrap_client_id: Option<String>,
     pub system_bootstrap_client_secret: Option<String>,
     pub state_cookie_secret: Vec<u8>,
@@ -106,6 +109,15 @@ impl std::fmt::Debug for Config {
                 "force_email_claim_client_ids",
                 &self.force_email_claim_client_ids,
             )
+            .field(
+                "default_entitlement_groups",
+                &self.default_entitlement_groups,
+            )
+            .field(
+                "dcr_unused_registration_ttl_days",
+                &self.dcr_unused_registration_ttl_days,
+            )
+            .field("dcr_gc_enabled", &self.dcr_gc_enabled)
             .field(
                 "system_bootstrap_client_id",
                 &self.system_bootstrap_client_id,
@@ -280,7 +292,10 @@ impl SelfServicePaths {
             ("SELF_SERVICE_VERIFICATION_PATH", self.verification.as_str()),
             ("SELF_SERVICE_LOGOUT_PATH", self.logout.as_str()),
             ("SELF_SERVICE_ERRORS_PATH", self.errors.as_str()),
-            ("SELF_SERVICE_OIDC_CALLBACK_PATH", self.oidc_callback.as_str()),
+            (
+                "SELF_SERVICE_OIDC_CALLBACK_PATH",
+                self.oidc_callback.as_str(),
+            ),
             ("SELF_SERVICE_WEBAUTHN_JS_PATH", self.webauthn_js.as_str()),
         ]
     }
@@ -317,8 +332,7 @@ impl SelfServicePaths {
             }
             // The OIDC callback also matches `{oidc_callback}/{provider}`, so
             // no other branded path may live underneath it.
-            if *path != self.oidc_callback
-                && path.starts_with(&format!("{}/", self.oidc_callback))
+            if *path != self.oidc_callback && path.starts_with(&format!("{}/", self.oidc_callback))
             {
                 return Err(ConfigError::InvalidConfig(format!(
                     "{var} must not live under SELF_SERVICE_OIDC_CALLBACK_PATH, got '{path}'"
@@ -508,8 +522,7 @@ impl Config {
         let openfga_url = env_var_or("OPENFGA_URL", "http://127.0.0.1:8081");
 
         Ok(Self {
-            bind_addr: env_var_or("BIND_ADDR", "127.0.0.1:8080")
-                .parse()?,
+            bind_addr: env_var_or("BIND_ADDR", "127.0.0.1:8080").parse()?,
             system_tenant_ulid,
             database_url,
             hydra_admin_url: env_var_or("HYDRA_ADMIN_URL", "http://127.0.0.1:4445"),
@@ -532,7 +545,10 @@ impl Config {
             registration_enabled: env_flag_or("REGISTRATION_ENABLED", false),
             // RFC 7591 public dynamic client registration is an opt-out:
             // browser/native OIDC clients (e.g. Matrix Element) rely on it.
-            dynamic_client_registration_enabled: env_flag_or("ENABLE_DYNAMIC_CLIENT_REGISTRATION", true),
+            dynamic_client_registration_enabled: env_flag_or(
+                "ENABLE_DYNAMIC_CLIENT_REGISTRATION",
+                true,
+            ),
             // Matrix (MSC2965) introspection email injection is an opt-out:
             // zendrite deployments rely on it out of the box.
             matrix_email_claim_enabled: env_flag_or("ENABLE_MATRIX_EMAIL_CLAIM", true),
@@ -541,8 +557,7 @@ impl Config {
             // request `offline_access` but need refresh tokens.
             matrix_offline_access_enabled: env_flag_or("ENABLE_MATRIX_OFFLINE_ACCESS", true),
             allowed_return_to_hosts,
-            force_email_claim_client_ids: match std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS").ok()
-            {
+            force_email_claim_client_ids: match std::env::var("FORCE_EMAIL_CLAIM_CLIENT_IDS").ok() {
                 Some(s) => s
                     .split(',')
                     .map(|id| id.trim().to_string())
@@ -550,6 +565,20 @@ impl Config {
                     .collect(),
                 None => Vec::new(),
             },
+            // Groups linked to every newly seeded application (admin-created,
+            // bootstrap, and consent-granted DCR registrations).
+            default_entitlement_groups: match std::env::var("DEFAULT_ENTITLEMENT_GROUPS").ok() {
+                Some(s) => s
+                    .split(',')
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect(),
+                None => vec!["employees".to_string()],
+            },
+            // DCR registrations that never complete first-use consent are
+            // reaped after this TTL by the garbage collector.
+            dcr_unused_registration_ttl_days: env_parse_or("DCR_UNUSED_REGISTRATION_TTL_DAYS", 7),
+            dcr_gc_enabled: env_flag_or("DCR_GC_ENABLED", true),
             system_bootstrap_client_id: std::env::var("SYSTEM_BOOTSTRAP_CLIENT_ID").ok(),
             system_bootstrap_client_secret,
             state_cookie_secret,
@@ -562,7 +591,10 @@ impl Config {
             database_acquire_timeout_seconds: env_parse_or("DATABASE_ACQUIRE_TIMEOUT_SECONDS", 10),
             database_idle_timeout_seconds: env_parse_or("DATABASE_IDLE_TIMEOUT_SECONDS", 600),
             database_max_lifetime_seconds: env_parse_or("DATABASE_MAX_LIFETIME_SECONDS", 1800),
-            database_statement_timeout_seconds: env_parse_or("DATABASE_STATEMENT_TIMEOUT_SECONDS", 30),
+            database_statement_timeout_seconds: env_parse_or(
+                "DATABASE_STATEMENT_TIMEOUT_SECONDS",
+                30,
+            ),
             token_introspection_cache_ttl_seconds: env_parse_or(
                 "TOKEN_INTROSPECTION_CACHE_TTL_SECONDS",
                 30,
@@ -685,6 +717,10 @@ mod tests {
         clear_env("ENABLE_MATRIX_EMAIL_CLAIM");
         clear_env("ENABLE_MATRIX_OFFLINE_ACCESS");
         clear_env("ALLOWED_RETURN_TO_HOSTS");
+        clear_env("FORCE_EMAIL_CLAIM_CLIENT_IDS");
+        clear_env("DEFAULT_ENTITLEMENT_GROUPS");
+        clear_env("DCR_UNUSED_REGISTRATION_TTL_DAYS");
+        clear_env("DCR_GC_ENABLED");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_ID");
         clear_env("SYSTEM_BOOTSTRAP_CLIENT_SECRET");
         clear_env("STATE_COOKIE_SECRET");
@@ -768,6 +804,12 @@ mod tests {
             config.allowed_return_to_hosts,
             vec!["example.com".to_string()]
         );
+        assert_eq!(
+            config.default_entitlement_groups,
+            vec!["employees".to_string()]
+        );
+        assert_eq!(config.dcr_unused_registration_ttl_days, 7);
+        assert!(config.dcr_gc_enabled);
     }
 
     #[test]
@@ -808,6 +850,78 @@ mod tests {
         let config = Config::from_env().expect("config should parse");
         drop(_guard);
         assert!(!config.dynamic_client_registration_enabled);
+    }
+
+    #[test]
+    fn config_default_entitlement_groups_parses_comma_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env(
+            "DEFAULT_ENTITLEMENT_GROUPS",
+            "staff, contractors ,,externals",
+        );
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert_eq!(
+            config.default_entitlement_groups,
+            vec![
+                "staff".to_string(),
+                "contractors".to_string(),
+                "externals".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn config_dcr_gc_options_use_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("DCR_UNUSED_REGISTRATION_TTL_DAYS", "30");
+        set_env("DCR_GC_ENABLED", "false");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert_eq!(config.dcr_unused_registration_ttl_days, 30);
+        assert!(!config.dcr_gc_enabled);
+    }
+
+    #[test]
+    fn config_dcr_ttl_falls_back_to_default_on_invalid_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_config_env();
+        let ulid = valid_ulid();
+        set_env("SYSTEM_TENANT_ULID", &ulid);
+        set_env("DATABASE_URL", "postgres://u:p@localhost/db");
+        set_env(
+            "STATE_COOKIE_SECRET",
+            "test-secret-key-that-is-at-least-32-bytes-long",
+        );
+        set_env("ALLOWED_RETURN_TO_HOSTS", "example.com");
+        set_env("COOKIE_SECURE", "true");
+        set_env("DCR_UNUSED_REGISTRATION_TTL_DAYS", "not-a-number");
+
+        let config = Config::from_env().expect("config should parse");
+        drop(_guard);
+        assert_eq!(config.dcr_unused_registration_ttl_days, 7);
     }
 
     #[test]
@@ -1117,7 +1231,10 @@ mod tests {
         );
         assert_eq!(config.agent_act_token_ttl_seconds, 900);
         assert_eq!(config.agent_cache_ttl_seconds, 2);
-        assert!(!debug.contains("nats://user:secret"), "nats url is redacted");
+        assert!(
+            !debug.contains("nats://user:secret"),
+            "nats url is redacted"
+        );
     }
 
     #[test]
@@ -1182,7 +1299,10 @@ mod tests {
             ("SELF_SERVICE_REGISTRATION_PATH", "/"),
             ("SELF_SERVICE_SETTINGS_PATH", "/identity/settings/"),
             ("SELF_SERVICE_RECOVERY_PATH", "/identity/recovery?x=1"),
-            ("SELF_SERVICE_VERIFICATION_PATH", "/identity/verification#frag"),
+            (
+                "SELF_SERVICE_VERIFICATION_PATH",
+                "/identity/verification#frag",
+            ),
             ("SELF_SERVICE_LOGOUT_PATH", "/oauth2/logout"),
             ("SELF_SERVICE_ERRORS_PATH", "/self-service/errors"),
             ("SELF_SERVICE_WEBAUTHN_JS_PATH", "/.well-known/webauthn.js"),
