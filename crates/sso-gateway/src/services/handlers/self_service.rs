@@ -13,6 +13,8 @@ use axum::{
 use tracing::{instrument, warn};
 
 use crate::config::SelfServicePaths;
+use crate::db::TransientTokenStore;
+use crate::services::identity_self_service::scrub_flow_id_in_url;
 use crate::services::self_service_url_rewriter::rewrite_gateway_facing_url;
 
 /// State shared by the public self-service proxy handlers.
@@ -22,6 +24,8 @@ pub struct SelfServiceState {
     kratos_public_url: String,
     gateway_public_url: String,
     paths: SelfServicePaths,
+    transient: Arc<dyn TransientTokenStore>,
+    system_tenant_id: String,
 }
 
 impl SelfServiceState {
@@ -29,6 +33,8 @@ impl SelfServiceState {
         kratos_public_url: String,
         gateway_public_url: String,
         paths: SelfServicePaths,
+        transient: Arc<dyn TransientTokenStore>,
+        system_tenant_id: String,
     ) -> Self {
         Self {
             client: match reqwest::Client::builder()
@@ -42,6 +48,8 @@ impl SelfServiceState {
             kratos_public_url,
             gateway_public_url,
             paths,
+            transient,
+            system_tenant_id,
         }
     }
 
@@ -52,12 +60,16 @@ impl SelfServiceState {
         kratos_public_url: String,
         gateway_public_url: String,
         paths: SelfServicePaths,
+        transient: Arc<dyn TransientTokenStore>,
+        system_tenant_id: String,
     ) -> Self {
         Self {
             client,
             kratos_public_url,
             gateway_public_url,
             paths,
+            transient,
+            system_tenant_id,
         }
     }
 }
@@ -266,7 +278,31 @@ async fn proxy_request(
                     &state.kratos_public_url,
                     &state.gateway_public_url,
                 );
-                if let Ok(value) = HeaderValue::from_str(&rewritten) {
+                // A Kratos redirect that creates or references a flow (e.g.
+                // the AAL2 step-up init) carries the raw Kratos flow UUID as
+                // `?flow=<uuid>`. Mint the transient mapping and swap in the
+                // public ULID so the RPC surface can resolve the flow the
+                // browser was sent to (SSO-041). The proxy serves browsers,
+                // not tenants, so the mapping rides on the system tenant.
+                let scrubbed = match scrub_flow_id_in_url(
+                    state.transient.as_ref(),
+                    &state.system_tenant_id,
+                    &rewritten,
+                    false,
+                )
+                .await
+                {
+                    Ok(scrubbed) => scrubbed,
+                    Err(err) => {
+                        warn!(%err, "failed to map kratos flow id in redirect location");
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            "failed to map flow id in redirect location",
+                        )
+                            .into_response();
+                    }
+                };
+                if let Ok(value) = HeaderValue::from_str(&scrubbed) {
                     response_headers.append(name.clone(), value);
                 }
             }
@@ -311,11 +347,119 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
-    const GATEWAY: &str = "https://gateway.example.com";
+    use crate::db::{DbError, TOKEN_TYPE_FLOW};
 
-    fn test_state(upstream_url: String) -> Arc<SelfServiceState> {
+    const GATEWAY: &str = "https://gateway.example.com";
+    const SYSTEM_TENANT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const BACKEND_KRATOS: &str = "kratos";
+
+    /// In-memory transient token store recording (tenant, ory_token,
+    /// public_token) rows so tests can assert which flow ids were mapped and
+    /// under which tenant.
+    #[derive(Default)]
+    struct StubTransientStore {
+        rows: Mutex<Vec<(String, String, String)>>,
+        fail_creates: std::sync::atomic::AtomicBool,
+    }
+
+    impl StubTransientStore {
+        fn public_for(&self, ory_token: &str) -> Option<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.1 == ory_token)
+                .map(|r| r.2.clone())
+        }
+
+        fn is_empty(&self) -> bool {
+            self.rows.lock().unwrap().is_empty()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransientTokenStore for StubTransientStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            _backend: &str,
+            _token_type: &str,
+            ory_token: &str,
+            _expires_at: time::OffsetDateTime,
+        ) -> Result<String, DbError> {
+            if self.fail_creates.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DbError::Sqlx(sqlx::Error::PoolTimedOut));
+            }
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter().find(|r| r.1 == ory_token) {
+                return Ok(row.2.clone());
+            }
+            let public = ulid::Ulid::new().to_string();
+            rows.push((
+                tenant_id.to_string(),
+                ory_token.to_string(),
+                public.clone(),
+            ));
+            Ok(public)
+        }
+
+        async fn get_ory_token(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _token_type: &str,
+            public_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.2 == public_token)
+                .map(|r| r.1.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_token(
+            &self,
+            _tenant_id: &str,
+            _backend: &str,
+            _token_type: &str,
+            ory_token: &str,
+        ) -> Result<String, DbError> {
+            self.public_for(ory_token).ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(&self, _tenant_id: &str, public_token: &str) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows.iter().position(|r| r.2 == public_token);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_ory_token_global(
+            &self,
+            _backend: &str,
+            _token_type: &str,
+            public_token: &str,
+        ) -> Result<(String, String), DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.2 == public_token)
+                .map(|r| (r.0.clone(), r.1.clone()))
+                .ok_or(DbError::MappingNotFound)
+        }
+    }
+
+    fn test_state_with_store(
+        upstream_url: String,
+        store: Arc<StubTransientStore>,
+    ) -> Arc<SelfServiceState> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -325,7 +469,13 @@ mod tests {
             upstream_url.clone(),
             GATEWAY.to_string(),
             SelfServicePaths::default(),
+            store,
+            SYSTEM_TENANT.to_string(),
         ))
+    }
+
+    fn test_state(upstream_url: String) -> Arc<SelfServiceState> {
+        test_state_with_store(upstream_url, Arc::new(StubTransientStore::default()))
     }
 
     async fn spawn_upstream(app: Router) -> String {
@@ -615,7 +765,110 @@ mod tests {
         });
         let upstream = format!("http://{addr}");
 
-        let state = test_state(upstream);
+        let store = Arc::new(StubTransientStore::default());
+        let state = test_state_with_store(upstream, store.clone());
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/identity/login?aal=aal2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        // The path is branded and the raw flow id is swapped for the public
+        // mapping minted under the system tenant.
+        let public = store.public_for("1").expect("flow id should be mapped");
+        assert_eq!(
+            location,
+            format!("https://gateway.example.com/identity/settings?flow={public}")
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_redirect_flow_id_is_minted_and_resolvable() {
+        // SSO-041: Kratos answers the browser flow init with a 303 to the
+        // login UI URL carrying the raw Kratos flow UUID. The proxy must mint
+        // the transient mapping and relay the public ULID instead, so the
+        // RPC surface (resolve_flow) can resolve the flow the browser was
+        // sent to. The UI URL is application-owned: host and unrelated
+        // parameters are preserved.
+        let raw_flow_id = "7b8a5f2e-7b7a-4c7a-9a5b-9f0e6c3d2b1a";
+        let location =
+            format!("https://ui.example.com/login?flow={raw_flow_id}&aal=aal2&refresh=true");
+        let upstream_origin = spawn_upstream(Router::new().route(
+            "/self-service/login/browser",
+            get(|| async move {
+                (
+                    StatusCode::SEE_OTHER,
+                    [(axum::http::header::LOCATION, location)],
+                    "",
+                )
+            }),
+        ))
+        .await;
+
+        let store = Arc::new(StubTransientStore::default());
+        let state = test_state_with_store(upstream_origin, store.clone());
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/identity/login?aal=aal2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let public = store
+            .public_for(raw_flow_id)
+            .expect("proxy should have minted a flow mapping");
+        assert_ne!(public, raw_flow_id);
+        assert_eq!(
+            location,
+            format!("https://ui.example.com/login?flow={public}&aal=aal2&refresh=true")
+        );
+        // The mapping is minted under the system tenant: the proxy serves
+        // browsers, which carry no tenant context.
+        let (tenant, ory) = store
+            .get_ory_token_global(BACKEND_KRATOS, TOKEN_TYPE_FLOW, &public)
+            .await
+            .unwrap();
+        assert_eq!(tenant, SYSTEM_TENANT);
+        assert_eq!(ory, raw_flow_id);
+    }
+
+    #[tokio::test]
+    async fn upstream_redirect_without_flow_id_is_relayed_untouched() {
+        let location = "https://ui.example.com/login?aal=aal2".to_string();
+        let upstream_origin = spawn_upstream(Router::new().route(
+            "/self-service/login/browser",
+            get(|| async move {
+                (
+                    StatusCode::SEE_OTHER,
+                    [(axum::http::header::LOCATION, location)],
+                    "",
+                )
+            }),
+        ))
+        .await;
+
+        let store = Arc::new(StubTransientStore::default());
+        let state = test_state_with_store(upstream_origin, store.clone());
         let app = router(state);
         let response = app
             .oneshot(
@@ -628,8 +881,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             response.headers().get("location").unwrap(),
-            "https://gateway.example.com/identity/settings?flow=1"
+            "https://ui.example.com/login?aal=aal2"
         );
+        assert!(
+            store.is_empty(),
+            "no mapping should be minted for a flowless redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_redirect_flow_mapping_failure_is_bad_gateway() {
+        // Relaying the raw Kratos flow id would recreate SSO-041 silently;
+        // when the mapping cannot be minted the proxy fails the redirect
+        // instead of leaking the backend identifier.
+        let location =
+            "https://ui.example.com/login?flow=7b8a5f2e-7b7a-4c7a-9a5b-9f0e6c3d2b1a".to_string();
+        let upstream_origin = spawn_upstream(Router::new().route(
+            "/self-service/login/browser",
+            get(|| async move {
+                (
+                    StatusCode::SEE_OTHER,
+                    [(axum::http::header::LOCATION, location)],
+                    "",
+                )
+            }),
+        ))
+        .await;
+
+        let store = Arc::new(StubTransientStore::default());
+        store
+            .fail_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = test_state_with_store(upstream_origin, store);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/identity/login?aal=aal2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

@@ -480,6 +480,8 @@ pub async fn build_app_with_upstream(
         config.kratos_public_url.clone(),
         config.public_base_url.clone(),
         config.self_service_paths.clone(),
+        Arc::new(transient.clone()),
+        config.system_tenant_ulid.clone(),
     ));
     let scim_state = Arc::new(ScimState::new(scim_service.clone()));
     let saml_state = Arc::new(SamlState::new(federation_service.clone()));

@@ -12,6 +12,9 @@
 
 use std::sync::Arc;
 
+use sso_gateway::db::{
+    TOKEN_TYPE_FLOW, TransientTokenRepo, TransientTokenStore, bootstrap_system_tenant, create_pool,
+};
 use sso_gateway::{
     config::SelfServicePaths,
     services::handlers::self_service::{SelfServiceState, router},
@@ -19,12 +22,26 @@ use sso_gateway::{
 mod support;
 
 const GATEWAY_URL: &str = "https://gateway.example.com";
+const SYSTEM_TENANT_ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 async fn spawn_gateway(kratos_public_url: String) -> String {
+    spawn_gateway_with_store(
+        kratos_public_url,
+        Arc::new(support::TestTransientTokenStore::default()),
+    )
+    .await
+}
+
+async fn spawn_gateway_with_store(
+    kratos_public_url: String,
+    transient: Arc<dyn TransientTokenStore>,
+) -> String {
     let state = Arc::new(SelfServiceState::new(
         kratos_public_url,
         GATEWAY_URL.to_string(),
         SelfServicePaths::default(),
+        transient,
+        SYSTEM_TENANT_ULID.to_string(),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -178,4 +195,82 @@ async fn kratos_init_paths_are_not_served_directly() {
         .await
         .expect("kratos-shaped init request");
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// SSO-041: a Kratos browser redirect that carries a flow id (the AAL2
+/// step-up init is the production case) must be relayed with a gateway-minted
+/// public ULID, and the mapping behind it must resolve — through the same
+/// global lookup `resolve_flow` falls back to — to the raw Kratos flow id,
+/// which Kratos then accepts.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxied_flow_redirect_mints_resolvable_public_flow_id() {
+    let (_postgres, db_url) = support::start_postgres()
+        .await
+        .expect("postgres should start");
+    let (_kratos, _admin, kratos_public) =
+        support::start_kratos().await.expect("kratos should start");
+    let pool = create_pool(&db_url, false).await.expect("pool");
+    bootstrap_system_tenant(&pool, SYSTEM_TENANT_ULID)
+        .await
+        .expect("system tenant should be bootstrapped");
+    let store = Arc::new(TransientTokenRepo::new(pool));
+    let gateway = spawn_gateway_with_store(kratos_public.clone(), store.clone()).await;
+
+    let response = browser_client()
+        .get(format!("{gateway}/identity/login"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("branded login request");
+    assert_eq!(response.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("303 must carry a location")
+        .to_string();
+    let url = reqwest::Url::parse(&location).expect("location is an absolute url");
+    let public_flow_id = url
+        .query_pairs()
+        .find(|(key, _)| key == "flow")
+        .map(|(_, value)| value.into_owned())
+        .expect("kratos flow redirect must carry a flow parameter");
+    assert!(
+        !public_flow_id.contains('-'),
+        "public flow id should be a ULID, not the raw kratos UUID: {public_flow_id}"
+    );
+
+    // The public id resolves back to the raw Kratos flow id through the
+    // global lookup resolve_flow falls back to...
+    let (tenant, raw_flow_id) = store
+        .get_ory_token_global("kratos", TOKEN_TYPE_FLOW, &public_flow_id)
+        .await
+        .expect("proxy-minted mapping should resolve");
+    assert_eq!(tenant, SYSTEM_TENANT_ULID);
+
+    // ...and Kratos accepts that raw id: the flow the browser was sent to
+    // really exists upstream. Browser flows are cookie-bound, so the fetch
+    // must carry the cookies Kratos issued on init (relayed by the proxy).
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let flow = browser_client()
+        .get(format!(
+            "{kratos_public}/self-service/login/flows?id={raw_flow_id}"
+        ))
+        .header("accept", "application/json")
+        .header("cookie", cookie)
+        .send()
+        .await
+        .expect("kratos flow fetch");
+    assert_eq!(
+        flow.status(),
+        reqwest::StatusCode::OK,
+        "kratos should resolve the raw flow id behind the public ULID"
+    );
 }

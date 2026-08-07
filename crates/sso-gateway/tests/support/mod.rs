@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::Connection;
 use sso_gateway::auth::{IntrospectionResult, TokenIntrospector};
-use sso_gateway::db::SessionStore;
+use sso_gateway::db::{DbError, SessionStore, TransientTokenStore};
 use testcontainers::{
     ContainerAsync, CopyTargetOptions, GenericImage, ImageExt,
     core::{ContainerPort, WaitFor, ports::IntoContainerPort},
@@ -457,6 +457,93 @@ impl SessionStore for TestSessionStore {
 /// Return a boxed test session store for use in the shared auth middleware.
 pub fn test_session_store() -> Arc<dyn SessionStore> {
     Arc::new(TestSessionStore)
+}
+
+/// In-memory transient token store recording (tenant, ory_token,
+/// public_token) rows. Browser-proxy tests use it where no database is
+/// running; it mirrors the Postgres store's idempotent create semantics.
+#[derive(Default)]
+pub struct TestTransientTokenStore {
+    rows: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait]
+impl TransientTokenStore for TestTransientTokenStore {
+    async fn create(
+        &self,
+        tenant_id: &str,
+        _backend: &str,
+        _token_type: &str,
+        ory_token: &str,
+        _expires_at: time::OffsetDateTime,
+    ) -> Result<String, DbError> {
+        let mut rows = self.rows.lock().expect("transient store lock");
+        if let Some(row) = rows.iter().find(|r| r.1 == ory_token) {
+            return Ok(row.2.clone());
+        }
+        let public = ulid::Ulid::new().to_string();
+        rows.push((
+            tenant_id.to_string(),
+            ory_token.to_string(),
+            public.clone(),
+        ));
+        Ok(public)
+    }
+
+    async fn get_ory_token(
+        &self,
+        _tenant_id: &str,
+        _backend: &str,
+        _token_type: &str,
+        public_token: &str,
+    ) -> Result<String, DbError> {
+        self.rows
+            .lock()
+            .expect("transient store lock")
+            .iter()
+            .find(|r| r.2 == public_token)
+            .map(|r| r.1.clone())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn get_public_token(
+        &self,
+        _tenant_id: &str,
+        _backend: &str,
+        _token_type: &str,
+        ory_token: &str,
+    ) -> Result<String, DbError> {
+        self.rows
+            .lock()
+            .expect("transient store lock")
+            .iter()
+            .find(|r| r.1 == ory_token)
+            .map(|r| r.2.clone())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn delete(&self, _tenant_id: &str, public_token: &str) -> Result<(), DbError> {
+        let mut rows = self.rows.lock().expect("transient store lock");
+        let pos = rows.iter().position(|r| r.2 == public_token);
+        pos.map(|i| rows.remove(i))
+            .map(|_| ())
+            .ok_or(DbError::MappingNotFound)
+    }
+
+    async fn get_ory_token_global(
+        &self,
+        _backend: &str,
+        _token_type: &str,
+        public_token: &str,
+    ) -> Result<(String, String), DbError> {
+        self.rows
+            .lock()
+            .expect("transient store lock")
+            .iter()
+            .find(|r| r.2 == public_token)
+            .map(|r| (r.0.clone(), r.1.clone()))
+            .ok_or(DbError::MappingNotFound)
+    }
 }
 
 /// Insert an id_mapping so the shared auth middleware can resolve
