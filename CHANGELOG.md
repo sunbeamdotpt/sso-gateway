@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.08.4] - 2026-08-06
+
+### Fixed
+
+- Matrix client scopes (MSC2965 `urn:matrix:client:*` and the unstable
+  MSC2967 prefix) are now exempt from the per-user entitlement scope ceiling
+  in `AcceptConsent` (SSO-039): they are not gateway-API capabilities, so
+  per-user gateway entitlements say nothing about them — they are vetted at
+  authorize time by the Matrix scope guardrail and bounded by the client's
+  registered scope (the same exemption the DCR registration ceiling gives
+  them). This unbreaks Element X first-use consent, which died with
+  "requested scopes exceed entitlement ceiling" when granting
+  `urn:matrix:client:device:<id>` scopes for users with an OIDC-only ceiling.
+
 ## [2026.08.3] - 2026-08-06
 
 ### Added
