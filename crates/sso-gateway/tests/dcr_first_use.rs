@@ -14,6 +14,7 @@
 //! login/consent challenges end to end.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use buffa::{HasMessageView, Message, MessageView, bytes::Bytes};
 use connectrpc::{ErrorCode, RequestContext, ServiceRequest};
@@ -31,10 +32,12 @@ use sso_gateway::proto::iam::v1::{
 use sso_gateway::services::entitlement::{
     EntitlementLevel, EntitlementService, EntitlementServiceImpl,
 };
+use sso_gateway::services::handlers::oauth2::{Oauth2State, router as oauth2_router};
 use sso_gateway::services::identity_self_service::IdentitySelfServiceImpl;
 use sso_gateway::services::oauth2_consent::OAuth2ConsentServiceImpl;
 use sso_gateway::services::permission::PermissionBackend;
 use sso_ory_client::{HydraClient, KratosClient};
+use sunbeam_g2v::server::axum::bind_random_port;
 use testcontainers::{ContainerAsync, GenericImage};
 
 mod support;
@@ -413,15 +416,115 @@ async fn register_client(svc: &Services, tenant_id: &str, source: Option<&str>) 
     }
 }
 
+/// Register a Matrix-shaped (MSC2965) client through the gateway's public
+/// RFC 7591 DCR endpoint: the Matrix scope passes the DCR ceiling verbatim,
+/// the registered scope becomes the wildcard `*` (Hydra exact-matches scopes,
+/// so per-login `urn:matrix:client:device:<id>` scopes could never be
+/// pre-registered), and the Matrix offline-access path adds `offline_access`
+/// plus the `refresh_token` grant. Anonymous DCR maps the client under the
+/// state's system tenant, which this harness points at the test tenant; no
+/// `applications` row is created, so the client stays provisional.
+async fn register_matrix_client_via_dcr(
+    svc: &Services,
+    tenant_id: &str,
+    device_scope: &str,
+) -> Client {
+    let oauth_state = Arc::new(
+        Oauth2State::new(
+            svc.hydra.clone(),
+            svc.mappings.clone(),
+            svc.hydra_public_url.clone(),
+            svc.entitlements.clone(),
+            Arc::new(svc.applications.clone()),
+            Duration::from_secs(604_800),
+        )
+        .with_system_tenant_id(tenant_id.to_string()),
+    );
+    let (listener, addr) = bind_random_port("127.0.0.1")
+        .await
+        .expect("random port should bind");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, oauth2_router(oauth_state))
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("dcr server should run");
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/oauth2/register"))
+        .json(&json!({
+            "client_name": "element-x",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "scope": format!("openid {device_scope}"),
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+        .send()
+        .await
+        .expect("register request should complete");
+    let status = resp.status();
+    let registered: Value = resp.json().await.expect("register response should be json");
+    assert!(
+        status.is_success(),
+        "matrix DCR failed: {status} {registered}"
+    );
+    assert_eq!(
+        registered["scope"].as_str(),
+        Some("*"),
+        "matrix clients must be registered with wildcard scope: {registered}"
+    );
+    let grants: Vec<&str> = registered["grant_types"]
+        .as_array()
+        .expect("registered grant_types")
+        .iter()
+        .filter_map(|g| g.as_str())
+        .collect();
+    assert!(
+        grants.contains(&"refresh_token"),
+        "refresh_token grant must be added at DCR: {grants:?}"
+    );
+    let public_id = registered["client_id"]
+        .as_str()
+        .expect("client_id should exist")
+        .to_string();
+    let client_secret = registered["client_secret"]
+        .as_str()
+        .expect("client_secret should exist")
+        .to_string();
+    let _ = shutdown_tx.send(());
+    server.await.expect("dcr server task should finish");
+    Client {
+        // Gateway DCR sets the Hydra client_id to the public ULID.
+        ory_client_id: public_id.clone(),
+        client_secret,
+        public_id,
+    }
+}
+
 /// Start an authorization request and return Hydra's login challenge.
 async fn start_authorize(svc: &Services, http: &reqwest::Client, client: &Client) -> String {
+    start_authorize_with_scope(svc, http, client, "openid offline_access").await
+}
+
+/// Start an authorization request with an explicit scope set and return
+/// Hydra's login challenge.
+async fn start_authorize_with_scope(
+    svc: &Services,
+    http: &reqwest::Client,
+    client: &Client,
+    scope: &str,
+) -> String {
     let resp = http
         .get(format!("{}/oauth2/auth", svc.hydra_public_url))
         .query(&[
             ("response_type", "code"),
             ("client_id", client.ory_client_id.as_str()),
             ("redirect_uri", REDIRECT_URI),
-            ("scope", "openid offline_access"),
+            ("scope", scope),
             ("state", "first-use-state"),
         ])
         .send()
@@ -501,10 +604,22 @@ async fn run_consent_gate(
     user: &User,
     consent_challenge: &str,
 ) -> Result<String, connectrpc::ConnectError> {
+    run_consent_gate_with_scopes(svc, tenant_id, user, consent_challenge, &["openid"]).await
+}
+
+/// Run the consent gate granting an explicit scope set. On success returns
+/// the consent `redirect_to`.
+async fn run_consent_gate_with_scopes(
+    svc: &Services,
+    tenant_id: &str,
+    user: &User,
+    consent_challenge: &str,
+    grant_scope: &[&str],
+) -> Result<String, connectrpc::ConnectError> {
     let ctx = consent_context(tenant_id, &user.public_subject);
     let req = service_request(AcceptConsentRequest {
         challenge: consent_challenge.to_string(),
-        grant_scope: vec!["openid".to_string()],
+        grant_scope: grant_scope.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     });
     svc.consent
@@ -694,6 +809,85 @@ async fn first_use_journey(svc: &Services) {
         tuples.iter().all(|t| !t.subject_id.contains("employees")),
         "first use must never write group links: {tuples:?}"
     );
+}
+
+/// Regression for the Matrix consent-ceiling hotfix (SSO-039): a
+/// Matrix-shaped (MSC2965) DCR client completes the full first-use journey
+/// with a consenting user whose scope ceiling is OIDC-only (no member/admin
+/// entitlement on the gateway app object). The
+/// `urn:matrix:client:device:<id>` scope sits above that ceiling, but Matrix
+/// scopes are exempt in `accept_consent` — vetted at authorize time by the
+/// Matrix scope guardrail and bounded by the client's wildcard registered
+/// scope — so the interactive consent accept succeeds and a token (with
+/// refresh) is issued. Pre-fix this is the exact Element X prod failure:
+/// "requested scopes exceed entitlement ceiling".
+async fn matrix_scope_first_use_journey(svc: &Services) {
+    let _guard = FLOW_LOCK.lock().await;
+    let tenant = create_tenant(&svc.pool).await;
+    // OIDC-only ceiling: no member/admin grant on the gateway app object.
+    let user = create_user(svc, &tenant, "matrix-user@example.com").await;
+    let device_scope = format!(
+        "urn:matrix:client:device:{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    );
+    let client = register_matrix_client_via_dcr(svc, &tenant, &device_scope).await;
+
+    let http = no_redirect_client();
+    let requested_scope = format!("openid {device_scope} offline_access");
+    let login_challenge = start_authorize_with_scope(svc, &http, &client, &requested_scope).await;
+    let redirect = run_login_gate(svc, &tenant, &user, &login_challenge)
+        .await
+        .expect("provisional matrix client must defer to consent, not 403");
+    let consent_challenge = consent_challenge_after_login(svc, &http, &redirect).await;
+    assert!(
+        first_use_flag(svc, &tenant, &user, &consent_challenge).await,
+        "first consent must be flagged first_use"
+    );
+    // The exact prod failure shape: granting a Matrix device scope (above the
+    // user's OIDC-only entitlement ceiling) must succeed.
+    let consent_redirect = run_consent_gate_with_scopes(
+        svc,
+        &tenant,
+        &user,
+        &consent_challenge,
+        &["openid", device_scope.as_str(), "offline_access"],
+    )
+    .await
+    .expect("matrix scopes are exempt from the entitlement ceiling");
+    let token = finish_flow(svc, &http, &client, &consent_redirect).await;
+    assert_token_issued(&token);
+    // The matrix + offline_access scopes survive into the issued token.
+    let granted_scope = token["scope"].as_str().unwrap_or_default();
+    assert!(
+        granted_scope.split_whitespace().any(|s| s == device_scope),
+        "matrix device scope must survive into the token: {token}"
+    );
+    assert!(
+        granted_scope
+            .split_whitespace()
+            .any(|s| s == "offline_access"),
+        "offline_access must survive into the token: {token}"
+    );
+    assert!(
+        !token["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "a refresh token must be issued: {token}"
+    );
+
+    // The consent was the user's first-use approval: per-user grant plus the
+    // DCR-marked applications row.
+    assert_eq!(
+        member_tuple_count(svc, &tenant, &client.public_id, &user.public_subject).await,
+        1
+    );
+    let row = svc
+        .applications
+        .get(&tenant, &client.public_id)
+        .await
+        .expect("first use must create the applications row");
+    assert_eq!(row.registration_source, REGISTRATION_SOURCE_DCR);
 }
 
 /// SSO-039 ownership: a provisional client mapped in another tenant is
@@ -987,6 +1181,11 @@ mod openfga {
     }
 
     #[tokio::test]
+    async fn matrix_scope_first_use_journey_openfga() {
+        matrix_scope_first_use_journey(&services().await).await;
+    }
+
+    #[tokio::test]
     async fn provisional_claim_openfga() {
         provisional_claim(&services().await).await;
     }
@@ -1042,6 +1241,11 @@ mod keto {
     #[tokio::test]
     async fn first_use_journey_keto() {
         first_use_journey(&services().await).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_scope_first_use_journey_keto() {
+        matrix_scope_first_use_journey(&services().await).await;
     }
 
     #[tokio::test]

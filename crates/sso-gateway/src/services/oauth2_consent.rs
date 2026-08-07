@@ -23,6 +23,7 @@ use crate::proto::iam::v1::{
 };
 use crate::services::client_entitlement::{ClientEntitlement, resolve_client_entitlement};
 use crate::services::entitlement::{EntitlementLevel, EntitlementService};
+use crate::services::handlers::oauth2::is_matrix_scope;
 
 use super::oauth2_consent_mapper::{
     accept_consent_request_to_json, accept_logout_request_to_json, inject_id_token_claim,
@@ -688,7 +689,12 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         }
 
         // Enforce the per-user OAuth2 scope ceiling derived from the user's
-        // entitlement on the gateway application object.
+        // entitlement on the gateway application object. Matrix client scopes
+        // (MSC2965/MSC2967) are exempt: they are not gateway-API capabilities,
+        // so per-user gateway entitlements say nothing about them — they are
+        // vetted at authorize time by the Matrix scope guardrail and bounded
+        // by the client's registered scope (the same exemption the DCR
+        // registration ceiling gives them).
         let ceiling = self
             .entitlements
             .effective_scope_ceiling(&tenant_id, &public_subject)
@@ -697,7 +703,7 @@ impl OAuth2ConsentService for OAuth2ConsentServiceImpl {
         let out_of_ceiling: Vec<_> = req
             .grant_scope
             .iter()
-            .filter(|s| !ceiling_set.contains(*s))
+            .filter(|s| !ceiling_set.contains(*s) && !is_matrix_scope(s))
             .cloned()
             .collect();
         if !out_of_ceiling.is_empty() {
@@ -2790,6 +2796,86 @@ mod tests {
             AcceptConsentRequest {
                 challenge: "pub-consent-2".into(),
                 grant_scope: vec!["openid".into(), "tenant:admin".into()],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let err: ServiceError = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, ServiceError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn accept_consent_allows_matrix_scopes_above_entitlement_ceiling() {
+        // Regression (SSO-039 hotfix): Matrix scopes (MSC2965 + MSC2967) are
+        // vetted at authorize time, not by the per-user gateway ceiling — a
+        // user with an OIDC-only ceiling must still consent to them.
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": [
+                "openid",
+                "urn:matrix:client:device:abc",
+                "urn:matrix:org.matrix.msc2967.client:api:*"
+            ],
+        })));
+        mock.queue(Ok(serde_json::json!({
+            "redirect_to": "https://example.com/callback",
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        let svc = service_with_entitlements(mock.clone(), entitlements);
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec![
+                    "openid".into(),
+                    "urn:matrix:client:device:abc".into(),
+                    "urn:matrix:org.matrix.msc2967.client:api:*".into(),
+                ],
+                ..Default::default()
+            },
+            AcceptConsentRequest
+        );
+        let resp = svc
+            .accept_consent(auth_context(&[SCOPE_IDENTITY_ADMIN]), req)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(resp.redirect_to, "https://example.com/callback");
+    }
+
+    #[tokio::test]
+    async fn accept_consent_still_denies_non_matrix_scope_above_ceiling() {
+        // The Matrix exemption must not smuggle gateway-API scopes past the
+        // ceiling: matrix scopes pass, `tenant:admin` is still rejected.
+        let mock = Arc::new(MockConsentHydra::default());
+        mock.queue(Ok(serde_json::json!({
+            "challenge": "consent-challenge-2",
+            "client": { "client_id": "client-1" },
+            "subject": "ory-subject-1",
+            "requested_scope": ["openid", "urn:matrix:client:device:abc", "tenant:admin"],
+        })));
+        let entitlements = Arc::new(ConfigurableEntitlementService::default());
+        entitlements.set_ceiling(vec!["openid".to_string()]);
+        entitlements.allow("tenant-1", "subject-1", "pub-client-1");
+        let svc = service_with_entitlements(mock.clone(), entitlements);
+        svc_req!(
+            req,
+            AcceptConsentRequest {
+                challenge: "pub-consent-2".into(),
+                grant_scope: vec![
+                    "openid".into(),
+                    "urn:matrix:client:device:abc".into(),
+                    "tenant:admin".into(),
+                ],
                 ..Default::default()
             },
             AcceptConsentRequest

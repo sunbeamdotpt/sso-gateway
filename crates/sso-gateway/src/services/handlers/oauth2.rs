@@ -1120,7 +1120,7 @@ const MATRIX_CLIENT_SCOPE_PREFIX_MSC2967: &str = "urn:matrix:org.matrix.msc2967.
 
 /// Whether a scope belongs to a Matrix client scope family (MSC2965 stable
 /// prefix or the unstable MSC2967 prefix).
-fn is_matrix_scope(scope: &str) -> bool {
+pub(crate) fn is_matrix_scope(scope: &str) -> bool {
     scope.starts_with(MATRIX_CLIENT_SCOPE_PREFIX)
         || scope.starts_with(MATRIX_CLIENT_SCOPE_PREFIX_MSC2967)
 }
