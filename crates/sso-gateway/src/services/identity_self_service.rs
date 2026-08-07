@@ -36,8 +36,73 @@ use buffa_types::google::protobuf::Empty;
 const BACKEND_KRATOS: &str = "kratos";
 const BACKEND_HYDRA: &str = "hydra";
 
-fn transient_expiry() -> time::OffsetDateTime {
+pub(crate) fn transient_expiry() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
+
+/// Replace every non-empty `flow` query parameter in `value` with the
+/// gateway's opaque public flow id, minted (idempotently) through the
+/// transient token store. Unrelated query parameters are preserved.
+///
+/// Kratos-owned URLs (flow `request_url`, `ui.action`, token-submit redirect
+/// locations, …) embed the raw Kratos flow UUID as `?flow=<uuid>`; leaking it
+/// would expose a backend identifier the gateway itself cannot resolve. When
+/// `strict` is false (flow payload URLs) a value that does not parse as an
+/// absolute URL is returned unchanged, preserving the historical tolerance of
+/// relative or non-URL strings. When `strict` is true (Kratos token-submit
+/// redirect locations, which must be absolute URLs) a parse failure is
+/// `ServiceError::Internal`.
+///
+/// Shared by the RPC surface and the branded browser proxy: a Kratos redirect
+/// relayed by the proxy (e.g. the AAL2 step-up init) carries the raw flow id
+/// too, and without a mapping the RPC surface cannot resolve the flow the
+/// browser was sent to.
+pub(crate) async fn scrub_flow_id_in_url(
+    transient: &dyn TransientTokenStore,
+    tenant_id: &str,
+    value: &str,
+    strict: bool,
+) -> Result<String, ServiceError> {
+    let mut url = match reqwest::Url::parse(value) {
+        Ok(url) => url,
+        Err(_) if strict => {
+            return Err(ServiceError::Internal(
+                "kratos returned an invalid redirect location".into(),
+            ));
+        }
+        Err(_) => return Ok(value.to_string()),
+    };
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, val)| (key.into_owned(), val.into_owned()))
+        .collect();
+    // Leave URLs without a scrubbable flow parameter byte-identical.
+    if !pairs
+        .iter()
+        .any(|(key, val)| key == "flow" && !val.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+    let mut scrubbed = Vec::with_capacity(pairs.len());
+    for (key, val) in pairs {
+        if key == "flow" && !val.is_empty() {
+            let public = transient
+                .create(
+                    tenant_id,
+                    BACKEND_KRATOS,
+                    TOKEN_TYPE_FLOW,
+                    &val,
+                    transient_expiry(),
+                )
+                .await
+                .map_err(ServiceError::from)?;
+            scrubbed.push((key, public));
+        } else {
+            scrubbed.push((key, val));
+        }
+    }
+    url.query_pairs_mut().clear().extend_pairs(scrubbed);
+    Ok(url.into())
 }
 
 /// Resolve a login challenge supplied by the caller to the Hydra challenge that
@@ -761,55 +826,15 @@ impl IdentitySelfServiceImpl {
             .await
     }
 
-    /// Replace every non-empty `flow` query parameter in `value` with the
-    /// gateway's opaque public flow id, minted (idempotently) through
-    /// [`Self::public_flow`]. Unrelated query parameters are preserved.
-    ///
-    /// Kratos-owned URLs (flow `request_url`, `ui.action`, token-submit
-    /// redirect locations, …) embed the raw Kratos flow UUID as
-    /// `?flow=<uuid>`; leaking it would expose a backend identifier the
-    /// gateway itself cannot resolve. When `strict` is false (flow payload
-    /// URLs) a value that does not parse as an absolute URL is returned
-    /// unchanged, preserving the historical tolerance of relative or non-URL
-    /// strings. When `strict` is true (Kratos token-submit redirect
-    /// locations, which must be absolute URLs) a parse failure is
-    /// `ServiceError::Internal`.
+    /// Rewrite a Kratos-owned flow URL's raw flow id onto a gateway-minted
+    /// public id. See the free [`scrub_flow_id_in_url`] for the semantics.
     async fn scrub_flow_id_in_url(
         &self,
         tenant_id: &str,
         value: &str,
         strict: bool,
     ) -> Result<String, ServiceError> {
-        let mut url = match reqwest::Url::parse(value) {
-            Ok(url) => url,
-            Err(_) if strict => {
-                return Err(ServiceError::Internal(
-                    "kratos returned an invalid redirect location".into(),
-                ));
-            }
-            Err(_) => return Ok(value.to_string()),
-        };
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(key, val)| (key.into_owned(), val.into_owned()))
-            .collect();
-        // Leave URLs without a scrubbable flow parameter byte-identical.
-        if !pairs
-            .iter()
-            .any(|(key, val)| key == "flow" && !val.is_empty())
-        {
-            return Ok(value.to_string());
-        }
-        let mut scrubbed = Vec::with_capacity(pairs.len());
-        for (key, val) in pairs {
-            if key == "flow" && !val.is_empty() {
-                scrubbed.push((key, self.public_flow(tenant_id, &val).await?));
-            } else {
-                scrubbed.push((key, val));
-            }
-        }
-        url.query_pairs_mut().clear().extend_pairs(scrubbed);
-        Ok(url.into())
+        scrub_flow_id_in_url(self.transient.as_ref(), tenant_id, value, strict).await
     }
 
     /// Rewrite a Kratos-owned flow URL onto the branded gateway surface and
@@ -924,10 +949,28 @@ impl IdentitySelfServiceImpl {
         if public_flow_id.is_empty() {
             return Err(ServiceError::InvalidArgument("flow id is required".into()));
         }
-        self.transient
+        match self
+            .transient
             .get_ory_token(tenant_id, BACKEND_KRATOS, TOKEN_TYPE_FLOW, public_flow_id)
             .await
-            .map_err(|e| e.into())
+        {
+            Ok(ory_flow_id) => Ok(ory_flow_id),
+            Err(DbError::MappingNotFound) => {
+                // Flows whose ids first appear in a Kratos redirect relayed by
+                // the branded browser proxy (e.g. the AAL2 step-up init) are
+                // minted under the system tenant, which the RPC caller does
+                // not necessarily act as. The public ULID is the capability —
+                // it only ever reaches the browser that owns the flow — so
+                // resolve it globally rather than shedding the flow (SSO-041).
+                let (_, ory_flow_id) = self
+                    .transient
+                    .get_ory_token_global(BACKEND_KRATOS, TOKEN_TYPE_FLOW, public_flow_id)
+                    .await
+                    .map_err(ServiceError::from)?;
+                Ok(ory_flow_id)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn public_flow(
@@ -3095,6 +3138,132 @@ mod tests {
         }
     }
 
+    /// Transient store that honors tenant scoping in the tenant-keyed
+    /// lookups, unlike [`StubTransientTokenStore`], so tests can prove the
+    /// system-tenant fallback in `resolve_flow` (SSO-041).
+    #[derive(Default)]
+    struct TenantScopedTransientStore {
+        rows: Mutex<Vec<TransientTokenRow>>,
+    }
+
+    impl TenantScopedTransientStore {
+        fn seed(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+            ory_token: &str,
+        ) {
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.to_string(),
+                ory_token: ory_token.to_string(),
+                expires_at: super::transient_expiry(),
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransientTokenStore for TenantScopedTransientStore {
+        async fn create(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+            expires_at: time::OffsetDateTime,
+        ) -> Result<String, DbError> {
+            let public_token = Ulid::new().to_string();
+            self.rows.lock().unwrap().push(TransientTokenRow {
+                id: Ulid::new().to_string(),
+                tenant_id: tenant_id.to_string(),
+                backend: backend.to_string(),
+                token_type: token_type.to_string(),
+                public_token: public_token.clone(),
+                ory_token: ory_token.to_string(),
+                expires_at,
+                created_at: time::OffsetDateTime::now_utc(),
+            });
+            Ok(public_token)
+        }
+
+        async fn get_ory_token(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id
+                        && r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| r.ory_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_public_token(
+            &self,
+            tenant_id: &str,
+            backend: &str,
+            token_type: &str,
+            ory_token: &str,
+        ) -> Result<String, DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.tenant_id == tenant_id
+                        && r.backend == backend
+                        && r.token_type == token_type
+                        && r.ory_token == ory_token
+                })
+                .map(|r| r.public_token.clone())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn delete(&self, tenant_id: &str, public_token: &str) -> Result<(), DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let pos = rows
+                .iter()
+                .position(|r| r.tenant_id == tenant_id && r.public_token == public_token);
+            pos.map(|i| rows.remove(i))
+                .map(|_| ())
+                .ok_or(DbError::MappingNotFound)
+        }
+
+        async fn get_ory_token_global(
+            &self,
+            backend: &str,
+            token_type: &str,
+            public_token: &str,
+        ) -> Result<(String, String), DbError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r.backend == backend
+                        && r.token_type == token_type
+                        && r.public_token == public_token
+                })
+                .map(|r| (r.tenant_id.clone(), r.ory_token.clone()))
+                .ok_or(DbError::MappingNotFound)
+        }
+    }
+
     fn default_mapping_store() -> StubMappingStore {
         StubMappingStore::default()
             .with_mapping("tenant-1", BACKEND_KRATOS, "pub-identity-1", "identity-1")
@@ -3518,6 +3687,28 @@ mod tests {
             schemas: Arc::new(default_schema_store()),
             memberships: Arc::new(default_membership_store()),
             entitlements,
+            consent_enabled: true,
+            kratos_public_url: "http://kratos.example.com".to_string(),
+            hydra_public_url: "https://hydra.example.com".to_string(),
+            gateway_public_url: "https://gateway.example.com".to_string(),
+            kratos_default_schema_id: "default".to_string(),
+            paths: crate::config::SelfServicePaths::default(),
+        }
+    }
+
+    fn service_with_transient(
+        kratos: FakeKratos,
+        transient: Arc<dyn TransientTokenStore>,
+    ) -> IdentitySelfServiceImpl {
+        IdentitySelfServiceImpl {
+            kratos: Arc::new(kratos),
+            hydra: Arc::new(FakeHydra::default()),
+            transient,
+            mappings: Arc::new(default_mapping_store()),
+            applications: Arc::new(MemoryApplicationStore::default()),
+            schemas: Arc::new(default_schema_store()),
+            memberships: Arc::new(default_membership_store()),
+            entitlements: entitlements(),
             consent_enabled: true,
             kratos_public_url: "http://kratos.example.com".to_string(),
             hydra_public_url: "https://hydra.example.com".to_string(),
@@ -4061,6 +4252,100 @@ mod tests {
         assert!(
             fake.calls.lock().unwrap().is_empty(),
             "gateway must not forward an unknown flow id to Kratos"
+        );
+    }
+
+    // SSO-041: the branded browser proxy mints flow mappings under the system
+    // tenant when it relays a Kratos redirect that carries a flow id (e.g.
+    // the AAL2 step-up init). The RPC caller acts as its own tenant, so the
+    // tenant-scoped lookup misses; resolve_flow must fall back to the global
+    // lookup rather than shedding the flow.
+    #[tokio::test]
+    async fn get_login_flow_resolves_proxy_minted_flow_via_global_fallback() {
+        let raw_flow_id = "b2c3a9db-5129-4156-8f2c-6ad045965953";
+        let transient = Arc::new(TenantScopedTransientStore::default());
+        transient.seed(
+            "tenant-system",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "public-flow-1",
+            raw_flow_id,
+        );
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service_with_transient(fake.clone(), transient);
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(GetFlowRequest {
+            id: "public-flow-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.get_login_flow(ctx, req).await.unwrap();
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            format!("get_login_flow(id={raw_flow_id}, cookie=None)"),
+            "kratos must be called with the raw flow id behind the public ULID"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_login_flow_on_proxy_minted_flow_reaches_kratos_with_raw_id() {
+        let raw_flow_id = "b2c3a9db-5129-4156-8f2c-6ad045965953";
+        let transient = Arc::new(TenantScopedTransientStore::default());
+        transient.seed(
+            "tenant-system",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "public-flow-1",
+            raw_flow_id,
+        );
+        let fake = FakeKratos {
+            flow: Arc::new(Mutex::new(Some(Ok(sample_flow())))),
+            ..Default::default()
+        };
+        let svc = service_with_transient(fake.clone(), transient);
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(SubmitFlowRequest {
+            id: "public-flow-1".to_string(),
+            ..Default::default()
+        });
+
+        svc.submit_login_flow(ctx, req).await.unwrap();
+        assert!(
+            fake.calls.lock().unwrap()[0]
+                .starts_with(&format!("submit_login_flow(id={raw_flow_id}")),
+            "kratos must be called with the raw flow id behind the public ULID"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_login_flow_unmapped_id_stays_not_found_with_global_fallback() {
+        // The fallback widens resolution to proxy-minted mappings, not to
+        // arbitrary ids: an id with no mapping anywhere is still NotFound
+        // and never reaches Kratos.
+        let transient = Arc::new(TenantScopedTransientStore::default());
+        transient.seed(
+            "tenant-system",
+            BACKEND_KRATOS,
+            TOKEN_TYPE_FLOW,
+            "public-flow-1",
+            "raw-flow-1",
+        );
+        let fake = FakeKratos::default();
+        let svc = service_with_transient(fake.clone(), transient);
+        let ctx = request_context_with_tenant("tenant-1");
+        let req = service_request(GetFlowRequest {
+            id: "no-such-flow".to_string(),
+            ..Default::default()
+        });
+
+        let err = svc.get_login_flow(ctx, req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            fake.calls.lock().unwrap().is_empty(),
+            "gateway must not forward an unmapped flow id to Kratos"
         );
     }
 
