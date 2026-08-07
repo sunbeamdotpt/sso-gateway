@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer).
 
+## [2026.08.5] - 2026-08-07
+
+### Fixed
+
+- Kratos redirect locations relayed by the branded self-service browser
+  proxy no longer leak the raw Kratos flow UUID (SSO-041): redirects that
+  create or reference a flow (the AAL2 step-up init is the production case)
+  carried `?flow=<uuid>` — a backend identifier the gateway itself cannot
+  resolve. The proxy now mints the transient flow mapping (on the system
+  tenant, since the proxy serves browsers, not tenants) and swaps in the
+  gateway's opaque public ULID, so the RPC surface can resolve the flow the
+  browser was sent to; a mapping failure fails the proxied request with 502
+  instead of leaking the raw id. The scrubbing logic is now shared between
+  the RPC surface and the browser proxy.
+
 ## [2026.08.4] - 2026-08-06
 
 ### Fixed
